@@ -114,6 +114,56 @@ describe("createRecoveryPoint", () => {
     expect(captured.snapshot.stateManifest).not.toBe(input.stateManifest);
   });
 
+  it("rejects duplicate durable paths before constructing a recovery point", async () => {
+    const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+    const input = createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z");
+    const duplicatePathInput = {
+      ...input,
+      stateManifest: {
+        ...input.stateManifest,
+        durablePaths: ["context.json", "context.json", "state.json", "manifest.json", "recovery.json"],
+      },
+    };
+
+    expect(() => createRecoveryPoint(duplicatePathInput)).toThrow(/duplicate/i);
+  });
+
+  it("rejects extra hash keys before constructing a recovery point", async () => {
+    const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+    const input = createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z");
+    const extraHashInput = {
+      ...input,
+      stateManifest: {
+        ...input.stateManifest,
+        hashes: { ...input.stateManifest.hashes, "extra.json": "e".repeat(64) },
+      },
+    };
+
+    expect(() => createRecoveryPoint(extraHashInput)).toThrow(/hash.*exactly match|extra/i);
+  });
+
+  it.each([
+    ["status", (input: RecoveryPointCaptureInput, secret: string) => ({ ...input, status: secret })],
+    ["binary patch", (input: RecoveryPointCaptureInput, secret: string) => ({ ...input, binaryPatch: secret })],
+    ["verification output", (input: RecoveryPointCaptureInput, secret: string) => ({
+      ...input,
+      verificationResults: [{ ...createVerification(), observedOutput: secret }],
+    })],
+  ])("rejects raw secret-shaped content in the captured %s", async (_label, updateInput) => {
+    const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+    const secrets = [
+      "github_pat_" + "a".repeat(30),
+      "ghp_" + "b".repeat(30),
+      "sk-proj-" + "c".repeat(20),
+      "sk-" + "d".repeat(20),
+      "-----BEGIN PRIVATE KEY-----",
+    ];
+
+    for (const secret of secrets) {
+      expect(() => createRecoveryPoint(updateInput(createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z"), secret))).toThrow(/secret-like/i);
+    }
+  });
+
   it.each(["ghp_123456789012345678901234567890", "sk_123456789012345678901234567890", "-----BEGIN PRIVATE KEY-----"])(
     "rejects unsafe snapshot manifest ids: %s",
     async (manifestId) => {

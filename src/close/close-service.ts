@@ -304,13 +304,27 @@ export async function closeTask(
   if (JSON.stringify(persistedState) !== JSON.stringify(state)) {
     return createVerdict(state, "BLOCKED", [failure("Persisted task state does not match the state submitted for close", "reload the task from durable storage before close")], state.verificationEvidence);
   }
+  if (state.durableContext !== null && !isSafeManifestId(state.durableContext.manifestId)) {
+    return createVerdict(state, "BLOCKED", [failure("Durable context manifest id is unsafe", "reload the task with a UUID or manifest-UUID durable context manifest")], state.verificationEvidence);
+  }
+  const requestedSnapshotManifestId = state.recoveryPoint?.snapshotManifestId;
+  if (requestedSnapshotManifestId !== undefined && !isSafeManifestId(requestedSnapshotManifestId)) {
+    return createVerdict(state, "BLOCKED", [failure("Recovery snapshot manifest id is unsafe", "reload the task with a UUID or manifest-UUID recovery snapshot manifest")], state.verificationEvidence);
+  }
   let snapshotManifest: DurableContextManifest | null = null;
-  if (state.recoveryPoint?.snapshotManifestId !== undefined && state.recoveryPoint.snapshotManifestId !== state.durableContext?.manifestId) {
+  if (requestedSnapshotManifestId !== undefined && requestedSnapshotManifestId !== state.durableContext?.manifestId) {
     if (dependencies.store.loadGenerationManifest === undefined) {
       return createVerdict(state, "BLOCKED", [failure("Recovery generation loader is unavailable", "use the real durable context store before close")], state.verificationEvidence);
     }
     try {
-      snapshotManifest = await dependencies.store.loadGenerationManifest(state.taskId, state.recoveryPoint.snapshotManifestId);
+      const loadedManifest = await dependencies.store.loadGenerationManifest(state.taskId, requestedSnapshotManifestId);
+      if (!isSafeManifestId(loadedManifest.manifestId)) {
+        return createVerdict(state, "BLOCKED", [failure("Loaded recovery generation manifest id is unsafe", "restore the recovery generation with a UUID or manifest-UUID manifest")], state.verificationEvidence);
+      }
+      if (loadedManifest.manifestId !== requestedSnapshotManifestId) {
+        return createVerdict(state, "BLOCKED", [failure("Loaded recovery generation manifest id does not match the requested id", "restore the requested manifest-addressed recovery generation")], state.verificationEvidence);
+      }
+      snapshotManifest = loadedManifest;
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       return createVerdict(state, "BLOCKED", [failure(`Recovery generation could not be loaded: ${redactSensitiveText(message)}`, "restore the manifest-addressed recovery generation and retry close")], state.verificationEvidence);

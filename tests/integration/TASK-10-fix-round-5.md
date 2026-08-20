@@ -18,7 +18,7 @@ The production-selected Skill resources, public completion path, task-bound hand
 
 Fresh verification from the actual checkout:
 
-- Targeted recovery/store/runtime/close/handoff/Skill tests: 6 files, 159 tests passed.
+- Targeted recovery/store/runtime/close/handoff/Skill tests: 6 files, 160 tests passed.
 - `npm test`: 19 files, 306 tests passed.
 - `npm run test:integration`: 2 files, 12 tests passed.
 - `npm run build`: passed with `tsc --noEmit`.

@@ -1,6 +1,6 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
 import { InvalidTaskStateError } from "../domain/errors.js";
-import { assertSafeManifestId } from "../domain/manifest-id.js";
+import { assertSafeManifestId, containsSecretShapedValue } from "../domain/manifest-id.js";
 import type { DurableContextManifest, Environment, RecoveryPoint, Role, Stage, VerificationEvidence } from "../domain/types.js";
 
 export type RecoveryTrigger = "risky-work" | "handoff" | "recovery" | "close";
@@ -46,7 +46,66 @@ function assertText(value: string, label: string): void {
 }
 
 function assertSafeCapturedValue(value: string, label: string): void {
-  if (redactSensitiveText(value) !== value) throw new InvalidTaskStateError(`${label} contains secret-like content and cannot be captured`);
+  if (redactSensitiveText(value) !== value || containsSecretShapedValue(value)) {
+    throw new InvalidTaskStateError(`${label} contains secret-like content and cannot be captured`);
+  }
+}
+
+function assertDurableArtifacts(manifest: DurableContextManifest): void {
+  if (manifest.durablePaths.length === 0) throw new InvalidTaskStateError("Recovery durable paths must be non-empty");
+  if (new Set(manifest.durablePaths).size !== manifest.durablePaths.length) {
+    throw new InvalidTaskStateError("Recovery durable paths must not contain duplicates");
+  }
+  const hashEntries = Object.entries(manifest.hashes);
+  const durablePathSet = new Set(manifest.durablePaths);
+  if (hashEntries.length !== manifest.durablePaths.length || manifest.durablePaths.some((path) => manifest.hashes[path] === undefined) || hashEntries.some(([path]) => !durablePathSet.has(path))) {
+    throw new InvalidTaskStateError("Recovery hash keys must exactly match durable paths");
+  }
+  for (const [path, hash] of hashEntries) {
+    if (!/^[a-f0-9]{64}$/i.test(hash)) throw new InvalidTaskStateError(`Recovery hash for ${path} must be a SHA-256 hash`);
+  }
+}
+
+function assertSafeCapturedFields(input: RecoveryPointCaptureInput): void {
+  const fields: readonly (readonly [string, string])[] = [
+    ["Recovery point id", input.recoveryPointId],
+    ["Task id", input.taskId],
+    ["Recovery trigger", input.trigger],
+    ["Recovery stage", input.stage],
+    ["Recovery environment", input.environment],
+    ["Recovery role", input.role],
+    ["Recovery HEAD", input.head],
+    ["Recovery branch", input.branch],
+    ["Recovery workspace path", input.workspacePath],
+    ["Git status", input.status],
+    ["Binary patch", input.binaryPatch],
+    ["Recovery created-at timestamp", input.createdAt],
+    ["Recovery snapshot manifest id", input.stateManifest.manifestId],
+    ["Recovery snapshot task id", input.stateManifest.taskId],
+    ["Recovery snapshot stage", input.stateManifest.stage],
+    ["Recovery snapshot environment", input.stateManifest.environment],
+    ["Recovery snapshot role", input.stateManifest.role],
+    ["Recovery snapshot recorded-at timestamp", input.stateManifest.recordedAt],
+  ];
+  for (const [label, value] of fields) assertSafeCapturedValue(value, label);
+  for (const path of input.stateManifest.durablePaths) assertSafeCapturedValue(path, "Recovery durable path");
+  if (input.stateManifest.recoveryPointId !== null) assertSafeCapturedValue(input.stateManifest.recoveryPointId, "Recovery snapshot recovery point id");
+  for (const [path, hash] of Object.entries(input.stateManifest.hashes)) {
+    assertSafeCapturedValue(path, "Recovery hash path");
+    assertSafeCapturedValue(hash, `Recovery hash for ${path}`);
+  }
+  for (const verification of input.verificationResults) {
+    assertSafeCapturedValue(verification.evidenceId, "Verification evidence id");
+    assertSafeCapturedValue(verification.stage, "Verification stage");
+    assertSafeCapturedValue(verification.environment, "Verification environment");
+    assertSafeCapturedValue(verification.role, "Verification role");
+    assertSafeCapturedValue(verification.selectedModel, "Verification selected model");
+    assertSafeCapturedValue(verification.command, "Verification command");
+    assertSafeCapturedValue(verification.observedOutput, "Verification observed output");
+    assertSafeCapturedValue(verification.interpretation, "Verification interpretation");
+    if (verification.recoveryPointId !== null) assertSafeCapturedValue(verification.recoveryPointId, "Verification recovery point id");
+    assertSafeCapturedValue(verification.recordedAt, "Verification recorded-at timestamp");
+  }
 }
 
 function assertVerificationEvidence(
@@ -90,7 +149,9 @@ function assertCaptureInput(input: RecoveryPointCaptureInput): void {
   const createdAt = Date.parse(input.createdAt);
   if (Number.isNaN(createdAt)) throw new InvalidTaskStateError("Recovery point timestamp must be valid");
   if (input.stateManifest.taskId !== input.taskId) throw new InvalidTaskStateError("Recovery state manifest task id must match the recovery point task id");
+  assertSafeCapturedFields(input);
   assertSafeManifestId(input.stateManifest.manifestId, "Recovery snapshot manifest id");
+  assertDurableArtifacts(input.stateManifest);
   assertSafeCapturedValue(input.status, "Git status");
   assertSafeCapturedValue(input.binaryPatch, "Binary patch");
   assertVerificationResults(input, createdAt);

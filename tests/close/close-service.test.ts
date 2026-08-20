@@ -115,6 +115,13 @@ function storeFor(state: TaskState | null): DurableContextStore {
   };
 }
 
+function storeWithGeneration(
+  state: TaskState,
+  loadGenerationManifest: (taskId: string, manifestId: string) => Promise<DurableContextManifest>,
+): DurableContextStore {
+  return { ...storeFor(state), loadGenerationManifest };
+}
+
 function successfulPush(): GitPushEvidence {
   return {
     remote: "origin",
@@ -168,6 +175,78 @@ describe("closeTask", () => {
 
     expect(verdict.status).toBe("YES");
     expect(verdict.reasons).toEqual([]);
+  });
+
+  it.each([
+    ["the durable manifest id", (state: TaskState) => ({
+      ...state,
+      durableContext: { ...state.durableContext!, manifestId: "ghp_" + "a".repeat(30) },
+      recoveryPoint: { ...state.recoveryPoint!, snapshotManifestId: "00000000-0000-4000-8000-000000000005" },
+    })],
+    ["the requested snapshot manifest id", (state: TaskState) => ({
+      ...state,
+      recoveryPoint: { ...state.recoveryPoint!, snapshotManifestId: "github_pat_" + "a".repeat(30) },
+    })],
+  ])("rejects an unsafe %s before generation loading or GitHub calls", async (_label, createState) => {
+    const state = createState(closeReadyState(new Date().toISOString()));
+    let loaderCalled = false;
+    let gitHubCalled = false;
+    const verdict = await closeTask(state, {
+      store: storeWithGeneration(state, async (): Promise<DurableContextManifest> => {
+        loaderCalled = true;
+        throw new Error("generation loader must not run");
+      }),
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          gitHubCalled = true;
+          throw new Error("GitHub push must not run");
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => {
+          gitHubCalled = true;
+          throw new Error("GitHub verification must not run");
+        },
+      },
+    });
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(loaderCalled).toBe(false);
+    expect(gitHubCalled).toBe(false);
+  });
+
+  it.each([
+    ["unsafe", "github_pat_" + "a".repeat(30)],
+    ["mismatched", "00000000-0000-4000-8000-000000000006"],
+  ])("rejects an %s loaded manifest id before GitHub calls", async (_label, returnedManifestId) => {
+    const state = closeReadyState(new Date().toISOString());
+    const recoveryPoint = state.recoveryPoint;
+    if (recoveryPoint === null) throw new Error("Expected recovery point");
+    const requestedManifestId = "00000000-0000-4000-8000-000000000005";
+    const stateWithSnapshot = {
+      ...state,
+      recoveryPoint: { ...recoveryPoint, snapshotManifestId: requestedManifestId },
+    };
+    const durableContext = stateWithSnapshot.durableContext;
+    if (durableContext === null) throw new Error("Expected durable context");
+    let gitHubCalled = false;
+    const verdict = await closeTask(stateWithSnapshot, {
+      store: storeWithGeneration(stateWithSnapshot, async (): Promise<DurableContextManifest> => ({
+        ...durableContext,
+        manifestId: returnedManifestId,
+      })),
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          gitHubCalled = true;
+          throw new Error("GitHub push must not run");
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => {
+          gitHubCalled = true;
+          throw new Error("GitHub verification must not run");
+        },
+      },
+    });
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(gitHubCalled).toBe(false);
   });
 
   it("accepts an exact 64-character commit artifact and matching adapter evidence", async () => {
