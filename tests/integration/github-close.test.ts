@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
-import { GitHubCliAdapter } from "../../src/adapters/github.js";
+import { GitHubCliAdapter, GitRemoteBlockedError } from "../../src/adapters/github.js";
+import { pushGitRef, readRemoteRef, type GitTransport } from "../../src/adapters/git.js";
 import { closeTask } from "../../src/close/close-service.js";
-import type { TaskState, VerificationEvidence } from "../../src/domain/types.js";
-import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
+import type { DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { DurableContextStore } from "../../src/state/durable-context-store.js";
+import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
 
 const gateNames = [
   "scope",
@@ -43,7 +45,41 @@ function verificationEvidence(now: string): readonly VerificationEvidence[] {
   }));
 }
 
-function stateFor(repositoryPath: string, commitSha: string, now: string): TaskState {
+interface ExternalIntegrationConfiguration {
+  readonly repositoryPath: string;
+  readonly remote: string;
+  readonly ref: string;
+  readonly enterpriseHost: string | null;
+}
+
+function externalIntegrationConfiguration(): ExternalIntegrationConfiguration | null {
+  const repositoryPath = process.env.D_AI_GITHUB_EXTERNAL_REPOSITORY_PATH;
+  const remote = process.env.D_AI_GITHUB_EXTERNAL_REMOTE;
+  const ref = process.env.D_AI_GITHUB_EXTERNAL_REF;
+  if (
+    process.env.D_AI_GITHUB_EXTERNAL_INTEGRATION !== "1"
+    || process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED !== "1"
+    || repositoryPath === undefined
+    || remote === undefined
+    || ref === undefined
+  ) {
+    return null;
+  }
+  return {
+    repositoryPath,
+    remote,
+    ref,
+    enterpriseHost: process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null,
+  };
+}
+
+function stateFor(repositoryPath: string, commitSha: string, now: string, remote: string, ref: string): TaskState {
+  const durablePaths = ["context.json", "evidence.json", "recovery.json"];
+  const hashes = {
+    "context.json": "a".repeat(64),
+    "evidence.json": "b".repeat(64),
+    "recovery.json": "c".repeat(64),
+  };
   return {
     taskId: "task-github-close-integration",
     goal: "Verify a local bare Git remote through the close workflow",
@@ -63,8 +99,8 @@ function stateFor(repositoryPath: string, commitSha: string, now: string): TaskS
     selectedCapabilities: ["shell"],
     contextManifest: [
       `identity:repository:${repositoryPath}:${createHash("sha256").update(repositoryPath, "utf8").digest("hex")}`,
-      "remote:origin",
-      "ref:refs/heads/main",
+      `remote:${remote}`,
+      `ref:${ref}`,
       "local-state:clean-required",
       `artifact:commit:${commitSha}`,
     ],
@@ -76,14 +112,39 @@ function stateFor(repositoryPath: string, commitSha: string, now: string): TaskS
       stage: "close",
       environment: "codex",
       role: "evidence-collector",
-      durablePaths: ["recovery-source.json"],
-      hashes: { "recovery-source.json": "a".repeat(64) },
+      durablePaths,
+      hashes,
       restorationInstructions: "Restore the recorded recovery state without deleting user work.",
       createdAt: now,
     },
     approvalState: "approved",
     criticalUnsavedContext: [],
-    durableContext: null,
+    durableContext: {
+      manifestId: "manifest-integration",
+      taskId: "task-github-close-integration",
+      stage: "close",
+      environment: "codex",
+      role: "evidence-collector",
+      durablePaths,
+      hashes,
+      recoveryPointId: "recovery-integration",
+      recordedAt: now,
+    },
+  };
+}
+
+function storeFor(state: TaskState): DurableContextStore {
+  return {
+    load: async (): Promise<TaskState> => state,
+    save: async (): Promise<DurableContextManifest> => {
+      throw new Error("Close integration must not save durable context");
+    },
+    recordCriticalUnsavedContext: async (): Promise<void> => {
+      throw new Error("Close integration must not record unsaved context");
+    },
+    clearCriticalUnsavedContext: async (): Promise<void> => {
+      throw new Error("Close integration must not clear unsaved context");
+    },
   };
 }
 
@@ -92,7 +153,68 @@ describe("GitHub close integration", () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-github-close-"));
     const repositoryPath = join(root, "repository");
     const bareRemotePath = join(root, "remote.git");
-    const storeRoot = join(root, "store");
+    try {
+      await git(null, ["init", "--bare", bareRemotePath]);
+      await git(null, ["init", "--initial-branch=main", repositoryPath]);
+      await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+      await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "verified artifact\n", "utf8");
+      await git(repositoryPath, ["add", "artifact.txt"]);
+      await git(repositoryPath, ["commit", "-m", "integration artifact"]);
+      const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
+      await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      const localBareTransport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, bareRemotePath, ref, head),
+        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(bareRemotePath, ref, null),
+      };
+
+      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+      const verdict = await closeTask(closeState, {
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.forTestTransport({ enterpriseHost: null }, localBareTransport),
+      });
+
+      expect(verdict).toMatchObject({ status: "YES", reasons: [] });
+      expect(await git(bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(commitSha);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a conflicting pushurl before it can divert the push", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-github-pushurl-"));
+    const repositoryPath = join(root, "repository");
+    const bareRemotePath = join(root, "remote.git");
+    try {
+      await git(null, ["init", "--bare", bareRemotePath]);
+      await git(null, ["init", "--initial-branch=main", repositoryPath]);
+      await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+      await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "verified artifact\n", "utf8");
+      await git(repositoryPath, ["add", "artifact.txt"]);
+      await git(repositoryPath, ["commit", "-m", "integration artifact"]);
+      const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
+      await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      await git(repositoryPath, ["remote", "set-url", "--push", "origin", `file://${bareRemotePath.replaceAll("\\", "/")}`]);
+
+      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+      const verdict = await closeTask(closeState, {
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.create({ enterpriseHost: null }),
+      });
+
+      expect(verdict.status).toBe("BLOCKED");
+      expect(verdict.reasons.join(" ")).toMatch(/remote|transport|push/i);
+      await expect(git(bareRemotePath, ["rev-parse", "--verify", "refs/heads/main"])).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a URL rewrite that diverts the effective push transport", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-github-rewrite-"));
+    const repositoryPath = join(root, "repository");
+    const bareRemotePath = join(root, "remote.git");
     try {
       await git(null, ["init", "--bare", bareRemotePath]);
       await git(null, ["init", "--initial-branch=main", repositoryPath]);
@@ -105,26 +227,107 @@ describe("GitHub close integration", () => {
       await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
       await git(repositoryPath, ["config", `url.file://${bareRemotePath.replaceAll("\\", "/")}.insteadOf`, "https://github.com/acme/d-ai.git"]);
 
-      const initialState = stateFor(repositoryPath, commitSha, new Date().toISOString());
-      const store = new FileDurableContextStore(storeRoot);
-      const manifest = await store.save(initialState);
-      const closeState = { ...initialState, durableContext: manifest };
+      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
       const verdict = await closeTask(closeState, {
-        store,
-        gitHub: new GitHubCliAdapter({ enterpriseHost: null }),
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.create({ enterpriseHost: null }),
       });
 
-      expect(verdict).toMatchObject({ status: "YES", reasons: [] });
-      expect(await git(bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(commitSha);
+      expect(verdict.status).toBe("BLOCKED");
+      expect(verdict.reasons.join(" ")).toMatch(/remote|transport|push/i);
+      await expect(git(bareRemotePath, ["rev-parse", "--verify", "refs/heads/main"])).rejects.toThrow();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("reports external GitHub verification as BLOCKED unless an explicit integration lane is configured", () => {
-    const optIn = process.env.D_AI_GITHUB_EXTERNAL_INTEGRATION === "1";
-    const status = optIn ? "NOT-RUN" : "BLOCKED";
+  it("returns BLOCKED when remote verification emits a malformed object id", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-github-malformed-remote-"));
+    const repositoryPath = join(root, "repository");
+    try {
+      await git(null, ["init", "--initial-branch=main", repositoryPath]);
+      await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+      await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "malformed remote evidence\n", "utf8");
+      await git(repositoryPath, ["add", "artifact.txt"]);
+      await git(repositoryPath, ["commit", "-m", "malformed remote evidence"]);
+      const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
+      await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      const malformedRemoteTransport: GitTransport = {
+        pushRef: async () => ({
+          pushed: true,
+          observedOutput: "Push completed",
+          exitCode: 0,
+          failureCategory: null,
+        }),
+        readRef: async (_localRepositoryPath, endpoint, ref) => ({
+          command: "git",
+          arguments: ["ls-remote", endpoint, ref],
+          stdout: `${"e".repeat(41)}\t${ref}\n`,
+          stderr: "",
+          exitCode: 0,
+        }),
+      };
 
-    expect(status).toBe(optIn ? "NOT-RUN" : "BLOCKED");
+      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+      const verdict = await closeTask(closeState, {
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.forTestTransport({ enterpriseHost: null }, malformedRemoteTransport),
+      });
+
+      expect(verdict.status).toBe("BLOCKED");
+      expect(verdict.reasons.join(" ")).toMatch(/malformed|object id|sha/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the external lane opt-in and returns BLOCKED through close when credentials or configuration are missing", async () => {
+    const externalConfiguration = externalIntegrationConfiguration();
+    if (externalConfiguration !== null) {
+      const commitSha = await git(externalConfiguration.repositoryPath, ["rev-parse", "HEAD"]);
+      const closeState = stateFor(
+        externalConfiguration.repositoryPath,
+        commitSha,
+        new Date().toISOString(),
+        externalConfiguration.remote,
+        externalConfiguration.ref,
+      );
+      const verdict = await closeTask(closeState, {
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.create({ enterpriseHost: externalConfiguration.enterpriseHost }),
+      });
+
+      expect(verdict).toMatchObject({ status: "YES", reasons: [] });
+      return;
+    }
+
+    const root = await mkdtemp(join(tmpdir(), "d-ai-github-external-blocked-"));
+    const repositoryPath = join(root, "repository");
+    try {
+      await git(null, ["init", "--initial-branch=main", repositoryPath]);
+      await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+      await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "external lane blocked\n", "utf8");
+      await git(repositoryPath, ["add", "artifact.txt"]);
+      await git(repositoryPath, ["commit", "-m", "external integration precondition"]);
+      const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
+      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+      const missingCredentialsAdapter: GitHubAdapter = {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          throw new GitRemoteBlockedError("External GitHub credentials and integration configuration are not available");
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => {
+          throw new GitRemoteBlockedError("External GitHub verification cannot run without explicit configuration");
+        },
+      };
+
+      const verdict = await closeTask(closeState, { store: storeFor(closeState), gitHub: missingCredentialsAdapter });
+
+      expect(verdict.status).toBe("BLOCKED");
+      expect(verdict.reasons.join(" ")).toMatch(/credentials|configuration/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

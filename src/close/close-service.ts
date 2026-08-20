@@ -1,5 +1,6 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../adapters/github.js";
+import type { GitFailureCategory } from "../adapters/git.js";
 import { CloseBlockedError } from "../domain/errors.js";
 import type { CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DurableContextStore } from "../state/durable-context-store.js";
@@ -22,6 +23,7 @@ interface CloseConfiguration {
   readonly repositoryPath: string;
   readonly remote: string;
   readonly ref: string;
+  readonly commitSha: string;
 }
 
 interface PreflightResult {
@@ -87,20 +89,45 @@ function repositoryPathFromManifest(values: readonly string[], reasons: string[]
 }
 
 function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState): boolean {
-  if (manifest.durablePaths.length === 0 || Object.keys(manifest.hashes).length !== manifest.durablePaths.length) {
+  const recoveryPoint = state.recoveryPoint;
+  if (recoveryPoint === null || recoveryPoint.recoveryPointId !== manifest.recoveryPointId) {
+    return false;
+  }
+  const manifestPaths = new Set(manifest.durablePaths);
+  const recoveryPaths = new Set(recoveryPoint.durablePaths);
+  const manifestHashPaths = Object.keys(manifest.hashes);
+  const recoveryHashPaths = Object.keys(recoveryPoint.hashes);
+  if (
+    manifest.durablePaths.length === 0
+    || manifestPaths.size !== manifest.durablePaths.length
+    || recoveryPaths.size !== recoveryPoint.durablePaths.length
+    || manifestHashPaths.length !== manifestPaths.size
+    || recoveryHashPaths.length !== recoveryPaths.size
+    || manifestPaths.size !== recoveryPaths.size
+  ) {
     return false;
   }
   if (manifest.durablePaths.some((path) => path.trim().length === 0 || !/^[a-f0-9]{64}$/i.test(manifest.hashes[path] ?? ""))) {
     return false;
   }
-  const recoveryPoint = state.recoveryPoint;
-  if (recoveryPoint === null || recoveryPoint.recoveryPointId !== manifest.recoveryPointId) {
-    return false;
-  }
-  if (recoveryPoint.durablePaths.length === 0 || recoveryPoint.durablePaths.some((path) => !/^[a-f0-9]{64}$/i.test(recoveryPoint.hashes[path] ?? ""))) {
+  if (recoveryPoint.durablePaths.some((path) => !manifestPaths.has(path) || recoveryPoint.hashes[path] !== manifest.hashes[path])) {
     return false;
   }
   return state.verificationEvidence.every((evidence) => evidence.recoveryPointId === recoveryPoint.recoveryPointId);
+}
+
+function commitArtifactFromManifest(values: readonly string[], reasons: string[]): string | null {
+  const entries = values.filter((value) => value.startsWith("artifact:commit:"));
+  if (entries.length !== 1) {
+    reasons.push(failure("Commit artifact is missing or ambiguous", "record exactly one artifact:commit:<full-object-id> context manifest entry"));
+    return null;
+  }
+  const sha = entries[0]?.slice("artifact:commit:".length).trim() ?? "";
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha)) {
+    reasons.push(failure("Commit artifact has a malformed object id", "record exactly one 40- or 64-character full Git object id"));
+    return null;
+  }
+  return sha;
 }
 
 function gateName(evidence: VerificationEvidence): GateName | null {
@@ -137,6 +164,7 @@ function preflight(state: TaskState, now: Date): PreflightResult {
   const repositoryPath = repositoryPathFromManifest(state.contextManifest, reasons);
   const remote = oneManifestValue(state.contextManifest, "remote:", "Configured remote", reasons);
   const ref = oneManifestValue(state.contextManifest, "ref:", "Target ref", reasons);
+  const commitSha = commitArtifactFromManifest(state.contextManifest, reasons);
   const policy = oneManifestValue(state.contextManifest, "local-state:", "Local-state policy", reasons);
   if (policy !== null && policy !== "clean-required") {
     reasons.push(failure("Local-state policy is not the supported clean-required policy", "record local-state:clean-required before close"));
@@ -147,10 +175,74 @@ function preflight(state: TaskState, now: Date): PreflightResult {
       reasons.push(failure(`Hard gate ${result.gate} failed: ${result.reason}`, "rerun and record fresh passing evidence for this gate"));
     }
   }
-  if (repositoryPath === null || remote === null || ref === null || policy === null || reasons.length > 0) {
+  if (repositoryPath === null || remote === null || ref === null || commitSha === null || policy === null || reasons.length > 0) {
     return { reasons, configuration: null };
   }
-  return { reasons, configuration: { repositoryPath, remote, ref } };
+  return { reasons, configuration: { repositoryPath, remote, ref, commitSha } };
+}
+
+const gitFailureCategories = [
+  "authentication",
+  "permission",
+  "network",
+  "remote-unavailable",
+  "ambiguous",
+  "verification-mismatch",
+  "dirty-worktree",
+] as const satisfies readonly GitFailureCategory[];
+
+function validObjectId(value: string): boolean {
+  return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value);
+}
+
+function validTargetRef(value: string): boolean {
+  return /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes("..") && !value.endsWith("/");
+}
+
+function validRepository(value: string): boolean {
+  const parts = value.split("/");
+  if (parts.length !== 3) return false;
+  const host = parts[0];
+  const owner = parts[1];
+  const repository = parts[2];
+  if (host === undefined || owner === undefined || repository === undefined) return false;
+  return /^[a-z0-9.-]+$/.test(host)
+    && !host.startsWith(".")
+    && !host.endsWith(".")
+    && !host.includes("..")
+    && /^[A-Za-z0-9._-]+$/.test(owner)
+    && /^[A-Za-z0-9._-]+$/.test(repository);
+}
+
+function validFailureCategory(value: GitFailureCategory | null): boolean {
+  return value === null || gitFailureCategories.some((category) => category === value);
+}
+
+function pushEvidenceFailure(evidence: GitPushEvidence, configuration: CloseConfiguration): string | null {
+  if (typeof evidence.remote !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidence.remote)) return "Push evidence remote is malformed";
+  if (evidence.remote !== configuration.remote) return "Push evidence remote does not match the configured remote";
+  if (typeof evidence.repository !== "string" || !validRepository(evidence.repository)) return "Push evidence repository is malformed";
+  if (typeof evidence.ref !== "string" || !validTargetRef(evidence.ref)) return "Push evidence ref is malformed";
+  if (evidence.ref !== configuration.ref) return "Push evidence ref does not match the configured target ref";
+  if (typeof evidence.localSha !== "string" || !validObjectId(evidence.localSha)) return "Push evidence local SHA is not a full Git object id";
+  if (typeof evidence.pushed !== "boolean") return "Push evidence pushed flag is malformed";
+  if (typeof evidence.observedOutput !== "string" || evidence.observedOutput.trim().length === 0) return "Push evidence observed output is missing";
+  if (typeof evidence.exitCode !== "number" || !Number.isInteger(evidence.exitCode)) return "Push evidence exit code is malformed";
+  if (!validFailureCategory(evidence.failureCategory)) return "Push evidence failure category is malformed";
+  if (evidence.pushed && (evidence.exitCode !== 0 || evidence.failureCategory !== null)) return "Successful push evidence has conflicting failure state";
+  if (!evidence.pushed && (evidence.exitCode === 0 || evidence.failureCategory === null)) return "Failed push evidence has conflicting failure state";
+  return null;
+}
+
+function remoteEvidenceFailure(remote: RemoteState, push: GitPushEvidence, configuration: CloseConfiguration): string | null {
+  if (typeof remote.repository !== "string" || !validRepository(remote.repository)) return "Remote state repository is malformed";
+  if (remote.repository !== push.repository) return "Remote state repository does not match the validated push evidence";
+  if (typeof remote.ref !== "string" || !validTargetRef(remote.ref)) return "Remote state ref is malformed";
+  if (remote.ref !== configuration.ref || remote.ref !== push.ref) return "Remote state ref does not match the configured target ref";
+  if (typeof remote.remoteSha !== "string" || (remote.remoteSha.length > 0 && !validObjectId(remote.remoteSha))) return "Remote state SHA is malformed";
+  if (typeof remote.matchesExpectedSha !== "boolean") return "Remote state match flag is malformed";
+  if (remote.matchesExpectedSha && remote.remoteSha !== push.localSha) return "Remote state match flag conflicts with its SHA";
+  return null;
 }
 
 function pushEvidence(state: TaskState, evidence: GitPushEvidence, now: string): VerificationEvidence {
@@ -231,14 +323,22 @@ export async function closeTask(
   if (pushResult.error !== null || pushResult.value === null) {
     return createVerdict(state, "BLOCKED", [blockedReason(pushResult.error ?? new CloseBlockedError("GitHub push returned no evidence"), "check remote reachability, permissions, and configured host")], state.verificationEvidence);
   }
+  const invalidPushEvidence = pushEvidenceFailure(pushResult.value, configuration);
+  if (invalidPushEvidence !== null) {
+    return createVerdict(state, "BLOCKED", [failure(`GitHub adapter evidence is invalid: ${invalidPushEvidence}`, "inspect the adapter boundary and rerun close with exact configured remote and ref evidence")], state.verificationEvidence);
+  }
   const recordedPushEvidence = pushEvidence(state, pushResult.value, now.toISOString());
   if (!pushResult.value.pushed || pushResult.value.exitCode !== 0) {
-    const reason = /worktree status:/i.test(pushResult.value.observedOutput)
-      ? failure("Local worktree is not clean", "commit, stash, or explicitly resolve the local worktree before close")
-      : failure("GitHub push did not succeed", "inspect the recorded push output and resolve the remote rejection");
-    return createVerdict(state, "NO", [reason], [...state.verificationEvidence, recordedPushEvidence]);
+    const category = pushResult.value.failureCategory;
+    if (category === "dirty-worktree") {
+      return createVerdict(state, "NO", [failure("Local worktree is not clean", "commit, stash, or explicitly resolve the local worktree before close")], [...state.verificationEvidence, recordedPushEvidence]);
+    }
+    if (category === "verification-mismatch") {
+      return createVerdict(state, "NO", [failure("GitHub push was rejected by a known verification mismatch", "reconcile the intended ref without force-pushing and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
+    }
+    return createVerdict(state, "BLOCKED", [failure(`GitHub push is blocked by ${category ?? "ambiguous"} failure`, "check authentication, permission, network, and remote availability before retrying")], [...state.verificationEvidence, recordedPushEvidence]);
   }
-  if (!state.contextManifest.includes(`artifact:commit:${pushResult.value.localSha}`)) {
+  if (pushResult.value.localSha !== configuration.commitSha) {
     return createVerdict(state, "NO", [failure("Durable artifact manifest does not identify the pushed commit", "record artifact:commit:<full-sha> in durable context and rerun verification")], [...state.verificationEvidence, recordedPushEvidence]);
   }
   const remoteResult = await dependencies.gitHub.verifyRemoteState(pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha).then(
@@ -248,10 +348,11 @@ export async function closeTask(
   if (remoteResult.error !== null || remoteResult.value === null) {
     return createVerdict(state, "BLOCKED", [blockedReason(remoteResult.error ?? new CloseBlockedError("GitHub remote verification returned no state"), "check remote reachability, permissions, and the configured GitHub host")], [...state.verificationEvidence, recordedPushEvidence]);
   }
-  const recordedRemoteEvidence = remoteEvidence(state, remoteResult.value, now.toISOString());
-  if (remoteResult.value.repository !== pushResult.value.repository || remoteResult.value.ref !== pushResult.value.ref) {
-    return createVerdict(state, "BLOCKED", [failure("Remote verification returned a different repository or ref", "verify the configured remote and target ref are unambiguous")], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]);
+  const invalidRemoteEvidence = remoteEvidenceFailure(remoteResult.value, pushResult.value, configuration);
+  if (invalidRemoteEvidence !== null) {
+    return createVerdict(state, "BLOCKED", [failure(`GitHub adapter remote state is invalid: ${invalidRemoteEvidence}`, "inspect the adapter boundary and independently verify the exact repository and ref")], [...state.verificationEvidence, recordedPushEvidence]);
   }
+  const recordedRemoteEvidence = remoteEvidence(state, remoteResult.value, now.toISOString());
   if (!remoteResult.value.matchesExpectedSha || remoteResult.value.remoteSha !== pushResult.value.localSha) {
     return createVerdict(state, "NO", [failure("Remote SHA does not match the pushed commit", "inspect the remote ref and push the intended commit again")], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]);
   }

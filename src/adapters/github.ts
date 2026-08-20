@@ -1,5 +1,5 @@
 import { redactSensitiveText } from "./command-runner.js";
-import { inspectLocalGitState, pushGitRef, readRemoteRef, summarizeLocalGitState } from "./git.js";
+import { gitCliTransport, inspectLocalGitState, summarizeLocalGitState, type GitFailureCategory, type GitTransport } from "./git.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../domain/errors.js";
 
 export interface GitPushEvidence {
@@ -10,6 +10,7 @@ export interface GitPushEvidence {
   readonly pushed: boolean;
   readonly observedOutput: string;
   readonly exitCode: number;
+  readonly failureCategory: GitFailureCategory | null;
 }
 
 export interface RemoteState {
@@ -41,9 +42,13 @@ export class GitRemoteBlockedError extends CloseBlockedError {
 }
 
 interface RemoteEndpoint {
-  readonly repository: string;
   readonly endpoint: string;
   readonly repositoryPath: string;
+  readonly ref: string;
+}
+
+function endpointKey(repository: string, ref: string): string {
+  return `${repository}\n${ref}`;
 }
 
 function normalizeHost(host: string): string {
@@ -101,6 +106,10 @@ function parsedRemote(value: string): { readonly host: string; readonly path: st
   if (parsed.protocol === "ssh:" && parsed.username !== "git") {
     throw new GitRemoteBlockedError("Configured SSH remote must use the git account");
   }
+  const supportedPort = parsed.protocol === "https:" ? "443" : "22";
+  if (parsed.port.length > 0 && parsed.port !== supportedPort) {
+    throw new GitRemoteBlockedError(`Configured Git remote uses unsupported port ${parsed.port}`);
+  }
   return { host: parsed.hostname, path: parsed.pathname, protocol: parsed.protocol === "https:" ? "https" : "ssh" };
 }
 
@@ -121,24 +130,10 @@ export function resolveGitHubRepository(remoteUrl: string, enterpriseHost: strin
 
 function assertExpectedSha(expectedSha: string): string {
   const normalized = expectedSha.trim();
-  if (!/^[a-f0-9]{40,64}$/i.test(normalized)) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(normalized)) {
     throw new InvalidTaskStateError("Expected remote SHA must be a full Git object id");
   }
   return normalized;
-}
-
-function remoteEndpoint(repository: string): string {
-  const parts = repository.split("/");
-  if (parts.length !== 3) {
-    throw new GitRemoteBlockedError("GitHub repository identity is malformed");
-  }
-  const host = parts[0];
-  const owner = parts[1];
-  const name = parts[2];
-  if (host === undefined || owner === undefined || name === undefined) {
-    throw new GitRemoteBlockedError("GitHub repository identity is incomplete");
-  }
-  return `https://${host}/${owner}/${name}.git`;
 }
 
 function parseRemoteSha(output: string, ref: string): string {
@@ -147,7 +142,7 @@ function parseRemoteSha(output: string, ref: string): string {
     .split(/\r?\n/)
     .filter((line) => line.length > 0)
     .map((line) => line.split(/\s+/))
-    .filter((parts) => parts.length === 2 && parts[1] === ref && /^[a-f0-9]{40,64}$/i.test(parts[0] ?? ""));
+    .filter((parts) => parts[1] === ref);
   if (matches.length > 1) {
     throw new GitRemoteBlockedError(`GitHub remote returned ambiguous SHA values for ${ref}`);
   }
@@ -156,7 +151,7 @@ function parseRemoteSha(output: string, ref: string): string {
     return "";
   }
   const sha = match[0];
-  if (sha === undefined) {
+  if (match.length !== 2 || sha === undefined || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha)) {
     throw new GitRemoteBlockedError(`GitHub remote returned malformed SHA output for ${ref}`);
   }
   return sha;
@@ -164,43 +159,59 @@ function parseRemoteSha(output: string, ref: string): string {
 
 export class GitHubCliAdapter implements GitHubAdapter {
   private readonly enterpriseHost: string | null;
+  private readonly transport: GitTransport;
   private readonly endpoints = new Map<string, RemoteEndpoint>();
 
-  public constructor(policy: GitHubRemotePolicy) {
+  private constructor(policy: GitHubRemotePolicy, transport: GitTransport) {
     this.enterpriseHost = policy.enterpriseHost === null ? null : normalizeHost(policy.enterpriseHost);
+    this.transport = transport;
+  }
+
+  public static create(policy: GitHubRemotePolicy): GitHubCliAdapter {
+    return new GitHubCliAdapter(policy, gitCliTransport);
+  }
+
+  public static forTestTransport(policy: GitHubRemotePolicy, transport: GitTransport): GitHubCliAdapter {
+    return new GitHubCliAdapter(policy, transport);
   }
 
   public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string): Promise<GitPushEvidence> {
     const localState = await inspectLocalGitState(repositoryPath, remote, ref);
-    const remoteRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
+    const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
+    const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
+    if (pushRepository.repository !== configuredRepository.repository) {
+      throw new GitRemoteBlockedError("Effective Git push transport conflicts with the configured remote repository identity");
+    }
     const localEvidence = summarizeLocalGitState(localState);
     if (localState.worktreeStatus.length > 0) {
       return {
         remote: localState.remote,
-        repository: remoteRepository.repository,
+        repository: configuredRepository.repository,
         ref: localState.ref,
         localSha: localState.head,
         pushed: false,
         observedOutput: `${localEvidence}\nPush was not attempted because the required clean worktree policy failed.`,
         exitCode: 1,
+        failureCategory: "dirty-worktree",
       };
     }
-    const pushResult = await pushGitRef(localState.repositoryPath, localState.remote, localState.ref, localState.head);
+    const pushResult = await this.transport.pushRef(localState.repositoryPath, localState.pushUrl, localState.ref, localState.head);
     if (pushResult.pushed) {
-      this.endpoints.set(remoteRepository.repository, {
-        repository: remoteRepository.repository,
-        endpoint: localState.remoteUrl,
+      this.endpoints.set(endpointKey(configuredRepository.repository, localState.ref), {
+        endpoint: localState.pushUrl,
         repositoryPath: localState.repositoryPath,
+        ref: localState.ref,
       });
     }
     return {
       remote: localState.remote,
-      repository: remoteRepository.repository,
+      repository: configuredRepository.repository,
       ref: localState.ref,
       localSha: localState.head,
       pushed: pushResult.pushed,
       observedOutput: redactSensitiveText(`${localEvidence}\nPush output: ${pushResult.observedOutput}`),
       exitCode: pushResult.exitCode,
+      failureCategory: pushResult.failureCategory,
     };
   }
 
@@ -212,9 +223,15 @@ export class GitHubCliAdapter implements GitHubAdapter {
       throw new GitRemoteBlockedError("GitHub repository identity is empty");
     }
     assertAllowedHost(host, this.enterpriseHost);
-    const recordedEndpoint = this.endpoints.get(repository);
-    const endpoint = recordedEndpoint?.endpoint ?? remoteEndpoint(repository);
-    const result = await readRemoteRef(endpoint, ref, recordedEndpoint?.repositoryPath ?? null);
+    const recordedEndpoint = this.endpoints.get(endpointKey(repository, ref));
+    if (recordedEndpoint === undefined || recordedEndpoint.ref !== ref) {
+      throw new GitRemoteBlockedError("Remote verification has no matching validated push endpoint for the repository and ref");
+    }
+    const endpointRepository = resolveGitHubRepository(recordedEndpoint.endpoint, this.enterpriseHost);
+    if (endpointRepository.repository !== repository) {
+      throw new GitRemoteBlockedError("Recorded Git push endpoint no longer matches the requested repository identity");
+    }
+    const result = await this.transport.readRef(recordedEndpoint.repositoryPath, recordedEndpoint.endpoint, ref);
     const remoteSha = parseRemoteSha(result.stdout, ref);
     return { repository, ref, remoteSha, matchesExpectedSha: remoteSha === expected };
   }

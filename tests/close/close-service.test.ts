@@ -3,6 +3,7 @@ import { GitRemoteBlockedError } from "../../src/adapters/github.js";
 import { closeTask } from "../../src/close/close-service.js";
 import type { DurableContextStore } from "../../src/state/durable-context-store.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
+import type { GitFailureCategory } from "../../src/adapters/git.js";
 import type { DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 
 const gateNames = [
@@ -121,6 +122,7 @@ function successfulPush(): GitPushEvidence {
     pushed: true,
     observedOutput: "Git push completed",
     exitCode: 0,
+    failureCategory: null,
   };
 }
 
@@ -140,6 +142,17 @@ function gitHubFor(pushEvidence: GitPushEvidence, remoteState: RemoteState): Git
   };
 }
 
+function unexpectedGitHub(): GitHubAdapter {
+  return {
+    pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+      throw new Error("GitHub adapter must not run after a failed close preflight");
+    },
+    verifyRemoteState: async (): Promise<RemoteState> => {
+      throw new Error("GitHub adapter must not run after a failed close preflight");
+    },
+  };
+}
+
 describe("closeTask", () => {
   it("returns YES only after persisted state, fresh gates, a successful push, and an exact remote SHA match", async () => {
     const now = new Date().toISOString();
@@ -153,6 +166,22 @@ describe("closeTask", () => {
 
     expect(verdict.status).toBe("YES");
     expect(verdict.reasons).toEqual([]);
+  });
+
+  it("accepts an exact 64-character commit artifact and matching adapter evidence", async () => {
+    const now = new Date().toISOString();
+    const state = closeReadyState(now);
+    const commitSha = "e".repeat(64);
+    const contextManifest = state.contextManifest.map((entry) => entry.startsWith("artifact:commit:") ? `artifact:commit:${commitSha}` : entry);
+    const stateWithSha256 = { ...state, contextManifest };
+    const pushEvidence = { ...successfulPush(), localSha: commitSha };
+
+    const verdict = await closeTask(stateWithSha256, {
+      store: storeFor(stateWithSha256),
+      gitHub: gitHubFor(pushEvidence, matchingRemoteState(commitSha)),
+    });
+
+    expect(verdict.status).toBe("YES");
   });
 
   it("returns NO when durable context is missing", async () => {
@@ -173,11 +202,31 @@ describe("closeTask", () => {
 
   it("returns NO when the push did not succeed", async () => {
     const state = closeReadyState(new Date().toISOString());
-    const failedPush = { ...successfulPush(), pushed: false, exitCode: 1, observedOutput: "rejected by remote" };
+    const failedPush = {
+      ...successfulPush(),
+      pushed: false,
+      exitCode: 1,
+      observedOutput: "rejected by remote",
+      failureCategory: "verification-mismatch" as const,
+    };
     const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) });
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/push/i);
+  });
+
+  it.each<readonly [string, GitFailureCategory]>([
+    ["Authentication failed for 'https://github.com/acme/d-ai.git'", "authentication"],
+    ["remote: Permission to acme/d-ai denied", "permission"],
+    ["fatal: unable to access remote: Could not resolve host: github.com", "network"],
+    ["fatal: repository 'https://github.com/acme/d-ai.git/' not found", "remote-unavailable"],
+    ["unexpected push failure", "ambiguous"],
+  ])("returns BLOCKED for ambiguous or external push failure: %s", async (observedOutput, failureCategory) => {
+    const state = closeReadyState(new Date().toISOString());
+    const failedPush = { ...successfulPush(), pushed: false, exitCode: 1, observedOutput, failureCategory };
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) });
+
+    expect(verdict.status).toBe("BLOCKED");
   });
 
   it("returns NO when the remote SHA differs from the pushed SHA", async () => {
@@ -204,6 +253,49 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/artifact/i);
   });
 
+  it("returns NO when durable and recovery path sets differ", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const recoveryPoint = state.recoveryPoint;
+    if (recoveryPoint === null) throw new Error("Expected recovery point");
+    const mismatchedState = {
+      ...state,
+      recoveryPoint: {
+        ...recoveryPoint,
+        durablePaths: ["recovery-only.json"],
+        hashes: { "recovery-only.json": "f".repeat(64) },
+      },
+    };
+
+    const verdict = await closeTask(mismatchedState, {
+      store: storeFor(mismatchedState),
+      gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))),
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/artifact correspondence/i);
+  });
+
+  it("returns NO when durable and recovery hashes differ for the same paths", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const recoveryPoint = state.recoveryPoint;
+    if (recoveryPoint === null) throw new Error("Expected recovery point");
+    const mismatchedState = {
+      ...state,
+      recoveryPoint: {
+        ...recoveryPoint,
+        hashes: { ...recoveryPoint.hashes, "artifacts/context.json": "f".repeat(64) },
+      },
+    };
+
+    const verdict = await closeTask(mismatchedState, {
+      store: storeFor(mismatchedState),
+      gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))),
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/artifact correspondence/i);
+  });
+
   it("returns NO when a required gate is stale", async () => {
     const staleAt = new Date(Date.now() - (6 * 60 * 1_000)).toISOString();
     const state = { ...closeReadyState(new Date().toISOString()), verificationEvidence: evidence(staleAt) };
@@ -221,9 +313,23 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/handoff/i);
   });
 
+  it("returns NO while close approval is pending", async () => {
+    const state = { ...closeReadyState(new Date().toISOString()), approvalState: "pending" as const };
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))) });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/approval/i);
+  });
+
   it("returns NO when local Git evidence reports a dirty worktree", async () => {
     const state = closeReadyState(new Date().toISOString());
-    const dirtyPush = { ...successfulPush(), pushed: false, exitCode: 1, observedOutput: "Worktree status: M src/close.ts" };
+    const dirtyPush = {
+      ...successfulPush(),
+      pushed: false,
+      exitCode: 1,
+      observedOutput: "Worktree status: M src/close.ts",
+      failureCategory: "dirty-worktree" as const,
+    };
     const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(dirtyPush, matchingRemoteState(dirtyPush.localSha)) });
 
     expect(verdict.status).toBe("NO");
@@ -243,5 +349,64 @@ describe("closeTask", () => {
 
     expect(verdict.status).toBe("BLOCKED");
     expect(verdict.reasons.join(" ")).toMatch(/remote/i);
+  });
+
+  it("returns BLOCKED when adapter push evidence does not match the configured remote or ref", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const mismatchedPush = { ...successfulPush(), remote: "upstream", ref: "refs/heads/other" };
+
+    const verdict = await closeTask(state, {
+      store: storeFor(state),
+      gitHub: gitHubFor(mismatchedPush, matchingRemoteState(mismatchedPush.localSha)),
+    });
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(verdict.reasons.join(" ")).toMatch(/evidence|remote|ref/i);
+  });
+
+  it("returns BLOCKED for malformed adapter commit evidence", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const malformedPush = { ...successfulPush(), localSha: "e".repeat(41) };
+
+    const verdict = await closeTask(state, {
+      store: storeFor(state),
+      gitHub: gitHubFor(malformedPush, matchingRemoteState(malformedPush.localSha)),
+    });
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(verdict.reasons.join(" ")).toMatch(/evidence|object id|sha/i);
+  });
+
+  it("returns BLOCKED when adapter remote state does not match the configured repository or ref", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const pushEvidence = successfulPush();
+    const mismatchedRemoteState = {
+      ...matchingRemoteState(pushEvidence.localSha),
+      repository: "github.com/acme/other",
+      ref: "refs/heads/other",
+    };
+
+    const verdict = await closeTask(state, {
+      store: storeFor(state),
+      gitHub: gitHubFor(pushEvidence, mismatchedRemoteState),
+    });
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(verdict.reasons.join(" ")).toMatch(/remote state|repository|ref/i);
+  });
+
+  it.each([
+    ["duplicate commit artifacts", ["artifact:commit:" + "e".repeat(40), "artifact:commit:" + "e".repeat(40)]],
+    ["conflicting commit artifacts", ["artifact:commit:" + "e".repeat(40), "artifact:commit:" + "f".repeat(40)]],
+    ["malformed commit artifact", ["artifact:commit:" + "e".repeat(41)]],
+  ])("returns NO before calling the adapter for %s", async (_label, commitArtifacts) => {
+    const state = closeReadyState(new Date().toISOString());
+    const withoutCommitArtifact = state.contextManifest.filter((entry) => !entry.startsWith("artifact:commit:"));
+    const invalidState = { ...state, contextManifest: [...withoutCommitArtifact, ...commitArtifacts] };
+
+    const verdict = await closeTask(invalidState, { store: storeFor(invalidState), gitHub: unexpectedGitHub() });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/commit artifact/i);
   });
 });

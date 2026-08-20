@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { GitRemoteBlockedError, resolveGitHubRepository } from "../../src/adapters/github.js";
+import { classifyGitFailure } from "../../src/adapters/git.js";
 
 describe("resolveGitHubRepository", () => {
   it("normalizes SSH and HTTPS GitHub remotes without retaining credentials", () => {
@@ -26,5 +27,23 @@ describe("resolveGitHubRepository", () => {
 
   it("blocks credential-bearing HTTPS remotes instead of exposing them to command output", () => {
     expect(() => resolveGitHubRepository("https://secret-token@github.com/acme/d-ai.git", null)).toThrow(GitRemoteBlockedError);
+  });
+
+  it("blocks unsupported HTTPS and SSH ports", () => {
+    expect(() => resolveGitHubRepository("https://github.com:8443/acme/d-ai.git", null)).toThrow(GitRemoteBlockedError);
+    expect(() => resolveGitHubRepository("ssh://git@github.com:2222/acme/d-ai.git", null)).toThrow(GitRemoteBlockedError);
+  });
+});
+
+describe("classifyGitFailure", () => {
+  it.each([
+    ["Authentication failed", "authentication"],
+    ["Permission denied (publickey)", "permission"],
+    ["Could not resolve host: github.com", "network"],
+    ["repository not found", "remote-unavailable"],
+    ["[rejected] main -> main (non-fast-forward)", "verification-mismatch"],
+    ["unrecognized failure", "ambiguous"],
+  ] as const)("classifies %s as %s", (observedOutput, expected) => {
+    expect(classifyGitFailure(observedOutput)).toBe(expected);
   });
 });
