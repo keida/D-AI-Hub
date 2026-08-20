@@ -437,6 +437,36 @@ describe("PersistentHandoffService", () => {
     }
   });
 
+  it("keeps a successor lock intact when it acquires during stale-holder release", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    const controls = { successorStarted: null as (() => void) | null, releaseSuccessor: null as (() => void) | null };
+    const successorStarted = new Promise<void>((resolve) => { controls.successorStarted = resolve; });
+    const releaseSuccessor = new Promise<void>((resolve) => { controls.releaseSuccessor = resolve; });
+    const successorPersistence = new FileHandoffPersistence(persistencePath);
+    let successor: Promise<void> | null = null;
+    const staleHolderPersistence = new FileHandoffPersistence(persistencePath, {
+      afterReleaseLockQuarantine: async () => {
+        successor = successorPersistence.withExclusive(async () => {
+          controls.successorStarted?.();
+          await releaseSuccessor;
+        });
+        await successorStarted;
+      },
+    });
+    try {
+      await staleHolderPersistence.withExclusive(async () => {});
+
+      expect((await stat(lockPath)).isDirectory()).toBe(true);
+      if (controls.releaseSuccessor === null || successor === null) throw new Error("The successor lock operation did not start");
+      controls.releaseSuccessor();
+      await successor;
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 1_000);
+
   it("wraps file lock preparation failures in InvalidHandoffError", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const parentFile = join(directory, "not-a-directory");

@@ -36,6 +36,7 @@ const fileHandoffLockOwnerFile = "owner";
 const fileHandoffLockLeaseFile = "lease";
 
 interface FileLockOwner { readonly lockPath: string; readonly token: string; }
+export interface FileHandoffPersistenceOptions { readonly afterReleaseLockQuarantine: (() => Promise<void>) | null; }
 
 function issueReason(result: { readonly error: z.ZodError }): string { const issue = result.error.issues[0]; return issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`; }
 function parseTarget(target: EnvironmentCapabilities): EnvironmentCapabilities { const result = targetSchema.safeParse(target); if (!result.success) throw new CapabilityMismatchError(`Invalid handoff target capabilities: ${issueReason(result)}`); return { environment: result.data.environment, capabilities: new Set(result.data.capabilities) }; }
@@ -83,7 +84,10 @@ export class InMemoryHandoffPersistence implements HandoffPersistence {
 
 export class FileHandoffPersistence implements HandoffPersistence {
   private readonly lockOwners = new AsyncLocalStorage<FileLockOwner>();
-  public constructor(private readonly filePath: string) {}
+  private readonly afterReleaseLockQuarantine: (() => Promise<void>) | null;
+  public constructor(filePath: string);
+  public constructor(filePath: string, options: FileHandoffPersistenceOptions);
+  public constructor(private readonly filePath: string, options?: FileHandoffPersistenceOptions) { this.afterReleaseLockQuarantine = options === undefined ? null : options.afterReleaseLockQuarantine; }
   public async load(): Promise<readonly HandoffPersistenceRecord[]> {
     try {
       await this.assertCurrentLockOwnership();
@@ -209,9 +213,13 @@ export class FileHandoffPersistence implements HandoffPersistence {
     }
   }
   private async releaseLock(owner: FileLockOwner): Promise<void> {
+    const quarantineOwner: FileLockOwner = { lockPath: `${owner.lockPath}.${randomUUID()}.release`, token: owner.token };
     try {
       await this.assertLockOwnership(owner);
-      await rm(owner.lockPath, { recursive: true, force: false });
+      await rename(owner.lockPath, quarantineOwner.lockPath);
+      await this.assertLockOwnership(quarantineOwner);
+      if (this.afterReleaseLockQuarantine !== null) await this.afterReleaseLockQuarantine();
+      await rm(quarantineOwner.lockPath, { recursive: true, force: false });
     } catch (error) {
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to release handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
