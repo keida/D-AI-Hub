@@ -25,11 +25,13 @@ function manifest(now: string): DurableContextManifest {
     stage: "close",
     environment: "codex",
     role: "evidence-collector",
-    durablePaths: ["artifacts/context.json", "artifacts/evidence.json", "artifacts/recovery.json"],
+    durablePaths: ["context.json", "evidence.json", "recovery.json", "state.json", "manifest.json"],
     hashes: {
-      "artifacts/context.json": "a".repeat(64),
-      "artifacts/evidence.json": "b".repeat(64),
-      "artifacts/recovery.json": "c".repeat(64),
+      "context.json": "a".repeat(64),
+      "evidence.json": "b".repeat(64),
+      "recovery.json": "c".repeat(64),
+      "state.json": "d".repeat(64),
+      "manifest.json": "e".repeat(64),
     },
     recoveryPointId: "recovery-close",
     recordedAt: now,
@@ -293,8 +295,26 @@ describe("closeTask", () => {
       ...state,
       recoveryPoint: {
         ...recoveryPoint,
-        hashes: { ...recoveryPoint.hashes, "artifacts/context.json": "f".repeat(64) },
+        hashes: { ...recoveryPoint.hashes, "context.json": "f".repeat(64) },
       },
+    };
+
+    const verdict = await closeTask(mismatchedState, {
+      store: storeFor(mismatchedState),
+      gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))),
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/artifact correspondence/i);
+  });
+
+  it.each(["recovery.json", "state.json", "manifest.json"] as const)("returns NO when the recovery hash for %s differs", async (path) => {
+    const state = closeReadyState(new Date().toISOString());
+    const recoveryPoint = state.recoveryPoint;
+    if (recoveryPoint === null) throw new Error("Expected recovery point");
+    const mismatchedState = {
+      ...state,
+      recoveryPoint: { ...recoveryPoint, hashes: { ...recoveryPoint.hashes, [path]: "f".repeat(64) } },
     };
 
     const verdict = await closeTask(mismatchedState, {

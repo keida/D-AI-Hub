@@ -95,6 +95,15 @@ function assertCaptureInput(input: RecoveryPointCaptureInput): void {
 
 export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedRecoveryPoint {
   assertCaptureInput(input);
+  // Recovery hashes are an immutable snapshot of stable companion artifacts.
+  // State, manifest, and recovery files are regenerated as the snapshot is recorded.
+  const snapshotPaths = input.stateManifest.durablePaths.filter((path) => !/(?:[\\/](?:state|manifest|recovery)\.json)$/u.test(path));
+  const snapshotHashes: Record<string, string> = {};
+  for (const path of snapshotPaths) {
+    const hash = input.stateManifest.hashes[path];
+    if (hash === undefined) throw new InvalidTaskStateError(`Recovery snapshot hash is missing for ${path}`);
+    snapshotHashes[path] = hash;
+  }
   const snapshot: RecoverySnapshot = {
     head: input.head,
     branch: input.branch,
@@ -112,8 +121,8 @@ export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedR
       stage: input.stage,
       environment: input.environment,
       role: input.role,
-      durablePaths: input.stateManifest.durablePaths,
-      hashes: input.stateManifest.hashes,
+      durablePaths: snapshotPaths,
+      hashes: snapshotHashes,
       restorationInstructions: "Preserve user work, revert committed changes audibly, restore the captured binary patch, and verify the recovery point.",
       createdAt: input.createdAt,
     },

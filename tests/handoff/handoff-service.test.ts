@@ -66,7 +66,7 @@ describe("PersistentHandoffService", () => {
 
     await targetAdapter.receive(envelope);
 
-    expect(targetAdapter.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: target });
+    expect(targetAdapter.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target, state: "active", reason: null, owner: target });
   });
 
   it("redacts every secret-like value, including bearer tokens and nested durable data", async () => {
@@ -111,7 +111,7 @@ describe("PersistentHandoffService", () => {
     await codex.receive(envelope);
     await expect(handoffService.complete(envelope.handoffId, "work")).rejects.toThrow(InvalidHandoffError);
     await codex.complete(envelope.handoffId);
-    expect(codex.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "completed", reason: "Completed by codex", owner: "codex" });
+    expect(codex.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "codex", state: "completed", reason: "Completed by codex", owner: "codex" });
   });
 
   it("persists lifecycle records across service restart and rejects tampered storage", async () => {
@@ -123,7 +123,7 @@ describe("PersistentHandoffService", () => {
       await new WorkEnvironmentAdapter(first).receive(envelope);
       const restarted = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       await restarted.ready();
-      expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: "work" });
+      expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "work", state: "active", reason: null, owner: "work" });
       const committedPath = join(`${persistencePath}.lock`, "2", "committed", "snapshot.json");
       await writeFile(committedPath, (await readFile(committedPath, "utf8")).replace('"owner":"work"', '"owner":"codex"'), "utf8");
       const tampered = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
@@ -222,7 +222,7 @@ describe("PersistentHandoffService", () => {
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
-    expect(work.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "completed", reason: "Completed by work", owner: "work" });
+    expect(work.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "work", state: "completed", reason: "Completed by work", owner: "work" });
   });
 
   it("coordinates concurrent lifecycle operations across services sharing one file", async () => {
@@ -250,7 +250,7 @@ describe("PersistentHandoffService", () => {
       await restarted.ready();
       expect(restarted.status(firstEnvelope.handoffId).state).toBe("pending");
       expect(restarted.status(secondEnvelope.handoffId).state).toBe("pending");
-      expect(restarted.status(acknowledgement.handoffId)).toEqual({ handoffId: acknowledgement.handoffId, state: "active", reason: null, owner: "work" });
+      expect(restarted.status(acknowledgement.handoffId)).toEqual({ handoffId: acknowledgement.handoffId, taskId: acknowledgement.taskId, target: "work", state: "active", reason: null, owner: "work" });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -313,7 +313,7 @@ describe("PersistentHandoffService", () => {
       const handoffService = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
 
-      expect(handoffService.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "pending", reason: null, owner: null });
+      expect(handoffService.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "work", state: "pending", reason: null, owner: null });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -586,7 +586,7 @@ describe("PersistentHandoffService", () => {
 
     expect(() => restarted.status(envelope.handoffId)).toThrow(InvalidHandoffError);
     await restarted.ready();
-    expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "pending", reason: null, owner: null });
+    expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "work", state: "pending", reason: null, owner: null });
   });
 
   it("restarts a file-backed adapter through ready before receive and status", async () => {
@@ -600,7 +600,7 @@ describe("PersistentHandoffService", () => {
       expect(() => restartedWork.status(envelope.handoffId)).toThrow(InvalidHandoffError);
       await restartedWork.ready();
       await restartedWork.receive(envelope);
-      expect(restartedWork.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: "work" });
+      expect(restartedWork.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "work", state: "active", reason: null, owner: "work" });
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

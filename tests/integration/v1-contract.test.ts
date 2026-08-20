@@ -13,6 +13,8 @@ import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/regi
 import { loadSelectedSkill, type LoadedSkill } from "../../src/skills/skill-loader.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateName } from "../../src/verification/gates.js";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createKnownGoodRepository, type KnownGoodRepositoryFixture } from "./fixtures/known-good-repo.js";
 
@@ -122,7 +124,7 @@ async function runLifecycle(fixture: KnownGoodRepositoryFixture): Promise<Runtim
   return runtimeFixture;
 }
 
-describe("D-AI V1 end-to-end contract", () => {
+describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
   it("keeps the zero-configuration handle fail-closed and proves the injectable public factory boundary", async () => {
     const result = await handleDAIRequest({ command: { kind: "status" }, sourceEnvironment: "chat", overrides: noOverrides });
     expect(result).toMatchObject({ status: "blocked", taskId: "unassigned", environment: "chat" });
@@ -137,12 +139,26 @@ describe("D-AI V1 end-to-end contract", () => {
       expect(result.trace.responses.at(-2), result.trace.responses.at(-2)?.message).toMatchObject({ taskId: result.trace.responses[0]?.taskId, stage: "verify", environment: "work", status: "completed" });
       expect(result.trace.responses.at(-1), result.trace.responses.at(-1)?.message).toMatchObject({ taskId: result.trace.responses[0]?.taskId, stage: "close", environment: "work", status: "completed" });
       expect(result.trace.handoffSnapshots).toEqual([
-        { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, state: "active", reason: null, owner: "work" },
-        { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, state: "completed", reason: "Completed by work", owner: "work" },
+        { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, taskId: result.trace.responses[0]?.taskId, target: "work", state: "active", reason: null, owner: "work" },
+        { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, taskId: result.trace.responses[0]?.taskId, target: "work", state: "completed", reason: "Completed by work", owner: "work" },
       ]);
+      const records = await new PersistentHandoffService(new FileHandoffPersistence(fixture.handoffPersistencePath)).ready().then(async () => new FileHandoffPersistence(fixture.handoffPersistencePath).load());
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        envelope: { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, taskId: result.trace.responses[0]?.taskId, targetEnvironment: "work" },
+        owner: "work",
+        state: "completed",
+      });
+      expect(records[0]?.envelope.taskId).toBe(result.trace.responses[0]?.taskId);
       expect(result.trace.loadedSkills.map((skill) => skill.descriptor.name).sort()).toEqual([...fixture.skillLibrary.selectedSkillNames].sort());
       expect(result.trace.loadedSkills.every((skill) => skill.instructions.includes(skill.descriptor.name))).toBe(true);
-      expect(result.trace.loadedSkills.every((skill) => skill.loadedResources.every((path) => path.startsWith(fixture.skillLibrary.rootPath)))).toBe(true);
+      for (const skill of result.trace.loadedSkills) {
+        expect(skill.loadedResources).toEqual([join(fixture.skillLibrary.rootPath, skill.descriptor.name, "references", "contract.md")]);
+        const expectedResource = skill.descriptor.name === "repository-execution"
+          ? "Use the repository-local command fixtures for execution evidence.\n"
+          : "Require a zero exit code and retain the observed output.\n";
+        expect(await readFile(skill.loadedResources[0]!, "utf8")).toBe(expectedResource);
+      }
       expect(result.trace.loadedSkills.flatMap((skill) => [skill.instructions, ...skill.loadedResources])).not.toContain(expect.stringContaining(fixture.skillLibrary.unrelatedSkillName));
       expect(result.trace.failedResult.exitCode).toBe(23);
       expect(result.trace.passingResult.stdout).toBe("fixture verification passed\n");

@@ -422,6 +422,96 @@ describe("D-AI runtime", () => {
     expect(await runtimeHarness.handoffService.status(handoffId)).toMatchObject({ state: "active", owner: "work" });
   });
 
+  it("rejects a handoff id belonging to another active task before changing either record", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const firstHandoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const firstId = /^Handoff (handoff-\S+) is owned/.exec(firstHandoff.message)?.[1];
+    if (firstId === undefined) throw new InvalidTaskStateError("First handoff id was not recorded");
+
+    const secondState = {
+      ...await runtimeHarness.store.load(accepted.taskId) as TaskState,
+      taskId: "task-other",
+      environment: "codex" as const,
+      routingDecision: null,
+      handoffState: "none" as const,
+      verificationEvidence: [],
+      recoveryPoint: null,
+      durableContext: null,
+    };
+    const secondEnvelope = await runtimeHarness.handoffService.create({ state: secondState, targetEnvironment: "work" });
+    await new WorkEnvironmentAdapter(runtimeHarness.handoffService).receive(secondEnvelope);
+    const beforeFirst = runtimeHarness.handoffService.status(firstId);
+    const beforeSecond = runtimeHarness.handoffService.status(secondEnvelope.handoffId);
+
+    const blocked = await handle({ command: { kind: "complete", handoffId: secondEnvelope.handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+
+    expect(blocked.status).toBe("blocked");
+    expect(runtimeHarness.handoffService.status(firstId)).toEqual(beforeFirst);
+    expect(runtimeHarness.handoffService.status(secondEnvelope.handoffId)).toEqual(beforeSecond);
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ taskId: accepted.taskId, stage: "handoff", handoffState: "active" });
+  });
+
+  it("reconciles a completed service handoff after task persistence fails", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let failCompletionSave = true;
+    const failingStore: DurableContextStore = {
+      load: (taskId) => runtimeHarness.store.load(taskId),
+      save: async (state) => {
+        if (failCompletionSave && state.handoffState === "completed") {
+          failCompletionSave = false;
+          throw new InvalidTaskStateError("completion task save failed");
+        }
+        return runtimeHarness.store.save(state);
+      },
+      recordCriticalUnsavedContext: (taskId, items) => runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
+      clearCriticalUnsavedContext: (taskId) => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: failingStore });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Handoff id was not recorded");
+
+    const firstAttempt = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(firstAttempt.status).toBe("blocked");
+    expect(await runtimeHarness.store.load(accepted.taskId)).toMatchObject({ stage: "handoff", handoffState: "active" });
+    expect(runtimeHarness.handoffService.status(handoffId)).toMatchObject({ state: "completed", owner: "work", taskId: accepted.taskId, target: "work" });
+
+    const retry = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(retry).toMatchObject({ taskId: accepted.taskId, stage: "verify", status: "completed" });
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed" });
+  });
+
+  it("leaves the task retryable when the handoff service completion fails", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let failCompletion = true;
+    const handoffService: HandoffService = {
+      ready: () => runtimeHarness.handoffService.ready(),
+      create: (input) => runtimeHarness.handoffService.create(input),
+      acknowledge: (envelope, target) => runtimeHarness.handoffService.acknowledge(envelope, target),
+      complete: async () => {
+        if (failCompletion) {
+          failCompletion = false;
+          throw new InvalidTaskStateError("service completion failed");
+        }
+        return Promise.resolve();
+      },
+      reject: (handoffId, reason) => runtimeHarness.handoffService.reject(handoffId, reason),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, handoffService });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Handoff id was not recorded");
+
+    const failed = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(failed.status).toBe("blocked");
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "handoff", handoffState: "active" });
+    expect(runtimeHarness.handoffService.status(handoffId)).toMatchObject({ state: "active", owner: "work" });
+  });
+
   it("uses the durable environment to reject stale continuation in a fresh runtime", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const seedingRuntime = createDAIRuntime(runtimeHarness.dependencies);
@@ -732,10 +822,10 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.executed).toHaveLength(executionsBeforeClose);
     await expect(readFile(sentinelPath, "utf8")).resolves.toBe(sentinelBefore);
     expect(response.message).toMatch(verdict === "YES" ? /yes/i : new RegExp(verdict, "i"));
-    expect(runtimeHarness.closedStates.at(-1)?.stage).toBe("close");
+    expect(runtimeHarness.closedStates.at(-1)?.stage).toBe("verify");
   });
 
-  it("transitions and persists verify to close before the real close evaluator runs", async () => {
+  it("keeps a NO close retryable in verify before the real close evaluator runs", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const gitHub: GitHubAdapter = {
       pushExpectedCommit: async (): Promise<GitPushEvidence> => {
@@ -753,10 +843,31 @@ describe("D-AI runtime", () => {
 
     const result = await handle({ command: { kind: "close" }, sourceEnvironment: "codex", overrides: noOverrides });
 
-    expect(result.stage).toBe("close");
+    expect(result.stage).toBe("verify");
     expect(result.status).toBe("blocked");
-    expect(result.message).not.toMatch(/not explicitly invoked/i);
-    expect(runtimeHarness.savedStates.at(-1)?.stage).toBe("close");
+    expect(runtimeHarness.savedStates.at(-1)?.stage).toBe("verify");
+  });
+
+  it("retries a NO close with the same runtime and durable store", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let closeAttempt = 0;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      closeTask: async (state): Promise<CloseVerdict> => {
+        closeAttempt += 1;
+        return closeVerdict(state, closeAttempt === 1 ? "NO" : "YES");
+      },
+    });
+    const accepted = await handle(intentRequest("codex", noOverrides));
+    await handle({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    const first = await handle({ command: { kind: "close" }, sourceEnvironment: "codex", overrides: noOverrides });
+    expect(first).toMatchObject({ taskId: accepted.taskId, stage: "verify", status: "blocked" });
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify" });
+
+    const second = await handle({ command: { kind: "close" }, sourceEnvironment: "codex", overrides: noOverrides });
+    expect(second).toMatchObject({ taskId: accepted.taskId, stage: "close", status: "completed" });
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "close" });
   });
 
   it("returns blocked when the close connector throws and preserves its reason", async () => {

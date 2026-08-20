@@ -562,12 +562,11 @@ function validateCapturedRecoveryPoint(
   const recoveryHashKeys = Object.keys(validated.hashes);
   const manifestHashKeys = Object.keys(manifest.hashes);
   if (
-    new Set(validated.durablePaths).size !== validated.durablePaths.length
-    || validated.durablePaths.length !== manifest.durablePaths.length
-    || validated.durablePaths.some((path, index) => path !== manifest.durablePaths[index] || validated.hashes[path] !== manifest.hashes[path])
+    validated.durablePaths.length === 0
+    || new Set(validated.durablePaths).size !== validated.durablePaths.length
+    || validated.durablePaths.some((path) => !manifest.durablePaths.includes(path) || validated.hashes[path] !== manifest.hashes[path])
     || recoveryHashKeys.length !== validated.durablePaths.length
     || recoveryHashKeys.some((key) => !validated.durablePaths.includes(key))
-    || manifestHashKeys.length !== manifest.durablePaths.length
     || manifestHashKeys.some((key) => !manifest.durablePaths.includes(key))
   ) return { kind: "blocked", message: "Captured recovery point does not match the persisted verify artifacts" };
   return { kind: "success", value: validated };
@@ -927,9 +926,6 @@ async function completeHandoffExclusive(
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is unavailable for handoff completion`);
   }
   const state = loadedState.value;
-  if (state.stage !== "handoff" || state.handoffState !== "active") {
-    return response(state, "blocked", `Task ${taskId} cannot complete a handoff from stage ${state.stage} and handoff state ${state.handoffState}`);
-  }
   const handoffStatus = await connectorOutcome(
     () => Promise.resolve(dependencies.adapters[request.sourceEnvironment].status(command.handoffId)),
     completionConnectorFailure,
@@ -937,37 +933,40 @@ async function completeHandoffExclusive(
   if (handoffStatus.kind === "blocked") {
     return response(state, "blocked", `Handoff completion blocked: ${handoffStatus.message}`);
   }
-  if (handoffStatus.value.state !== "active" || handoffStatus.value.owner !== request.sourceEnvironment) {
+  if (handoffStatus.value.taskId !== taskId || handoffStatus.value.target !== request.sourceEnvironment) {
+    return response(state, "blocked", `Handoff ${command.handoffId} does not belong to active task ${taskId} and target ${request.sourceEnvironment}`);
+  }
+  if (handoffStatus.value.owner !== request.sourceEnvironment) {
     return response(state, "blocked", `Handoff ${command.handoffId} is not actively owned by ${request.sourceEnvironment}`);
   }
-  const verifyCandidate = {
-    ...transitionState(state, "verify", "evidence-collector", request.sourceEnvironment),
-    contextManifest: [...state.contextManifest],
-  };
-  const preliminary = await connectorOutcome(
-    () => persistState(dependencies.store, verifyCandidate),
-    completionConnectorFailure,
-  );
-  if (preliminary.kind === "blocked") {
-    return response(state, "blocked", `Handoff completion persistence blocked: ${preliminary.message}`);
+  if (state.stage === "verify" && state.handoffState === "completed" && handoffStatus.value.state === "completed") {
+    return response(state, "completed", `Handoff ${command.handoffId} was already completed; task ${taskId} remains in verify`);
   }
-  const completion = await connectorOutcome(
-    () => dependencies.handoffService.complete(command.handoffId, request.sourceEnvironment),
-    completionConnectorFailure,
-  );
-  if (completion.kind === "blocked") {
-    return response(preliminary.value, "blocked", `Handoff completion blocked: ${completion.message}`);
+  if (state.stage !== "handoff" || state.handoffState !== "active") {
+    return response(state, "blocked", `Task ${taskId} cannot complete a handoff from stage ${state.stage} and handoff state ${state.handoffState}`);
   }
-  const priorRecoveryPointId = preliminary.value.recoveryPoint?.recoveryPointId;
+  if (handoffStatus.value.state !== "active" && handoffStatus.value.state !== "completed") {
+    return response(state, "blocked", `Handoff ${command.handoffId} cannot complete from state ${handoffStatus.value.state}`);
+  }
+  const priorRecoveryPointId = state.recoveryPoint?.recoveryPointId;
   if (priorRecoveryPointId === undefined) {
-    return response(preliminary.value, "blocked", "Handoff completion blocked: no prior recovery point is available");
+    return response(state, "blocked", "Handoff completion blocked: no prior recovery point is available");
+  }
+  if (handoffStatus.value.state === "active") {
+    const completion = await connectorOutcome(
+      () => dependencies.handoffService.complete(command.handoffId, request.sourceEnvironment),
+      completionConnectorFailure,
+    );
+    if (completion.kind === "blocked") {
+      return response(state, "blocked", `Handoff completion blocked: ${completion.message}`);
+    }
   }
   const completionEvidence: VerificationEvidence = {
     evidenceId: "gate:handoff",
     stage: "verify",
     environment: request.sourceEnvironment,
     role: "evidence-collector",
-    selectedModel: preliminary.value.routingDecision?.selectedModel ?? "unrecorded-model",
+    selectedModel: state.routingDecision?.selectedModel ?? "unrecorded-model",
     command: `handoff complete ${command.handoffId}`,
     observedOutput: `Handoff ${command.handoffId} completed by ${request.sourceEnvironment}`,
     exitCode: 0,
@@ -976,16 +975,18 @@ async function completeHandoffExclusive(
     recoveryPointId: priorRecoveryPointId,
     recordedAt: dependencies.now().toISOString(),
   };
+  const completedCandidate = {
+    ...transitionState(state, "verify", "evidence-collector", request.sourceEnvironment),
+    contextManifest: [...state.contextManifest],
+    verificationEvidence: [...state.verificationEvidence, completionEvidence],
+    handoffState: "completed" as const,
+  };
   const completedState = await connectorOutcome(
-    () => persistState(dependencies.store, {
-      ...preliminary.value,
-      verificationEvidence: [...preliminary.value.verificationEvidence, completionEvidence],
-      handoffState: "completed",
-    }),
+    () => persistState(dependencies.store, completedCandidate),
     completionConnectorFailure,
   );
   if (completedState.kind === "blocked") {
-    return response(preliminary.value, "blocked", `Handoff completion persistence blocked: ${completedState.message}`);
+    return response(state, "blocked", `Handoff completion persistence blocked after service completion: ${completedState.message}`);
   }
   const recoveryPoint = await connectorOutcome(
     () => dependencies.captureRecoveryPoint(completedState.value),
@@ -1040,23 +1041,39 @@ async function closeActiveTaskExclusive(
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
   }
-  const closeState = await persistState(
-    dependencies.store,
-    transitionState(state, "close", "evidence-collector", state.environment),
-  );
-  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(closeState), closeConnectorFailure);
+  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(state), closeConnectorFailure);
   if (closeOutcome.kind === "blocked") {
-    return response(closeState, "blocked", `Close connector blocked: ${closeOutcome.message}`);
+    return response(state, "blocked", `Close connector blocked: ${closeOutcome.message}`);
   }
   const verdict = closeOutcome.value;
-  const status: DAIResponse["status"] = verdict.status === "YES" ? "completed" : "blocked";
-  const message = verdict.status === "YES"
-    ? "Safe-to-delete: YES"
-    : `Close verdict ${verdict.status}: ${verdict.reasons.join(" ")}`;
+  if (verdict.status !== "YES") {
+    const status: DAIResponse["status"] = "blocked";
+    const message = `Close verdict ${verdict.status}: ${verdict.reasons.join(" ")}`;
+    return {
+      taskId: state.taskId,
+      stage: state.stage,
+      environment: state.environment,
+      status,
+      evidence: verdict.evidence.map(redactEvidence),
+      message: redactSensitiveText(message),
+    };
+  }
+  const closeState = await connectorOutcome(
+    () => persistState(dependencies.store, {
+      ...transitionState(state, "close", "evidence-collector", state.environment),
+      verificationEvidence: [...verdict.evidence],
+    }),
+    closeConnectorFailure,
+  );
+  if (closeState.kind === "blocked") {
+    return response(state, "blocked", `Close persistence blocked after successful close verification: ${closeState.message}`);
+  }
+  const status: DAIResponse["status"] = "completed";
+  const message = "Safe-to-delete: YES";
   return {
-    taskId: verdict.taskId,
-    stage: verdict.stage,
-    environment: verdict.environment,
+    taskId: closeState.value.taskId,
+    stage: closeState.value.stage,
+    environment: closeState.value.environment,
     status,
     evidence: verdict.evidence.map(redactEvidence),
     message: redactSensitiveText(message),

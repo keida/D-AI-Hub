@@ -17,7 +17,7 @@ export interface HandoffService {
   reject(handoffId: string, reason: string): Promise<void>;
 }
 
-export interface HandoffStatus { readonly handoffId: string; readonly state: "pending" | "active" | "completed" | "rejected"; readonly reason: string | null; readonly owner: Environment | null; }
+export interface HandoffStatus { readonly handoffId: string; readonly taskId: string; readonly target: Environment; readonly state: "pending" | "active" | "completed" | "rejected"; readonly reason: string | null; readonly owner: Environment | null; }
 export interface HandoffPersistenceRecord { readonly envelope: HandoffEnvelope; readonly owner: Environment | null; readonly state: HandoffStatus["state"]; readonly reason: string | null; }
 export interface HandoffPersistence { load(): Promise<readonly HandoffPersistenceRecord[]>; save(records: readonly HandoffPersistenceRecord[]): Promise<void>; withExclusive<T>(operation: () => Promise<T>): Promise<T>; }
 
@@ -380,7 +380,7 @@ export class PersistentHandoffService implements HandoffService {
     const validatedHandoffId = parseHandoffId(handoffId);
     if (!this.initialized) throw new InvalidHandoffError("Handoff service must complete an asynchronous lifecycle operation before status is read");
     const record = this.requireRecord(validatedHandoffId);
-    return { handoffId: validatedHandoffId, state: record.state, reason: record.reason, owner: record.owner };
+    return { handoffId: validatedHandoffId, taskId: record.envelope.taskId, target: record.envelope.targetEnvironment, state: record.state, reason: record.reason, owner: record.owner };
   }
 
   public async ready(): Promise<void> { await this.runExclusive(async () => {}); }

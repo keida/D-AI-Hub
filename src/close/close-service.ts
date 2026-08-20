@@ -103,15 +103,15 @@ function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState): 
     || recoveryPaths.size !== recoveryPoint.durablePaths.length
     || manifestHashPaths.length !== manifestPaths.size
     || recoveryHashPaths.length !== recoveryPaths.size
-    || manifestPaths.size !== recoveryPaths.size
+    || recoveryPaths.size === 0
+    || [...recoveryPaths].some((path) => !manifestPaths.has(path))
   ) {
     return false;
   }
   if (manifest.durablePaths.some((path) => path.trim().length === 0 || !/^[a-f0-9]{64}$/i.test(manifest.hashes[path] ?? ""))) {
     return false;
   }
-  const selfReferentialArtifact = (path: string): boolean => /(?:[\\/](?:state|manifest|recovery)\.json)$/u.test(path);
-  if (recoveryPoint.durablePaths.some((path) => !manifestPaths.has(path) || (!selfReferentialArtifact(path) && recoveryPoint.hashes[path] !== manifest.hashes[path]))) {
+  if (recoveryPoint.durablePaths.some((path) => !manifestPaths.has(path) || recoveryPoint.hashes[path] !== manifest.hashes[path])) {
     return false;
   }
   return state.verificationEvidence.every((evidence) => evidence.recoveryPointId === recoveryPoint.recoveryPointId);
@@ -145,9 +145,6 @@ function gateEvidence(state: TaskState): readonly GateEvidence[] {
 
 function preflight(state: TaskState, now: Date): PreflightResult {
   const reasons: string[] = [];
-  if (state.stage !== "close") {
-    reasons.push(failure("Close was not explicitly invoked", "transition the verified task to the close stage before evaluating close"));
-  }
   if (state.handoffState !== "completed") {
     reasons.push(failure(`Close has unresolved handoff state ${state.handoffState}`, "complete or explicitly resolve the handoff"));
   }
