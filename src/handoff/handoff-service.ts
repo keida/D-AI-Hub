@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../domain/errors.js";
@@ -27,6 +27,11 @@ const persistedRecordSchema = z.object({ envelope: handoffEnvelopeSchema, owner:
 const persistedRecordsSchema = z.object({ records: z.array(persistedRecordSchema) }).strict();
 const persistenceDocumentSchema = persistedRecordsSchema.extend({ integrityHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 
+export const FILE_HANDOFF_LOCK_LEASE_MS = 300;
+const fileHandoffLockRefreshMs = 50;
+const fileHandoffLockRetryMs = 10;
+const fileHandoffLockAttempts = 200;
+
 function issueReason(result: { readonly error: z.ZodError }): string { const issue = result.error.issues[0]; return issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`; }
 function parseTarget(target: EnvironmentCapabilities): EnvironmentCapabilities { const result = targetSchema.safeParse(target); if (!result.success) throw new CapabilityMismatchError(`Invalid handoff target capabilities: ${issueReason(result)}`); return { environment: result.data.environment, capabilities: new Set(result.data.capabilities) }; }
 function parseHandoffId(handoffId: string): string { const result = handoffIdSchema.safeParse(handoffId); if (!result.success) throw new InvalidHandoffError(`Invalid handoff id: ${issueReason(result)}`); return result.data; }
@@ -38,9 +43,12 @@ function parsePersistenceRecords(value: object): readonly HandoffPersistenceReco
   if (!result.success) throw new InvalidHandoffError(`Invalid persisted handoff records: ${issueReason(result)}`);
   return result.data.records.map((record) => {
     const envelope = parseHandoffEnvelope(record.envelope);
-    if (record.state === "pending" && record.owner !== null) throw new InvalidHandoffError(`Invalid persisted handoff ownership for ${envelope.handoffId}: pending records must not have an owner`);
-    if ((record.state === "active" || record.state === "completed") && record.owner === null) throw new InvalidHandoffError(`Invalid persisted handoff ownership for ${envelope.handoffId}: ${record.state} records must have an owner`);
-    if ((record.state === "completed" || record.state === "rejected") && (record.reason === null || !reasonSchema.safeParse(record.reason).success)) throw new InvalidHandoffError(`Invalid persisted handoff reason for ${envelope.handoffId}: ${record.state} records require a non-empty actionable reason`);
+    const hasActionableReason = record.reason !== null && reasonSchema.safeParse(record.reason).success;
+    const ownerMatchesTarget = record.owner === envelope.targetEnvironment;
+    if (record.state === "pending" && (record.owner !== null || record.reason !== null)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: pending records require a null owner and reason`);
+    if (record.state === "active" && (!ownerMatchesTarget || record.reason !== null)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: active records require the target owner and a null reason`);
+    if (record.state === "completed" && (!ownerMatchesTarget || !hasActionableReason)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: completed records require the target owner and an actionable reason`);
+    if (record.state === "rejected" && (!hasActionableReason || (record.owner !== null && !ownerMatchesTarget))) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: rejected records require an actionable reason and a null or target owner`);
     return { envelope, owner: record.owner, state: record.state, reason: record.reason };
   });
 }
@@ -98,26 +106,67 @@ export class FileHandoffPersistence implements HandoffPersistence {
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to prepare handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
+    let refreshFailure: InvalidHandoffError | null = null;
+    const refreshTimer = setInterval(() => {
+      void this.refreshLockLease(lockPath).catch((error) => {
+        refreshFailure = error instanceof InvalidHandoffError ? error : new InvalidHandoffError(`Unable to refresh handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, fileHandoffLockRefreshMs);
     try {
-      return await operation();
+      const result = await operation();
+      if (refreshFailure !== null) throw refreshFailure;
+      return result;
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      clearInterval(refreshTimer);
+      await this.releaseLock(lockPath);
     }
   }
   private async acquireLock(lockPath: string): Promise<void> {
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < fileHandoffLockAttempts; attempt += 1) {
       try {
         await mkdir(lockPath);
         return;
       } catch (error) {
         if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
-          await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+          await this.removeExpiredLock(lockPath);
+          await new Promise<void>((resolve) => { setTimeout(resolve, fileHandoffLockRetryMs); });
           continue;
         }
         throw new InvalidHandoffError(`Unable to acquire handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     throw new InvalidHandoffError(`Timed out acquiring handoff persistence lock at ${this.filePath}`);
+  }
+  private async removeExpiredLock(lockPath: string): Promise<void> {
+    try {
+      const lockStats = await stat(lockPath);
+      if (!lockStats.isDirectory()) throw new InvalidHandoffError(`Invalid handoff persistence lock at ${this.filePath}: lock path is not a directory`);
+      if (Date.now() - lockStats.mtimeMs <= FILE_HANDOFF_LOCK_LEASE_MS) return;
+    } catch (error) {
+      if (error instanceof InvalidHandoffError) throw error;
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return;
+      throw new InvalidHandoffError(`Unable to inspect handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      await rm(lockPath, { recursive: true, force: false });
+    } catch (error) {
+      throw new InvalidHandoffError(`Unable to remove expired handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  private async refreshLockLease(lockPath: string): Promise<void> {
+    const refreshedAt = new Date();
+    try {
+      await utimes(lockPath, refreshedAt, refreshedAt);
+    } catch (error) {
+      throw new InvalidHandoffError(`Unable to refresh handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  private async releaseLock(lockPath: string): Promise<void> {
+    try {
+      await rm(lockPath, { recursive: true, force: false });
+    } catch (error) {
+      throw new InvalidHandoffError(`Unable to release handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 

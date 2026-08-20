@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -8,7 +8,7 @@ import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-ada
 import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-adapter.js";
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../../src/domain/errors.js";
 import type { Environment, TaskState } from "../../src/domain/types.js";
-import { FileHandoffPersistence, InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistence, type HandoffPersistenceRecord } from "../../src/handoff/handoff-service.js";
+import { FILE_HANDOFF_LOCK_LEASE_MS, FileHandoffPersistence, InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistence, type HandoffPersistenceRecord } from "../../src/handoff/handoff-service.js";
 import { validateHandoffCreateInput } from "../../src/handoff/envelope.js";
 
 function state(environment: Environment): TaskState {
@@ -226,8 +226,16 @@ describe("PersistentHandoffService", () => {
 
   it.each([
     { state: "pending", owner: "work", reason: null },
+    { state: "pending", owner: null, reason: "Awaiting work" },
     { state: "active", owner: null, reason: null },
+    { state: "active", owner: "codex", reason: null },
+    { state: "active", owner: "work", reason: "Unexpected reason" },
+    { state: "completed", owner: null, reason: "Completed by work" },
+    { state: "completed", owner: "codex", reason: "Completed by work" },
     { state: "completed", owner: "work", reason: null },
+    { state: "completed", owner: "work", reason: "   " },
+    { state: "rejected", owner: "codex", reason: "Rejected by another environment" },
+    { state: "rejected", owner: null, reason: null },
     { state: "rejected", owner: "work", reason: "   " },
   ] as const)("rejects persisted $state records that violate lifecycle invariants", async ({ state: recordState, owner, reason }) => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
@@ -239,6 +247,59 @@ describe("PersistentHandoffService", () => {
       await writeFile(persistencePath, JSON.stringify({ records, integrityHash }), "utf8");
 
       await expect(new PersistentHandoffService(new FileHandoffPersistence(persistencePath)).ready()).rejects.toThrow(InvalidHandoffError);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers an expired file lock before running a lifecycle operation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    try {
+      await mkdir(lockPath);
+      const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
+      await utimes(lockPath, expiredAt, expiredAt);
+
+      const handoffService = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+
+      expect(handoffService.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "pending", reason: null, owner: null });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("does not remove a renewed lock held by another operation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const persistence = new FileHandoffPersistence(persistencePath);
+    const firstLock = { release: null as (() => void) | null };
+    let secondEntered = false;
+    try {
+      const first = persistence.withExclusive(async () => new Promise<void>((resolve) => { firstLock.release = resolve; }));
+      await new Promise<void>((resolve) => { setTimeout(resolve, FILE_HANDOFF_LOCK_LEASE_MS * 2); });
+      const second = persistence.withExclusive(async () => { secondEntered = true; });
+      await new Promise<void>((resolve) => { setTimeout(resolve, FILE_HANDOFF_LOCK_LEASE_MS); });
+
+      expect(secondEntered).toBe(false);
+      if (firstLock.release === null) throw new Error("The first lock operation did not start");
+      firstLock.release();
+      await Promise.all([first, second]);
+      expect(secondEntered).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("wraps file lock preparation failures in InvalidHandoffError", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const parentFile = join(directory, "not-a-directory");
+    try {
+      await writeFile(parentFile, "block lock parent", "utf8");
+      const persistence = new FileHandoffPersistence(join(parentFile, "handoffs.json"));
+
+      await expect(persistence.withExclusive(async () => {})).rejects.toThrow(InvalidHandoffError);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
