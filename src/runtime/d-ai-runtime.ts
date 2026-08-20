@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { z } from "zod";
+import { CommandExecutionError, redactSensitiveText } from "../adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js";
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
@@ -7,8 +8,9 @@ import { GitHubCliAdapter } from "../adapters/github.js";
 import { bootstrapTask } from "../bootstrap/bootstrap-task.js";
 import { closeTask } from "../close/close-service.js";
 import { createDebugSession, type DebugSession } from "../debugging/debug-session.js";
-import { InvalidTaskStateError } from "../domain/errors.js";
-import type { CloseVerdict, Environment, Role, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
+import { CapabilityMismatchError, CloseBlockedError, InvalidHandoffError, InvalidTaskStateError } from "../domain/errors.js";
+import { assertStageTransition } from "../domain/transitions.js";
+import type { CloseVerdict, Environment, RecoveryPoint, Role, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
 import { FileHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../handoff/envelope.js";
@@ -37,7 +39,17 @@ export interface DAIResponse {
   readonly message: string;
 }
 
-export type ExternalDAIRequest = DAIRequest | object | null;
+export interface ExternalRoutingOverrides {
+  readonly model: string | null;
+  readonly role: string | null;
+  readonly environment: string | null;
+}
+
+export interface ExternalDAIRequest {
+  readonly command: DAICommand;
+  readonly sourceEnvironment: string;
+  readonly overrides: ExternalRoutingOverrides;
+}
 
 export interface EnvironmentExecutionRequest {
   readonly state: TaskState;
@@ -68,6 +80,7 @@ type SelectCapabilities = typeof selectCapabilities;
 type LoadSelectedSkill = typeof loadSelectedSkill;
 type EvaluateHardGates = (input: HardGateInput) => readonly GateResult[];
 type CreateDebugSession = (originalFailure: string, preservedRecoveryPointId: string) => DebugSession;
+type CaptureRecoveryPoint = (state: TaskState) => Promise<RecoveryPoint>;
 type Recover = (state: TaskState, reason: string) => Promise<TaskState>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
@@ -85,6 +98,7 @@ export interface DAIRuntimeDependencies {
   readonly loadSelectedSkill: LoadSelectedSkill;
   readonly evaluateHardGates: EvaluateHardGates;
   readonly createDebugSession: CreateDebugSession;
+  readonly captureRecoveryPoint: CaptureRecoveryPoint;
   readonly recover: Recover;
   readonly closeTask: (state: TaskState) => Promise<CloseVerdict>;
   readonly maximumEvidenceAgeMs: number;
@@ -137,15 +151,30 @@ const applicableExecutionGates = [
   "critical-unsaved-context",
 ] as const;
 
-function validationReason(result: z.ZodSafeParseError<object>): string {
-  const issue = result.error.issues[0];
+type ApplicableExecutionGate = typeof applicableExecutionGates[number];
+
+interface ConnectorSuccess<T> {
+  readonly kind: "success";
+  readonly value: T;
+}
+
+interface ConnectorBlocked {
+  readonly kind: "blocked";
+  readonly message: string;
+}
+
+type ConnectorOutcome<T> = ConnectorSuccess<T> | ConnectorBlocked;
+type ConnectorFailureMessage = (error: Error) => string | null;
+
+function validationReason(issues: readonly z.ZodIssue[]): string {
+  const issue = issues[0];
   return issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
 }
 
 function validateRequest(request: ExternalDAIRequest): DAIRequest {
   const result = requestSchema.safeParse(request);
   if (!result.success) {
-    throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result)}`);
+    throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
   return result.data;
 }
@@ -174,14 +203,35 @@ function validateDependencies(dependencies: DAIRuntimeDependencies): void {
 function validateExecutionResult(result: EnvironmentExecutionResult): EnvironmentExecutionResult {
   const parsed = executionResultSchema.safeParse(result);
   if (!parsed.success) {
-    throw new InvalidTaskStateError(`Invalid environment execution result: ${validationReason(parsed)}`);
+    throw new InvalidTaskStateError(`Invalid environment execution result: ${validationReason(parsed.error.issues)}`);
   }
-  return parsed.data;
+  return {
+    ...parsed.data,
+    evidence: parsed.data.evidence.map(redactEvidence),
+    message: redactSensitiveText(parsed.data.message),
+  };
+}
+
+function redactEvidence(evidence: VerificationEvidence): VerificationEvidence {
+  return {
+    ...evidence,
+    evidenceId: redactSensitiveText(evidence.evidenceId),
+    selectedModel: redactSensitiveText(evidence.selectedModel),
+    command: redactSensitiveText(evidence.command),
+    observedOutput: redactSensitiveText(evidence.observedOutput),
+    interpretation: redactSensitiveText(evidence.interpretation),
+    recoveryPointId: evidence.recoveryPointId === null ? null : redactSensitiveText(evidence.recoveryPointId),
+  };
+}
+
+function redactStateEvidence(state: TaskState): TaskState {
+  return { ...state, verificationEvidence: state.verificationEvidence.map(redactEvidence) };
 }
 
 async function persistState(store: DurableContextStore, state: TaskState): Promise<TaskState> {
-  const manifest = await store.save(state);
-  return { ...state, durableContext: manifest };
+  const redactedState = redactStateEvidence(state);
+  const manifest = await store.save(redactedState);
+  return { ...redactedState, durableContext: manifest };
 }
 
 function response(state: TaskState, status: DAIResponse["status"], message: string): DAIResponse {
@@ -190,13 +240,60 @@ function response(state: TaskState, status: DAIResponse["status"], message: stri
     stage: state.stage,
     environment: state.environment,
     status,
-    evidence: [...state.verificationEvidence],
-    message,
+    evidence: state.verificationEvidence.map(redactEvidence),
+    message: redactSensitiveText(message),
   };
 }
 
 function blockedWithoutState(taskId: string, environment: Environment, message: string): DAIResponse {
-  return { taskId, stage: "bootstrap", environment, status: "blocked", evidence: [], message };
+  return { taskId, stage: "bootstrap", environment, status: "blocked", evidence: [], message: redactSensitiveText(message) };
+}
+
+function connectorOutcome<T>(operation: () => Promise<T>, failureMessage: ConnectorFailureMessage): Promise<ConnectorOutcome<T>> {
+  return Promise.resolve().then(operation).then(
+    (value): ConnectorSuccess<T> => ({ kind: "success", value }),
+    (error: Error): ConnectorBlocked | Promise<never> => {
+      const message = failureMessage(error);
+      return message === null
+        ? Promise.reject(error)
+        : { kind: "blocked", message: redactSensitiveText(message) };
+    },
+  );
+}
+
+function executionConnectorFailure(error: Error): string | null {
+  if (error instanceof CommandExecutionError) {
+    const output = [error.result.stderr, error.result.stdout].find((value) => value.trim().length > 0);
+    return output === undefined ? error.message : `${error.message}: ${output}`;
+  }
+  return error instanceof InvalidTaskStateError ? error.message : null;
+}
+
+function handoffConnectorFailure(error: Error): string | null {
+  return error instanceof InvalidHandoffError || error instanceof CapabilityMismatchError || error instanceof InvalidTaskStateError
+    ? error.message
+    : null;
+}
+
+function closeConnectorFailure(error: Error): string | null {
+  return error instanceof CloseBlockedError ? error.message : null;
+}
+
+function transitionState(state: TaskState, stage: Stage, role: Role, environment: Environment): TaskState {
+  assertStageTransition(state.stage, stage);
+  return {
+    ...state,
+    stage,
+    role,
+    environment,
+    routingDecision: state.routingDecision === null ? null : {
+      ...state.routingDecision,
+      stage,
+      role,
+      environment,
+    },
+    durableContext: null,
+  };
 }
 
 function preferredEnvironment(
@@ -236,30 +333,81 @@ async function routeIntent(
   const routingDecision = route.environment === modelDecision.environment
     ? modelDecision
     : dependencies.resolveModelRoute("execute", "implementer", route.environment, dependencies.modelPolicies, request.overrides);
-  const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
-  const selected = dependencies.selectCapabilities(state.goal, "execute", route.environment, descriptors);
-  const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, [])));
-  const contextManifest = [
-    ...state.contextManifest,
-    ...selected.map((descriptor) => `skill:${descriptor.name}:${descriptor.skillPath}`),
-  ];
-  const routedState: TaskState = {
+  assertStageTransition(state.stage, "route");
+  const routedState = await persistState(dependencies.store, {
     ...state,
     constraints: state.constraints.length === 0 ? ["Execute only the requested D-AI intent"] : state.constraints,
     environment: route.environment,
-    stage: "execute",
-    role: routingDecision.role,
-    routingDecision,
+    stage: "route",
+    role: "planner",
+    routingDecision: {
+      ...routingDecision,
+      stage: "route",
+      environment: route.environment,
+      role: "planner",
+    },
     selectedCapabilities: [...routingDecision.selectedCapabilities],
-    contextManifest,
     durableContext: null,
-  };
-  return { state: await persistState(dependencies.store, routedState), skills };
+  });
+  const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
+  const selected = dependencies.selectCapabilities(routedState.goal, "execute", route.environment, descriptors);
+  const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, [])));
+  const contextManifest = [
+    ...routedState.contextManifest,
+    ...selected.map((descriptor) => `skill:${descriptor.name}:${descriptor.skillPath}`),
+  ];
+  const plannedState = await persistState(dependencies.store, {
+    ...transitionState(routedState, "plan", "planner", route.environment),
+    contextManifest,
+  });
+  const executionState = transitionState(plannedState, "execute", routingDecision.role, route.environment);
+  return { state: await persistState(dependencies.store, executionState), skills };
 }
 
 function gateEvidence(evidence: readonly VerificationEvidence[]): readonly GateEvidence[] {
-  const latest = evidence[evidence.length - 1];
-  return latest === undefined ? [] : applicableExecutionGates.map((gate) => ({ gate, verification: latest }));
+  return evidence.flatMap((verification) => {
+    const gate: ApplicableExecutionGate | undefined = applicableExecutionGates.find((candidate) => verification.evidenceId === `gate:${candidate}`);
+    return gate === undefined ? [] : [{ gate, verification }];
+  });
+}
+
+function gateEvidenceFailure(evidence: readonly VerificationEvidence[]): string | null {
+  for (const gate of applicableExecutionGates) {
+    const matches = evidence.filter((verification) => verification.evidenceId === `gate:${gate}`);
+    if (matches.length === 0) return `Missing evidence for ${gate} gate`;
+    if (matches.length > 1) return `Ambiguous evidence for ${gate} gate`;
+  }
+  return null;
+}
+
+function evidenceIdentityFailure(state: TaskState, evidence: readonly VerificationEvidence[]): string | null {
+  const selectedModel = state.routingDecision?.selectedModel;
+  for (const verification of evidence) {
+    if (verification.stage !== "verify") return `External evidence ${verification.evidenceId} is not recorded for the verify stage`;
+    if (verification.environment !== state.environment) return `External evidence ${verification.evidenceId} does not match the routed environment`;
+    if (verification.role !== "evidence-collector") return `External evidence ${verification.evidenceId} is not recorded by the evidence collector`;
+    if (selectedModel === undefined || verification.selectedModel !== selectedModel) return `External evidence ${verification.evidenceId} does not match the selected model`;
+  }
+  return null;
+}
+
+function recoveryPointFailure(state: TaskState, recoveryPoint: RecoveryPoint): string | null {
+  const manifest = state.durableContext;
+  if (manifest === null) return "Recovery point capture requires a persisted verify manifest";
+  if (
+    recoveryPoint.taskId !== state.taskId
+    || recoveryPoint.stage !== state.stage
+    || recoveryPoint.environment !== state.environment
+    || recoveryPoint.role !== state.role
+  ) return "Captured recovery point identity does not match the verify state";
+  if (recoveryPoint.recoveryPointId.trim().length === 0 || recoveryPoint.restorationInstructions.trim().length === 0) {
+    return "Captured recovery point is incomplete";
+  }
+  if (
+    recoveryPoint.durablePaths.length !== manifest.durablePaths.length
+    || recoveryPoint.durablePaths.some((path, index) => path !== manifest.durablePaths[index] || recoveryPoint.hashes[path] !== manifest.hashes[path])
+  ) return "Captured recovery point does not match the persisted verify artifacts";
+  return null;
 }
 
 function failedGateReason(results: readonly GateResult[]): string | null {
@@ -287,23 +435,27 @@ async function enterRecovery(
   reason: string,
   dependencies: DAIRuntimeDependencies,
 ): Promise<DAIResponse> {
+  const redactedReason = redactSensitiveText(reason);
+  const debugTransition = transitionState(state, "debug", "debugger", state.environment);
   const debugState = await persistState(dependencies.store, {
-    ...state,
-    stage: "debug",
-    role: "debugger",
-    routingDecision: state.routingDecision === null ? null : {
-      ...state.routingDecision,
-      stage: "debug",
-      role: "debugger",
-      reason: `Debugging required: ${reason}`,
+    ...debugTransition,
+    routingDecision: debugTransition.routingDecision === null ? null : {
+      ...debugTransition.routingDecision,
+      reason: `Debugging required: ${redactedReason}`,
     },
-    durableContext: null,
   });
-  dependencies.createDebugSession(reason, debugState.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
-  const recovered = await dependencies.recover(debugState, reason);
+  dependencies.createDebugSession(redactedReason, debugState.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
+  const recovered = await dependencies.recover(debugState, redactedReason);
   if (recovered.taskId !== state.taskId) {
     throw new InvalidTaskStateError("Recovery changed the stable task id");
   }
+  if (recovered.environment !== state.environment) {
+    throw new InvalidTaskStateError("Recovery changed the authoritative task environment");
+  }
+  if (recovered.stage !== "recover" || recovered.role !== "recovery-operator") {
+    throw new InvalidTaskStateError("Recovery must return the recover stage and recovery-operator role");
+  }
+  assertStageTransition(debugState.stage, recovered.stage);
   const recoveredState = await persistState(dependencies.store, {
     ...recovered,
     routingDecision: recovered.routingDecision === null ? null : {
@@ -311,11 +463,11 @@ async function enterRecovery(
       stage: recovered.stage,
       environment: recovered.environment,
       role: recovered.role,
-      reason: `Recovery outcome: ${reason}`,
+      reason: `Recovery outcome: ${redactedReason}`,
     },
     durableContext: null,
   });
-  return response(recoveredState, "blocked", reason);
+  return response(recoveredState, "blocked", redactedReason);
 }
 
 async function requireActiveState(
@@ -325,6 +477,16 @@ async function requireActiveState(
 ): Promise<TaskState | null> {
   const taskId = activeTaskIds.get(environment);
   return taskId === undefined ? null : store.load(taskId);
+}
+
+function transferTaskOwnership(activeTaskIds: Map<Environment, string>, taskId: string, environment: Environment): void {
+  const nextOwners = new Map(activeTaskIds);
+  for (const [owner, activeTaskId] of nextOwners) {
+    if (activeTaskId === taskId || owner === environment) nextOwners.delete(owner);
+  }
+  nextOwners.set(environment, taskId);
+  activeTaskIds.clear();
+  for (const [owner, activeTaskId] of nextOwners) activeTaskIds.set(owner, activeTaskId);
 }
 
 async function executeIntent(
@@ -340,32 +502,72 @@ async function executeIntent(
     workspacePath: dependencies.workspacePath,
     repositoryPath: dependencies.repositoryPath,
   }, dependencies.store);
-  activeTaskIds.set(request.sourceEnvironment, bootstrapped.taskId);
   const routed = await routeIntent(bootstrapped, request, dependencies);
-  activeTaskIds.set(routed.state.environment, routed.state.taskId);
-  const execution = validateExecutionResult(await dependencies.adapters[routed.state.environment].execute({
-    state: routed.state,
-    skills: routed.skills,
-  }));
-  const executedState = await persistState(dependencies.store, {
-    ...routed.state,
-    verificationEvidence: [...routed.state.verificationEvidence, ...execution.evidence],
-    durableContext: null,
-  });
+  transferTaskOwnership(activeTaskIds, routed.state.taskId, routed.state.environment);
+  const executionOutcome = await connectorOutcome(
+    () => dependencies.adapters[routed.state.environment].execute({ state: routed.state, skills: routed.skills }),
+    executionConnectorFailure,
+  );
+  if (executionOutcome.kind === "blocked") {
+    return enterRecovery(routed.state, executionOutcome.message, dependencies);
+  }
+  const execution = validateExecutionResult(executionOutcome.value);
+  const identityFailure = evidenceIdentityFailure(routed.state, execution.evidence);
+  if (identityFailure !== null) {
+    return enterRecovery(routed.state, identityFailure, dependencies);
+  }
   if (execution.status !== "completed") {
+    const executedState = await persistState(dependencies.store, {
+      ...routed.state,
+      verificationEvidence: [...routed.state.verificationEvidence, ...execution.evidence],
+      durableContext: null,
+    });
     return enterRecovery(executedState, execution.message, dependencies);
   }
+  const inspectedTransition = transitionState(routed.state, "inspect", "evidence-collector", routed.state.environment);
+  const inspectedState = await persistState(dependencies.store, {
+    ...inspectedTransition,
+    verificationEvidence: [...inspectedTransition.verificationEvidence, ...execution.evidence],
+  });
+  const preliminaryVerifyState = await persistState(
+    dependencies.store,
+    transitionState(inspectedState, "verify", "evidence-collector", inspectedState.environment),
+  );
+  const recoveryPointOutcome = await connectorOutcome(
+    () => dependencies.captureRecoveryPoint(preliminaryVerifyState),
+    executionConnectorFailure,
+  );
+  if (recoveryPointOutcome.kind === "blocked") {
+    return enterRecovery(preliminaryVerifyState, recoveryPointOutcome.message, dependencies);
+  }
+  const recoveryFailure = recoveryPointFailure(preliminaryVerifyState, recoveryPointOutcome.value);
+  if (recoveryFailure !== null) {
+    return enterRecovery(preliminaryVerifyState, recoveryFailure, dependencies);
+  }
+  const verifiedState = await persistState(dependencies.store, {
+    ...preliminaryVerifyState,
+    verificationEvidence: preliminaryVerifyState.verificationEvidence.map((verification) => ({
+      ...verification,
+      recoveryPointId: recoveryPointOutcome.value.recoveryPointId,
+    })),
+    recoveryPoint: recoveryPointOutcome.value,
+    durableContext: null,
+  });
+  const exactEvidenceFailure = gateEvidenceFailure(verifiedState.verificationEvidence);
+  if (exactEvidenceFailure !== null) {
+    return enterRecovery(verifiedState, exactEvidenceFailure, dependencies);
+  }
   const gates = dependencies.evaluateHardGates({
-    state: executedState,
-    evidence: gateEvidence(executedState.verificationEvidence),
+    state: verifiedState,
+    evidence: gateEvidence(verifiedState.verificationEvidence),
     now: dependencies.now(),
     maximumEvidenceAgeMs: dependencies.maximumEvidenceAgeMs,
   });
   const gateFailure = failedGateReason(gates);
   if (gateFailure !== null) {
-    return enterRecovery(executedState, gateFailure, dependencies);
+    return enterRecovery(verifiedState, gateFailure, dependencies);
   }
-  return response(executedState, "completed", execution.message);
+  return response(verifiedState, "completed", execution.message);
 }
 
 async function continueTask(
@@ -378,8 +580,7 @@ async function continueTask(
   if (state === null) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
   }
-  activeTaskIds.set(request.sourceEnvironment, state.taskId);
-  activeTaskIds.set(state.environment, state.taskId);
+  transferTaskOwnership(activeTaskIds, state.taskId, state.environment);
   return response(state, "accepted", `Continuing task ${state.taskId}`);
 }
 
@@ -393,24 +594,29 @@ async function handoffTask(
   if (state === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for handoff");
   }
-  const envelope = await dependencies.handoffService.create({ state: { ...state, handoffState: "none" }, targetEnvironment: command.target });
-  await dependencies.adapters[command.target].receive(envelope);
+  if (state.handoffState !== "none") {
+    return response(state, "blocked", `Task ${state.taskId} cannot hand off from state ${state.handoffState}`);
+  }
+  assertStageTransition(state.stage, "handoff");
+  const handoffOutcome = await connectorOutcome(async () => {
+    const envelope = await dependencies.handoffService.create({ state, targetEnvironment: command.target });
+    await dependencies.adapters[command.target].receive(envelope);
+    return envelope;
+  }, handoffConnectorFailure);
+  if (handoffOutcome.kind === "blocked") {
+    return response(state, "blocked", handoffOutcome.message);
+  }
+  const handoffTransition = transitionState(state, "handoff", state.role, command.target);
   const handoffState = await persistState(dependencies.store, {
-    ...state,
-    stage: "handoff",
-    environment: command.target,
+    ...handoffTransition,
     handoffState: "active",
-    routingDecision: state.routingDecision === null ? null : {
-      ...state.routingDecision,
-      stage: "handoff",
-      environment: command.target,
+    routingDecision: handoffTransition.routingDecision === null ? null : {
+      ...handoffTransition.routingDecision,
       reason: `Handoff ownership transferred to ${command.target}`,
     },
-    durableContext: null,
   });
-  activeTaskIds.delete(request.sourceEnvironment);
-  activeTaskIds.set(command.target, state.taskId);
-  return response(handoffState, "accepted", `Handoff ${envelope.handoffId} is owned by ${command.target}`);
+  transferTaskOwnership(activeTaskIds, state.taskId, command.target);
+  return response(handoffState, "accepted", `Handoff ${handoffOutcome.value.handoffId} is owned by ${command.target}`);
 }
 
 async function closeActiveTask(
@@ -422,7 +628,18 @@ async function closeActiveTask(
   if (state === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for close");
   }
-  const verdict = await dependencies.closeTask(state);
+  if (state.stage !== "verify") {
+    return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
+  }
+  const closeState = await persistState(
+    dependencies.store,
+    transitionState(state, "close", "evidence-collector", state.environment),
+  );
+  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(closeState), closeConnectorFailure);
+  if (closeOutcome.kind === "blocked") {
+    return response(closeState, "blocked", `Close connector blocked: ${closeOutcome.message}`);
+  }
+  const verdict = closeOutcome.value;
   const status: DAIResponse["status"] = verdict.status === "YES" ? "completed" : "blocked";
   const message = verdict.status === "YES"
     ? "Safe-to-delete: YES"
@@ -432,8 +649,8 @@ async function closeActiveTask(
     stage: verdict.stage,
     environment: verdict.environment,
     status,
-    evidence: [...verdict.evidence],
-    message,
+    evidence: verdict.evidence.map(redactEvidence),
+    message: redactSensitiveText(message),
   };
 }
 
@@ -478,6 +695,10 @@ function defaultRecovery(state: TaskState, reason: string): Promise<TaskState> {
   });
 }
 
+function defaultCaptureRecoveryPoint(state: TaskState): Promise<RecoveryPoint> {
+  return Promise.reject(new InvalidTaskStateError(`No recovery point connector is configured for ${state.taskId}`));
+}
+
 function createDefaultDependencies(): DAIRuntimeDependencies {
   const root = process.cwd();
   const durableRoot = join(root, ".d-ai");
@@ -504,6 +725,7 @@ function createDefaultDependencies(): DAIRuntimeDependencies {
     loadSelectedSkill,
     evaluateHardGates,
     createDebugSession,
+    captureRecoveryPoint: defaultCaptureRecoveryPoint,
     recover: defaultRecovery,
     closeTask: (state: TaskState): Promise<CloseVerdict> => closeTask(state, { store, gitHub }),
     maximumEvidenceAgeMs: 300_000,
