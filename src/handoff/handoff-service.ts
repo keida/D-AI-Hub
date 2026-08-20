@@ -31,7 +31,7 @@ const persistenceDocumentSchema = persistedRecordsSchema.extend({ integrityHash:
 // A local persistence transaction must finish within this fixed, fail-closed bound.
 export const FILE_HANDOFF_LOCK_LEASE_MS = 30_000;
 const fileHandoffLockRetryMs = 10;
-const fileHandoffLockAttempts = 200;
+const fileHandoffLockAcquireMarginMs = 1_000;
 const fileHandoffLockOwnerFile = "owner";
 const fileHandoffLockLeaseFile = "lease";
 
@@ -135,7 +135,8 @@ export class FileHandoffPersistence implements HandoffPersistence {
     }
   }
   private async acquireLock(lockPath: string): Promise<FileLockOwner> {
-    for (let attempt = 0; attempt < fileHandoffLockAttempts; attempt += 1) {
+    const acquisitionDeadline = Date.now() + FILE_HANDOFF_LOCK_LEASE_MS + fileHandoffLockAcquireMarginMs;
+    while (Date.now() <= acquisitionDeadline) {
       try {
         await mkdir(lockPath);
         const owner: FileLockOwner = { lockPath, token: randomUUID() };
@@ -150,7 +151,9 @@ export class FileHandoffPersistence implements HandoffPersistence {
       } catch (error) {
         if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
           await this.reclaimExpiredLock(lockPath);
-          await new Promise<void>((resolve) => { setTimeout(resolve, fileHandoffLockRetryMs); });
+          const remainingWaitMs = acquisitionDeadline - Date.now();
+          if (remainingWaitMs <= 0) break;
+          await new Promise<void>((resolve) => { setTimeout(resolve, Math.min(fileHandoffLockRetryMs, remainingWaitMs)); });
           continue;
         }
         throw new InvalidHandoffError(`Unable to acquire handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);

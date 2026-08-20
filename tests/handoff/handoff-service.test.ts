@@ -338,6 +338,38 @@ describe("PersistentHandoffService", () => {
     }
   });
 
+  it("waits for a valid holder released after the former acquisition budget", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const persistence = new FileHandoffPersistence(persistencePath);
+    const controls = { holderStarted: null as (() => void) | null, releaseHolder: null as (() => void) | null };
+    const holderStarted = new Promise<void>((resolve) => { controls.holderStarted = resolve; });
+    const releaseHolder = new Promise<void>((resolve) => { controls.releaseHolder = resolve; });
+    let contenderEntered = false;
+    try {
+      const holder = persistence.withExclusive(async () => {
+        controls.holderStarted?.();
+        await releaseHolder;
+      });
+      await holderStarted;
+      const contender = persistence.withExclusive(async () => { contenderEntered = true; }).then(
+        () => "acquired" as const,
+        (error: Error) => error,
+      );
+
+      await new Promise<void>((resolve) => { setTimeout(resolve, 4_000); });
+      expect(contenderEntered).toBe(false);
+      if (controls.releaseHolder === null) throw new Error("The holder lock operation did not start");
+      controls.releaseHolder();
+
+      await holder;
+      expect(await contender).toBe("acquired");
+      expect(contenderEntered).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an expired fixed-lease holder before reclaiming the lock for a successor", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");
