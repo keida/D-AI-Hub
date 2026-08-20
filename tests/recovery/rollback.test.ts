@@ -17,7 +17,7 @@ describe("safeRollback", () => {
       status: " M src/example.ts",
       binaryPatch: "diff --git a/src/example.ts b/src/example.ts",
       stateManifest: { manifestId: "manifest-1", taskId: "task-rollback", stage: "recover", environment: "codex", role: "recovery-operator", durablePaths: ["state.json"], hashes: { "state.json": "b".repeat(64) }, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" },
-      verificationResults: [],
+      verificationResults: [{ evidenceId: "evidence-rollback", stage: "verify", environment: "codex", role: "evidence-collector", selectedModel: "model", command: "npm test", observedOutput: "all tests passed", exitCode: 0, interpretation: "Quality passed", passed: true, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" }],
       createdAt: "2026-08-21T00:00:00.000Z",
     });
     const events: string[] = [];

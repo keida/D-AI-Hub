@@ -26,10 +26,14 @@ export class CommandExecutionError extends Error {
 }
 
 const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)([^\s"']+)/gi;
+const authorizationBearerPattern = /(authorization\s*:\s*bearer\s+)([^\s"']+)/gi;
 const bearerTokenPattern = /(bearer\s+)([^\s"']+)/gi;
 
 export function redactSensitiveText(value: string): string {
-  return value.replace(secretAssignmentPattern, "$1[REDACTED]").replace(bearerTokenPattern, "$1[REDACTED]");
+  return value
+    .replace(authorizationBearerPattern, "$1[REDACTED]")
+    .replace(secretAssignmentPattern, "$1[REDACTED]")
+    .replace(bearerTokenPattern, "$1[REDACTED]");
 }
 
 function assertCommandRequest(request: CommandRequest): void {

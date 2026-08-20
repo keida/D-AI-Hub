@@ -37,6 +37,8 @@ export interface RecoveryPointCaptureInput {
   readonly createdAt: string;
 }
 
+const maximumVerificationAgeMs = 5 * 60 * 1_000;
+
 function assertText(value: string, label: string): void {
   if (value.trim().length === 0) throw new InvalidTaskStateError(`${label} must be non-empty`);
 }
@@ -45,16 +47,50 @@ function assertSafeCapturedValue(value: string, label: string): void {
   if (redactSensitiveText(value) !== value) throw new InvalidTaskStateError(`${label} contains secret-like content and cannot be captured`);
 }
 
+function assertVerificationEvidence(
+  verification: VerificationEvidence,
+  input: RecoveryPointCaptureInput,
+  createdAt: number,
+): void {
+  assertText(verification.evidenceId, "Verification evidence id");
+  assertText(verification.selectedModel, "Verification selected model");
+  assertText(verification.command, "Verification command");
+  assertText(verification.observedOutput, "Verification observed output");
+  assertText(verification.interpretation, "Verification interpretation");
+  const recordedAt = Date.parse(verification.recordedAt);
+  if (Number.isNaN(recordedAt)) throw new InvalidTaskStateError("Verification evidence timestamp must be valid");
+  if (recordedAt > createdAt) throw new InvalidTaskStateError("Verification evidence timestamp must not be in the future relative to recovery capture");
+  if (createdAt - recordedAt > maximumVerificationAgeMs) throw new InvalidTaskStateError("Verification evidence is stale for recovery capture");
+  if (!verification.passed) throw new InvalidTaskStateError("Verification evidence must have passed before recovery capture");
+  if (verification.exitCode !== 0) throw new InvalidTaskStateError("Passed verification evidence must have exit code 0");
+  if (verification.environment !== input.environment) throw new InvalidTaskStateError("Verification evidence environment must match the recovery environment");
+  if (verification.recoveryPointId !== input.stateManifest.recoveryPointId) {
+    throw new InvalidTaskStateError("Verification evidence recovery point must match the state manifest");
+  }
+  assertSafeCapturedValue(verification.evidenceId, "Verification evidence id");
+  assertSafeCapturedValue(verification.selectedModel, "Verification selected model");
+  assertSafeCapturedValue(verification.command, "Verification command");
+  assertSafeCapturedValue(verification.observedOutput, "Verification observed output");
+  assertSafeCapturedValue(verification.interpretation, "Verification interpretation");
+}
+
+function assertVerificationResults(input: RecoveryPointCaptureInput, createdAt: number): void {
+  if (input.verificationResults.length === 0) throw new InvalidTaskStateError("At least one verification result is required for recovery capture");
+  for (const verification of input.verificationResults) assertVerificationEvidence(verification, input, createdAt);
+}
+
 function assertCaptureInput(input: RecoveryPointCaptureInput): void {
   assertText(input.recoveryPointId, "Recovery point id");
   assertText(input.taskId, "Task id");
   assertText(input.branch, "Branch");
   assertText(input.workspacePath, "Workspace path");
   if (!/^[a-f0-9]{40,64}$/i.test(input.head)) throw new InvalidTaskStateError("Recovery HEAD must be a full Git object id");
-  if (Number.isNaN(Date.parse(input.createdAt))) throw new InvalidTaskStateError("Recovery point timestamp must be valid");
+  const createdAt = Date.parse(input.createdAt);
+  if (Number.isNaN(createdAt)) throw new InvalidTaskStateError("Recovery point timestamp must be valid");
   if (input.stateManifest.taskId !== input.taskId) throw new InvalidTaskStateError("Recovery state manifest task id must match the recovery point task id");
   assertSafeCapturedValue(input.status, "Git status");
   assertSafeCapturedValue(input.binaryPatch, "Binary patch");
+  assertVerificationResults(input, createdAt);
 }
 
 export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedRecoveryPoint {
@@ -66,7 +102,7 @@ export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedR
     status: input.status,
     binaryPatch: input.binaryPatch,
     stateManifest: input.stateManifest,
-    verificationResults: input.verificationResults,
+    verificationResults: input.verificationResults.map((verification) => ({ ...verification })),
   };
   return {
     trigger: input.trigger,
