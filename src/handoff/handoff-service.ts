@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../domain/errors.js";
@@ -34,8 +34,10 @@ const fileHandoffLockRetryMs = 10;
 const fileHandoffLockAcquireMarginMs = 1_000;
 const fileHandoffLockOwnerFile = "owner";
 const fileHandoffLockLeaseFile = "lease";
+const fileHandoffLockReleasedFile = "released";
 
 interface FileLockOwner { readonly lockPath: string; readonly token: string; }
+interface FileLockGeneration { readonly lockPath: string; readonly generation: bigint; }
 export interface FileHandoffPersistenceOptions { readonly afterReleaseLockQuarantine: (() => Promise<void>) | null; }
 
 function issueReason(result: { readonly error: z.ZodError }): string { const issue = result.error.issues[0]; return issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`; }
@@ -140,57 +142,63 @@ export class FileHandoffPersistence implements HandoffPersistence {
   }
   private async acquireLock(lockPath: string): Promise<FileLockOwner> {
     const acquisitionDeadline = Date.now() + FILE_HANDOFF_LOCK_LEASE_MS + fileHandoffLockAcquireMarginMs;
+    await mkdir(lockPath, { recursive: true });
     while (Date.now() <= acquisitionDeadline) {
+      const latest = await this.latestLockGeneration(lockPath);
+      if (latest !== null && !await this.isLockReleased(latest.lockPath) && !await this.isLockExpired(latest.lockPath)) {
+        const remainingWaitMs = acquisitionDeadline - Date.now();
+        if (remainingWaitMs <= 0) break;
+        await new Promise<void>((resolve) => { setTimeout(resolve, Math.min(fileHandoffLockRetryMs, remainingWaitMs)); });
+        continue;
+      }
+      const generation = (latest === null ? 0n : latest.generation) + 1n;
+      const generationPath = join(lockPath, generation.toString());
       try {
-        await mkdir(lockPath);
-        const owner: FileLockOwner = { lockPath, token: randomUUID() };
+        await mkdir(generationPath);
+        const owner: FileLockOwner = { lockPath: generationPath, token: randomUUID() };
         try {
-          await writeFile(join(lockPath, fileHandoffLockOwnerFile), owner.token, { encoding: "utf8", flag: "wx" });
-          await writeFile(join(lockPath, fileHandoffLockLeaseFile), owner.token, { encoding: "utf8", flag: "wx" });
+          await writeFile(join(generationPath, fileHandoffLockOwnerFile), owner.token, { encoding: "utf8", flag: "wx" });
+          await writeFile(join(generationPath, fileHandoffLockLeaseFile), owner.token, { encoding: "utf8", flag: "wx" });
           return owner;
         } catch (error) {
-          await rm(lockPath, { recursive: true, force: false });
-          throw error;
+          throw new InvalidHandoffError(`Unable to initialize handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
         }
       } catch (error) {
-        if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
-          await this.reclaimExpiredLock(lockPath);
-          const remainingWaitMs = acquisitionDeadline - Date.now();
-          if (remainingWaitMs <= 0) break;
-          await new Promise<void>((resolve) => { setTimeout(resolve, Math.min(fileHandoffLockRetryMs, remainingWaitMs)); });
-          continue;
-        }
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") continue;
+        if (error instanceof InvalidHandoffError) throw error;
         throw new InvalidHandoffError(`Unable to acquire handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     throw new InvalidHandoffError(`Timed out acquiring handoff persistence lock at ${this.filePath}`);
   }
-  private async reclaimExpiredLock(lockPath: string): Promise<void> {
-    const expired = await this.isLockExpired(lockPath);
-    if (!expired) return;
-    const quarantinePath = `${lockPath}.${randomUUID()}.quarantine`;
-    try {
-      await rename(lockPath, quarantinePath);
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return;
-      throw new InvalidHandoffError(`Unable to quarantine expired handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  private async latestLockGeneration(lockPath: string): Promise<FileLockGeneration | null> {
+    const entries = await readdir(lockPath, { withFileTypes: true });
+    let latest: FileLockGeneration | null = null;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) throw new InvalidHandoffError(`Invalid handoff persistence lock generation at ${this.filePath}: ${entry.name}`);
+      const generation = BigInt(entry.name);
+      if (latest === null || generation > latest.generation) latest = { lockPath: join(lockPath, entry.name), generation };
     }
-    if (!await this.isLockExpired(quarantinePath)) {
-      try {
-        await rename(quarantinePath, lockPath);
-      } catch (error) {
-        if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
-          await rm(quarantinePath, { recursive: true, force: false });
-          return;
-        }
-        throw new InvalidHandoffError(`Unable to restore nonexpired handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      return;
+    return latest;
+  }
+  private async isLockReleased(lockPath: string): Promise<boolean> {
+    let releasedToken: string;
+    try {
+      releasedToken = await readFile(join(lockPath, fileHandoffLockReleasedFile), "utf8");
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return false;
+      throw new InvalidHandoffError(`Unable to inspect released handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
     try {
-      await rm(quarantinePath, { recursive: true, force: false });
+      const [ownerToken, leaseToken] = await Promise.all([
+        readFile(join(lockPath, fileHandoffLockOwnerFile), "utf8"),
+        readFile(join(lockPath, fileHandoffLockLeaseFile), "utf8"),
+      ]);
+      if (releasedToken !== ownerToken || releasedToken !== leaseToken) throw new InvalidHandoffError(`Invalid released handoff persistence lock at ${this.filePath}`);
+      return true;
     } catch (error) {
-      throw new InvalidHandoffError(`Unable to remove quarantined handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof InvalidHandoffError) throw error;
+      throw new InvalidHandoffError(`Unable to verify released handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   private async isLockExpired(lockPath: string): Promise<boolean> {
@@ -213,13 +221,10 @@ export class FileHandoffPersistence implements HandoffPersistence {
     }
   }
   private async releaseLock(owner: FileLockOwner): Promise<void> {
-    const quarantineOwner: FileLockOwner = { lockPath: `${owner.lockPath}.${randomUUID()}.release`, token: owner.token };
     try {
       await this.assertLockOwnership(owner);
-      await rename(owner.lockPath, quarantineOwner.lockPath);
-      await this.assertLockOwnership(quarantineOwner);
       if (this.afterReleaseLockQuarantine !== null) await this.afterReleaseLockQuarantine();
-      await rm(quarantineOwner.lockPath, { recursive: true, force: false });
+      await writeFile(join(owner.lockPath, fileHandoffLockReleasedFile), owner.token, { encoding: "utf8", flag: "wx" });
     } catch (error) {
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to release handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);

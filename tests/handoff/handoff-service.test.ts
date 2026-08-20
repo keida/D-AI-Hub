@@ -279,9 +279,12 @@ describe("PersistentHandoffService", () => {
     const persistencePath = join(directory, "handoffs.json");
     const lockPath = `${persistencePath}.lock`;
     try {
-      await mkdir(lockPath);
+      const generationPath = join(lockPath, "1");
+      await mkdir(generationPath, { recursive: true });
+      await writeFile(join(generationPath, "owner"), "expired-owner", "utf8");
+      await writeFile(join(generationPath, "lease"), "expired-owner", "utf8");
       const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
-      await utimes(lockPath, expiredAt, expiredAt);
+      await utimes(join(generationPath, "lease"), expiredAt, expiredAt);
 
       const handoffService = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
@@ -299,7 +302,7 @@ describe("PersistentHandoffService", () => {
     const persistence = new FileHandoffPersistence(persistencePath);
     try {
       await persistence.withExclusive(async () => {
-        const leasePath = join(lockPath, "lease");
+        const leasePath = join(lockPath, "1", "lease");
         const createdAt = (await stat(leasePath)).mtimeMs;
         await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
         await persistence.save([]);
@@ -387,7 +390,7 @@ describe("PersistentHandoffService", () => {
       });
       await holderStarted;
       const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
-      await utimes(join(lockPath, "lease"), expiredAt, expiredAt);
+      await utimes(join(lockPath, "1", "lease"), expiredAt, expiredAt);
       if (controls.refreshExpiredHolder === null) throw new Error("The expired holder did not start");
       controls.refreshExpiredHolder();
 
@@ -417,7 +420,7 @@ describe("PersistentHandoffService", () => {
       });
       await firstStartedPromise;
       const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
-      await utimes(join(lockPath, "lease"), expiredAt, expiredAt);
+      await utimes(join(lockPath, "1", "lease"), expiredAt, expiredAt);
 
       const second = secondPersistence.withExclusive(async () => {
         controls.secondStarted?.();
@@ -437,19 +440,26 @@ describe("PersistentHandoffService", () => {
     }
   });
 
-  it("keeps a successor lock intact when it acquires during stale-holder release", async () => {
+  it("keeps a successor lock intact when stale release resumes after successor acquisition", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");
     const lockPath = `${persistencePath}.lock`;
-    const controls = { successorStarted: null as (() => void) | null, releaseSuccessor: null as (() => void) | null };
+    const controls = { successorStarted: null as (() => void) | null, verifySuccessor: null as (() => void) | null, successorVerified: null as (() => void) | null, releaseSuccessor: null as (() => void) | null };
     const successorStarted = new Promise<void>((resolve) => { controls.successorStarted = resolve; });
+    const verifySuccessor = new Promise<void>((resolve) => { controls.verifySuccessor = resolve; });
+    const successorVerified = new Promise<void>((resolve) => { controls.successorVerified = resolve; });
     const releaseSuccessor = new Promise<void>((resolve) => { controls.releaseSuccessor = resolve; });
     const successorPersistence = new FileHandoffPersistence(persistencePath);
     let successor: Promise<void> | null = null;
     const staleHolderPersistence = new FileHandoffPersistence(persistencePath, {
       afterReleaseLockQuarantine: async () => {
+        const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
+        await utimes(join(lockPath, "1", "lease"), expiredAt, expiredAt);
         successor = successorPersistence.withExclusive(async () => {
           controls.successorStarted?.();
+          await verifySuccessor;
+          await successorPersistence.save([]);
+          controls.successorVerified?.();
           await releaseSuccessor;
         });
         await successorStarted;
@@ -458,10 +468,14 @@ describe("PersistentHandoffService", () => {
     try {
       await staleHolderPersistence.withExclusive(async () => {});
 
-      expect((await stat(lockPath)).isDirectory()).toBe(true);
-      if (controls.releaseSuccessor === null || successor === null) throw new Error("The successor lock operation did not start");
+      if (controls.verifySuccessor === null) throw new Error("The successor lock operation did not start");
+      controls.verifySuccessor();
+      await successorVerified;
+      expect((await stat(join(lockPath, "2", "lease"))).isFile()).toBe(true);
+      if (controls.releaseSuccessor === null || successor === null) throw new Error("The successor lock operation was not retained");
       controls.releaseSuccessor();
       await successor;
+      await new FileHandoffPersistence(persistencePath).withExclusive(async () => {});
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
