@@ -388,6 +388,28 @@ describe("D-AI runtime", () => {
     expect(repeated.status).toBe("blocked");
   });
 
+  it("uses the durable environment to reject stale continuation in a fresh runtime", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const seedingRuntime = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await seedingRuntime(intentRequest("chat", noOverrides));
+    await seedingRuntime({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const freshRuntime = createDAIRuntime(runtimeHarness.dependencies);
+
+    const staleContinuation = await freshRuntime({
+      command: { kind: "continue", taskIdOrProject: accepted.taskId },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+    const ownerContinuation = await freshRuntime({
+      command: { kind: "continue", taskIdOrProject: accepted.taskId },
+      sourceEnvironment: "work",
+      overrides: noOverrides,
+    });
+
+    expect(staleContinuation.status).toBe("blocked");
+    expect(ownerContinuation.status).toBe("accepted");
+  });
+
   it("serializes handoffs, persists pending before acknowledgement, and blocks source operations", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const handoffStates: TaskState["handoffState"][] = [];

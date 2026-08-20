@@ -757,8 +757,11 @@ async function continueTaskExclusive(
   if (state === null) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
   }
+  if (request.sourceEnvironment !== state.environment) {
+    return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
+  }
   const owner = registry.owner(state.taskId);
-  if (registry.isBlocked(state.taskId) || (owner !== null && (owner !== state.environment || owner !== request.sourceEnvironment))) {
+  if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
     return response(state, "blocked", `Task ${state.taskId} ownership changed while continue was loading durable state`);
   }
   if (state.handoffState === "pending" || state.handoffState === "acknowledged" || state.handoffState === "rejected") {
