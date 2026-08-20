@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError } from "../domain/errors.js";
@@ -220,6 +220,23 @@ function allDurablePaths(paths: SnapshotPaths): readonly string[] {
   return [paths.context, paths.evidence, paths.approval, paths.handoff, paths.recovery, paths.state, paths.manifest];
 }
 
+async function hasRemainingSnapshotArtifacts(paths: SnapshotPaths): Promise<boolean> {
+  for (const artifactPath of allDurablePaths(paths)) {
+    if (artifactPath === paths.state) {
+      continue;
+    }
+    try {
+      await lstat(artifactPath);
+      return true;
+    } catch (error: unknown) {
+      if (!isMissingFileError(error)) {
+        throw new InvalidTaskStateError(`Unable to inspect durable snapshot artifact at ${artifactPath}: ${describeError(error)}`);
+      }
+    }
+  }
+  return false;
+}
+
 function createCanonicalManifestContent(manifest: DurableContextManifest): string {
   return serialize({ ...manifest, hashes: {} });
 }
@@ -310,6 +327,11 @@ export class FileDurableContextStore implements DurableContextStore {
       stateContent = await readFile(paths.state, "utf8");
     } catch (error: unknown) {
       if (isMissingFileError(error)) {
+        if (await hasRemainingSnapshotArtifacts(paths)) {
+          throw new InvalidTaskStateError(
+            `Durable task state is missing for task ${taskId} at ${paths.state} while snapshot artifacts remain in ${paths.taskRoot}`,
+          );
+        }
         return null;
       }
       throw new InvalidTaskStateError(`Unable to read durable task state at ${paths.state}: ${describeError(error)}`);

@@ -149,6 +149,24 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("rejects recovery when the state commit marker is missing but snapshot artifacts remain", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-missing-state", "Require the durable state commit marker");
+    const statePath = join(rootPath, state.taskId, "state.json");
+
+    try {
+      await store.save(state);
+      await rm(statePath);
+
+      await expect(store.load(state.taskId)).rejects.toThrow(
+        new RegExp(`task-missing-state.*${statePath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}`),
+      );
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("rejects invalid persisted state during recovery", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
