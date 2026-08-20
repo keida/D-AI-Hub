@@ -24,10 +24,14 @@ Excluded from V1: vector databases, embeddings, RAG infrastructure, web applicat
 ## Repositories / Environments
 
 - Canonical repository: `https://github.com/keida/D-AI-Hub`
-- Local checkout: `C:\Users\User\Documents\ChatGPT\D-AI-Hub`
-- Current local branch: `main`
-- Current authenticated snapshot: remote commit `791114d50ba86857bbae4322af93831b03b2cbca`, tree `8a203f6900e4fa636297d418e6ecf320b29f1216`
+- Canonical branch: `main`
+- Local checkouts are working copies and may live at different paths on different machines.
+- A local checkout is current only after sync has been verified against the canonical repository. Do not preserve transient commit/tree identifiers here as durable state.
+
+## Bootstrap
+
+Agents should read the root `AGENTS.md` when entering this repository. It defines session-start, canonical ownership, security, branch, and session-close rules.
 
 ## Current continuation entry point
 
-Read `STATUS.md` first, then `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, and `REFERENCES.md`. For general repository rules, read the root `README.md`; for knowledge or project updates, follow the canonical Skills under `skills/custom/`.
+Read `STATUS.md` first, then `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, and `REFERENCES.md`. For general repository rules, read `AGENTS.md` and the root `README.md`; for knowledge or project updates, follow the canonical Skills under `skills/custom/`.
