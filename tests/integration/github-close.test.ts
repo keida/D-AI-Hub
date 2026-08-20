@@ -241,6 +241,44 @@ describe("GitHub close integration", () => {
     }
   });
 
+  it("blocks chained URL rewrites before Git can divert a validated endpoint", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-github-chained-rewrite-"));
+    const repositoryPath = join(root, "repository");
+    const bareRemotePath = join(root, "remote.git");
+    const globalConfigPath = join(root, "global.gitconfig");
+    const previousGlobalConfigPath = process.env.GIT_CONFIG_GLOBAL;
+    try {
+      await git(null, ["init", "--bare", bareRemotePath]);
+      await git(null, ["init", "--initial-branch=main", repositoryPath]);
+      await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+      await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "verified artifact\n", "utf8");
+      await git(repositoryPath, ["add", "artifact.txt"]);
+      await git(repositoryPath, ["commit", "-m", "integration artifact"]);
+      const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
+      await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      await git(null, ["config", "--file", globalConfigPath, "url.git@github.com:acme/d-ai.git.pushInsteadOf", "https://github.com/acme/d-ai.git"]);
+      process.env.GIT_CONFIG_GLOBAL = globalConfigPath;
+      await git(repositoryPath, ["config", `url.file://${bareRemotePath.replaceAll("\\", "/")}.insteadOf`, "git@github.com:acme/d-ai.git"]);
+
+      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+      const verdict = await closeTask(closeState, {
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.create({ enterpriseHost: null }),
+      });
+
+      expect(verdict.status).toBe("BLOCKED");
+      await expect(git(bareRemotePath, ["rev-parse", "--verify", "refs/heads/main"])).rejects.toThrow();
+    } finally {
+      if (previousGlobalConfigPath === undefined) {
+        delete process.env.GIT_CONFIG_GLOBAL;
+      } else {
+        process.env.GIT_CONFIG_GLOBAL = previousGlobalConfigPath;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("returns BLOCKED when remote verification emits a malformed object id", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-github-malformed-remote-"));
     const repositoryPath = join(root, "repository");

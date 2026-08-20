@@ -239,6 +239,16 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/sha/i);
   });
 
+  it("returns BLOCKED when the remote SHA matches but the adapter match flag is false", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const pushEvidence = successfulPush();
+    const contradictoryRemoteState = { ...matchingRemoteState(pushEvidence.localSha), matchesExpectedSha: false };
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(pushEvidence, contradictoryRemoteState) });
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(verdict.reasons.join(" ")).toMatch(/invalid|conflict|sha/i);
+  });
+
   it("returns NO when a required durable artifact is missing", async () => {
     const state = closeReadyState(new Date().toISOString());
     const durableContext = state.durableContext;

@@ -241,7 +241,7 @@ function remoteEvidenceFailure(remote: RemoteState, push: GitPushEvidence, confi
   if (remote.ref !== configuration.ref || remote.ref !== push.ref) return "Remote state ref does not match the configured target ref";
   if (typeof remote.remoteSha !== "string" || (remote.remoteSha.length > 0 && !validObjectId(remote.remoteSha))) return "Remote state SHA is malformed";
   if (typeof remote.matchesExpectedSha !== "boolean") return "Remote state match flag is malformed";
-  if (remote.matchesExpectedSha && remote.remoteSha !== push.localSha) return "Remote state match flag conflicts with its SHA";
+  if (remote.matchesExpectedSha !== (remote.remoteSha === push.localSha)) return "Remote state match flag conflicts with its SHA";
   return null;
 }
 

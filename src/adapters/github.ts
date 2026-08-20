@@ -1,5 +1,5 @@
 import { redactSensitiveText } from "./command-runner.js";
-import { gitCliTransport, inspectLocalGitState, summarizeLocalGitState, type GitFailureCategory, type GitTransport } from "./git.js";
+import { gitCliTransport, inspectLocalGitState, resolveGitEndpoint, summarizeLocalGitState, type GitFailureCategory, type GitTransport } from "./git.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../domain/errors.js";
 
 export interface GitPushEvidence {
@@ -227,11 +227,12 @@ export class GitHubCliAdapter implements GitHubAdapter {
     if (recordedEndpoint === undefined || recordedEndpoint.ref !== ref) {
       throw new GitRemoteBlockedError("Remote verification has no matching validated push endpoint for the repository and ref");
     }
-    const endpointRepository = resolveGitHubRepository(recordedEndpoint.endpoint, this.enterpriseHost);
+    const verificationEndpoint = await resolveGitEndpoint(recordedEndpoint.repositoryPath, recordedEndpoint.endpoint);
+    const endpointRepository = resolveGitHubRepository(verificationEndpoint, this.enterpriseHost);
     if (endpointRepository.repository !== repository) {
       throw new GitRemoteBlockedError("Recorded Git push endpoint no longer matches the requested repository identity");
     }
-    const result = await this.transport.readRef(recordedEndpoint.repositoryPath, recordedEndpoint.endpoint, ref);
+    const result = await this.transport.readRef(recordedEndpoint.repositoryPath, verificationEndpoint, ref);
     const remoteSha = parseRemoteSha(result.stdout, ref);
     return { repository, ref, remoteSha, matchesExpectedSha: remoteSha === expected };
   }

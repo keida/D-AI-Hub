@@ -33,6 +33,11 @@ export interface GitTransport {
   readRef(repositoryPath: string, endpoint: string, ref: string): Promise<CommandResult>;
 }
 
+interface GitUrlRewriteRule {
+  readonly base: string;
+  readonly prefix: string;
+}
+
 export class GitLocalStateError extends CloseBlockedError {
   public readonly category: GitFailureCategory;
 
@@ -94,16 +99,112 @@ function outputValue(result: CommandResult, label: string): string {
   return assertNonEmpty(result.stdout, label);
 }
 
-function oneOutputLine(result: CommandResult, label: string): string {
-  const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
-  if (lines.length !== 1) {
-    throw new GitLocalStateError("ambiguous", `${label} must resolve to exactly one endpoint; observed ${lines.length}`);
+async function runGitOptionalConfigQuery(
+  repositoryPath: string,
+  argumentsList: readonly string[],
+  commandLabel: string,
+): Promise<CommandResult | null> {
+  return runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath }).then(
+    (result) => result,
+    (error: CommandExecutionError) => {
+      if (!(error instanceof CommandExecutionError)) {
+        throw new GitLocalStateError("ambiguous", `Unable to run git ${commandLabel}: command runner returned an untyped failure`);
+      }
+      if (error.result.exitCode === 1 && error.result.stdout.length === 0 && error.result.stderr.length === 0) {
+        return null;
+      }
+      throw commandFailure(commandLabel, error);
+    },
+  );
+}
+
+function parseNullTerminatedValues(output: string, label: string): readonly string[] {
+  const values = output.split("\0");
+  const trailingValue = values.pop();
+  if (trailingValue !== "") {
+    throw new GitLocalStateError("ambiguous", `${label} has malformed command output`);
   }
-  const value = lines[0];
-  if (value === undefined) {
-    throw new GitLocalStateError("ambiguous", `${label} did not resolve to an endpoint`);
+  return values;
+}
+
+async function readGitConfigValues(repositoryPath: string, key: string, label: string): Promise<readonly string[]> {
+  const result = await runGitOptionalConfigQuery(repositoryPath, ["config", "--null", "--get-all", key], `config --get-all ${key}`);
+  return result === null ? [] : parseNullTerminatedValues(result.stdout, label);
+}
+
+function parseGitUrlRewriteRules(output: string): readonly GitUrlRewriteRule[] {
+  const records = output.split("\0");
+  const trailingRecord = records.pop();
+  if (trailingRecord !== "") {
+    throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration has malformed command output");
   }
-  return value;
+  return records.map((record) => {
+    const separator = record.indexOf("\n");
+    if (separator <= 4) {
+      throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration contains a malformed rule");
+    }
+    const key = record.slice(0, separator);
+    const normalizedKey = key.toLowerCase();
+    const suffix = normalizedKey.endsWith(".pushinsteadof") ? ".pushinsteadof" : ".insteadof";
+    if (!normalizedKey.startsWith("url.") || !normalizedKey.endsWith(suffix)) {
+      throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration contains an unexpected rule");
+    }
+    const base = key.slice(4, -suffix.length);
+    const prefix = record.slice(separator + 1);
+    if (base.length === 0 || prefix.length === 0) {
+      throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration contains an empty base or prefix");
+    }
+    return { base, prefix };
+  });
+}
+
+async function readGitUrlRewriteRules(repositoryPath: string): Promise<readonly GitUrlRewriteRule[]> {
+  const result = await runGitOptionalConfigQuery(
+    repositoryPath,
+    ["config", "--includes", "--null", "--get-regexp", "^url\\..*\\.(insteadof|pushinsteadof)$"],
+    "config --get-regexp URL rewrites",
+  );
+  return result === null ? [] : parseGitUrlRewriteRules(result.stdout);
+}
+
+function rewriteGitUrlOnce(endpoint: string, rules: readonly GitUrlRewriteRule[]): string | null {
+  const matchingRules = rules.filter((rule) => endpoint.startsWith(rule.prefix));
+  if (matchingRules.length === 0) {
+    return null;
+  }
+  const longestPrefixLength = Math.max(...matchingRules.map((rule) => rule.prefix.length));
+  const rewrittenEndpoints = new Set(
+    matchingRules
+      .filter((rule) => rule.prefix.length === longestPrefixLength)
+      .map((rule) => `${rule.base}${endpoint.slice(rule.prefix.length)}`),
+  );
+  if (rewrittenEndpoints.size !== 1) {
+    throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration has ambiguous longest-prefix rules");
+  }
+  const rewrittenEndpoint = rewrittenEndpoints.values().next().value;
+  if (rewrittenEndpoint === undefined) {
+    throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration did not produce an endpoint");
+  }
+  return rewrittenEndpoint;
+}
+
+export async function resolveGitEndpoint(repositoryPath: string, endpoint: string): Promise<string> {
+  const normalizedEndpoint = assertNonEmpty(endpoint, "Git endpoint");
+  const rules = await readGitUrlRewriteRules(repositoryPath);
+  const visited = new Set<string>([normalizedEndpoint]);
+  let resolvedEndpoint = normalizedEndpoint;
+  for (let step = 0; step <= rules.length; step += 1) {
+    const rewrittenEndpoint = rewriteGitUrlOnce(resolvedEndpoint, rules);
+    if (rewrittenEndpoint === null) {
+      return resolvedEndpoint;
+    }
+    if (visited.has(rewrittenEndpoint)) {
+      throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration contains a cycle");
+    }
+    visited.add(rewrittenEndpoint);
+    resolvedEndpoint = rewrittenEndpoint;
+  }
+  throw new GitLocalStateError("ambiguous", "Git URL rewrite configuration does not reach a fixed endpoint");
 }
 
 export function classifyGitFailure(observedOutput: string): GitFailureCategory {
@@ -136,11 +237,20 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
     throw new GitLocalStateError("ambiguous", `Git HEAD is not a full object id: ${head}`);
   }
   const worktreeStatus = (await runGitRead(repositoryPath, ["status", "--porcelain=v1"], "status --porcelain=v1")).stdout.trim();
-  const remoteUrl = outputValue(await runGitRead(repositoryPath, ["config", "--get", `remote.${normalizedRemote}.url`], `config --get remote.${normalizedRemote}.url`), "Git remote URL");
-  const pushUrl = oneOutputLine(
-    await runGitRead(repositoryPath, ["remote", "get-url", "--push", "--all", normalizedRemote], `remote get-url --push --all ${normalizedRemote}`),
-    "Effective Git push transport",
-  );
+  const remoteUrls = await readGitConfigValues(root, `remote.${normalizedRemote}.url`, "Git remote URL");
+  if (remoteUrls.length !== 1) {
+    throw new GitLocalStateError("ambiguous", `Git remote URL must resolve to exactly one endpoint; observed ${remoteUrls.length}`);
+  }
+  const remoteUrl = remoteUrls[0];
+  if (remoteUrl === undefined) {
+    throw new GitLocalStateError("ambiguous", "Git remote URL did not resolve to an endpoint");
+  }
+  const pushUrls = await readGitConfigValues(root, `remote.${normalizedRemote}.pushurl`, "Git push URL");
+  if (pushUrls.length > 1) {
+    throw new GitLocalStateError("ambiguous", `Git push URL must resolve to at most one endpoint; observed ${pushUrls.length}`);
+  }
+  const configuredPushUrl = pushUrls[0] ?? remoteUrl;
+  const pushUrl = await resolveGitEndpoint(root, configuredPushUrl);
   return {
     repositoryPath: root,
     branch,
