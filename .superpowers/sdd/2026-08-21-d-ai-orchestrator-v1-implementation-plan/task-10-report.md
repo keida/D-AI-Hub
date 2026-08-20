@@ -1,6 +1,6 @@
 # Historical/superseded Task 10 report: V1 integration contract suite
 
-> Historical baseline only. This report is superseded by `tests/integration/TASK-10-fix-round-4.md`; its original claim that the public intent lifecycle completed in one executor and that recovery self-artifacts were already fully correspondent is stale.
+> Historical baseline only. This report is superseded by `tests/integration/TASK-10-fix-round-5.md`; its original claim that the public intent lifecycle completed in one executor and that recovery self-artifacts were already fully correspondent is stale.
 
 ## Scope
 

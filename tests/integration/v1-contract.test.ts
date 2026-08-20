@@ -13,7 +13,7 @@ import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/regi
 import { loadSelectedSkill, type LoadedSkill } from "../../src/skills/skill-loader.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateName } from "../../src/verification/gates.js";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createKnownGoodRepository, type KnownGoodRepositoryFixture } from "./fixtures/known-good-repo.js";
@@ -77,11 +77,14 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
       return {
         status: "failed",
         message: "Configured failing command reproduced the public intent failure",
-        evidence: [{ ...evidence(request.state, "failure-handling", fixture.failingCommand.command, failedResult.stderr, now), passed: false, exitCode: failedResult.exitCode }],
+        evidence: [
+          evidence(request.state, "scope", "fixture scope", "scope recorded", now),
+          { ...evidence(request.state, "failure-handling", fixture.failingCommand.command, failedResult.stderr, now), passed: false, exitCode: failedResult.exitCode },
+        ],
       };
     }
-    passingResult = await runCommand(fixture.passingCommand);
-    regressionResult = passingResult;
+    passingResult = await runCommand(fixture.failingCommand);
+    regressionResult = await runCommand(fixture.regressionCommand);
     const now = new Date().toISOString();
     const statusOutput = (await runCommand({ command: "git", arguments: ["status", "--porcelain=v1"], cwd: fixture.repositoryPath })).stdout;
     const headOutput = (await runCommand({ command: "git", arguments: ["rev-parse", "HEAD"], cwd: fixture.repositoryPath })).stdout.trim();
@@ -91,8 +94,8 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
       evidence(request.state, "scope", "git status --porcelain=v1", statusOutput || "clean worktree", now),
       evidence(request.state, "environment-capability", "git rev-parse --show-toplevel", fixture.repositoryPath, now),
       evidence(request.state, "task-state", "git rev-parse HEAD", headOutput, now),
-      evidence(request.state, "quality", `${fixture.passingCommand.command} ${fixture.passingCommand.arguments.join(" ")}`, passingResult.stdout, now),
-      evidence(request.state, "failure-handling", `${fixture.failingCommand.command} -> ${fixture.passingCommand.command}`, `${failedResult.stderr}${passingResult.stdout}`, now),
+      evidence(request.state, "quality", `${fixture.failingCommand.command} ${fixture.failingCommand.arguments.join(" ")}`, passingResult.stdout, now),
+      evidence(request.state, "failure-handling", `${fixture.failingCommand.command} (recovered)`, `${failedResult.stderr}${passingResult.stdout}`, now),
       evidence(request.state, "durable-context", `FileDurableContextStore.load(${request.state.taskId})`, durable.durableContext?.durablePaths.join("\n") ?? "missing", now),
       evidence(request.state, "critical-unsaved-context", "FileDurableContextStore.load criticalUnsavedContext", durable.criticalUnsavedContext.join("\n") || "empty", now),
       evidence(request.state, "recovery", "git rev-parse HEAD + recovery-point capture", headOutput, now),
@@ -110,7 +113,7 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
     resolveModelRoute: (await import("../../src/routing/model-router.js")).resolveModelRoute,
     discoverSkillMetadata, selectCapabilities,
     loadSelectedSkill: async (descriptor, resources) => { trace.requestedResources.push({ name: descriptor.name, resources: [...resources] }); const skill = await loadSelectedSkill(descriptor, resources); trace.loadedSkills.push(skill); return skill; },
-    evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture", recoveryPointId: "fixture" }), recover: async (state) => ({ ...state, stage: "recover", role: "recovery-operator" }),
+    evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture", recoveryPointId: "fixture" }), recover: async (state) => { await rm(fixture.recoveryMarkerPath); return { ...state, stage: "recover", role: "recovery-operator" }; },
     closeTask: async (state): Promise<CloseVerdict> => closeTask(state, { store, gitHub: localGitHubAdapter(fixture) }), maximumEvidenceAgeMs: 300_000, now: () => new Date(),
   };
   Object.defineProperty(trace, "failedResult", { get: () => failedResult });
@@ -179,8 +182,12 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
       }
       expect(result.trace.loadedSkills.flatMap((skill) => [skill.instructions, ...skill.loadedResources])).not.toContain(expect.stringContaining(fixture.skillLibrary.unrelatedSkillName));
       expect(result.trace.failedResult.exitCode).toBe(23);
-      expect(result.trace.passingResult.stdout).toBe("fixture verification passed\n");
-      expect(result.trace.regressionResult.exitCode).toBe(0);
+      expect(result.trace.passingResult.stdout).toBe("fixture command recovered\n");
+      expect(result.trace.regressionResult.stdout).toBe("fixture verification passed\n");
+      const finalState = await result.store.load(result.trace.responses[0]!.taskId);
+      expect(finalState?.verificationHistory?.some((item) => item.evidenceId === "gate:failure-handling" && !item.passed)).toBe(true);
+      expect(finalState?.verificationHistory?.some((item) => item.evidenceId === "gate:scope" && item.passed)).toBe(true);
+      expect(new Set(finalState?.verificationEvidence.map((item) => item.evidenceId)).size).toBe(finalState?.verificationEvidence.length);
     } finally { await fixture.cleanup(); }
   });
 

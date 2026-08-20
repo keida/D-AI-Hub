@@ -20,7 +20,7 @@ const gateNames = [
 
 function manifest(now: string): DurableContextManifest {
   return {
-    manifestId: "manifest-close",
+    manifestId: "00000000-0000-4000-8000-000000000004",
     taskId: "task-close",
     stage: "close",
     environment: "codex",

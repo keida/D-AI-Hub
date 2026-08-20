@@ -1,4 +1,6 @@
-# Task 10/V1 fix-round-3 report
+# Historical/superseded Task 10/V1 fix-round-3 report
+
+> Historical record only. Superseded by `tests/integration/TASK-10-fix-round-5.md`.
 
 ## Scope
 

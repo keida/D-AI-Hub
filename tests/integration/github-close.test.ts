@@ -120,7 +120,7 @@ function stateFor(repositoryPath: string, commitSha: string, now: string, remote
     approvalState: "approved",
     criticalUnsavedContext: [],
     durableContext: {
-      manifestId: "manifest-integration",
+      manifestId: "00000000-0000-4000-8000-000000000005",
       taskId: "task-github-close-integration",
       stage: "close",
       environment: "codex",

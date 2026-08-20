@@ -4,7 +4,7 @@ import type { RecoveryPointCaptureInput } from "../../src/recovery/recovery-poin
 
 function createManifest(): DurableContextManifest {
   return {
-    manifestId: "manifest-1",
+    manifestId: "00000000-0000-4000-8000-000000000001",
     taskId: "task-recovery",
     stage: "execute",
     environment: "codex",
@@ -103,4 +103,22 @@ describe("createRecoveryPoint", () => {
     expect(() => createRecoveryPoint(createCaptureInput([failed], "2026-08-21T00:00:00.000Z"))).toThrow(/passed/i);
     expect(() => createRecoveryPoint(createCaptureInput([inconsistent], "2026-08-21T00:00:00.000Z"))).toThrow(/exit code 0/i);
   });
+
+  it("deep-clones the state manifest in the captured snapshot", async () => {
+    const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+    const input = createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z");
+    const captured = createRecoveryPoint(input);
+
+    (input.stateManifest as { hashes: Record<string, string> }).hashes["context.json"] = "f".repeat(64);
+    expect(captured.snapshot.stateManifest.hashes["context.json"]).toBe("a".repeat(64));
+    expect(captured.snapshot.stateManifest).not.toBe(input.stateManifest);
+  });
+
+  it.each(["ghp_123456789012345678901234567890", "sk_123456789012345678901234567890", "-----BEGIN PRIVATE KEY-----"])(
+    "rejects unsafe snapshot manifest ids: %s",
+    async (manifestId) => {
+      const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+      expect(() => createRecoveryPoint({ ...createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z"), stateManifest: { ...createManifest(), manifestId } })).toThrow(/manifest id/i);
+    },
+  );
 });

@@ -1,8 +1,10 @@
-# Task 10/V1 fix-round-4 report
+# Historical/superseded Task 10/V1 fix-round-4 report
+
+> Historical record only. Superseded by `tests/integration/TASK-10-fix-round-5.md`; its documented passing-command alias is no longer the current integration behavior.
 
 ## Scope
 
-This report is the current Task 10/V1 fix-round-4 record. The approved spec/plan, `AGENTS.md`, `sources/`, and dependency set were preserved.
+This report records the historical Task 10/V1 fix-round-4 state. The approved spec/plan, `AGENTS.md`, `sources/`, and dependency set were preserved.
 
 ## Fixes
 

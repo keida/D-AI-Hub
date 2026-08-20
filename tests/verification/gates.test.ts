@@ -37,7 +37,7 @@ function createState(verificationEvidence: readonly VerificationEvidence[]): Tas
     approvalState: "approved",
     criticalUnsavedContext: [],
     durableContext: {
-      manifestId: "manifest-1",
+      manifestId: "00000000-0000-4000-8000-000000000003",
       taskId: "task-gates",
       stage: "verify",
       environment: "codex",

@@ -16,6 +16,7 @@ import {
   UnsavedContextError,
   VerificationGateError,
 } from "../domain/errors.js";
+import { isSafeManifestId } from "../domain/manifest-id.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, Role, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
@@ -158,7 +159,7 @@ const recoveryPointSchema = z.object({
   hashes: z.record(z.string().trim().min(1), z.string().regex(/^[a-f0-9]{64}$/i)),
   restorationInstructions: z.string().trim().min(1),
   createdAt: z.string().datetime(),
-  snapshotManifestId: z.string().trim().min(1).optional(),
+  snapshotManifestId: z.string().trim().refine(isSafeManifestId, "must be a UUID or manifest-UUID").optional(),
 }).strict();
 
 const baseApplicableExecutionGates = [
@@ -325,7 +326,11 @@ function redactEvidence(evidence: VerificationEvidence): VerificationEvidence {
 }
 
 function redactStateEvidence(state: TaskState): TaskState {
-  return { ...state, verificationEvidence: state.verificationEvidence.map(redactEvidence) };
+  return {
+    ...state,
+    verificationEvidence: state.verificationEvidence.map(redactEvidence),
+    ...(state.verificationHistory === undefined ? {} : { verificationHistory: state.verificationHistory.map(redactEvidence) }),
+  };
 }
 
 async function persistState(store: DurableContextStore, state: TaskState): Promise<TaskState> {
@@ -523,6 +528,7 @@ function secretLikeRecoveryPointField(recoveryPoint: RecoveryPoint): string | nu
     { label: "role", value: recoveryPoint.role },
     { label: "restoration instructions", value: recoveryPoint.restorationInstructions },
     { label: "timestamp", value: recoveryPoint.createdAt },
+    ...(recoveryPoint.snapshotManifestId === undefined ? [] : [{ label: "snapshot manifest id", value: recoveryPoint.snapshotManifestId }]),
     ...recoveryPoint.durablePaths.map((value, index) => ({ label: `durable path ${index}`, value })),
     ...Object.entries(recoveryPoint.hashes).flatMap(([key, value]) => [
       { label: "hash key", value: key },
@@ -790,7 +796,8 @@ async function continueTaskExclusive(
       dependencies.store,
       {
         ...transitionState(state, "execute", "implementer", state.environment),
-        verificationEvidence: state.verificationEvidence.filter((evidence) => evidence.passed),
+        verificationEvidence: [],
+        verificationHistory: [...(state.verificationHistory ?? []), ...state.verificationEvidence],
         contextManifest: failedEvidence.length === 0
           ? [...state.contextManifest]
           : [...state.contextManifest, `recovered-from-failure:${failedEvidence.map((evidence) => evidence.evidenceId).join(",")}`],

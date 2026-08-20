@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -52,6 +52,34 @@ describe("FileDurableContextStore", () => {
       }
       const content = await readFile(contextPath, "utf8");
       expect(manifest.hashes[contextPath]).toBe(createHash("sha256").update(content, "utf8").digest("hex"));
+      const generationRoot = join(rootPath, state.taskId, "generations", manifest.manifestId);
+      expect((await readdir(generationRoot)).sort()).toEqual([
+        "approval.json",
+        "context.json",
+        "evidence.json",
+        "handoff.json",
+        "manifest.json",
+        "recovery.json",
+        "state.json",
+      ]);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("reloads the manifest-addressed generation and rejects generation corruption", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-generation-corruption", "Verify immutable generation reload");
+
+    try {
+      const manifest = await store.save(state);
+      const generationStatePath = join(rootPath, state.taskId, "generations", manifest.manifestId, "state.json");
+      const generationState = JSON.parse(await readFile(generationStatePath, "utf8")) as { goal: string };
+      generationState.goal = "corrupted";
+      await writeFile(generationStatePath, `${JSON.stringify(generationState, null, 2)}\n`, "utf8");
+
+      await expect(store.load(state.taskId)).rejects.toThrow(/generation.*state\.json|content hash mismatch/i);
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }
@@ -197,6 +225,20 @@ describe("FileDurableContextStore", () => {
       await rm(rootPath, { recursive: true, force: true });
     }
   });
+
+  it.each(["ghp_123456789012345678901234567890", "sk_123456789012345678901234567890", "-----BEGIN PRIVATE KEY-----"]) (
+    "rejects secret-shaped values before writing %s",
+    async (secret) => {
+      const rootPath = await createStoreRoot();
+      const store = new FileDurableContextStore(rootPath);
+      try {
+        await expect(store.save({ ...createState(`task-secret-${secret.slice(0, 3)}`, secret) })).rejects.toThrow(/secret-like|credential/i);
+        await expect(store.load(`task-secret-${secret.slice(0, 3)}`)).resolves.toBeNull();
+      } finally {
+        await rm(rootPath, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("atomically replaces a prior durable snapshot", async () => {
     const rootPath = await createStoreRoot();

@@ -14,7 +14,8 @@ export interface KnownGoodRepositoryFixture {
   readonly durableContextRoot: string;
   readonly handoffPersistencePath: string;
   readonly failingCommand: CommandRequest;
-  readonly passingCommand: CommandRequest;
+  readonly regressionCommand: CommandRequest;
+  readonly recoveryMarkerPath: string;
   readonly skillLibrary: SkillLibraryFixture;
   readonly cleanup: () => Promise<void>;
 }
@@ -41,6 +42,7 @@ export async function createKnownGoodRepository(): Promise<KnownGoodRepositoryFi
   const handoffPersistencePath = join(repositoryPath, ".d-ai", "handoffs.json");
   const failingScriptPath = join(repositoryPath, "commands", "fail.mjs");
   const passingScriptPath = join(repositoryPath, "commands", "pass.mjs");
+  const recoveryMarkerPath = join(repositoryPath, "commands", "recoverable.marker");
   const skillRootPath = join(repositoryPath, ".agents", "skills");
 
   try {
@@ -52,13 +54,14 @@ export async function createKnownGoodRepository(): Promise<KnownGoodRepositoryFi
     await mkdir(durableContextRoot, { recursive: true });
     await writeFile(join(repositoryPath, ".gitignore"), ".d-ai/\n", "utf8");
     await writeFile(join(repositoryPath, "artifact.txt"), "known-good artifact\n", "utf8");
-    await writeFile(failingScriptPath, "process.stderr.write('intentional fixture failure\\n'); process.exit(23);\n", "utf8");
+    await writeFile(failingScriptPath, "import { access } from 'node:fs/promises';\ntry { await access(new URL('./recoverable.marker', import.meta.url)); process.stderr.write('recoverable marker present\\n'); process.exit(23); } catch { process.stdout.write('fixture command recovered\\n'); }\n", "utf8");
     await writeFile(passingScriptPath, "process.stdout.write('fixture verification passed\\n');\n", "utf8");
     const skillLibrary = await createSkillLibrary(skillRootPath);
     await git(repositoryPath, ["add", "."]);
     await git(repositoryPath, ["commit", "-m", "known-good Task 10 fixture"]);
     const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
     await git(repositoryPath, ["remote", "add", "origin", "https://github.com/d-ai-contract/known-good.git"]);
+    await writeFile(recoveryMarkerPath, "remove during recovery\n", "utf8");
 
     return {
       rootPath,
@@ -70,7 +73,8 @@ export async function createKnownGoodRepository(): Promise<KnownGoodRepositoryFi
       durableContextRoot,
       handoffPersistencePath,
       failingCommand: { command: process.execPath, arguments: [failingScriptPath], cwd: repositoryPath },
-      passingCommand: { command: process.execPath, arguments: [passingScriptPath], cwd: repositoryPath },
+      regressionCommand: { command: process.execPath, arguments: [passingScriptPath], cwd: repositoryPath },
+      recoveryMarkerPath,
       skillLibrary,
       cleanup: async (): Promise<void> => {
         assertSafeCleanupTarget(rootPath);

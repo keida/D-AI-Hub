@@ -3,6 +3,7 @@ import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../adapters/gi
 import type { GitFailureCategory } from "../adapters/git.js";
 import { CloseBlockedError } from "../domain/errors.js";
 import type { CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
+import { isSafeManifestId } from "../domain/manifest-id.js";
 import type { DurableContextStore } from "../state/durable-context-store.js";
 import { evaluateHardGates, type GateEvidence, type GateName } from "../verification/gates.js";
 
@@ -88,7 +89,7 @@ function repositoryPathFromManifest(values: readonly string[], reasons: string[]
   return repositoryPath;
 }
 
-function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState): boolean {
+function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState, snapshotManifest: DurableContextManifest | null): boolean {
   const recoveryPoint = state.recoveryPoint;
   if (recoveryPoint === null || recoveryPoint.recoveryPointId !== manifest.recoveryPointId) {
     return false;
@@ -111,12 +112,11 @@ function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState): 
   if (manifest.durablePaths.some((path) => path.trim().length === 0 || !/^[a-f0-9]{64}$/i.test(manifest.hashes[path] ?? ""))) {
     return false;
   }
-  const immutableSnapshotPaths = new Set(["state.json", "manifest.json", "recovery.json"]);
-  const snapshotGenerationIsPersisted = recoveryPoint.snapshotManifestId !== undefined && recoveryPoint.snapshotManifestId !== manifest.manifestId;
+  if (recoveryPoint.snapshotManifestId !== undefined && !isSafeManifestId(recoveryPoint.snapshotManifestId)) return false;
+  const artifactManifest = snapshotManifest === null ? manifest : snapshotManifest;
   if (recoveryPoint.durablePaths.some((path) => {
-    if (!manifestPaths.has(path)) return true;
-    if (recoveryPoint.hashes[path] === manifest.hashes[path]) return false;
-    return !(snapshotGenerationIsPersisted && immutableSnapshotPaths.has(path.split(/[\\/]/u).at(-1) ?? ""));
+    if (!manifestPaths.has(path) || !artifactManifest.durablePaths.includes(path)) return true;
+    return recoveryPoint.hashes[path] !== artifactManifest.hashes[path];
   })) {
     return false;
   }
@@ -149,7 +149,7 @@ function gateEvidence(state: TaskState): readonly GateEvidence[] {
   });
 }
 
-function preflight(state: TaskState, now: Date): PreflightResult {
+function preflight(state: TaskState, now: Date, snapshotManifest: DurableContextManifest | null): PreflightResult {
   const reasons: string[] = [];
   if (state.handoffState !== "completed") {
     reasons.push(failure(`Close has unresolved handoff state ${state.handoffState}`, "complete or explicitly resolve the handoff"));
@@ -162,7 +162,7 @@ function preflight(state: TaskState, now: Date): PreflightResult {
   }
   if (state.durableContext === null) {
     reasons.push(failure("Durable context manifest is missing", "save the task state and durable artifact manifest"));
-  } else if (!hasExactArtifacts(state.durableContext, state)) {
+  } else if (!hasExactArtifacts(state.durableContext, state, snapshotManifest)) {
     reasons.push(failure("Required durable artifact correspondence is incomplete", "restore the durable artifact manifest and matching recovery point"));
   }
   const repositoryPath = repositoryPathFromManifest(state.contextManifest, reasons);
@@ -315,7 +315,19 @@ export async function closeTask(
   if (JSON.stringify(persistedState) !== JSON.stringify(state)) {
     return createVerdict(state, "BLOCKED", [failure("Persisted task state does not match the state submitted for close", "reload the task from durable storage before close")], state.verificationEvidence);
   }
-  const preflightResult = preflight(state, now);
+  let snapshotManifest: DurableContextManifest | null = null;
+  if (state.recoveryPoint?.snapshotManifestId !== undefined && state.recoveryPoint.snapshotManifestId !== state.durableContext?.manifestId) {
+    if (dependencies.store.loadGenerationManifest === undefined) {
+      return createVerdict(state, "BLOCKED", [failure("Recovery generation loader is unavailable", "use the real durable context store before close")], state.verificationEvidence);
+    }
+    try {
+      snapshotManifest = await dependencies.store.loadGenerationManifest(state.taskId, state.recoveryPoint.snapshotManifestId);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return createVerdict(state, "BLOCKED", [failure(`Recovery generation could not be loaded: ${redactSensitiveText(message)}`, "restore the manifest-addressed recovery generation and retry close")], state.verificationEvidence);
+    }
+  }
+  const preflightResult = preflight(state, now, snapshotManifest);
   if (preflightResult.configuration === null) {
     return createVerdict(state, "NO", preflightResult.reasons, state.verificationEvidence);
   }

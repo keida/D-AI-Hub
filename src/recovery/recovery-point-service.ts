@@ -1,5 +1,6 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
 import { InvalidTaskStateError } from "../domain/errors.js";
+import { assertSafeManifestId } from "../domain/manifest-id.js";
 import type { DurableContextManifest, Environment, RecoveryPoint, Role, Stage, VerificationEvidence } from "../domain/types.js";
 
 export type RecoveryTrigger = "risky-work" | "handoff" | "recovery" | "close";
@@ -89,6 +90,7 @@ function assertCaptureInput(input: RecoveryPointCaptureInput): void {
   const createdAt = Date.parse(input.createdAt);
   if (Number.isNaN(createdAt)) throw new InvalidTaskStateError("Recovery point timestamp must be valid");
   if (input.stateManifest.taskId !== input.taskId) throw new InvalidTaskStateError("Recovery state manifest task id must match the recovery point task id");
+  assertSafeManifestId(input.stateManifest.manifestId, "Recovery snapshot manifest id");
   assertSafeCapturedValue(input.status, "Git status");
   assertSafeCapturedValue(input.binaryPatch, "Binary patch");
   assertVerificationResults(input, createdAt);
@@ -111,7 +113,11 @@ export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedR
     workspacePath: input.workspacePath,
     status: input.status,
     binaryPatch: input.binaryPatch,
-    stateManifest: input.stateManifest,
+    stateManifest: {
+      ...input.stateManifest,
+      durablePaths: [...input.stateManifest.durablePaths],
+      hashes: { ...input.stateManifest.hashes },
+    },
     verificationResults: input.verificationResults.map((verification) => ({ ...verification })),
     durableArtifacts,
   };

@@ -97,6 +97,7 @@ export interface TaskState {
   readonly contextManifest: readonly string[];
   readonly handoffState: "none" | "pending" | "acknowledged" | "active" | "completed" | "rejected";
   readonly verificationEvidence: readonly VerificationEvidence[];
+  readonly verificationHistory?: readonly VerificationEvidence[] | undefined;
   readonly recoveryPoint: RecoveryPoint | null;
   readonly approvalState: "not-required" | "pending" | "approved" | "rejected";
   readonly criticalUnsavedContext: readonly string[];

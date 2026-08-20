@@ -74,7 +74,7 @@ function memoryStore(savedStates: TaskState[], durablePath: string): DurableCont
     save: async (state: TaskState): Promise<DurableContextManifest> => {
       savedStates.push(state);
       const manifest: DurableContextManifest = {
-        manifestId: `manifest-${state.taskId}-${state.stage}`,
+        manifestId: "00000000-0000-4000-8000-000000000008",
         taskId: state.taskId,
         stage: state.stage,
         environment: state.environment,

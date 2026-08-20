@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError } from "../domain/errors.js";
+import { assertSafeManifestId, containsSecretShapedValue } from "../domain/manifest-id.js";
 import type { DurableContextManifest, TaskState } from "../domain/types.js";
 import type { DurableContextStore } from "./durable-context-store.js";
 
@@ -49,7 +50,7 @@ const verificationEvidenceSchema = z
   .strict();
 const manifestSchema = z
   .object({
-    manifestId: z.string().min(1),
+    manifestId: z.string().regex(/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|manifest-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i),
     taskId: z.string().min(1),
     stage: stageSchema,
     environment: environmentSchema,
@@ -98,6 +99,7 @@ const taskStateSchema = z
     contextManifest: z.array(z.string()),
     handoffState: z.enum(["none", "pending", "acknowledged", "active", "completed", "rejected"]),
     verificationEvidence: z.array(verificationEvidenceSchema),
+    verificationHistory: z.array(verificationEvidenceSchema).optional(),
     recoveryPoint: recoveryPointSchema.nullable(),
     approvalState: z.enum(["not-required", "pending", "approved", "rejected"]),
     criticalUnsavedContext: z.array(z.string()),
@@ -111,7 +113,7 @@ const contextRecordSchema = z
     contextManifest: z.array(z.string()),
   })
   .strict();
-const evidenceRecordSchema = z.object({ verificationEvidence: z.array(verificationEvidenceSchema) }).strict();
+const evidenceRecordSchema = z.object({ verificationEvidence: z.array(verificationEvidenceSchema), verificationHistory: z.array(verificationEvidenceSchema).optional() }).strict();
 const approvalRecordSchema = z
   .object({ approvalState: z.enum(["not-required", "pending", "approved", "rejected"]), criticalUnsavedContext: z.array(z.string()) })
   .strict();
@@ -151,6 +153,12 @@ function assertNoCredentialLikeFields(value: unknown, targetPath: string, fieldP
     return;
   }
 
+  if (typeof value === "string") {
+    if (containsSecretShapedValue(value)) {
+      throw new InvalidTaskStateError(`Secret-like value rejected for target path ${targetPath}: durable context must be redacted`);
+    }
+    return;
+  }
   if (value === null || typeof value !== "object") {
     return;
   }
@@ -215,6 +223,14 @@ function createSnapshotPaths(rootPath: string, taskId: string): SnapshotPaths {
     recovery: join(taskRoot, "recovery.json"),
     manifest: join(taskRoot, "manifest.json"),
   };
+}
+
+function generationRoot(paths: SnapshotPaths, manifestId: string): string {
+  return join(paths.taskRoot, "generations", manifestId);
+}
+
+function generationPath(paths: SnapshotPaths, manifestId: string, activePath: string): string {
+  return join(generationRoot(paths, manifestId), basename(activePath));
 }
 
 function allDurablePaths(paths: SnapshotPaths): readonly string[] {
@@ -313,6 +329,23 @@ async function writeAtomically(targetPath: string, content: string): Promise<voi
   }
 }
 
+async function writeGenerationAtomically(paths: SnapshotPaths, manifestId: string, contents: ReadonlyMap<string, string>): Promise<void> {
+  const generationsRoot = join(paths.taskRoot, "generations");
+  await mkdir(generationsRoot, { recursive: true });
+  const temporaryRoot = join(generationsRoot, `.${manifestId}.${randomUUID()}.tmp`);
+  const finalRoot = generationRoot(paths, manifestId);
+  try {
+    await mkdir(temporaryRoot, { recursive: true });
+    for (const [path, content] of contents) {
+      await writeFile(join(temporaryRoot, basename(path)), content, { encoding: "utf8", flag: "wx" });
+    }
+    await rename(temporaryRoot, finalRoot);
+  } catch (error) {
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export class FileDurableContextStore implements DurableContextStore {
   private readonly rootPath: string;
 
@@ -340,24 +373,42 @@ export class FileDurableContextStore implements DurableContextStore {
 
     const manifestContent = await readRequiredContent(taskId, paths.manifest, "declared SHA-256");
     const manifest = parseManifest(parseJson(manifestContent, taskId, paths.manifest), taskId, paths.manifest);
+    assertSafeManifestId(manifest.manifestId, "Durable manifest id");
     assertManifestContract(manifest, taskId, paths);
     const manifestHash = manifest.hashes[paths.manifest];
     const stateHash = manifest.hashes[paths.state];
     if (manifestHash === undefined || stateHash === undefined) {
       throw new InvalidTaskStateError(`Manifest contract for task ${taskId} is missing required state integrity hashes`);
     }
-
-    const state = parseTaskState(parseJson(stateContent, taskId, paths.state), paths.state);
-    assertNoCredentialLikeFields(state, paths.state, "state");
-    const observedStateHash = createHashForContent(createCanonicalStateContent(state));
-    if (observedStateHash !== stateHash) {
-      throwIntegrityError(taskId, paths.state, stateHash, observedStateHash, "canonical state hash mismatch");
-    }
     const observedManifestHash = createHashForContent(createCanonicalManifestContent(manifest));
     if (observedManifestHash !== manifestHash) {
       throwIntegrityError(taskId, paths.manifest, manifestHash, observedManifestHash, "canonical manifest hash mismatch");
     }
 
+    const generationManifestPath = generationPath(paths, manifest.manifestId, paths.manifest);
+    const generationManifestContent = await readRequiredContent(taskId, generationManifestPath, manifestHash);
+    const generationManifest = parseManifest(parseJson(generationManifestContent, taskId, generationManifestPath), taskId, generationManifestPath);
+    const observedGenerationManifestHash = createHashForContent(createCanonicalManifestContent(generationManifest));
+    if (observedGenerationManifestHash !== manifestHash) {
+      throwIntegrityError(taskId, generationManifestPath, manifestHash, observedGenerationManifestHash, "canonical generation manifest hash mismatch");
+    }
+    if (JSON.stringify(generationManifest) !== JSON.stringify(manifest)) {
+      throwIntegrityError(taskId, generationManifestPath, manifestHash, "manifest identity mismatch", "generation manifest does not match active manifest");
+    }
+    const activeState = parseTaskState(parseJson(stateContent, taskId, paths.state), paths.state);
+    assertNoCredentialLikeFields(activeState, paths.state, "state");
+    const observedActiveStateHash = createHashForContent(createCanonicalStateContent(activeState));
+    if (observedActiveStateHash !== stateHash) {
+      throwIntegrityError(taskId, paths.state, stateHash, observedActiveStateHash, "canonical state hash mismatch");
+    }
+    const generationStatePath = generationPath(paths, manifest.manifestId, paths.state);
+    const generationStateContent = await readRequiredContent(taskId, generationStatePath, stateHash);
+    const state = parseTaskState(parseJson(generationStateContent, taskId, generationStatePath), generationStatePath);
+    assertNoCredentialLikeFields(state, paths.state, "state");
+    const observedStateHash = createHashForContent(createCanonicalStateContent(state));
+    if (observedStateHash !== stateHash) {
+      throwIntegrityError(taskId, generationStatePath, stateHash, observedStateHash, "canonical state hash mismatch");
+    }
     const companionRecords: readonly [string, z.ZodType][] = [
       [paths.context, contextRecordSchema],
       [paths.evidence, evidenceRecordSchema],
@@ -373,6 +424,10 @@ export class FileDurableContextStore implements DurableContextStore {
       const content = await readRequiredContent(taskId, targetPath, expectedHash);
       assertRawHash(taskId, targetPath, content, expectedHash);
       parseCompanionRecord(parseJson(content, taskId, targetPath), taskId, targetPath, schema);
+      const generationTargetPath = generationPath(paths, manifest.manifestId, targetPath);
+      const generationContent = await readRequiredContent(taskId, generationTargetPath, expectedHash);
+      assertRawHash(taskId, generationTargetPath, generationContent, expectedHash);
+      parseCompanionRecord(parseJson(generationContent, taskId, generationTargetPath), taskId, generationTargetPath, schema);
     }
 
     if (state.durableContext === null || JSON.stringify(state.durableContext) !== JSON.stringify(manifest)) {
@@ -390,7 +445,7 @@ export class FileDurableContextStore implements DurableContextStore {
 
     const contents = new Map<string, string>([
       [paths.context, serialize({ goal: validatedState.goal, constraints: validatedState.constraints, contextManifest: validatedState.contextManifest })],
-      [paths.evidence, serialize({ verificationEvidence: validatedState.verificationEvidence })],
+      [paths.evidence, serialize({ verificationEvidence: validatedState.verificationEvidence, ...(validatedState.verificationHistory === undefined ? {} : { verificationHistory: validatedState.verificationHistory }) })],
       [paths.approval, serialize({ approvalState: validatedState.approvalState, criticalUnsavedContext: validatedState.criticalUnsavedContext })],
       [paths.handoff, serialize({ handoffState: validatedState.handoffState })],
       [paths.recovery, serialize({ recoveryPoint: validatedState.recoveryPoint })],
@@ -406,6 +461,7 @@ export class FileDurableContextStore implements DurableContextStore {
       recoveryPointId: validatedState.recoveryPoint?.recoveryPointId ?? null,
       recordedAt: new Date().toISOString(),
     };
+    assertSafeManifestId(manifest.manifestId, "Durable manifest id");
     const persistedState = { ...validatedState, durableContext: manifest };
     const hashes: Record<string, string> = {};
     for (const [path, content] of contents) {
@@ -416,13 +472,51 @@ export class FileDurableContextStore implements DurableContextStore {
     const persistedManifest: DurableContextManifest = { ...manifest, hashes };
     const stateContent = serialize({ ...persistedState, durableContext: persistedManifest });
     const manifestContent = serialize(persistedManifest);
+    const generationContents = new Map<string, string>([
+      ...contents,
+      [paths.manifest, manifestContent],
+      [paths.state, stateContent],
+    ]);
 
+    await writeGenerationAtomically(paths, manifest.manifestId, generationContents);
     for (const [path, content] of contents) {
       await writeAtomically(path, content);
     }
     await writeAtomically(paths.manifest, manifestContent);
     await writeAtomically(paths.state, stateContent);
     return persistedManifest;
+  }
+
+  public async loadGenerationManifest(taskId: string, manifestId: string): Promise<DurableContextManifest> {
+    assertTaskId(taskId);
+    assertSafeManifestId(manifestId, "Requested generation manifest id");
+    const paths = createSnapshotPaths(this.rootPath, taskId);
+    const manifestPath = generationPath(paths, manifestId, paths.manifest);
+    const content = await readRequiredContent(taskId, manifestPath, "generation manifest");
+    const manifest = parseManifest(parseJson(content, taskId, manifestPath), taskId, manifestPath);
+    if (manifest.manifestId !== manifestId) throw new InvalidTaskStateError(`Generation manifest id mismatch for task ${taskId}`);
+    assertManifestContract(manifest, taskId, paths);
+    const manifestHash = manifest.hashes[paths.manifest];
+    if (manifestHash === undefined) throw new InvalidTaskStateError(`Generation manifest for task ${taskId} is missing its manifest hash`);
+    const observedManifestHash = createHashForContent(createCanonicalManifestContent(manifest));
+    if (observedManifestHash !== manifestHash) throwIntegrityError(taskId, manifestPath, manifestHash, observedManifestHash, "canonical generation manifest hash mismatch");
+    for (const activePath of allDurablePaths(paths)) {
+      const expectedHash = manifest.hashes[activePath];
+      if (expectedHash === undefined) throw new InvalidTaskStateError(`Generation manifest for task ${taskId} is missing a hash for ${activePath}`);
+      const targetPath = generationPath(paths, manifestId, activePath);
+      const artifact = await readRequiredContent(taskId, targetPath, expectedHash);
+      if (activePath === paths.state) {
+        const state = parseTaskState(parseJson(artifact, taskId, targetPath), targetPath);
+        assertNoCredentialLikeFields(state, targetPath, "state");
+        const observedStateHash = createHashForContent(createCanonicalStateContent(state));
+        if (observedStateHash !== expectedHash) throwIntegrityError(taskId, targetPath, expectedHash, observedStateHash, "canonical generation state hash mismatch");
+      } else if (activePath === paths.manifest) {
+        continue;
+      } else {
+        assertRawHash(taskId, targetPath, artifact, expectedHash);
+      }
+    }
+    return manifest;
   }
 
   public async recordCriticalUnsavedContext(taskId: string, items: readonly string[]): Promise<void> {
