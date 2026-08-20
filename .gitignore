@@ -1,0 +1,58 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+secrets/
+credentials/
+
+# Authentication/session artifacts
+*.cookie
+*.cookies
+*.session
+
+# Local worktrees
+.worktrees/
+worktrees/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+
+# Build/cache outputs
+dist/
+build/
+coverage/
+.cache/
+.tmp/
+tmp/
+
+# Logs
+*.log
+logs/
