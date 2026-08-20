@@ -53,6 +53,9 @@ function assertSafeCapturedValue(value: string, label: string): void {
 
 function assertDurableArtifacts(manifest: DurableContextManifest): void {
   if (manifest.durablePaths.length === 0) throw new InvalidTaskStateError("Recovery durable paths must be non-empty");
+  if (manifest.durablePaths.some((path) => path.trim().length === 0)) {
+    throw new InvalidTaskStateError("Recovery durable paths must be non-empty");
+  }
   if (new Set(manifest.durablePaths).size !== manifest.durablePaths.length) {
     throw new InvalidTaskStateError("Recovery durable paths must not contain duplicates");
   }

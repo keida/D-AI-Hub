@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { InvalidTaskStateError } from "../domain/errors.js";
+import { redactSecretShapedValues } from "../domain/manifest-id.js";
 
 export interface CommandRequest {
   readonly command: string;
@@ -30,10 +31,11 @@ const authorizationBearerPattern = /(authorization\s*:\s*bearer\s+)([^\s"']+)/gi
 const bearerTokenPattern = /(bearer\s+)([^\s"']+)/gi;
 
 export function redactSensitiveText(value: string): string {
-  return value
+  const redacted = value
     .replace(authorizationBearerPattern, "$1[REDACTED]")
     .replace(secretAssignmentPattern, "$1[REDACTED]")
     .replace(bearerTokenPattern, "$1[REDACTED]");
+  return redactSecretShapedValues(redacted);
 }
 
 function assertCommandRequest(request: CommandRequest): void {

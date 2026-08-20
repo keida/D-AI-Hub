@@ -128,6 +128,21 @@ describe("createRecoveryPoint", () => {
     expect(() => createRecoveryPoint(duplicatePathInput)).toThrow(/duplicate/i);
   });
 
+  it("rejects blank durable paths before constructing a recovery point", async () => {
+    const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+    const input = createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z");
+    const blankPathInput = {
+      ...input,
+      stateManifest: {
+        ...input.stateManifest,
+        durablePaths: ["", "state.json", "manifest.json", "recovery.json"],
+        hashes: { "": "a".repeat(64), "state.json": "b".repeat(64), "manifest.json": "c".repeat(64), "recovery.json": "d".repeat(64) },
+      },
+    };
+
+    expect(() => createRecoveryPoint(blankPathInput)).toThrow(/durable paths.*non-empty/i);
+  });
+
   it("rejects extra hash keys before constructing a recovery point", async () => {
     const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
     const input = createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z");

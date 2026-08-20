@@ -246,7 +246,7 @@ function pushEvidence(state: TaskState, evidence: GitPushEvidence, now: string):
     role: state.role,
     selectedModel: selectedModel(state),
     command: `git push ${evidence.remote} ${evidence.ref}`,
-    observedOutput: evidence.observedOutput,
+    observedOutput: redactSensitiveText(evidence.observedOutput),
     exitCode: evidence.exitCode,
     interpretation: evidence.pushed ? "Git push command completed" : "Git push command did not complete",
     passed: evidence.pushed && evidence.exitCode === 0,
