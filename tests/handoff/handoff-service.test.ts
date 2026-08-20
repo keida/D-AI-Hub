@@ -292,17 +292,41 @@ describe("PersistentHandoffService", () => {
     }
   });
 
-  it("does not remove a renewed lock held by another operation", async () => {
+  it("does not renew its fixed lease while saving", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    const persistence = new FileHandoffPersistence(persistencePath);
+    try {
+      await persistence.withExclusive(async () => {
+        const leasePath = join(lockPath, "lease");
+        const createdAt = (await stat(leasePath)).mtimeMs;
+        await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
+        await persistence.save([]);
+
+        expect((await stat(leasePath)).mtimeMs).toBe(createdAt);
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a fixed unexpired lease exclusive during ordinary contention", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");
     const persistence = new FileHandoffPersistence(persistencePath);
     const firstLock = { release: null as (() => void) | null };
+    const firstStarted = { notify: null as (() => void) | null };
+    const firstStartedPromise = new Promise<void>((resolve) => { firstStarted.notify = resolve; });
     let secondEntered = false;
     try {
-      const first = persistence.withExclusive(async () => new Promise<void>((resolve) => { firstLock.release = resolve; }));
-      await new Promise<void>((resolve) => { setTimeout(resolve, FILE_HANDOFF_LOCK_LEASE_MS * 2); });
+      const first = persistence.withExclusive(async () => {
+        firstStarted.notify?.();
+        await new Promise<void>((resolve) => { firstLock.release = resolve; });
+      });
+      await firstStartedPromise;
       const second = persistence.withExclusive(async () => { secondEntered = true; });
-      await new Promise<void>((resolve) => { setTimeout(resolve, FILE_HANDOFF_LOCK_LEASE_MS); });
+      await new Promise<void>((resolve) => { setTimeout(resolve, 20); });
 
       expect(secondEntered).toBe(false);
       if (firstLock.release === null) throw new Error("The first lock operation did not start");
@@ -314,7 +338,7 @@ describe("PersistentHandoffService", () => {
     }
   });
 
-  it("rejects an expired holder refresh before reclaiming the lock for a successor", async () => {
+  it("rejects an expired fixed-lease holder before reclaiming the lock for a successor", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");
     const lockPath = `${persistencePath}.lock`;
