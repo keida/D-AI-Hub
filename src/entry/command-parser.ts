@@ -6,11 +6,12 @@ export type DAICommand =
   | { readonly kind: "continue"; readonly taskIdOrProject: string }
   | { readonly kind: "status" }
   | { readonly kind: "handoff"; readonly target: Environment }
+  | { readonly kind: "complete"; readonly handoffId: string }
   | { readonly kind: "close" };
 
 const commandPrefix = "@D-AI";
 const environments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
-const reservedCommands: ReadonlySet<string> = new Set(["continue", "status", "handoff", "close"]);
+const reservedCommands: ReadonlySet<string> = new Set(["continue", "status", "handoff", "complete", "close"]);
 
 function normalizedTokens(input: string): readonly string[] {
   if (typeof input !== "string") {
@@ -55,6 +56,10 @@ export function parseDAICommand(input: string): DAICommand {
   if (command === "handoff") {
     assertArgumentCount(command, arguments_, 1);
     return { kind: "handoff", target: parseEnvironment(arguments_[0]!) };
+  }
+  if (command === "complete") {
+    assertArgumentCount(command, arguments_, 1);
+    return { kind: "complete", handoffId: arguments_[0]! };
   }
   if (command === "close") {
     assertArgumentCount(command, arguments_, 0);

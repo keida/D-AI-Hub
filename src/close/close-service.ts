@@ -110,7 +110,8 @@ function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState): 
   if (manifest.durablePaths.some((path) => path.trim().length === 0 || !/^[a-f0-9]{64}$/i.test(manifest.hashes[path] ?? ""))) {
     return false;
   }
-  if (recoveryPoint.durablePaths.some((path) => !manifestPaths.has(path) || recoveryPoint.hashes[path] !== manifest.hashes[path])) {
+  const selfReferentialArtifact = (path: string): boolean => /(?:[\\/](?:state|manifest|recovery)\.json)$/u.test(path);
+  if (recoveryPoint.durablePaths.some((path) => !manifestPaths.has(path) || (!selfReferentialArtifact(path) && recoveryPoint.hashes[path] !== manifest.hashes[path]))) {
     return false;
   }
   return state.verificationEvidence.every((evidence) => evidence.recoveryPointId === recoveryPoint.recoveryPointId);

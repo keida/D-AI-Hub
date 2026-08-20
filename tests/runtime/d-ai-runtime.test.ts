@@ -388,6 +388,40 @@ describe("D-AI runtime", () => {
     expect(repeated.status).toBe("blocked");
   });
 
+  it("completes the real active handoff and persists the same Work-owned task at verify", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Handoff response did not include its id");
+
+    const completed = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+
+    expect(completed).toMatchObject({ taskId: accepted.taskId, stage: "verify", environment: "work", status: "completed" });
+    expect(await runtimeHarness.store.load(accepted.taskId)).toMatchObject({
+      taskId: accepted.taskId,
+      stage: "verify",
+      environment: "work",
+      handoffState: "completed",
+    });
+    expect(runtimeHarness.handoffService.status(handoffId)).toMatchObject({ state: "completed", owner: "work" });
+  });
+
+  it("blocks handoff completion when the source is not the durable target owner", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Handoff response did not include its id");
+
+    const blocked = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(blocked).toMatchObject({ taskId: "unassigned", stage: "bootstrap", status: "blocked" });
+    expect(await runtimeHarness.handoffService.status(handoffId)).toMatchObject({ state: "active", owner: "work" });
+  });
+
   it("uses the durable environment to reject stale continuation in a fresh runtime", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const seedingRuntime = createDAIRuntime(runtimeHarness.dependencies);

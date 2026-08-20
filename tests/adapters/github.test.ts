@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GitRemoteBlockedError, resolveGitHubRepository } from "../../src/adapters/github.js";
+import { GitHubCliAdapter, GitRemoteBlockedError, resolveGitHubRepository } from "../../src/adapters/github.js";
 import { classifyGitFailure } from "../../src/adapters/git.js";
 
 describe("resolveGitHubRepository", () => {
@@ -45,5 +45,13 @@ describe("classifyGitFailure", () => {
     ["unrecognized failure", "ambiguous"],
   ] as const)("classifies %s as %s", (observedOutput, expected) => {
     expect(classifyGitFailure(observedOutput)).toBe(expected);
+  });
+});
+
+describe("GitHubCliAdapter external boundary", () => {
+  it("blocks before transport when external credentials are not configured", async () => {
+    const external = GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: false });
+
+    await expect(external.pushExpectedCommit("not-a-repository", "origin", "refs/heads/main")).rejects.toThrow(/credentials|configuration/i);
   });
 });

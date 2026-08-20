@@ -56,12 +56,16 @@ function sameValues(left: readonly string[], right: readonly string[]): boolean 
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function evidenceEnvironmentAllowed(state: TaskState, environment: TaskState["environment"]): boolean {
+  return environment === state.environment || state.contextManifest.includes(`handoff-source:${environment}`);
+}
+
 function recoveryStateFailure(state: TaskState, now: Date): string | null {
   const recoveryPoint = state.recoveryPoint;
   if (recoveryPoint === null) return "No preserved recovery point is recorded";
   if (
     recoveryPoint.taskId !== state.taskId
-    || recoveryPoint.stage !== state.stage
+    || (recoveryPoint.stage !== state.stage && !(state.stage === "close" && recoveryPoint.stage === "verify"))
     || recoveryPoint.environment !== state.environment
     || recoveryPoint.role !== state.role
   ) return "Recovery point identity does not match the current task state";
@@ -176,7 +180,7 @@ function invalidEvidenceReason(verification: VerificationEvidence, state: TaskSt
   const recordedAt = Date.parse(verification.recordedAt);
   if (Number.isNaN(recordedAt) || recordedAt > now.getTime()) return "Evidence timestamp is malformed or in the future";
   if (now.getTime() - recordedAt > maximumEvidenceAgeMs) return "Evidence is stale";
-  if (verification.environment !== state.environment) return "Evidence environment does not match the current task state";
+  if (!evidenceEnvironmentAllowed(state, verification.environment)) return "Evidence environment does not match the current task state or recorded handoff source";
   if (verification.recoveryPointId !== state.recoveryPoint?.recoveryPointId) return "Evidence recovery point does not match the current task state";
   if (verification.exitCode !== null && !Number.isInteger(verification.exitCode)) return "Evidence exit code must be an integer or null";
   if (verification.passed && verification.exitCode !== 0) return "Passed evidence must report exit code 0";

@@ -3,6 +3,7 @@ import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-ada
 import { CodexEnvironmentAdapter } from "../../src/adapters/environments/codex-adapter.js";
 import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-adapter.js";
 import { GitHubCliAdapter, type GitHubAdapter } from "../../src/adapters/github.js";
+import { readRemoteRef } from "../../src/adapters/git.js";
 import { closeTask } from "../../src/close/close-service.js";
 import { createRecoveryPoint } from "../../src/recovery/recovery-point-service.js";
 import type { CloseVerdict, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../../src/domain/types.js";
@@ -18,7 +19,7 @@ import { createKnownGoodRepository, type KnownGoodRepositoryFixture } from "./fi
 const noOverrides = { model: null, role: null, environment: null } as const;
 
 interface LifecycleTrace {
-  readonly responses: { taskId: string; stage: string; environment: Environment; status: string }[];
+  readonly responses: { taskId: string; stage: string; environment: Environment; status: string; message: string }[];
   readonly handoffSnapshots: HandoffStatus[];
   readonly loadedSkills: LoadedSkill[];
   failedResult: CommandResult;
@@ -43,12 +44,12 @@ async function expectedFailure(command: Parameters<typeof runCommand>[0]): Promi
 }
 
 function localGitHubAdapter(fixture: KnownGoodRepositoryFixture): GitHubAdapter {
-  return GitHubCliAdapter.forTestTransport({ enterpriseHost: null }, {
+  return GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, {
     pushRef: async (repositoryPath, _endpoint, ref, head) => {
       const result = await runCommand({ command: "git", arguments: ["push", fixture.bareRemotePath, `${head}:${ref}`], cwd: repositoryPath });
       return { pushed: result.exitCode === 0, observedOutput: result.stdout || result.stderr, exitCode: result.exitCode ?? 1, failureCategory: null };
     },
-    readRef: async (_repositoryPath, _endpoint, ref) => runCommand({ command: "git", arguments: ["show-ref", "--hash", ref], cwd: fixture.bareRemotePath }),
+    readRef: async (_repositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
   });
 }
 
@@ -88,7 +89,7 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
   const captureRecoveryPoint = async (state: TaskState): Promise<RecoveryPoint> => {
     const head = (await runCommand({ command: "git", arguments: ["rev-parse", "HEAD"], cwd: fixture.repositoryPath })).stdout.trim();
     const status = (await runCommand({ command: "git", arguments: ["status", "--porcelain=v1"], cwd: fixture.repositoryPath })).stdout.trim();
-    return createRecoveryPoint({ recoveryPointId: `recovery-${state.taskId}`, taskId: state.taskId, trigger: "recovery", stage: state.stage, environment: state.environment, role: state.role, head, branch: fixture.branch, workspacePath: fixture.repositoryPath, status: status || "clean", binaryPatch: "no patch required", stateManifest: state.durableContext!, verificationResults: state.verificationEvidence, createdAt: new Date().toISOString() }).recoveryPoint;
+    return createRecoveryPoint({ recoveryPointId: `recovery-${state.taskId}`, taskId: state.taskId, trigger: state.contextManifest.some((entry) => entry.startsWith("handoff-source:")) ? "handoff" : "recovery", stage: state.stage, environment: state.environment, role: state.role, head, branch: fixture.branch, workspacePath: fixture.repositoryPath, status: status || "clean", binaryPatch: "no patch required", stateManifest: state.durableContext!, verificationResults: state.verificationEvidence, createdAt: new Date().toISOString() }).recoveryPoint;
   };
   const dependencies: DAIRuntimeDependencies = {
     store, workspacePath: fixture.repositoryPath, repositoryPath: fixture.repositoryPath, skillRoots: [fixture.skillLibrary.rootPath], modelPolicies: [{ stage: "execute", role: "implementer", model: "codex-default", requiredCapabilities: ["local-execution"], compatibleEnvironments: ["codex"] }], adapters, handoffService: handoffs, bootstrapTask: bootstrap,
@@ -108,12 +109,14 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
 async function runLifecycle(fixture: KnownGoodRepositoryFixture): Promise<RuntimeFixture> {
   const runtimeFixture = await makeRuntimeFixture(fixture);
   const send = (command: Parameters<RuntimeFixture["runtime"]>[0]["command"], sourceEnvironment: Environment) => runtimeFixture.runtime({ command, sourceEnvironment, overrides: noOverrides });
-  const record = async (response: Awaited<ReturnType<RuntimeFixture["runtime"]>>): Promise<void> => { runtimeFixture.trace.responses.push({ taskId: response.taskId, stage: response.stage, environment: response.environment, status: response.status }); };
+  const record = async (response: Awaited<ReturnType<RuntimeFixture["runtime"]>>): Promise<void> => { runtimeFixture.trace.responses.push({ taskId: response.taskId, stage: response.stage, environment: response.environment, status: response.status, message: response.message }); };
   const intent = await send({ kind: "intent", text: "implement verify repository" }, "chat"); await record(intent);
   if (intent.status !== "completed") throw new Error(`Intent blocked: ${intent.message}`);
   const continued = await send({ kind: "continue", taskIdOrProject: intent.taskId }, "codex"); await record(continued);
   const status = await send({ kind: "status" }, "codex"); await record(status);
   const handoff = await send({ kind: "handoff", target: "work" }, "codex"); await record(handoff);
+  runtimeFixture.trace.handoffSnapshots.push(runtimeFixture.handoffs.status(`handoff-${intent.taskId}-1`));
+  const completedHandoff = await send({ kind: "complete", handoffId: `handoff-${intent.taskId}-1` }, "work"); await record(completedHandoff);
   runtimeFixture.trace.handoffSnapshots.push(runtimeFixture.handoffs.status(`handoff-${intent.taskId}-1`));
   const closeAttempt = await send({ kind: "close" }, "work"); await record(closeAttempt);
   return runtimeFixture;
@@ -130,8 +133,13 @@ describe("D-AI V1 end-to-end contract", () => {
     try {
       const result = await runLifecycle(fixture);
       expect(new Set(result.trace.responses.map((response) => response.taskId)).size).toBe(1);
-      expect(result.trace.responses.map((response) => response.stage)).toEqual(["verify", "verify", "verify", "handoff", "handoff"]);
-      expect(result.trace.handoffSnapshots).toEqual([{ handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, state: "active", reason: null, owner: "work" }]);
+      expect(result.trace.responses.map((response) => response.stage)).toEqual(["verify", "verify", "verify", "handoff", "verify", "close"]);
+      expect(result.trace.responses.at(-2), result.trace.responses.at(-2)?.message).toMatchObject({ taskId: result.trace.responses[0]?.taskId, stage: "verify", environment: "work", status: "completed" });
+      expect(result.trace.responses.at(-1), result.trace.responses.at(-1)?.message).toMatchObject({ taskId: result.trace.responses[0]?.taskId, stage: "close", environment: "work", status: "completed" });
+      expect(result.trace.handoffSnapshots).toEqual([
+        { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, state: "active", reason: null, owner: "work" },
+        { handoffId: `handoff-${result.trace.responses[0]?.taskId}-1`, state: "completed", reason: "Completed by work", owner: "work" },
+      ]);
       expect(result.trace.loadedSkills.map((skill) => skill.descriptor.name).sort()).toEqual([...fixture.skillLibrary.selectedSkillNames].sort());
       expect(result.trace.loadedSkills.every((skill) => skill.instructions.includes(skill.descriptor.name))).toBe(true);
       expect(result.trace.loadedSkills.every((skill) => skill.loadedResources.every((path) => path.startsWith(fixture.skillLibrary.rootPath)))).toBe(true);
@@ -155,15 +163,17 @@ describe("D-AI V1 end-to-end contract", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it("records the concrete close blocker: public handoff has no completion/verify transition", async () => {
+  it("retains exact task ownership and durable records through handoff completion and close", async () => {
     const fixture = await createKnownGoodRepository();
     try {
       const result = await runLifecycle(fixture);
-      expect(result.trace.responses.at(-1)?.status).toBe("blocked");
-      expect(result.trace.responses.at(-1)?.stage).toBe("handoff");
+      expect(result.trace.responses.at(-1)?.status).toBe("completed");
+      expect(result.trace.responses.at(-1)?.stage).toBe("close");
       const persisted = await result.store.load(result.trace.responses[0]!.taskId);
-      expect(persisted?.stage).toBe("handoff");
-      expect(persisted?.handoffState).toBe("active");
+      expect(persisted?.taskId).toBe(result.trace.responses[0]!.taskId);
+      expect(persisted?.stage).toBe("close");
+      expect(persisted?.environment).toBe("work");
+      expect(persisted?.handoffState).toBe("completed");
       expect(persisted?.durableContext).not.toBeNull();
     } finally { await fixture.cleanup(); }
   });

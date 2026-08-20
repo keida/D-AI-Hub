@@ -25,9 +25,9 @@ export interface GitHubAdapter {
   verifyRemoteState(repository: string, ref: string, expectedSha: string): Promise<RemoteState>;
 }
 
-export interface GitHubRemotePolicy {
-  readonly enterpriseHost: string | null;
-}
+export type GitHubRemotePolicy =
+  | { readonly mode: "external"; readonly enterpriseHost: string | null; readonly credentialsConfigured: boolean }
+  | { readonly mode: "test"; readonly enterpriseHost: string | null };
 
 export interface GitHubRepository {
   readonly host: string;
@@ -160,22 +160,27 @@ function parseRemoteSha(output: string, ref: string): string {
 export class GitHubCliAdapter implements GitHubAdapter {
   private readonly enterpriseHost: string | null;
   private readonly transport: GitTransport;
+  private readonly mode: GitHubRemotePolicy["mode"];
+  private readonly credentialsConfigured: boolean;
   private readonly endpoints = new Map<string, RemoteEndpoint>();
 
   private constructor(policy: GitHubRemotePolicy, transport: GitTransport) {
     this.enterpriseHost = policy.enterpriseHost === null ? null : normalizeHost(policy.enterpriseHost);
     this.transport = transport;
+    this.mode = policy.mode;
+    this.credentialsConfigured = policy.mode === "external" ? policy.credentialsConfigured : true;
   }
 
-  public static create(policy: GitHubRemotePolicy): GitHubCliAdapter {
+  public static create(policy: Extract<GitHubRemotePolicy, { readonly mode: "external" }>): GitHubCliAdapter {
     return new GitHubCliAdapter(policy, gitCliTransport);
   }
 
-  public static forTestTransport(policy: GitHubRemotePolicy, transport: GitTransport): GitHubCliAdapter {
+  public static forTestTransport(policy: Extract<GitHubRemotePolicy, { readonly mode: "test" }>, transport: GitTransport): GitHubCliAdapter {
     return new GitHubCliAdapter(policy, transport);
   }
 
   public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string): Promise<GitPushEvidence> {
+    this.assertConfigured();
     const localState = await inspectLocalGitState(repositoryPath, remote, ref);
     const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
     const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
@@ -216,6 +221,7 @@ export class GitHubCliAdapter implements GitHubAdapter {
   }
 
   public async verifyRemoteState(repository: string, ref: string, expectedSha: string): Promise<RemoteState> {
+    this.assertConfigured();
     const expected = assertExpectedSha(expectedSha);
     const parts = repository.split("/");
     const host = parts[0];
@@ -235,5 +241,11 @@ export class GitHubCliAdapter implements GitHubAdapter {
     const result = await this.transport.readRef(recordedEndpoint.repositoryPath, verificationEndpoint, ref);
     const remoteSha = parseRemoteSha(result.stdout, ref);
     return { repository, ref, remoteSha, matchesExpectedSha: remoteSha === expected };
+  }
+
+  private assertConfigured(): void {
+    if (this.mode === "external" && !this.credentialsConfigured) {
+      throw new GitRemoteBlockedError("External GitHub credentials and integration configuration are not available");
+    }
   }
 }

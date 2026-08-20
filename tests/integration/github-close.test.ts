@@ -171,7 +171,7 @@ describe("GitHub close integration", () => {
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
       const verdict = await closeTask(closeState, {
         store: storeFor(closeState),
-        gitHub: GitHubCliAdapter.forTestTransport({ enterpriseHost: null }, localBareTransport),
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
       });
 
       expect(verdict).toMatchObject({ status: "YES", reasons: [] });
@@ -200,7 +200,7 @@ describe("GitHub close integration", () => {
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
       const verdict = await closeTask(closeState, {
         store: storeFor(closeState),
-        gitHub: GitHubCliAdapter.create({ enterpriseHost: null }),
+        gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: true }),
       });
 
       expect(verdict.status).toBe("BLOCKED");
@@ -230,7 +230,7 @@ describe("GitHub close integration", () => {
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
       const verdict = await closeTask(closeState, {
         store: storeFor(closeState),
-        gitHub: GitHubCliAdapter.create({ enterpriseHost: null }),
+        gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: true }),
       });
 
       expect(verdict.status).toBe("BLOCKED");
@@ -264,7 +264,7 @@ describe("GitHub close integration", () => {
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
       const verdict = await closeTask(closeState, {
         store: storeFor(closeState),
-        gitHub: GitHubCliAdapter.create({ enterpriseHost: null }),
+        gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: true }),
       });
 
       expect(verdict.status).toBe("BLOCKED");
@@ -310,7 +310,7 @@ describe("GitHub close integration", () => {
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
       const verdict = await closeTask(closeState, {
         store: storeFor(closeState),
-        gitHub: GitHubCliAdapter.forTestTransport({ enterpriseHost: null }, malformedRemoteTransport),
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, malformedRemoteTransport),
       });
 
       expect(verdict.status).toBe("BLOCKED");
@@ -333,7 +333,7 @@ describe("GitHub close integration", () => {
       );
       const verdict = await closeTask(closeState, {
         store: storeFor(closeState),
-        gitHub: GitHubCliAdapter.create({ enterpriseHost: externalConfiguration.enterpriseHost }),
+        gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: externalConfiguration.enterpriseHost, credentialsConfigured: true }),
       });
 
       expect(verdict).toMatchObject({ status: "YES", reasons: [] });
@@ -351,16 +351,10 @@ describe("GitHub close integration", () => {
       await git(repositoryPath, ["commit", "-m", "external integration precondition"]);
       const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const missingCredentialsAdapter: GitHubAdapter = {
-        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
-          throw new GitRemoteBlockedError("External GitHub credentials and integration configuration are not available");
-        },
-        verifyRemoteState: async (): Promise<RemoteState> => {
-          throw new GitRemoteBlockedError("External GitHub verification cannot run without explicit configuration");
-        },
-      };
-
-      const verdict = await closeTask(closeState, { store: storeFor(closeState), gitHub: missingCredentialsAdapter });
+      const verdict = await closeTask(closeState, {
+        store: storeFor(closeState),
+        gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: false }),
+      });
 
       expect(verdict.status).toBe("BLOCKED");
       expect(verdict.reasons.join(" ")).toMatch(/credentials|configuration/i);

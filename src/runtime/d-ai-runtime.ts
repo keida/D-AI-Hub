@@ -120,6 +120,7 @@ const commandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("continue"), taskIdOrProject: z.string().trim().min(1) }).strict(),
   z.object({ kind: z.literal("status") }).strict(),
   z.object({ kind: z.literal("handoff"), target: environmentSchema }).strict(),
+  z.object({ kind: z.literal("complete"), handoffId: z.string().trim().min(1) }).strict(),
   z.object({ kind: z.literal("close") }).strict(),
 ]);
 const overridesSchema = z.object({
@@ -371,6 +372,10 @@ function handoffConnectorFailure(error: Error): string | null {
   return error instanceof InvalidHandoffError || error instanceof CapabilityMismatchError || error instanceof InvalidTaskStateError
     ? error.message
     : null;
+}
+
+function completionConnectorFailure(error: Error): string | null {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function closeConnectorFailure(error: Error): string | null {
@@ -859,6 +864,7 @@ async function handoffTaskExclusive(
       ...pendingState,
       environment: command.target,
       handoffState: "active",
+      contextManifest: [...pendingState.contextManifest, `handoff-source:${state.environment}`],
       routingDecision: pendingState.routingDecision === null ? null : {
         ...pendingState.routingDecision,
         environment: command.target,
@@ -901,6 +907,121 @@ async function handoffTask(
     taskId,
     () => handoffTaskExclusive(taskId, request, command, dependencies, registry),
   );
+}
+
+async function completeHandoffExclusive(
+  taskId: string,
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "complete" }>,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
+  }
+  const loadedState = await connectorOutcome(() => dependencies.store.load(taskId), completionConnectorFailure);
+  if (loadedState.kind === "blocked") {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Handoff completion blocked: ${loadedState.message}`);
+  }
+  if (loadedState.value === null) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is unavailable for handoff completion`);
+  }
+  const state = loadedState.value;
+  if (state.stage !== "handoff" || state.handoffState !== "active") {
+    return response(state, "blocked", `Task ${taskId} cannot complete a handoff from stage ${state.stage} and handoff state ${state.handoffState}`);
+  }
+  const handoffStatus = await connectorOutcome(
+    () => Promise.resolve(dependencies.adapters[request.sourceEnvironment].status(command.handoffId)),
+    completionConnectorFailure,
+  );
+  if (handoffStatus.kind === "blocked") {
+    return response(state, "blocked", `Handoff completion blocked: ${handoffStatus.message}`);
+  }
+  if (handoffStatus.value.state !== "active" || handoffStatus.value.owner !== request.sourceEnvironment) {
+    return response(state, "blocked", `Handoff ${command.handoffId} is not actively owned by ${request.sourceEnvironment}`);
+  }
+  const verifyCandidate = {
+    ...transitionState(state, "verify", "evidence-collector", request.sourceEnvironment),
+    contextManifest: [...state.contextManifest],
+  };
+  const preliminary = await connectorOutcome(
+    () => persistState(dependencies.store, verifyCandidate),
+    completionConnectorFailure,
+  );
+  if (preliminary.kind === "blocked") {
+    return response(state, "blocked", `Handoff completion persistence blocked: ${preliminary.message}`);
+  }
+  const completion = await connectorOutcome(
+    () => dependencies.handoffService.complete(command.handoffId, request.sourceEnvironment),
+    completionConnectorFailure,
+  );
+  if (completion.kind === "blocked") {
+    return response(preliminary.value, "blocked", `Handoff completion blocked: ${completion.message}`);
+  }
+  const priorRecoveryPointId = preliminary.value.recoveryPoint?.recoveryPointId;
+  if (priorRecoveryPointId === undefined) {
+    return response(preliminary.value, "blocked", "Handoff completion blocked: no prior recovery point is available");
+  }
+  const completionEvidence: VerificationEvidence = {
+    evidenceId: "gate:handoff",
+    stage: "verify",
+    environment: request.sourceEnvironment,
+    role: "evidence-collector",
+    selectedModel: preliminary.value.routingDecision?.selectedModel ?? "unrecorded-model",
+    command: `handoff complete ${command.handoffId}`,
+    observedOutput: `Handoff ${command.handoffId} completed by ${request.sourceEnvironment}`,
+    exitCode: 0,
+    interpretation: "The durable handoff service completed ownership transfer",
+    passed: true,
+    recoveryPointId: priorRecoveryPointId,
+    recordedAt: dependencies.now().toISOString(),
+  };
+  const completedState = await connectorOutcome(
+    () => persistState(dependencies.store, {
+      ...preliminary.value,
+      verificationEvidence: [...preliminary.value.verificationEvidence, completionEvidence],
+      handoffState: "completed",
+    }),
+    completionConnectorFailure,
+  );
+  if (completedState.kind === "blocked") {
+    return response(preliminary.value, "blocked", `Handoff completion persistence blocked: ${completedState.message}`);
+  }
+  const recoveryPoint = await connectorOutcome(
+    () => dependencies.captureRecoveryPoint(completedState.value),
+    completionConnectorFailure,
+  );
+  if (recoveryPoint.kind === "blocked") {
+    return response(completedState.value, "blocked", `Handoff completion recovery capture blocked: ${recoveryPoint.message}`);
+  }
+  if (recoveryPoint.value.recoveryPointId !== priorRecoveryPointId) {
+    return response(completedState.value, "blocked", "Handoff completion recovery capture returned a new identity");
+  }
+  const recoveryValidation = validateCapturedRecoveryPoint(completedState.value, recoveryPoint.value, dependencies.now());
+  if (recoveryValidation.kind === "blocked") {
+    return response(completedState.value, "blocked", `Handoff completion recovery capture blocked: ${recoveryValidation.message}`);
+  }
+  const persisted = await connectorOutcome(
+    () => persistState(dependencies.store, { ...completedState.value, recoveryPoint: recoveryValidation.value }),
+    completionConnectorFailure,
+  );
+  if (persisted.kind === "blocked") {
+    return response(completedState.value, "blocked", `Handoff completion persistence blocked: ${persisted.message}`);
+  }
+  return response(persisted.value, "completed", `Handoff ${command.handoffId} completed; task ${taskId} returned to verify`);
+}
+
+async function completeHandoff(
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "complete" }>,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  const taskId = registry.activeTaskId(request.sourceEnvironment);
+  if (taskId === null) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "No active durable task is available for handoff completion");
+  }
+  return registry.serializeMutation(taskId, () => completeHandoffExclusive(taskId, request, command, dependencies, registry));
 }
 
 async function closeActiveTaskExclusive(
@@ -965,6 +1086,7 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
     if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, registry);
     if (request.command.kind === "continue") return continueTask(request, request.command, dependencies, registry);
     if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, registry);
+    if (request.command.kind === "complete") return completeHandoff(request, request.command, dependencies, registry);
     if (request.command.kind === "close") return closeActiveTask(request, dependencies, registry);
     const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
     return state === null
@@ -1007,7 +1129,7 @@ function createDefaultDependencies(): DAIRuntimeDependencies {
   const durableRoot = join(root, ".d-ai");
   const store = new FileDurableContextStore(durableRoot);
   const handoffService = new PersistentHandoffService(new FileHandoffPersistence(join(durableRoot, "handoffs.json")));
-  const gitHub = GitHubCliAdapter.create({ enterpriseHost: null });
+  const gitHub = GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED === "1" });
   return {
     store,
     workspacePath: root,

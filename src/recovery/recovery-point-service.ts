@@ -63,7 +63,7 @@ function assertVerificationEvidence(
   if (createdAt - recordedAt > maximumVerificationAgeMs) throw new InvalidTaskStateError("Verification evidence is stale for recovery capture");
   if (!verification.passed) throw new InvalidTaskStateError("Verification evidence must have passed before recovery capture");
   if (verification.exitCode !== 0) throw new InvalidTaskStateError("Passed verification evidence must have exit code 0");
-  if (verification.environment !== input.environment) throw new InvalidTaskStateError("Verification evidence environment must match the recovery environment");
+  if (verification.environment !== input.environment && input.trigger !== "handoff") throw new InvalidTaskStateError("Verification evidence environment must match the recovery environment outside a handoff recovery capture");
   if (verification.recoveryPointId !== input.stateManifest.recoveryPointId) {
     throw new InvalidTaskStateError("Verification evidence recovery point must match the state manifest");
   }
