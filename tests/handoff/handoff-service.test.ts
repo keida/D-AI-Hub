@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -124,7 +124,8 @@ describe("PersistentHandoffService", () => {
       const restarted = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       await restarted.ready();
       expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: "work" });
-      await writeFile(persistencePath, (await readFile(persistencePath, "utf8")).replace('"owner":"work"', '"owner":"codex"'), "utf8");
+      const committedPath = join(`${persistencePath}.lock`, "2", "committed", "snapshot.json");
+      await writeFile(committedPath, (await readFile(committedPath, "utf8")).replace('"owner":"work"', '"owner":"codex"'), "utf8");
       const tampered = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       await expect(tampered.ready()).rejects.toThrow(InvalidHandoffError);
     } finally { await rm(directory, { recursive: true, force: true }); }
@@ -440,6 +441,40 @@ describe("PersistentHandoffService", () => {
     }
   });
 
+  it("keeps generation 2 authoritative when generation 1 save resumes after expiry", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    const envelope = await service().create({ state: state("chat"), targetEnvironment: "work" });
+    const newerRecords: readonly HandoffPersistenceRecord[] = [{ envelope, owner: null, state: "pending", reason: null }];
+    const successorPersistence = new FileHandoffPersistence(persistencePath);
+    const staleHolderPersistence = new FileHandoffPersistence(persistencePath, {
+      afterReleaseLockQuarantine: null,
+      afterSaveLockOwnershipCheck: async () => {
+        const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
+        await utimes(join(lockPath, "1", "lease"), expiredAt, expiredAt);
+        await successorPersistence.withExclusive(async () => {
+          await successorPersistence.save(newerRecords);
+        });
+      },
+    });
+    try {
+      await expect(staleHolderPersistence.withExclusive(async () => {
+        await staleHolderPersistence.save([]);
+      })).rejects.toThrow(InvalidHandoffError);
+
+      const nextPersistence = new FileHandoffPersistence(persistencePath);
+      let loaded: readonly HandoffPersistenceRecord[] = [];
+      await nextPersistence.withExclusive(async () => {
+        loaded = await nextPersistence.load();
+      });
+      expect(loaded).toEqual(newerRecords);
+      expect((await stat(join(lockPath, "3", "lease"))).isFile()).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a successor lock intact when stale release resumes after successor acquisition", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");
@@ -480,6 +515,32 @@ describe("PersistentHandoffService", () => {
       await rm(directory, { recursive: true, force: true });
     }
   }, 1_000);
+
+  it("recovers after release marker publication is interrupted before commit", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    let temporaryMarkerObserved = false;
+    const interruptedPersistence = new FileHandoffPersistence(persistencePath, {
+      afterReleaseLockQuarantine: async () => {
+        temporaryMarkerObserved = (await readdir(join(lockPath, "1"))).some((entry) => /^\.released\..+\.tmp$/.test(entry));
+        const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
+        await utimes(join(lockPath, "1", "lease"), expiredAt, expiredAt);
+        throw new Error("Simulated interrupted release marker publication");
+      },
+    });
+    try {
+      await expect(interruptedPersistence.withExclusive(async () => {})).rejects.toThrow(InvalidHandoffError);
+      expect(temporaryMarkerObserved).toBe(true);
+
+      let successorEntered = false;
+      await new FileHandoffPersistence(persistencePath).withExclusive(async () => { successorEntered = true; });
+      expect(successorEntered).toBe(true);
+      expect((await stat(join(lockPath, "2", "released"))).isFile()).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   it("wraps file lock preparation failures in InvalidHandoffError", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));

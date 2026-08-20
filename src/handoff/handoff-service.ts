@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { z } from "zod";
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../domain/errors.js";
 import type { Environment, TaskState } from "../domain/types.js";
@@ -35,10 +35,12 @@ const fileHandoffLockAcquireMarginMs = 1_000;
 const fileHandoffLockOwnerFile = "owner";
 const fileHandoffLockLeaseFile = "lease";
 const fileHandoffLockReleasedFile = "released";
+const fileHandoffCommittedDirectory = "committed";
+const fileHandoffCommittedSnapshotFile = "snapshot.json";
 
 interface FileLockOwner { readonly lockPath: string; readonly token: string; }
 interface FileLockGeneration { readonly lockPath: string; readonly generation: bigint; }
-export interface FileHandoffPersistenceOptions { readonly afterReleaseLockQuarantine: (() => Promise<void>) | null; }
+export interface FileHandoffPersistenceOptions { readonly afterReleaseLockQuarantine: (() => Promise<void>) | null; readonly afterSaveLockOwnershipCheck?: (() => Promise<void>) | null; }
 
 function issueReason(result: { readonly error: z.ZodError }): string { const issue = result.error.issues[0]; return issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`; }
 function parseTarget(target: EnvironmentCapabilities): EnvironmentCapabilities { const result = targetSchema.safeParse(target); if (!result.success) throw new CapabilityMismatchError(`Invalid handoff target capabilities: ${issueReason(result)}`); return { environment: result.data.environment, capabilities: new Set(result.data.capabilities) }; }
@@ -87,14 +89,20 @@ export class InMemoryHandoffPersistence implements HandoffPersistence {
 export class FileHandoffPersistence implements HandoffPersistence {
   private readonly lockOwners = new AsyncLocalStorage<FileLockOwner>();
   private readonly afterReleaseLockQuarantine: (() => Promise<void>) | null;
+  private readonly afterSaveLockOwnershipCheck: (() => Promise<void>) | null;
   public constructor(filePath: string);
   public constructor(filePath: string, options: FileHandoffPersistenceOptions);
-  public constructor(private readonly filePath: string, options?: FileHandoffPersistenceOptions) { this.afterReleaseLockQuarantine = options === undefined ? null : options.afterReleaseLockQuarantine; }
+  public constructor(private readonly filePath: string, options?: FileHandoffPersistenceOptions) {
+    this.afterReleaseLockQuarantine = options === undefined ? null : options.afterReleaseLockQuarantine;
+    this.afterSaveLockOwnershipCheck = options?.afterSaveLockOwnershipCheck ?? null;
+  }
   public async load(): Promise<readonly HandoffPersistenceRecord[]> {
     try {
       await this.assertCurrentLockOwnership();
-      let content: string;
-      try { content = await readFile(this.filePath, "utf8"); } catch (error) { if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return []; throw error; }
+      let content = await this.readLatestCommittedSnapshot();
+      if (content === null) {
+        try { content = await readFile(this.filePath, "utf8"); } catch (error) { if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return []; throw error; }
+      }
       const parsedDocument: object = JSON.parse(content);
       const document = persistenceDocumentSchema.safeParse(parsedDocument);
       if (!document.success) throw new InvalidHandoffError(`Invalid handoff persistence at ${this.filePath}: ${issueReason(document)}`);
@@ -104,18 +112,21 @@ export class FileHandoffPersistence implements HandoffPersistence {
     } catch (error) { if (error instanceof InvalidHandoffError) throw error; throw new InvalidHandoffError(`Invalid handoff persistence at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`); }
   }
   public async save(records: readonly HandoffPersistenceRecord[]): Promise<void> {
-    let temporaryPath: string | null = null;
+    const owner = this.lockOwners.getStore();
+    if (owner === undefined) {
+      await this.withExclusive(async () => { await this.save(records); });
+      return;
+    }
     try {
-      await this.assertCurrentLockOwnership();
+      await this.assertLockOwnership(owner);
       const normalized = parsePersistenceRecords({ records: records.map(cloneRecord) });
-      const parent = dirname(this.filePath);
-      temporaryPath = join(parent, `.${basename(this.filePath)}.${randomUUID()}.tmp`);
-      await mkdir(parent, { recursive: true });
-      await writeFile(temporaryPath, JSON.stringify({ records: normalized, integrityHash: persistenceHash(normalized) }), { encoding: "utf8", flag: "wx" });
-      await this.assertCurrentLockOwnership();
-      await rename(temporaryPath, this.filePath);
+      const temporaryPath = join(owner.lockPath, `.${fileHandoffCommittedDirectory}.${randomUUID()}.tmp`);
+      await mkdir(temporaryPath);
+      await writeFile(join(temporaryPath, fileHandoffCommittedSnapshotFile), JSON.stringify({ records: normalized, integrityHash: persistenceHash(normalized) }), { encoding: "utf8", flag: "wx" });
+      await this.assertLockOwnership(owner);
+      if (this.afterSaveLockOwnershipCheck !== null) await this.afterSaveLockOwnershipCheck();
+      await rename(temporaryPath, join(owner.lockPath, fileHandoffCommittedDirectory));
     } catch (error) {
-      if (temporaryPath !== null) await rm(temporaryPath, { force: true });
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to persist handoffs at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -172,14 +183,42 @@ export class FileHandoffPersistence implements HandoffPersistence {
     throw new InvalidHandoffError(`Timed out acquiring handoff persistence lock at ${this.filePath}`);
   }
   private async latestLockGeneration(lockPath: string): Promise<FileLockGeneration | null> {
-    const entries = await readdir(lockPath, { withFileTypes: true });
-    let latest: FileLockGeneration | null = null;
+    const generations = await this.lockGenerations(lockPath);
+    return generations[0] ?? null;
+  }
+  private async lockGenerations(lockPath: string): Promise<readonly FileLockGeneration[]> {
+    let entries;
+    try {
+      entries = await readdir(lockPath, { withFileTypes: true });
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return [];
+      throw new InvalidHandoffError(`Unable to inspect handoff persistence lock generations at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const generations: FileLockGeneration[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) throw new InvalidHandoffError(`Invalid handoff persistence lock generation at ${this.filePath}: ${entry.name}`);
-      const generation = BigInt(entry.name);
-      if (latest === null || generation > latest.generation) latest = { lockPath: join(lockPath, entry.name), generation };
+      generations.push({ lockPath: join(lockPath, entry.name), generation: BigInt(entry.name) });
     }
-    return latest;
+    return generations.sort((left, right) => left.generation === right.generation ? 0 : left.generation > right.generation ? -1 : 1);
+  }
+  private async readLatestCommittedSnapshot(): Promise<string | null> {
+    for (const generation of await this.lockGenerations(`${this.filePath}.lock`)) {
+      const committedPath = join(generation.lockPath, fileHandoffCommittedDirectory);
+      let committedStats;
+      try {
+        committedStats = await stat(committedPath);
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue;
+        throw new InvalidHandoffError(`Unable to inspect committed handoff persistence at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!committedStats.isDirectory()) throw new InvalidHandoffError(`Invalid committed handoff persistence at ${this.filePath}: committed path is not a directory`);
+      try {
+        return await readFile(join(committedPath, fileHandoffCommittedSnapshotFile), "utf8");
+      } catch (error) {
+        throw new InvalidHandoffError(`Unable to read committed handoff persistence at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return null;
   }
   private async isLockReleased(lockPath: string): Promise<boolean> {
     let releasedToken: string;
@@ -223,8 +262,10 @@ export class FileHandoffPersistence implements HandoffPersistence {
   private async releaseLock(owner: FileLockOwner): Promise<void> {
     try {
       await this.assertLockOwnership(owner);
+      const temporaryPath = join(owner.lockPath, `.${fileHandoffLockReleasedFile}.${randomUUID()}.tmp`);
+      await writeFile(temporaryPath, owner.token, { encoding: "utf8", flag: "wx" });
       if (this.afterReleaseLockQuarantine !== null) await this.afterReleaseLockQuarantine();
-      await writeFile(join(owner.lockPath, fileHandoffLockReleasedFile), owner.token, { encoding: "utf8", flag: "wx" });
+      await rename(temporaryPath, join(owner.lockPath, fileHandoffLockReleasedFile));
     } catch (error) {
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to release handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
