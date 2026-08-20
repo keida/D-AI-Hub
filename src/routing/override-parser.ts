@@ -48,12 +48,19 @@ function parseEnvironment(value: string): Environment {
 }
 
 export function parseRoutingOverrides(tokens: readonly string[]): RoutingOverrides {
+  if (!Array.isArray(tokens)) {
+    throw new InvalidTaskStateError("Routing override tokens must be an array.");
+  }
+
   let model: string | null = null;
   let role: Role | null = null;
   let environment: Environment | null = null;
   const keys = new Set<string>();
 
-  for (const token of tokens) {
+  for (const [index, token] of tokens.entries()) {
+    if (typeof token !== "string") {
+      throw new InvalidTaskStateError(`Routing override at index=${index} must be a string.`);
+    }
     const [key, value] = parseToken(token);
     if (keys.has(key)) {
       throw new InvalidTaskStateError(`Duplicate routing override key: ${key}`);

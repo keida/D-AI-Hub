@@ -32,4 +32,13 @@ describe("parseRoutingOverrides", () => {
     expect(() => parseRoutingOverrides(tokens)).toThrow(InvalidTaskStateError);
     expect(() => parseRoutingOverrides(tokens)).toThrowError(expectedMessage);
   });
+
+  it.each([
+    [null as never, "Routing override tokens must be an array."],
+    [[null] as never, "Routing override at index=0 must be a string."],
+    [["model=   "] as never, "Routing override model must not have an empty value"],
+  ])("rejects malformed runtime inputs", (tokens, expectedMessage) => {
+    expect(() => parseRoutingOverrides(tokens)).toThrow(InvalidTaskStateError);
+    expect(() => parseRoutingOverrides(tokens)).toThrowError(expectedMessage);
+  });
 });
