@@ -6,17 +6,22 @@
 - URL / repository path: `https://github.com/keida/D-AI-Hub`
 - Why it matters: canonical private source for Skills, knowledge, project memory, prompts, templates, and indexes.
 - Accessed / reviewed: 2026-08-20
-- Local note: current authenticated `main` snapshot was commit `791114d50ba86857bbae4322af93831b03b2cbca` with tree `8a203f6900e4fa636297d418e6ecf320b29f1216`.
+- Canonical branch: `main`.
 
 ## Local checkout
 
 - Title: D-AI-Hub local working copy
-- URL / repository path: `C:\Users\User\Documents\ChatGPT\D-AI-Hub`
-- Why it matters: local filesystem used by Codex for reading canonical context and maintaining repository state.
+- URL / repository path: environment-specific local checkout
+- Why it matters: local filesystem used by Codex or another compatible agent for reading context and maintaining repository state.
 - Accessed / reviewed: 2026-08-20
-- Local note: branch is `main`; content-level verification passed for 34 files. Local Git HTTPS authentication remains unresolved.
+- Local note: local paths and transient snapshot identifiers differ by machine and are intentionally not stored as canonical project state. Verify sync against GitHub before treating a checkout as current.
 
 ## Repository guidance
+
+- Title: D-AI-Hub Agent Bootstrap
+- URL / repository path: `AGENTS.md`
+- Why it matters: defines session-start, canonical ownership, security, branch, and session-close rules for agents.
+- Accessed / reviewed: 2026-08-20
 
 - Title: D-AI-Hub README
 - URL / repository path: `README.md`
