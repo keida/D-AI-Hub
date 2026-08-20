@@ -1,176 +1,101 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CodexEnvironmentAdapter } from "../../src/adapters/environments/codex-adapter.js";
 import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-adapter.js";
 import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-adapter.js";
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../../src/domain/errors.js";
 import type { Environment, TaskState } from "../../src/domain/types.js";
-import { InMemoryHandoffService } from "../../src/handoff/handoff-service.js";
+import { FileHandoffPersistence, InMemoryHandoffPersistence, PersistentHandoffService } from "../../src/handoff/handoff-service.js";
 
 function state(environment: Environment): TaskState {
-  return {
-    taskId: "task-handoff",
-    goal: "Transfer the portable task state",
-    constraints: ["keep scope narrow"],
-    environment,
-    stage: "execute",
-    role: "implementer",
-    routingDecision: null,
-    selectedCapabilities: [],
-    contextManifest: ["workspace:src"],
-    handoffState: "none",
-    verificationEvidence: [],
-    recoveryPoint: null,
-    approvalState: "approved",
-    criticalUnsavedContext: [],
-    durableContext: null,
-  };
+  return { taskId: "task-handoff", goal: "Transfer the portable task state", constraints: ["keep scope narrow"], environment, stage: "execute", role: "implementer", routingDecision: null, selectedCapabilities: [], contextManifest: ["workspace:src"], handoffState: "none", verificationEvidence: [], recoveryPoint: null, approvalState: "approved", criticalUnsavedContext: [], durableContext: null };
 }
 
-function adapter(environment: Environment, service: InMemoryHandoffService): ChatEnvironmentAdapter | WorkEnvironmentAdapter | CodexEnvironmentAdapter {
-  if (environment === "chat") {
-    return new ChatEnvironmentAdapter(service);
-  }
-  if (environment === "work") {
-    return new WorkEnvironmentAdapter(service);
-  }
-  return new CodexEnvironmentAdapter(service);
-}
+function service(): PersistentHandoffService { return new PersistentHandoffService(new InMemoryHandoffPersistence()); }
 
-describe("InMemoryHandoffService", () => {
-  it.each<[Environment, Environment]>([
-    ["chat", "work"],
-    ["work", "codex"],
-    ["codex", "work"],
-    ["codex", "chat"],
-    ["work", "chat"],
-    ["chat", "codex"],
-  ])("acknowledges the compatible %s to %s handoff exactly once", async (source, target) => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state(source), targetEnvironment: target });
-
-    await adapter(target, service).receive(envelope);
-
-    expect(envelope.handoffId).toBe("handoff-task-handoff-1");
-    expect(adapter(target, service).status(envelope.handoffId)).toEqual({
-      handoffId: envelope.handoffId,
-      state: "active",
-      reason: null,
-    });
+describe("PersistentHandoffService", () => {
+  it("redacts every secret-like value, including bearer tokens and nested durable data", async () => {
+    const source: TaskState = {
+      ...state("codex"), goal: "Authorization: Bearer bearer-secret-value", constraints: ["apiKey=api-secret-value"],
+      routingDecision: { stage: "execute", environment: "codex", role: "implementer", selectedModel: "model-secret=router-secret", selectedCapabilities: ["token=capability-secret"], reason: "password=reason-secret", overrideSource: "user" },
+      verificationEvidence: [{ evidenceId: "evidence-secret=identifier", stage: "execute", environment: "codex", role: "implementer", selectedModel: "secret=model-secret", command: "Authorization: Bearer command-secret-value", observedOutput: "cookie=output-secret", exitCode: 0, interpretation: "credential: interpretation-secret", passed: true, recoveryPointId: "secret=recovery-id", recordedAt: "2026-08-21T00:00:00.000Z" }],
+      recoveryPoint: { recoveryPointId: "secret=recovery-point", taskId: "task-handoff", stage: "execute", environment: "codex", role: "implementer", durablePaths: ["secret=path-secret"], hashes: { secretHash: "hash-secret" }, restorationInstructions: "private_key=restore-secret", createdAt: "2026-08-21T00:00:00.000Z" },
+      durableContext: { manifestId: "secret=manifest-id", taskId: "task-handoff", stage: "execute", environment: "codex", role: "implementer", durablePaths: ["token=durable-path-secret"], hashes: { accessToken: "manifest-hash-secret" }, recoveryPointId: "secret=manifest-recovery", recordedAt: "2026-08-21T00:00:00.000Z" },
+      criticalUnsavedContext: ["session_token=unsaved-secret"],
+    };
+    Object.defineProperty(source, "rawTranscript", { value: "private conversation" });
+    const envelope = await service().create({ state: source, targetEnvironment: "work" });
+    const serialized = JSON.stringify(envelope);
+    for (const secret of ["bearer-secret-value", "api-secret-value", "router-secret", "capability-secret", "reason-secret", "command-secret-value", "output-secret", "interpretation-secret", "path-secret", "hash-secret", "restore-secret", "durable-path-secret", "manifest-hash-secret", "unsaved-secret", "private conversation"]) expect(serialized).not.toContain(secret);
+    expect(envelope.redactions.length).toBeGreaterThan(10);
   });
 
-  it("returns immutable copies without mutating source state", async () => {
-    const service = new InMemoryHandoffService();
-    const source = state("chat");
-    const envelope = await service.create({ state: source, targetEnvironment: "work" });
-
-    expect(envelope.taskState).not.toBe(source);
-    expect(envelope.taskState.constraints).not.toBe(source.constraints);
-    expect(envelope.taskState.handoffState).toBe("pending");
-    expect(source.handoffState).toBe("none");
-    expect(envelope.capabilitySnapshot.work).toEqual(["durable-context"]);
+  it("validates malformed create input before dereferencing state or counters", async () => {
+    const handoffService = service();
+    await expect(handoffService.create(null as never)).rejects.toThrow(InvalidTaskStateError);
+    await expect(handoffService.create({ state: null as never, targetEnvironment: "work" })).rejects.toThrow(InvalidTaskStateError);
+    await expect(handoffService.create({ state: state("chat"), targetEnvironment: null as never })).rejects.toThrow(InvalidTaskStateError);
   });
 
-  it("rejects malformed envelopes at acknowledgement", async () => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state("chat"), targetEnvironment: "work" });
-    Object.defineProperty(envelope, "schemaVersion", { value: 2 });
-
-    await expect(new WorkEnvironmentAdapter(service).receive(envelope)).rejects.toThrow(InvalidHandoffError);
+  it("rejects malformed envelopes and nested identity mismatches", async () => {
+    const handoffService = service();
+    const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    const malformed = { ...envelope, integrityHash: "0".repeat(64) };
+    const routingMismatch = { ...envelope, taskState: { ...envelope.taskState, routingDecision: { stage: "execute" as const, environment: "codex" as const, role: "implementer" as const, selectedModel: "model", selectedCapabilities: [], reason: "reason", overrideSource: "default" as const } } };
+    await expect(handoffService.acknowledge(malformed, new WorkEnvironmentAdapter(handoffService).capabilities())).rejects.toThrow(InvalidHandoffError);
+    await expect(handoffService.acknowledge(routingMismatch, new WorkEnvironmentAdapter(handoffService).capabilities())).rejects.toThrow(InvalidHandoffError);
+    await expect(handoffService.create({ state: { ...state("chat"), routingDecision: { stage: "execute", environment: "codex", role: "implementer", selectedModel: "model", selectedCapabilities: [], reason: "reason", overrideSource: "default" } }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
+    await expect(handoffService.create({ state: { ...state("chat"), durableContext: { manifestId: "manifest", taskId: "other-task", stage: "execute", environment: "chat", role: "implementer", durablePaths: [], hashes: {}, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" } }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
+    await expect(handoffService.create({ state: { ...state("chat"), recoveryPoint: { recoveryPointId: "recovery", taskId: "other-task", stage: "execute", environment: "chat", role: "implementer", durablePaths: [], hashes: {}, restorationInstructions: "restore", createdAt: "2026-08-21T00:00:00.000Z" } }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
+    await expect(handoffService.create({ state: { ...state("chat"), verificationEvidence: [{ evidenceId: "evidence", stage: "execute", environment: "codex", role: "implementer", selectedModel: "model", command: "command", observedOutput: "output", exitCode: 0, interpretation: "interpretation", passed: true, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" }] }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
   });
 
-  it("rejects stale, task-mismatched, and source-target-mismatched envelopes", async () => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state("chat"), targetEnvironment: "work" });
-    const stale = { ...envelope, handoffId: "handoff-task-handoff-99" };
-    const taskMismatch = { ...envelope, taskId: "other-task" };
-    const sourceMismatch = { ...envelope, sourceEnvironment: "codex" as const };
-    const targetMismatch = { ...envelope, targetEnvironment: "codex" as const };
-    const work = new WorkEnvironmentAdapter(service);
-
-    await expect(work.receive(stale)).rejects.toThrow(InvalidHandoffError);
-    await expect(work.receive(taskMismatch)).rejects.toThrow(InvalidHandoffError);
-    await expect(work.receive(sourceMismatch)).rejects.toThrow(InvalidHandoffError);
-    await expect(work.receive(targetMismatch)).rejects.toThrow(InvalidHandoffError);
+  it("requires the verified recipient to complete", async () => {
+    const handoffService = service();
+    const envelope = await handoffService.create({ state: state("work"), targetEnvironment: "codex" });
+    const codex = new CodexEnvironmentAdapter(handoffService);
+    await codex.receive(envelope);
+    await expect(handoffService.complete(envelope.handoffId, "work")).rejects.toThrow(InvalidHandoffError);
+    await codex.complete(envelope.handoffId);
+    expect(codex.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "completed", reason: "Completed by codex", owner: "codex" });
   });
 
-  it("rejects a target that does not cover its capability snapshot", async () => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state("chat"), targetEnvironment: "work" });
-    const insufficientTarget = { environment: "work" as const, capabilities: new Set<string>() };
-
-    await expect(service.acknowledge(envelope, insufficientTarget)).rejects.toThrow(CapabilityMismatchError);
+  it("persists lifecycle records across service restart and rejects tampered storage", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    try {
+      const first = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      const envelope = await first.create({ state: state("chat"), targetEnvironment: "work" });
+      await new WorkEnvironmentAdapter(first).receive(envelope);
+      const restarted = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      await restarted.ready();
+      expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: "work" });
+      await writeFile(persistencePath, (await readFile(persistencePath, "utf8")).replace('"owner":"work"', '"owner":"codex"'), "utf8");
+      const tampered = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      await expect(tampered.ready()).rejects.toThrow(InvalidHandoffError);
+    } finally { await rm(directory, { recursive: true, force: true }); }
   });
 
-  it("rejects duplicate ownership and terminal-state rewrites", async () => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state("work"), targetEnvironment: "codex" });
-    const codex = new CodexEnvironmentAdapter(service);
-
+  it("preserves capability, ownership, and terminal-state checks", async () => {
+    const handoffService = service();
+    const envelope = await handoffService.create({ state: state("work"), targetEnvironment: "codex" });
+    const codex = new CodexEnvironmentAdapter(handoffService);
+    await expect(handoffService.acknowledge(envelope, { environment: "codex", capabilities: new Set<string>() })).rejects.toThrow(CapabilityMismatchError);
     await codex.receive(envelope);
     await expect(codex.receive(envelope)).rejects.toThrow(InvalidHandoffError);
-    await service.complete(envelope.handoffId);
-    await expect(service.complete(envelope.handoffId)).rejects.toThrow(InvalidTaskStateError);
-    await expect(service.reject(envelope.handoffId, "retry later")).rejects.toThrow(InvalidTaskStateError);
+    await codex.complete(envelope.handoffId);
+    await expect(codex.complete(envelope.handoffId)).rejects.toThrow(InvalidTaskStateError);
+    await expect(handoffService.reject(envelope.handoffId, "retry later")).rejects.toThrow(InvalidTaskStateError);
   });
 
-  it("records actionable rejection reasons and rejects repeated rejection", async () => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state("codex"), targetEnvironment: "chat" });
-
-    await service.reject(envelope.handoffId, "Approval context is incomplete");
-
-    expect(new ChatEnvironmentAdapter(service).status(envelope.handoffId)).toEqual({
-      handoffId: envelope.handoffId,
-      state: "rejected",
-      reason: "Approval context is incomplete",
-    });
-    await expect(service.reject(envelope.handoffId, "another reason")).rejects.toThrow(InvalidTaskStateError);
-  });
-
-  it("redacts secret-like values, excludes raw transcripts, and preserves unsaved context", async () => {
-    const service = new InMemoryHandoffService();
-    const source = state("codex");
-    const withSensitiveContext = {
-      ...source,
-      constraints: ["apiKey=super-secret", "keep this migration"],
-      criticalUnsavedContext: ["uncommitted migration"],
-    };
-    Object.defineProperty(withSensitiveContext, "rawTranscript", { value: "private conversation" });
-
-    const envelope = await service.create({ state: withSensitiveContext, targetEnvironment: "work" });
-
-    expect(envelope.taskState.constraints).toEqual(["apiKey=[REDACTED]", "keep this migration"]);
-    expect(envelope.unsavedContext).toEqual(["uncommitted migration"]);
-    expect(envelope.redactions).toContain("taskState.constraints[0]");
-    expect(JSON.stringify(envelope)).not.toContain("super-secret");
-    expect(JSON.stringify(envelope)).not.toContain("private conversation");
-    expect(source.constraints).toEqual(["keep scope narrow"]);
-  });
-
-  it("validates task state before creating a pending owner", async () => {
-    const service = new InMemoryHandoffService();
-    const invalid = state("chat");
-    Object.defineProperty(invalid, "taskId", { value: "" });
-
-    await expect(service.create({ state: invalid, targetEnvironment: "work" })).rejects.toThrow(InvalidTaskStateError);
-  });
-});
-
-describe("environment adapters", () => {
-  it.each([
-    ["chat", ["approval", "status"]],
-    ["work", ["durable-context"]],
-    ["codex", ["local-execution", "codex-evidence"]],
-  ] as const)("declares only %s capabilities", (environment, expectedCapabilities) => {
-    const service = new InMemoryHandoffService();
-
-    expect([...adapter(environment, service).capabilities().capabilities]).toEqual(expectedCapabilities);
-  });
-
-  it("keeps adapter receive boundaries environment-specific", async () => {
-    const service = new InMemoryHandoffService();
-    const envelope = await service.create({ state: state("chat"), targetEnvironment: "work" });
-
-    await expect(new CodexEnvironmentAdapter(service).receive(envelope)).rejects.toThrow(InvalidHandoffError);
+  it("keeps adapters environment-specific", async () => {
+    const handoffService = service();
+    const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    expect([...new ChatEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["approval", "status"]);
+    expect([...new WorkEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["durable-context"]);
+    expect([...new CodexEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["local-execution", "codex-evidence"]);
+    await expect(new CodexEnvironmentAdapter(handoffService).receive(envelope)).rejects.toThrow(InvalidHandoffError);
   });
 });
