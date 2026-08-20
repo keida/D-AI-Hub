@@ -131,6 +131,29 @@ describe("PersistentHandoffService", () => {
     } finally { await rm(directory, { recursive: true, force: true }); }
   });
 
+  it("loads the latest state after two saves in one file transaction", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const envelope = await service().create({ state: state("chat"), targetEnvironment: "work" });
+    const latestRecords: readonly HandoffPersistenceRecord[] = [{ envelope, owner: null, state: "pending", reason: null }];
+    try {
+      const persistence = new FileHandoffPersistence(persistencePath);
+      await persistence.withExclusive(async () => {
+        await persistence.save([]);
+        await persistence.save(latestRecords);
+      });
+
+      const restarted = new FileHandoffPersistence(persistencePath);
+      let loaded: readonly HandoffPersistenceRecord[] = [];
+      await restarted.withExclusive(async () => {
+        loaded = await restarted.load();
+      });
+      expect(loaded).toEqual(latestRecords);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("preserves capability, ownership, and terminal-state checks", async () => {
     const handoffService = service();
     const envelope = await handoffService.create({ state: state("work"), targetEnvironment: "codex" });

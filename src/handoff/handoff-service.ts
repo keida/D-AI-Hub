@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
+import type { Dirent } from "node:fs";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
@@ -40,6 +41,7 @@ const fileHandoffCommittedSnapshotFile = "snapshot.json";
 
 interface FileLockOwner { readonly lockPath: string; readonly token: string; }
 interface FileLockGeneration { readonly lockPath: string; readonly generation: bigint; }
+interface FileCommittedSnapshot { readonly snapshotPath: string; readonly sequence: bigint; }
 export interface FileHandoffPersistenceOptions { readonly afterReleaseLockQuarantine: (() => Promise<void>) | null; readonly afterSaveLockOwnershipCheck?: (() => Promise<void>) | null; }
 
 function issueReason(result: { readonly error: z.ZodError }): string { const issue = result.error.issues[0]; return issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`; }
@@ -120,12 +122,16 @@ export class FileHandoffPersistence implements HandoffPersistence {
     try {
       await this.assertLockOwnership(owner);
       const normalized = parsePersistenceRecords({ records: records.map(cloneRecord) });
+      const snapshotSequence = await this.nextCommittedSnapshotSequence(owner.lockPath);
       const temporaryPath = join(owner.lockPath, `.${fileHandoffCommittedDirectory}.${randomUUID()}.tmp`);
+      const committedPath = snapshotSequence === 1n
+        ? join(owner.lockPath, fileHandoffCommittedDirectory)
+        : join(owner.lockPath, `${fileHandoffCommittedDirectory}-${snapshotSequence.toString()}`);
       await mkdir(temporaryPath);
       await writeFile(join(temporaryPath, fileHandoffCommittedSnapshotFile), JSON.stringify({ records: normalized, integrityHash: persistenceHash(normalized) }), { encoding: "utf8", flag: "wx" });
       await this.assertLockOwnership(owner);
       if (this.afterSaveLockOwnershipCheck !== null) await this.afterSaveLockOwnershipCheck();
-      await rename(temporaryPath, join(owner.lockPath, fileHandoffCommittedDirectory));
+      await rename(temporaryPath, committedPath);
     } catch (error) {
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to persist handoffs at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
@@ -187,7 +193,7 @@ export class FileHandoffPersistence implements HandoffPersistence {
     return generations[0] ?? null;
   }
   private async lockGenerations(lockPath: string): Promise<readonly FileLockGeneration[]> {
-    let entries;
+    let entries: Dirent<string>[];
     try {
       entries = await readdir(lockPath, { withFileTypes: true });
     } catch (error) {
@@ -201,19 +207,40 @@ export class FileHandoffPersistence implements HandoffPersistence {
     }
     return generations.sort((left, right) => left.generation === right.generation ? 0 : left.generation > right.generation ? -1 : 1);
   }
+  private async committedSnapshots(generationPath: string): Promise<readonly FileCommittedSnapshot[]> {
+    let entries: Dirent<string>[];
+    try {
+      entries = await readdir(generationPath, { withFileTypes: true });
+    } catch (error) {
+      throw new InvalidHandoffError(`Unable to inspect committed handoff snapshots at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const snapshots: FileCommittedSnapshot[] = [];
+    for (const entry of entries) {
+      let sequence: bigint | null = null;
+      if (entry.name === fileHandoffCommittedDirectory) {
+        sequence = 1n;
+      } else if (entry.name.startsWith(`${fileHandoffCommittedDirectory}-`)) {
+        const match: RegExpExecArray | null = /^committed-([1-9][0-9]*)$/.exec(entry.name);
+        if (match === null || match[1] === undefined || match[1] === "1") throw new InvalidHandoffError(`Invalid committed handoff snapshot at ${this.filePath}: ${entry.name}`);
+        sequence = BigInt(match[1]);
+      }
+      if (sequence === null) continue;
+      if (!entry.isDirectory()) throw new InvalidHandoffError(`Invalid committed handoff snapshot at ${this.filePath}: ${entry.name} is not a directory`);
+      snapshots.push({ snapshotPath: join(generationPath, entry.name), sequence });
+    }
+    return snapshots.sort((left, right) => left.sequence === right.sequence ? 0 : left.sequence > right.sequence ? -1 : 1);
+  }
+  private async nextCommittedSnapshotSequence(generationPath: string): Promise<bigint> {
+    const snapshots: readonly FileCommittedSnapshot[] = await this.committedSnapshots(generationPath);
+    return (snapshots[0]?.sequence ?? 0n) + 1n;
+  }
   private async readLatestCommittedSnapshot(): Promise<string | null> {
     for (const generation of await this.lockGenerations(`${this.filePath}.lock`)) {
-      const committedPath = join(generation.lockPath, fileHandoffCommittedDirectory);
-      let committedStats;
+      const snapshots: readonly FileCommittedSnapshot[] = await this.committedSnapshots(generation.lockPath);
+      const latestSnapshot: FileCommittedSnapshot | undefined = snapshots[0];
+      if (latestSnapshot === undefined) continue;
       try {
-        committedStats = await stat(committedPath);
-      } catch (error) {
-        if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") continue;
-        throw new InvalidHandoffError(`Unable to inspect committed handoff persistence at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      if (!committedStats.isDirectory()) throw new InvalidHandoffError(`Invalid committed handoff persistence at ${this.filePath}: committed path is not a directory`);
-      try {
-        return await readFile(join(committedPath, fileHandoffCommittedSnapshotFile), "utf8");
+        return await readFile(join(latestSnapshot.snapshotPath, fileHandoffCommittedSnapshotFile), "utf8");
       } catch (error) {
         throw new InvalidHandoffError(`Unable to read committed handoff persistence at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
       }
