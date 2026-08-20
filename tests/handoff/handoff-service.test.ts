@@ -314,6 +314,34 @@ describe("PersistentHandoffService", () => {
     }
   });
 
+  it("rejects an expired holder refresh before reclaiming the lock for a successor", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    const expiredHolderPersistence = new FileHandoffPersistence(persistencePath);
+    const successorPersistence = new FileHandoffPersistence(persistencePath);
+    const controls = { holderStarted: null as (() => void) | null, refreshExpiredHolder: null as (() => void) | null };
+    const holderStarted = new Promise<void>((resolve) => { controls.holderStarted = resolve; });
+    const refreshExpiredHolder = new Promise<void>((resolve) => { controls.refreshExpiredHolder = resolve; });
+    try {
+      const expiredHolder = expiredHolderPersistence.withExclusive(async () => {
+        controls.holderStarted?.();
+        await refreshExpiredHolder;
+        await expiredHolderPersistence.save([]);
+      });
+      await holderStarted;
+      const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
+      await utimes(join(lockPath, "lease"), expiredAt, expiredAt);
+      if (controls.refreshExpiredHolder === null) throw new Error("The expired holder did not start");
+      controls.refreshExpiredHolder();
+
+      await expect(expiredHolder).rejects.toThrow(InvalidHandoffError);
+      await successorPersistence.withExclusive(async () => {});
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("prevents a reclaimed lock holder from saving or removing its successor lock", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");

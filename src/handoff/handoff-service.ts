@@ -238,11 +238,14 @@ export class FileHandoffPersistence implements HandoffPersistence {
   }
   private async assertLockOwnership(owner: FileLockOwner): Promise<void> {
     try {
-      const [ownerToken, leaseToken] = await Promise.all([
+      const [ownerToken, leaseToken, leaseStats] = await Promise.all([
         readFile(join(owner.lockPath, fileHandoffLockOwnerFile), "utf8"),
         readFile(join(owner.lockPath, fileHandoffLockLeaseFile), "utf8"),
+        stat(join(owner.lockPath, fileHandoffLockLeaseFile)),
       ]);
       if (ownerToken !== owner.token || leaseToken !== owner.token) throw new InvalidHandoffError(`Handoff persistence lock ownership was lost at ${this.filePath}`);
+      if (!leaseStats.isFile()) throw new InvalidHandoffError(`Invalid handoff persistence lock at ${this.filePath}: lease path is not a file`);
+      if (Date.now() - leaseStats.mtimeMs > FILE_HANDOFF_LOCK_LEASE_MS) throw new InvalidHandoffError(`Handoff persistence lock lease expired at ${this.filePath}`);
     } catch (error) {
       if (error instanceof InvalidHandoffError) throw error;
       throw new InvalidHandoffError(`Unable to verify handoff persistence lock ownership at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
