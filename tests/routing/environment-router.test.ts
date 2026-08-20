@@ -56,6 +56,39 @@ describe("selectEnvironment", () => {
     expect(requiredCapabilities).toEqual(["approval", "status"]);
   });
 
+  it("rejects duplicate environment declarations before routing", () => {
+    expect(() =>
+      route(
+        "execute",
+        [environment("work", ["local-execution"]), environment("work", ["local-execution"])],
+        ["local-execution"],
+      ),
+    ).toThrowError("Duplicate environment declaration: work");
+  });
+
+  it("rejects unknown environment declarations before routing", () => {
+    const unknownEnvironment = {
+      environment: "unknown",
+      capabilities: new Set(["stage-routing"]),
+    } as unknown as EnvironmentCapabilities;
+
+    expect(() => route("route", [unknownEnvironment, environment("chat", ["stage-routing"])], ["stage-routing"])).toThrowError(
+      "Unknown environment declaration: unknown",
+    );
+  });
+
+  it("rejects malformed environment capability collections before routing", () => {
+    const malformedCapabilities = {
+      environment: "chat",
+      capabilities: ["stage-routing"],
+    } as unknown as EnvironmentCapabilities;
+
+    expect(() => route("route", [malformedCapabilities], ["stage-routing"])).toThrow(CapabilityMismatchError);
+    expect(() => route("route", [malformedCapabilities], ["stage-routing"])).toThrowError(
+      "Environment chat must declare capabilities as a ReadonlySet-compatible collection",
+    );
+  });
+
   it("rejects a route when no default environment covers the required capabilities", () => {
     expect(() => route("plan", [environment("chat", ["approval"]), environment("work", ["durable-context"])], ["local-execution"])).toThrow(
       CapabilityMismatchError,

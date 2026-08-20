@@ -28,6 +28,48 @@ const defaultEnvironmentsByStage: ReadonlyMap<Stage, readonly Environment[]> = n
   ["close", ["work"]],
 ]);
 
+const knownEnvironments: ReadonlySet<Environment> = new Set(["chat", "work", "codex"]);
+
+function isEnvironment(value: unknown): value is Environment {
+  return typeof value === "string" && knownEnvironments.has(value as Environment);
+}
+
+function isReadonlySetCompatible(value: unknown): value is ReadonlySet<string> {
+  return value instanceof Set && Array.from(value).every((capability) => typeof capability === "string");
+}
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null;
+}
+
+function assertAvailableEnvironments(available: unknown): asserts available is readonly EnvironmentCapabilities[] {
+  if (!Array.isArray(available)) {
+    throw new CapabilityMismatchError("Available environments must be an array of environment capability declarations");
+  }
+
+  const declaredEnvironments = new Set<Environment>();
+
+  for (const candidate of available) {
+    if (!isRecord(candidate)) {
+      throw new CapabilityMismatchError("Available environments must contain environment capability declarations");
+    }
+
+    const environment = candidate.environment;
+    if (!isEnvironment(environment)) {
+      throw new CapabilityMismatchError(`Unknown environment declaration: ${String(environment)}`);
+    }
+    if (!isReadonlySetCompatible(candidate.capabilities)) {
+      throw new CapabilityMismatchError(
+        `Environment ${environment} must declare capabilities as a ReadonlySet-compatible collection`,
+      );
+    }
+    if (declaredEnvironments.has(environment)) {
+      throw new CapabilityMismatchError(`Duplicate environment declaration: ${environment}`);
+    }
+    declaredEnvironments.add(environment);
+  }
+}
+
 function hasRequiredCapabilities(
   environment: EnvironmentCapabilities,
   requiredCapabilities: readonly string[],
@@ -73,6 +115,7 @@ function createRoute(
 }
 
 export function selectEnvironment(input: EnvironmentRouteInput): EnvironmentRoute {
+  assertAvailableEnvironments(input.available);
   const defaultEnvironments = getDefaultEnvironments(input.stage);
 
   if (input.userEnvironmentOverride !== null) {
