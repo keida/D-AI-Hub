@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -41,7 +41,8 @@ describe("FileDurableContextStore", () => {
 
       expect(recovered?.goal).toBe(state.goal);
       expect(recovered?.durableContext).toEqual(manifest);
-      expect(Object.keys(manifest.hashes)).toHaveLength(5);
+      expect(Object.keys(manifest.hashes)).toHaveLength(7);
+      expect(Object.keys(manifest.hashes).sort()).toEqual([...manifest.durablePaths].sort());
       expect(Object.values(manifest.hashes)).toEqual(
         expect.arrayContaining([expect.stringMatching(/^[a-f0-9]{64}$/)]),
       );
@@ -56,13 +57,105 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("rejects recovery when a hashed companion record is changed", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-tampered-companion", "Detect durable corruption");
+
+    try {
+      const manifest = await store.save(state);
+      const contextPath = join(rootPath, state.taskId, "context.json");
+      const expectedHash = manifest.hashes[contextPath];
+      if (expectedHash === undefined) {
+        throw new Error("Expected a context hash");
+      }
+      await writeFile(contextPath, '{\n  "goal": "changed",\n  "constraints": [],\n  "contextManifest": []\n}\n', "utf8");
+
+      await expect(store.load(state.taskId)).rejects.toThrow(
+        new RegExp(`task-tampered-companion.*${contextPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
+      );
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects recovery when the canonical state record is changed", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-tampered-state", "Protect canonical state");
+
+    try {
+      const manifest = await store.save(state);
+      const statePath = join(rootPath, state.taskId, "state.json");
+      const expectedHash = manifest.hashes[statePath];
+      if (expectedHash === undefined) {
+        throw new Error("Expected a state hash");
+      }
+      const persisted = JSON.parse(await readFile(statePath, "utf8")) as { goal: string };
+      persisted.goal = "changed";
+      await writeFile(statePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+
+      await expect(store.load(state.taskId)).rejects.toThrow(
+        new RegExp(`task-tampered-state.*${statePath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
+      );
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects recovery when the canonical manifest record is changed", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-tampered-manifest", "Protect canonical manifest");
+
+    try {
+      const manifest = await store.save(state);
+      const manifestPath = join(rootPath, state.taskId, "manifest.json");
+      const expectedHash = manifest.hashes[manifestPath];
+      if (expectedHash === undefined) {
+        throw new Error("Expected a manifest hash");
+      }
+      const persisted = JSON.parse(await readFile(manifestPath, "utf8")) as { recordedAt: string };
+      persisted.recordedAt = "2026-01-01T00:00:00.000Z";
+      await writeFile(manifestPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+
+      await expect(store.load(state.taskId)).rejects.toThrow(
+        new RegExp(`task-tampered-manifest.*${manifestPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
+      );
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects recovery when a required companion record is missing", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-missing-companion", "Require durable records");
+
+    try {
+      const manifest = await store.save(state);
+      const evidencePath = join(rootPath, state.taskId, "evidence.json");
+      const expectedHash = manifest.hashes[evidencePath];
+      if (expectedHash === undefined) {
+        throw new Error("Expected an evidence hash");
+      }
+      await rm(evidencePath);
+
+      await expect(store.load(state.taskId)).rejects.toThrow(
+        new RegExp(`task-missing-companion.*${evidencePath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*missing`),
+      );
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("rejects invalid persisted state during recovery", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
     const statePath = join(rootPath, "task-invalid", "state.json");
 
     try {
-      await mkdir(join(rootPath, "task-invalid"), { recursive: true });
+      await store.save(createState("task-invalid", "Reject invalid state"));
       await writeFile(statePath, "{\"taskId\":\"task-invalid\"}", { encoding: "utf8" });
 
       await expect(store.load("task-invalid")).rejects.toThrow("Invalid task state");

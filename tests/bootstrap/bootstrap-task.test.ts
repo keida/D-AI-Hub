@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -9,6 +10,20 @@ async function createDirectory(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), prefix));
 }
 
+async function hashWorkspace(path: string): Promise<string> {
+  const entry = await lstat(path);
+  if (entry.isFile()) {
+    return createHash("sha256").update(`file:${path}:${await readFile(path)}`).digest("hex");
+  }
+  if (!entry.isDirectory()) {
+    return createHash("sha256").update(`other:${path}`).digest("hex");
+  }
+  const childHashes = await Promise.all(
+    (await readdir(path)).sort().map(async (name) => hashWorkspace(join(path, name))),
+  );
+  return createHash("sha256").update(`directory:${path}:${childHashes.join(":")}`).digest("hex");
+}
+
 describe("bootstrapTask", () => {
   it("creates and persists a new bootstrap task without changing workspace content", async () => {
     const storeRoot = await createDirectory("d-ai-bootstrap-store-");
@@ -16,6 +31,7 @@ describe("bootstrapTask", () => {
     const workspaceFile = join(workspacePath, "workspace.txt");
     await writeFile(workspaceFile, "unchanged", "utf8");
     const store = new FileDurableContextStore(storeRoot);
+    const workspaceHashBefore = await hashWorkspace(workspacePath);
 
     try {
       const state = await bootstrapTask(
@@ -27,6 +43,7 @@ describe("bootstrapTask", () => {
       expect(state.durableContext).not.toBeNull();
       expect(await store.load(state.taskId)).toMatchObject({ taskId: state.taskId });
       await expect(readFile(workspaceFile, "utf8")).resolves.toBe("unchanged");
+      expect(await hashWorkspace(workspacePath)).toBe(workspaceHashBefore);
     } finally {
       await rm(storeRoot, { recursive: true, force: true });
       await rm(workspacePath, { recursive: true, force: true });
