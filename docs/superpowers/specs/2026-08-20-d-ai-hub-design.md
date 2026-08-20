@@ -1,7 +1,7 @@
 # D-AI-Hub Design Specification
 
 Date: 2026-08-20
-Status: Design approved for specification review
+Status: Approved — historical V1 baseline
 Visibility: Private
 
 ## 1. Purpose
@@ -54,6 +54,8 @@ D-AI-Hub/
 │   └── superpowers/
 │       └── specs/
 └── README.md
+
+The actual repository has since expanded beyond this initial V1 tree with the active project record at `projects/d-ai-hub/`, the command protocol at `docs/commands.md`, the cross-client safety contract at `docs/workflow.md`, and the root `AGENTS.md` bootstrap. These additions are operational documentation, not a change to the V1 ownership boundaries.
 
 ## 4. Component Responsibilities
 
@@ -225,7 +227,7 @@ Never commit:
 - secret environment files
 - employer-confidential data that is not authorized for personal storage
 
-A root `.gitignore` will later include common secret and environment patterns.
+The root `.gitignore` provides the initial common secret and environment patterns.
 
 ## 10. Initial Scope
 

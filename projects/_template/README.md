@@ -18,4 +18,4 @@ List relevant repositories, environments, or deployment targets.
 
 ## Current continuation entry point
 
-Read `STATUS.md` first, then `DECISIONS.md`, `BUGS.md`, and `ROADMAP.md`.
+Read `STATUS.md` first, then `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, and `REFERENCES.md`.

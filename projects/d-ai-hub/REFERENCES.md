@@ -23,6 +23,11 @@
 - Why it matters: defines session-start, canonical ownership, security, branch, and session-close rules for agents.
 - Accessed / reviewed: 2026-08-20
 
+- Title: D-AI-Hub Cross-Client Workflow
+- URL / repository path: `docs/workflow.md`
+- Why it matters: defines safe sync, dirty/diverged checkout handling, Web/Codex coordination, push failure reporting, and completion evidence.
+- Accessed / reviewed: 2026-08-20
+
 - Title: D-AI-Hub README
 - URL / repository path: `README.md`
 - Why it matters: defines the GitHub-first model, directory ownership, privacy rules, and V1 scope.

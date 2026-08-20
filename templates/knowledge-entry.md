@@ -20,7 +20,7 @@ Add concise examples only when they improve retrieval or reuse.
 
 ## Related notes
 
-- [Related note](../relative/path.md)
+Add repository-relative links to related canonical notes here.
 
 ## Review trigger
 

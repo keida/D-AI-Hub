@@ -1,6 +1,6 @@
 ---
 name: knowledge-manager
-description: Use when durable information should be captured, classified, normalized, linked, indexed, retrieved, or cleaned up inside D-AI-Hub.
+description: Use when durable information should be captured, classified, normalized, linked, indexed, retrieved, or cleaned up inside D-AI-Hub. Do not use for transient chat, secrets, credentials, or project-only state that belongs under projects/.
 ---
 
 # Knowledge Manager — Agent Entry Point

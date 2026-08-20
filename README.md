@@ -17,7 +17,7 @@ GitHub is the canonical source of truth. ChatGPT Web and Codex should both read 
 ## Repository map
 
 - `.agents/skills/` — Agent Skills-compatible entry points.
-- `skills/custom/` — documentation and management notes for user-authored skills.
+- `skills/custom/` — canonical user-authored Skill instructions and management notes.
 - `skills/external/` — references to third-party skills without copying upstream code.
 - `knowledge/` — durable knowledge by domain.
 - `projects/` — project-specific working memory.

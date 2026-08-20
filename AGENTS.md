@@ -22,11 +22,12 @@ Use when setting up D-AI-Hub in a new Codex/agent environment or when setup stat
 
 Use before starting or resuming durable work.
 
-1. Get the latest available `main` safely. With local Git, fetch/pull using authenticated access; otherwise use the authenticated repository source available in the environment.
-2. If freshness cannot be verified, state that limitation before proceeding.
-3. Read the relevant indexes and identify the narrowest relevant Skill, knowledge note, and/or project.
-4. For a continuing project, read `README.md`, `STATUS.md`, `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, then `REFERENCES.md`.
-5. Continue the user's task using repository state as canonical context instead of relying on old chat history.
+1. Read and follow [`docs/workflow.md`](docs/workflow.md) before any sync or write operation.
+2. Get the latest available `main` safely. With local Git, fetch/pull using authenticated access only when the working tree is clean and the branch is fast-forwardable; otherwise stop and report the state.
+3. If freshness cannot be verified, state that limitation before proceeding. Never stash, reset, delete, or force-push automatically.
+4. Read the relevant indexes and identify the narrowest relevant Skill, knowledge note, and/or project.
+5. For a continuing project, read `README.md`, `STATUS.md`, `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, then `REFERENCES.md`.
+6. Continue the user's task using repository state as canonical context instead of relying on old chat history.
 
 ### `@D-AI update`
 
@@ -57,13 +58,13 @@ Use at the end of meaningful work.
 6. Verify no secrets or unauthorized confidential material were added.
 7. Commit/push durable changes when possible and report the final sync state plus the next action. If push fails, do not claim the close is fully synced.
 
-Detailed command examples and behavior notes live in `docs/commands.md`.
+Detailed command examples and behavior notes live in `docs/commands.md`; cross-client safety and Git decision rules live in `docs/workflow.md`.
 
 ## Session start
 
 Before doing durable work in this repository:
 
-1. Confirm you are using the latest available `main` state. If local Git access is available, fetch/pull safely before treating the checkout as current. If sync cannot be verified, state the limitation instead of assuming freshness.
+1. Read `docs/workflow.md` and confirm you are using the latest available `main` state. If local Git access is available, fetch/pull safely only from a clean, fast-forwardable checkout. If sync cannot be verified, state the limitation instead of assuming freshness.
 2. Read `README.md` for repository purpose, boundaries, and security rules.
 3. Read the relevant discovery indexes:
    - `indexes/SKILLS.md`

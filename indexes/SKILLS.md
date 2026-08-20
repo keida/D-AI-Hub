@@ -2,8 +2,10 @@
 
 ## Custom skills
 
-- [Knowledge Manager](../.agents/skills/knowledge-manager/SKILL.md)
-- [Project Memory](../.agents/skills/project-memory/SKILL.md)
+- [Knowledge Manager (canonical)](../skills/custom/knowledge-manager/SKILL.md)
+  - [Compatibility entry point](../.agents/skills/knowledge-manager/SKILL.md)
+- [Project Memory (canonical)](../skills/custom/project-memory/SKILL.md)
+  - [Compatibility entry point](../.agents/skills/project-memory/SKILL.md)
 
 Management notes for locally authored skills live under `skills/custom/`.
 
@@ -12,9 +14,9 @@ Management notes for locally authored skills live under `skills/custom/`.
 Third-party skills are referenced under `skills/external/` rather than copied into this repository.
 
 Initial registry:
-- Superpowers
-- Taste Skill / `gpt-taste`
-- Darwin Skill
+- [Superpowers](../skills/external/superpowers.md)
+- [Taste Skill / `gpt-taste`](../skills/external/taste-skill.md)
+- [Darwin Skill](../skills/external/darwin-skill.md)
 
 ## Rule
 
