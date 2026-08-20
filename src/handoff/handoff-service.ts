@@ -17,7 +17,7 @@ export interface HandoffService {
 
 export interface HandoffStatus { readonly handoffId: string; readonly state: "pending" | "active" | "completed" | "rejected"; readonly reason: string | null; readonly owner: Environment | null; }
 export interface HandoffPersistenceRecord { readonly envelope: HandoffEnvelope; readonly owner: Environment | null; readonly state: HandoffStatus["state"]; readonly reason: string | null; }
-export interface HandoffPersistence { load(): Promise<readonly HandoffPersistenceRecord[]>; save(records: readonly HandoffPersistenceRecord[]): Promise<void>; }
+export interface HandoffPersistence { load(): Promise<readonly HandoffPersistenceRecord[]>; save(records: readonly HandoffPersistenceRecord[]): Promise<void>; withExclusive<T>(operation: () => Promise<T>): Promise<T>; }
 
 const environmentSchema = z.enum(["chat", "work", "codex"]);
 const targetSchema = z.object({ environment: environmentSchema, capabilities: z.set(z.string()) }).strict();
@@ -38,7 +38,9 @@ function parsePersistenceRecords(value: object): readonly HandoffPersistenceReco
   if (!result.success) throw new InvalidHandoffError(`Invalid persisted handoff records: ${issueReason(result)}`);
   return result.data.records.map((record) => {
     const envelope = parseHandoffEnvelope(record.envelope);
-    if ((record.state === "pending" && record.owner !== null) || (record.state !== "pending" && record.owner === null)) throw new InvalidHandoffError(`Invalid persisted handoff ownership for ${envelope.handoffId}`);
+    if (record.state === "pending" && record.owner !== null) throw new InvalidHandoffError(`Invalid persisted handoff ownership for ${envelope.handoffId}: pending records must not have an owner`);
+    if ((record.state === "active" || record.state === "completed") && record.owner === null) throw new InvalidHandoffError(`Invalid persisted handoff ownership for ${envelope.handoffId}: ${record.state} records must have an owner`);
+    if ((record.state === "completed" || record.state === "rejected") && (record.reason === null || !reasonSchema.safeParse(record.reason).success)) throw new InvalidHandoffError(`Invalid persisted handoff reason for ${envelope.handoffId}: ${record.state} records require a non-empty actionable reason`);
     return { envelope, owner: record.owner, state: record.state, reason: record.reason };
   });
 }
@@ -50,8 +52,20 @@ function nextSequence(records: ReadonlyMap<string, HandoffPersistenceRecord>, ta
 
 export class InMemoryHandoffPersistence implements HandoffPersistence {
   private records: readonly HandoffPersistenceRecord[] = [];
+  private exclusiveQueue: Promise<void> = Promise.resolve();
   public async load(): Promise<readonly HandoffPersistenceRecord[]> { return this.records.map(cloneRecord); }
   public async save(records: readonly HandoffPersistenceRecord[]): Promise<void> { this.records = records.map(cloneRecord); }
+  public async withExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.exclusiveQueue;
+    let release: () => void = () => {};
+    this.exclusiveQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
 }
 
 export class FileHandoffPersistence implements HandoffPersistence {
@@ -74,6 +88,36 @@ export class FileHandoffPersistence implements HandoffPersistence {
     const temporaryPath = join(parent, `.${basename(this.filePath)}.${randomUUID()}.tmp`);
     await mkdir(parent, { recursive: true });
     try { await writeFile(temporaryPath, JSON.stringify({ records: normalized, integrityHash: persistenceHash(normalized) }), { encoding: "utf8", flag: "wx" }); await rename(temporaryPath, this.filePath); } catch (error) { await rm(temporaryPath, { force: true }); throw new InvalidHandoffError(`Unable to persist handoffs at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  public async withExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    const lockPath = `${this.filePath}.lock`;
+    try {
+      await mkdir(dirname(this.filePath), { recursive: true });
+      await this.acquireLock(lockPath);
+    } catch (error) {
+      if (error instanceof InvalidHandoffError) throw error;
+      throw new InvalidHandoffError(`Unable to prepare handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      return await operation();
+    } finally {
+      await rm(lockPath, { recursive: true, force: true });
+    }
+  }
+  private async acquireLock(lockPath: string): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await mkdir(lockPath);
+        return;
+      } catch (error) {
+        if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+          await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+          continue;
+        }
+        throw new InvalidHandoffError(`Unable to acquire handoff persistence lock at ${this.filePath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    throw new InvalidHandoffError(`Timed out acquiring handoff persistence lock at ${this.filePath}`);
   }
 }
 
@@ -140,18 +184,10 @@ export class PersistentHandoffService implements HandoffService {
     return { handoffId: validatedHandoffId, state: record.state, reason: record.reason, owner: record.owner };
   }
 
-  public async ready(): Promise<void> { await this.runExclusive(async () => this.initialize()); }
+  public async ready(): Promise<void> { await this.runExclusive(async () => {}); }
 
   private async initialize(): Promise<void> {
-    if (this.initialized) return;
-    const loaded = new Map<string, HandoffPersistenceRecord>();
-    for (const record of await this.persistence.load()) {
-      if (loaded.has(record.envelope.handoffId)) throw new InvalidHandoffError(`Duplicate persisted handoff id: ${record.envelope.handoffId}`);
-      loaded.set(record.envelope.handoffId, cloneRecord(record));
-    }
-    this.records.clear();
-    for (const record of loaded.values()) this.records.set(record.envelope.handoffId, record);
-    this.initialized = true;
+    if (!this.initialized) await this.refresh();
   }
   private requireRecord(handoffId: string): HandoffPersistenceRecord { const record = this.records.get(handoffId); if (record === undefined) throw new InvalidHandoffError(`Stale or unknown handoff id: ${handoffId}`); return record; }
   private async replace(record: HandoffPersistenceRecord): Promise<void> { const updated = new Map(this.records); updated.set(record.envelope.handoffId, cloneRecord(record)); await this.persistence.save([...updated.values()]); this.records.clear(); for (const value of updated.values()) this.records.set(value.envelope.handoffId, value); }
@@ -161,9 +197,22 @@ export class PersistentHandoffService implements HandoffService {
     this.lifecycleQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      return await operation();
+      return await this.persistence.withExclusive(async () => {
+        await this.refresh();
+        return operation();
+      });
     } finally {
       release();
     }
+  }
+  private async refresh(): Promise<void> {
+    const loaded = new Map<string, HandoffPersistenceRecord>();
+    for (const record of await this.persistence.load()) {
+      if (loaded.has(record.envelope.handoffId)) throw new InvalidHandoffError(`Duplicate persisted handoff id: ${record.envelope.handoffId}`);
+      loaded.set(record.envelope.handoffId, cloneRecord(record));
+    }
+    this.records.clear();
+    for (const record of loaded.values()) this.records.set(record.envelope.handoffId, record);
+    this.initialized = true;
   }
 }

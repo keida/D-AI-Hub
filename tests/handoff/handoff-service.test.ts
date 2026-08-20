@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,6 +40,7 @@ class BlockingHandoffPersistence implements HandoffPersistence {
     }
     await this.delegate.save(records);
   }
+  public async withExclusive<T>(operation: () => Promise<T>): Promise<T> { return this.delegate.withExclusive(operation); }
 }
 
 describe("PersistentHandoffService", () => {
@@ -189,6 +191,57 @@ describe("PersistentHandoffService", () => {
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
     expect(work.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "completed", reason: "Completed by work", owner: "work" });
+  });
+
+  it("coordinates concurrent lifecycle operations across services sharing one file", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "nested", "handoffs.json");
+    try {
+      const first = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      const second = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      const [firstEnvelope, secondEnvelope] = await Promise.all([
+        first.create({ state: state("chat"), targetEnvironment: "work" }),
+        second.create({ state: state("chat"), targetEnvironment: "work" }),
+      ]);
+
+      expect(new Set([firstEnvelope.handoffId, secondEnvelope.handoffId])).toEqual(new Set(["handoff-task-handoff-1", "handoff-task-handoff-2"]));
+
+      const acknowledgement = await first.create({ state: state("chat"), targetEnvironment: "work" });
+      const firstWork = new WorkEnvironmentAdapter(first);
+      const secondWork = new WorkEnvironmentAdapter(second);
+      const results = await Promise.allSettled([firstWork.receive(acknowledgement), secondWork.receive(acknowledgement)]);
+
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+
+      const restarted = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      await restarted.ready();
+      expect(restarted.status(firstEnvelope.handoffId).state).toBe("pending");
+      expect(restarted.status(secondEnvelope.handoffId).state).toBe("pending");
+      expect(restarted.status(acknowledgement.handoffId)).toEqual({ handoffId: acknowledgement.handoffId, state: "active", reason: null, owner: "work" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { state: "pending", owner: "work", reason: null },
+    { state: "active", owner: null, reason: null },
+    { state: "completed", owner: "work", reason: null },
+    { state: "rejected", owner: "work", reason: "   " },
+  ] as const)("rejects persisted $state records that violate lifecycle invariants", async ({ state: recordState, owner, reason }) => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    try {
+      const envelope = await service().create({ state: state("chat"), targetEnvironment: "work" });
+      const records: readonly HandoffPersistenceRecord[] = [{ envelope, owner, state: recordState, reason }];
+      const integrityHash = createHash("sha256").update(JSON.stringify({ records }), "utf8").digest("hex");
+      await writeFile(persistencePath, JSON.stringify({ records, integrityHash }), "utf8");
+
+      await expect(new PersistentHandoffService(new FileHandoffPersistence(persistencePath)).ready()).rejects.toThrow(InvalidHandoffError);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("exposes restarted adapter status only after adapter ready", async () => {
