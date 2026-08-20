@@ -13,6 +13,7 @@ interface SkillFixtureDefinition {
   readonly triggers: readonly string[];
   readonly compatibleEnvironments: readonly string[];
   readonly compatibleStages: readonly string[];
+  readonly requiredResources?: readonly string[];
   readonly instructions: string;
   readonly reference: string;
 }
@@ -24,6 +25,7 @@ const skillDefinitions: readonly SkillFixtureDefinition[] = [
     triggers: ["implement", "repository"],
     compatibleEnvironments: ["codex"],
     compatibleStages: ["execute"],
+    requiredResources: ["references/contract.md"],
     instructions: "Run the requested repository command and preserve exact evidence.",
     reference: "Use the repository-local command fixtures for execution evidence.",
   },
@@ -33,6 +35,7 @@ const skillDefinitions: readonly SkillFixtureDefinition[] = [
     triggers: ["verify"],
     compatibleEnvironments: ["codex"],
     compatibleStages: ["execute", "verify"],
+    requiredResources: ["references/contract.md"],
     instructions: "Record observed output and exit status separately.",
     reference: "Require a zero exit code and retain the observed output.",
   },
@@ -62,6 +65,7 @@ function skillDocument(definition: SkillFixtureDefinition): string {
     frontmatterList(definition.compatibleEnvironments),
     "compatibleStages:",
     frontmatterList(definition.compatibleStages),
+    ...(definition.requiredResources === undefined ? [] : ["requiredResources:", frontmatterList(definition.requiredResources)]),
     "---",
     "",
     `# ${definition.name}`,

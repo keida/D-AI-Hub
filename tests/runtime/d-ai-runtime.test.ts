@@ -484,6 +484,74 @@ describe("D-AI runtime", () => {
     await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed" });
   });
 
+  it("retries recovery capture after the handoff service has completed", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const originalCapture = runtimeHarness.dependencies.captureRecoveryPoint;
+    let captureAttempts = 0;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      captureRecoveryPoint: async (state): Promise<RecoveryPoint> => {
+        captureAttempts += 1;
+        if (captureAttempts === 2) throw new InvalidTaskStateError("recovery capture failed once");
+        return originalCapture(state);
+      },
+    });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Handoff id was not recorded");
+
+    const firstAttempt = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(firstAttempt.status).toBe("blocked");
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed", recoveryPoint: { recoveryPointId: expect.any(String) } });
+
+    const retry = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(retry).toMatchObject({ taskId: accepted.taskId, stage: "verify", status: "completed" });
+    expect(captureAttempts).toBe(3);
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed", recoveryPoint: { recoveryPointId: expect.any(String) } });
+  });
+
+  it("retries recovery capture and final persistence after the final save fails", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let recoverySaveAttempts = 0;
+    const failingStore: DurableContextStore = {
+      load: (taskId) => runtimeHarness.store.load(taskId),
+      save: async (state) => {
+        if (state.stage === "verify" && state.handoffState === "completed" && state.recoveryPoint !== null) {
+          recoverySaveAttempts += 1;
+        }
+        if (recoverySaveAttempts === 2) {
+          throw new InvalidTaskStateError("final recovery save failed once");
+        }
+        return runtimeHarness.store.save(state);
+      },
+      recordCriticalUnsavedContext: (taskId, items) => runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
+      clearCriticalUnsavedContext: (taskId) => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+    };
+    const captureAttempts: TaskState[] = [];
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store: failingStore,
+      captureRecoveryPoint: async (state): Promise<RecoveryPoint> => {
+        captureAttempts.push(state);
+        return runtimeHarness.dependencies.captureRecoveryPoint(state);
+      },
+    });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Handoff id was not recorded");
+
+    const firstAttempt = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(firstAttempt.status).toBe("blocked");
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed", recoveryPoint: { recoveryPointId: expect.any(String) } });
+
+    const retry = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(retry).toMatchObject({ taskId: accepted.taskId, stage: "verify", status: "completed" });
+    expect(captureAttempts).toHaveLength(3);
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed", recoveryPoint: { recoveryPointId: expect.any(String) } });
+  });
+
   it("leaves the task retryable when the handoff service completion fails", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     let failCompletion = true;

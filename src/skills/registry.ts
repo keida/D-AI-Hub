@@ -10,6 +10,7 @@ export interface SkillDescriptor {
   readonly triggers: readonly string[];
   readonly compatibleEnvironments: readonly Environment[];
   readonly compatibleStages: readonly Stage[];
+  readonly requiredResources?: readonly string[];
   readonly skillPath: string;
 }
 
@@ -19,6 +20,7 @@ interface ParsedSkillFrontmatter {
   readonly triggers?: readonly string[];
   readonly compatibleEnvironments?: readonly string[];
   readonly compatibleStages?: readonly string[];
+  readonly requiredResources?: readonly string[];
 }
 
 const knownEnvironments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
@@ -79,6 +81,19 @@ function assertStringArray(
   if (new Set(normalized).size !== normalized.length) {
     throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} contains duplicate ${field} values.`);
   }
+  return normalized;
+}
+
+function assertResourcePaths(values: readonly string[] | undefined, sourcePath: string): readonly string[] | undefined {
+  if (values === undefined) return undefined;
+  if (!Array.isArray(values)) throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} has an invalid requiredResources array.`);
+  const normalized = values.map((value) => {
+    if (typeof value !== "string" || value.trim().length === 0 || isAbsolute(value) || value.trim().split(/[\\/]+/u).includes("..")) {
+      throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} has an unsafe requiredResources value.`);
+    }
+    return value.trim();
+  });
+  if (new Set(normalized).size !== normalized.length) throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} contains duplicate requiredResources values.`);
   return normalized;
 }
 
@@ -181,6 +196,7 @@ function parseDescriptor(skillPath: string, frontmatter: string): SkillDescripto
   for (const stage of compatibleStages) {
     assertStage(stage);
   }
+  const requiredResources = assertResourcePaths(metadata.requiredResources, skillPath);
 
   return {
     name,
@@ -188,6 +204,7 @@ function parseDescriptor(skillPath: string, frontmatter: string): SkillDescripto
     triggers,
     compatibleEnvironments: compatibleEnvironments as readonly Environment[],
     compatibleStages: compatibleStages as readonly Stage[],
+    ...(requiredResources === undefined ? {} : { requiredResources }),
     skillPath,
   };
 }
@@ -206,6 +223,7 @@ function assertDescriptor(descriptor: SkillDescriptor, index: number): void {
   const triggers = assertStringArray(descriptor.triggers, "triggers", descriptor.skillPath);
   const environments = assertStringArray(descriptor.compatibleEnvironments, "compatibleEnvironments", descriptor.skillPath);
   const stages = assertStringArray(descriptor.compatibleStages, "compatibleStages", descriptor.skillPath);
+  const requiredResources = assertResourcePaths(descriptor.requiredResources, descriptor.skillPath);
   for (const environment of environments) {
     assertEnvironment(environment, `Skill descriptor at index=${index}`);
   }
@@ -219,6 +237,7 @@ function assertDescriptor(descriptor: SkillDescriptor, index: number): void {
     !triggers.every((trigger, triggerIndex) => trigger === descriptor.triggers[triggerIndex]) ||
     !environments.every((compatibleEnvironment, environmentIndex) => compatibleEnvironment === descriptor.compatibleEnvironments[environmentIndex]) ||
     !stages.every((compatibleStage, stageIndex) => compatibleStage === descriptor.compatibleStages[stageIndex])
+    || (requiredResources !== undefined && !requiredResources.every((resource, resourceIndex) => resource === descriptor.requiredResources?.[resourceIndex]))
   ) {
     throw new InvalidTaskStateError(`Skill descriptor at index=${index} contains invalid metadata.`);
   }
@@ -319,6 +338,7 @@ export async function discoverSkillMetadata(roots: readonly string[]): Promise<r
     triggers: [...descriptor.triggers],
     compatibleEnvironments: [...descriptor.compatibleEnvironments],
     compatibleStages: [...descriptor.compatibleStages],
+    ...(descriptor.requiredResources === undefined ? {} : { requiredResources: [...descriptor.requiredResources] }),
   }));
 }
 
@@ -357,5 +377,6 @@ export function selectCapabilities(
     triggers: [...descriptor.triggers],
     compatibleEnvironments: [...descriptor.compatibleEnvironments],
     compatibleStages: [...descriptor.compatibleStages],
+    ...(descriptor.requiredResources === undefined ? {} : { requiredResources: [...descriptor.requiredResources] }),
   }));
 }

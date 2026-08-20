@@ -111,7 +111,13 @@ function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState): 
   if (manifest.durablePaths.some((path) => path.trim().length === 0 || !/^[a-f0-9]{64}$/i.test(manifest.hashes[path] ?? ""))) {
     return false;
   }
-  if (recoveryPoint.durablePaths.some((path) => !manifestPaths.has(path) || recoveryPoint.hashes[path] !== manifest.hashes[path])) {
+  const immutableSnapshotPaths = new Set(["state.json", "manifest.json", "recovery.json"]);
+  const snapshotGenerationIsPersisted = recoveryPoint.snapshotManifestId !== undefined && recoveryPoint.snapshotManifestId !== manifest.manifestId;
+  if (recoveryPoint.durablePaths.some((path) => {
+    if (!manifestPaths.has(path)) return true;
+    if (recoveryPoint.hashes[path] === manifest.hashes[path]) return false;
+    return !(snapshotGenerationIsPersisted && immutableSnapshotPaths.has(path.split(/[\\/]/u).at(-1) ?? ""));
+  })) {
     return false;
   }
   return state.verificationEvidence.every((evidence) => evidence.recoveryPointId === recoveryPoint.recoveryPointId);

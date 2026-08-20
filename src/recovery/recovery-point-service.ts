@@ -12,6 +12,7 @@ export interface RecoverySnapshot {
   readonly binaryPatch: string;
   readonly stateManifest: DurableContextManifest;
   readonly verificationResults: readonly VerificationEvidence[];
+  readonly durableArtifacts: Readonly<Record<string, string>>;
 }
 
 export interface CapturedRecoveryPoint {
@@ -95,14 +96,14 @@ function assertCaptureInput(input: RecoveryPointCaptureInput): void {
 
 export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedRecoveryPoint {
   assertCaptureInput(input);
-  // Recovery hashes are an immutable snapshot of stable companion artifacts.
-  // State, manifest, and recovery files are regenerated as the snapshot is recorded.
-  const snapshotPaths = input.stateManifest.durablePaths.filter((path) => !/(?:[\\/](?:state|manifest|recovery)\.json)$/u.test(path));
+  const snapshotPaths = [...input.stateManifest.durablePaths];
   const snapshotHashes: Record<string, string> = {};
+  const durableArtifacts: Record<string, string> = {};
   for (const path of snapshotPaths) {
     const hash = input.stateManifest.hashes[path];
     if (hash === undefined) throw new InvalidTaskStateError(`Recovery snapshot hash is missing for ${path}`);
     snapshotHashes[path] = hash;
+    durableArtifacts[path] = hash;
   }
   const snapshot: RecoverySnapshot = {
     head: input.head,
@@ -112,6 +113,7 @@ export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedR
     binaryPatch: input.binaryPatch,
     stateManifest: input.stateManifest,
     verificationResults: input.verificationResults.map((verification) => ({ ...verification })),
+    durableArtifacts,
   };
   return {
     trigger: input.trigger,
@@ -125,6 +127,7 @@ export function createRecoveryPoint(input: RecoveryPointCaptureInput): CapturedR
       hashes: snapshotHashes,
       restorationInstructions: "Preserve user work, revert committed changes audibly, restore the captured binary patch, and verify the recovery point.",
       createdAt: input.createdAt,
+      snapshotManifestId: input.stateManifest.manifestId,
     },
     snapshot,
   };

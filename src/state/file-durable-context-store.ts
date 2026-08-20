@@ -71,6 +71,7 @@ const recoveryPointSchema = z
     hashes: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
     restorationInstructions: z.string(),
     createdAt: z.string().datetime(),
+    snapshotManifestId: z.string().min(1).optional(),
   })
   .strict();
 const taskStateSchema = z

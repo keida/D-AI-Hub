@@ -68,6 +68,7 @@ export interface RecoveryPoint {
   readonly hashes: Readonly<Record<string, string>>;
   readonly restorationInstructions: string;
   readonly createdAt: string;
+  readonly snapshotManifestId?: string | undefined;
 }
 
 export interface CloseVerdict {

@@ -9,8 +9,8 @@ function createManifest(): DurableContextManifest {
     stage: "execute",
     environment: "codex",
     role: "implementer",
-    durablePaths: ["state.json"],
-    hashes: { "state.json": "b".repeat(64) },
+    durablePaths: ["context.json", "state.json", "manifest.json", "recovery.json"],
+    hashes: { "context.json": "a".repeat(64), "state.json": "b".repeat(64), "manifest.json": "c".repeat(64), "recovery.json": "d".repeat(64) },
     recoveryPointId: null,
     recordedAt: "2026-08-21T00:00:00.000Z",
   };
@@ -62,6 +62,7 @@ describe("createRecoveryPoint", () => {
       snapshot: expect.objectContaining({ head: "0123456789abcdef0123456789abcdef01234567", branch: "feat/task-7", workspacePath: "C:/workspace" }),
       recoveryPoint: expect.objectContaining({ recoveryPointId: "recovery-1", taskId: "task-recovery" }),
     });
+    expect(point.snapshot.durableArtifacts).toEqual(point.recoveryPoint.hashes);
   });
 
   it("rejects capture without verification evidence", async () => {

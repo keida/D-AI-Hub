@@ -117,6 +117,7 @@ export async function loadSelectedSkill(
       triggers: [...descriptor.triggers],
       compatibleEnvironments: [...descriptor.compatibleEnvironments],
       compatibleStages: [...descriptor.compatibleStages],
+      ...(descriptor.requiredResources === undefined ? {} : { requiredResources: [...descriptor.requiredResources] }),
     },
     instructions,
     loadedResources: [...resourcePaths],

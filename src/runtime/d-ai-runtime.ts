@@ -158,6 +158,7 @@ const recoveryPointSchema = z.object({
   hashes: z.record(z.string().trim().min(1), z.string().regex(/^[a-f0-9]{64}$/i)),
   restorationInstructions: z.string().trim().min(1),
   createdAt: z.string().datetime(),
+  snapshotManifestId: z.string().trim().min(1).optional(),
 }).strict();
 
 const baseApplicableExecutionGates = [
@@ -467,7 +468,7 @@ async function routeIntent(
   });
   const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
   const selected = dependencies.selectCapabilities(routedState.goal, "execute", route.environment, descriptors);
-  const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, [])));
+  const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
   const contextManifest = [
     ...routedState.contextManifest,
     ...selected.map((descriptor) => `skill:${descriptor.name}:${descriptor.skillPath}`),
@@ -650,35 +651,34 @@ async function requireActiveState(
   return registry.isActiveOwner(taskId, environment) ? state : null;
 }
 
-async function executeIntentExclusive(
-  request: DAIRequest,
-  bootstrapped: TaskState,
+async function executeRoutedState(
+  routedState: TaskState,
+  skills: readonly LoadedSkill[],
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const routed = await routeIntent(bootstrapped, request, dependencies);
-  registry.transfer(routed.state.taskId, routed.state.environment);
+  registry.transfer(routedState.taskId, routedState.environment);
   const executionOutcome = await connectorOutcome(
-    () => dependencies.adapters[routed.state.environment].execute({ state: routed.state, skills: routed.skills }),
+    () => dependencies.adapters[routedState.environment].execute({ state: routedState, skills }),
     executionConnectorFailure,
   );
   if (executionOutcome.kind === "blocked") {
-    return enterRecovery(routed.state, executionOutcome.message, dependencies);
+    return enterRecovery(routedState, executionOutcome.message, dependencies);
   }
   const execution = validateExecutionResult(executionOutcome.value);
-  const identityFailure = evidenceIdentityFailure(routed.state, execution.evidence);
+  const identityFailure = evidenceIdentityFailure(routedState, execution.evidence);
   if (identityFailure !== null) {
-    return enterRecovery(routed.state, identityFailure, dependencies);
+    return enterRecovery(routedState, identityFailure, dependencies);
   }
   if (execution.status !== "completed") {
     const executedState = await persistState(dependencies.store, {
-      ...routed.state,
-      verificationEvidence: [...routed.state.verificationEvidence, ...execution.evidence],
+      ...routedState,
+      verificationEvidence: [...routedState.verificationEvidence, ...execution.evidence],
       durableContext: null,
     });
     return enterRecovery(executedState, execution.message, dependencies);
   }
-  const inspectedTransition = transitionState(routed.state, "inspect", "evidence-collector", routed.state.environment);
+  const inspectedTransition = transitionState(routedState, "inspect", "evidence-collector", routedState.environment);
   const inspectedState = await persistState(dependencies.store, {
     ...inspectedTransition,
     verificationEvidence: [...inspectedTransition.verificationEvidence, ...execution.evidence],
@@ -729,6 +729,16 @@ async function executeIntentExclusive(
   return response(verifiedState, "completed", execution.message);
 }
 
+async function executeIntentExclusive(
+  request: DAIRequest,
+  bootstrapped: TaskState,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  const routed = await routeIntent(bootstrapped, request, dependencies);
+  return executeRoutedState(routed.state, routed.skills, dependencies, registry);
+}
+
 async function executeIntent(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "intent" }>,
@@ -770,6 +780,24 @@ async function continueTaskExclusive(
   }
   if (state.handoffState === "pending" || state.handoffState === "acknowledged" || state.handoffState === "rejected") {
     return response(state, "blocked", `Task ${state.taskId} cannot continue from handoff state ${state.handoffState}`);
+  }
+  if (state.stage === "recover") {
+    const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
+    const selected = dependencies.selectCapabilities(state.goal, "execute", state.environment, descriptors);
+    const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
+    const failedEvidence = state.verificationEvidence.filter((evidence) => !evidence.passed);
+    const executionState = await persistState(
+      dependencies.store,
+      {
+        ...transitionState(state, "execute", "implementer", state.environment),
+        verificationEvidence: state.verificationEvidence.filter((evidence) => evidence.passed),
+        contextManifest: failedEvidence.length === 0
+          ? [...state.contextManifest]
+          : [...state.contextManifest, `recovered-from-failure:${failedEvidence.map((evidence) => evidence.evidenceId).join(",")}`],
+      },
+    );
+    registry.transfer(state.taskId, state.environment);
+    return executeRoutedState(executionState, skills, dependencies, registry);
   }
   registry.transfer(state.taskId, state.environment);
   return response(state, "accepted", `Continuing task ${state.taskId}`);
@@ -939,10 +967,10 @@ async function completeHandoffExclusive(
   if (handoffStatus.value.owner !== request.sourceEnvironment) {
     return response(state, "blocked", `Handoff ${command.handoffId} is not actively owned by ${request.sourceEnvironment}`);
   }
-  if (state.stage === "verify" && state.handoffState === "completed" && handoffStatus.value.state === "completed") {
-    return response(state, "completed", `Handoff ${command.handoffId} was already completed; task ${taskId} remains in verify`);
-  }
-  if (state.stage !== "handoff" || state.handoffState !== "active") {
+  const retryingCompletedHandoff = state.stage === "verify"
+    && state.handoffState === "completed"
+    && handoffStatus.value.state === "completed";
+  if (!retryingCompletedHandoff && (state.stage !== "handoff" || state.handoffState !== "active")) {
     return response(state, "blocked", `Task ${taskId} cannot complete a handoff from stage ${state.stage} and handoff state ${state.handoffState}`);
   }
   if (handoffStatus.value.state !== "active" && handoffStatus.value.state !== "completed") {
@@ -961,26 +989,27 @@ async function completeHandoffExclusive(
       return response(state, "blocked", `Handoff completion blocked: ${completion.message}`);
     }
   }
-  const completionEvidence: VerificationEvidence = {
-    evidenceId: "gate:handoff",
-    stage: "verify",
-    environment: request.sourceEnvironment,
-    role: "evidence-collector",
-    selectedModel: state.routingDecision?.selectedModel ?? "unrecorded-model",
-    command: `handoff complete ${command.handoffId}`,
-    observedOutput: `Handoff ${command.handoffId} completed by ${request.sourceEnvironment}`,
-    exitCode: 0,
-    interpretation: "The durable handoff service completed ownership transfer",
-    passed: true,
-    recoveryPointId: priorRecoveryPointId,
-    recordedAt: dependencies.now().toISOString(),
-  };
-  const completedCandidate = {
-    ...transitionState(state, "verify", "evidence-collector", request.sourceEnvironment),
-    contextManifest: [...state.contextManifest],
-    verificationEvidence: [...state.verificationEvidence, completionEvidence],
-    handoffState: "completed" as const,
-  };
+  const completedCandidate: TaskState = retryingCompletedHandoff
+    ? state
+    : {
+      ...transitionState(state, "verify", "evidence-collector", request.sourceEnvironment),
+      contextManifest: [...state.contextManifest],
+      verificationEvidence: [...state.verificationEvidence, {
+        evidenceId: "gate:handoff",
+        stage: "verify",
+        environment: request.sourceEnvironment,
+        role: "evidence-collector",
+        selectedModel: state.routingDecision?.selectedModel ?? "unrecorded-model",
+        command: `handoff complete ${command.handoffId}`,
+        observedOutput: `Handoff ${command.handoffId} completed by ${request.sourceEnvironment}`,
+        exitCode: 0,
+        interpretation: "The durable handoff service completed ownership transfer",
+        passed: true,
+        recoveryPointId: priorRecoveryPointId,
+        recordedAt: dependencies.now().toISOString(),
+      }],
+      handoffState: "completed",
+    };
   const completedState = await connectorOutcome(
     () => persistState(dependencies.store, completedCandidate),
     completionConnectorFailure,
