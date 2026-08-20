@@ -10,7 +10,7 @@ import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../../src/domain/errors.js";
 import type { CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
-import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
+import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../../src/handoff/envelope.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
 import type { EnvironmentCapabilities } from "../../src/routing/environment-capabilities.js";
@@ -21,6 +21,7 @@ import {
   createDAIRuntime,
   type DAIEnvironmentAdapter,
   type DAIRequest,
+  type DAIResponse,
   type DAIRuntimeDependencies,
   type EnvironmentExecutionRequest,
   type EnvironmentExecutionResult,
@@ -433,6 +434,82 @@ describe("D-AI runtime", () => {
     expect(secondResponse.status).toBe("blocked");
   });
 
+  it("persists pending before the handoff connector creates an envelope", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let stateObservedByCreate: TaskState | null = null;
+    const otherRuntimeResponses: DAIResponse[] = [];
+    const otherRuntime = createDAIRuntime(runtimeHarness.dependencies);
+    const handoffService: HandoffService = {
+      create: async (input): Promise<HandoffEnvelope> => {
+        stateObservedByCreate = await runtimeHarness.store.load(input.state.taskId);
+        otherRuntimeResponses.push(await otherRuntime({
+          command: { kind: "continue", taskIdOrProject: input.state.taskId },
+          sourceEnvironment: "codex",
+          overrides: noOverrides,
+        }));
+        return runtimeHarness.handoffService.create(input);
+      },
+      acknowledge: (envelope, target): Promise<void> => runtimeHarness.handoffService.acknowledge(envelope, target),
+      complete: (handoffId, recipient): Promise<void> => runtimeHarness.handoffService.complete(handoffId, recipient),
+      reject: (handoffId, reason): Promise<void> => runtimeHarness.handoffService.reject(handoffId, reason),
+      ready: (): Promise<void> => runtimeHarness.handoffService.ready(),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, handoffService });
+    await handle(intentRequest("chat", noOverrides));
+
+    const result = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(result.status).toBe("accepted");
+    expect(stateObservedByCreate).toMatchObject({ stage: "handoff", handoffState: "pending" });
+    expect(otherRuntimeResponses[0]?.status).toBe("blocked");
+  });
+
+  it("prevents a delayed handoff load from racing concurrent close and continue mutations", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let delayNextLoad = false;
+    let releaseHandoffLoad: () => void = () => {};
+    let markHandoffLoadStarted: () => void = () => {};
+    const handoffLoadStarted = new Promise<void>((resolve) => { markHandoffLoadStarted = resolve; });
+    const handoffLoadRelease = new Promise<void>((resolve) => { releaseHandoffLoad = resolve; });
+    const delayedStore: DurableContextStore = {
+      load: async (taskId: string): Promise<TaskState | null> => {
+        const loaded = await runtimeHarness.store.load(taskId);
+        if (delayNextLoad) {
+          delayNextLoad = false;
+          markHandoffLoadStarted();
+          await handoffLoadRelease;
+        }
+        return loaded;
+      },
+      save: (state: TaskState): Promise<DurableContextManifest> => runtimeHarness.store.save(state),
+      recordCriticalUnsavedContext: (taskId: string, items: readonly string[]): Promise<void> =>
+        runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
+      clearCriticalUnsavedContext: (taskId: string): Promise<void> => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: delayedStore });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+    delayNextLoad = true;
+
+    const handoff = handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    await handoffLoadStarted;
+    const close = handle({ command: { kind: "close" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const continuation = handle({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+    await Promise.resolve();
+    await Promise.resolve();
+    releaseHandoffLoad();
+    const [handoffResult, closeResult, continueResult] = await Promise.all([handoff, close, continuation]);
+
+    expect(handoffResult.status).toBe("accepted");
+    expect(closeResult.status).toBe("blocked");
+    expect(continueResult.status).toBe("blocked");
+    expect(runtimeHarness.closedStates).toEqual([]);
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({
+      environment: "work",
+      stage: "handoff",
+      handoffState: "active",
+    });
+  });
+
   it("rejects an acknowledged handoff when active-state persistence fails and blocks both runtime lanes", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const receivedHandoffIds: string[] = [];
@@ -691,23 +768,41 @@ describe("D-AI runtime", () => {
     expect(serializedResponse).toContain("[REDACTED]");
   });
 
-  it("rejects secret-like text in every injected recovery-point text surface before persistence", async () => {
+  it.each([
+    {
+      label: "recovery point id",
+      secret: "id-secret",
+      inject: (captured: RecoveryPoint): RecoveryPoint => ({ ...captured, recoveryPointId: "recovery-token=id-secret" }),
+    },
+    {
+      label: "task id",
+      secret: "task-secret",
+      inject: (captured: RecoveryPoint): RecoveryPoint => ({ ...captured, taskId: "task-token=task-secret" }),
+    },
+    {
+      label: "durable path",
+      secret: "path-secret",
+      inject: (captured: RecoveryPoint): RecoveryPoint => ({ ...captured, durablePaths: ["token=path-secret"] }),
+    },
+    {
+      label: "hash key",
+      secret: "apiKey",
+      inject: (captured: RecoveryPoint): RecoveryPoint => ({ ...captured, hashes: { ...captured.hashes, apiKey: "b".repeat(64) } }),
+    },
+    {
+      label: "restoration instructions",
+      secret: "instructions-secret",
+      inject: (captured: RecoveryPoint): RecoveryPoint => ({ ...captured, restorationInstructions: "Restore token=instructions-secret" }),
+    },
+  ] as const)("rejects labelled secret-like text in the injected recovery-point $label before persistence", async ({ secret, inject }) => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const secretSavedStates: TaskState[] = [];
-    const secretStore = memoryStore(secretSavedStates, "token=path-secret");
+    const secretStore = memoryStore(secretSavedStates, "state.json");
     const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
       store: secretStore,
-      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => {
-        const captured = await captureRecoveryPoint(state);
-        return {
-          ...captured,
-          recoveryPointId: "recovery-token=id-secret",
-          hashes: { ...captured.hashes, apiKey: "b".repeat(64) },
-          restorationInstructions: "Restore token=instructions-secret",
-        };
-      },
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => inject(await captureRecoveryPoint(state)),
     });
 
     const result = await handle(intentRequest("chat", noOverrides));
@@ -715,10 +810,52 @@ describe("D-AI runtime", () => {
     expect(result.status).toBe("blocked");
     expect(result.message).toMatch(/secret-like/i);
     expect(secretSavedStates.every((state) => state.recoveryPoint === null)).toBe(true);
-    for (const secret of ["path-secret", "id-secret", "instructions-secret", "apiKey"]) {
-      expect(JSON.stringify(secretSavedStates.map((state) => state.recoveryPoint))).not.toContain(secret);
-      expect(JSON.stringify(result)).not.toContain(secret);
-    }
+    expect(JSON.stringify(secretSavedStates.map((state) => state.recoveryPoint))).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it.each([
+    {
+      signature: "sk-proj",
+      secret: "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+      inject: (captured: RecoveryPoint, secret: string): RecoveryPoint => ({ ...captured, recoveryPointId: `recovery-${secret}` }),
+    },
+    {
+      signature: "sk",
+      secret: "sk-abcdefghijklmnopqrstuvwxyz0123456789",
+      inject: (captured: RecoveryPoint, secret: string): RecoveryPoint => ({ ...captured, taskId: secret }),
+    },
+    {
+      signature: "ghp",
+      secret: "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      inject: (captured: RecoveryPoint, secret: string): RecoveryPoint => ({ ...captured, durablePaths: [`artifacts/${secret}`] }),
+    },
+    {
+      signature: "github_pat",
+      secret: "github_pat_abcdefghijklmnopqrstuvwxyz_0123456789",
+      inject: (captured: RecoveryPoint, secret: string): RecoveryPoint => ({ ...captured, hashes: { ...captured.hashes, [secret]: "b".repeat(64) } }),
+    },
+    {
+      signature: "PEM private key",
+      secret: "-----BEGIN PRIVATE KEY-----",
+      inject: (captured: RecoveryPoint, secret: string): RecoveryPoint => ({ ...captured, restorationInstructions: `${secret}\nprivate-key-material` }),
+    },
+  ] as const)("rejects an unlabelled $signature credential signature before recovery-point persistence", async ({ secret, inject }) => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => inject(await captureRecoveryPoint(state), secret),
+    });
+
+    const savedBeforeCapture = runtimeHarness.savedStates.length;
+    const result = await handle(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/secret-like/i);
+    expect(runtimeHarness.savedStates.slice(savedBeforeCapture).every((state) => state.recoveryPoint === null)).toBe(true);
+    expect(JSON.stringify(runtimeHarness.savedStates.map((state) => state.recoveryPoint))).not.toContain(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   it("rejects malformed external request overrides without alternate interpretation", async () => {

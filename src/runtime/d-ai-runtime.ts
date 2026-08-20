@@ -171,6 +171,7 @@ const baseApplicableExecutionGates = [
 
 type ApplicableExecutionGate = typeof baseApplicableExecutionGates[number] | "recovery";
 const secretLikeTextPattern = /\b(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credentials?|cookies?|passwords?|passwd|private[_-]?key|secrets?|session[_-]?token|tokens?)\b/i;
+const unlabelledCredentialPattern = /(?:\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b|-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----)/i;
 
 interface ConnectorSuccess<T> {
   readonly kind: "success";
@@ -192,7 +193,7 @@ interface RuntimeTaskRegistry {
   readonly isBlocked: (taskId: string) => boolean;
   readonly transfer: (taskId: string, environment: Environment) => void;
   readonly block: (taskId: string) => void;
-  readonly serializeHandoff: (taskId: string, operation: () => Promise<DAIResponse>) => Promise<DAIResponse>;
+  readonly serializeMutation: (taskId: string, operation: () => Promise<DAIResponse>) => Promise<DAIResponse>;
 }
 
 function transferredOwners(
@@ -219,7 +220,7 @@ function ownersWithoutTask(owners: ReadonlyMap<Environment, string>, taskId: str
 function createRuntimeTaskRegistry(): RuntimeTaskRegistry {
   let owners: ReadonlyMap<Environment, string> = new Map<Environment, string>();
   const blockedTaskIds = new Set<string>();
-  const handoffQueues = new Map<string, Promise<void>>();
+  const mutationQueues = new Map<string, Promise<void>>();
   return {
     activeTaskId: (environment: Environment): string | null => {
       const taskId = owners.get(environment);
@@ -240,18 +241,18 @@ function createRuntimeTaskRegistry(): RuntimeTaskRegistry {
       blockedTaskIds.add(taskId);
       owners = ownersWithoutTask(owners, taskId);
     },
-    serializeHandoff: async (taskId: string, operation: () => Promise<DAIResponse>): Promise<DAIResponse> => {
-      const previous = handoffQueues.get(taskId) ?? Promise.resolve();
+    serializeMutation: async (taskId: string, operation: () => Promise<DAIResponse>): Promise<DAIResponse> => {
+      const previous = mutationQueues.get(taskId) ?? Promise.resolve();
       let release: () => void = () => {};
       const current = new Promise<void>((resolve) => { release = resolve; });
       const tail = previous.then(() => current);
-      handoffQueues.set(taskId, tail);
+      mutationQueues.set(taskId, tail);
       await previous;
       try {
         return await operation();
       } finally {
         release();
-        if (handoffQueues.get(taskId) === tail) handoffQueues.delete(taskId);
+        if (mutationQueues.get(taskId) === tail) mutationQueues.delete(taskId);
       }
     },
   };
@@ -522,7 +523,10 @@ function secretLikeRecoveryPointField(recoveryPoint: RecoveryPoint): string | nu
       { label: `hash value for ${key}`, value },
     ]),
   ];
-  const secretField = fields.find((field) => redactSensitiveText(field.value) !== field.value || secretLikeTextPattern.test(field.value));
+  const secretField = fields.find((field) =>
+    redactSensitiveText(field.value) !== field.value
+    || secretLikeTextPattern.test(field.value)
+    || unlabelledCredentialPattern.test(field.value));
   return secretField === undefined ? null : `Captured recovery point ${secretField.label} contains secret-like content`;
 }
 
@@ -642,19 +646,12 @@ async function requireActiveState(
   return registry.isActiveOwner(taskId, environment) ? state : null;
 }
 
-async function executeIntent(
+async function executeIntentExclusive(
   request: DAIRequest,
-  command: Extract<DAICommand, { readonly kind: "intent" }>,
+  bootstrapped: TaskState,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const bootstrapped = await dependencies.bootstrapTask({
-    taskId: null,
-    goal: command.text,
-    environment: request.sourceEnvironment,
-    workspacePath: dependencies.workspacePath,
-    repositoryPath: dependencies.repositoryPath,
-  }, dependencies.store);
   const routed = await routeIntent(bootstrapped, request, dependencies);
   registry.transfer(routed.state.taskId, routed.state.environment);
   const executionOutcome = await connectorOutcome(
@@ -728,7 +725,26 @@ async function executeIntent(
   return response(verifiedState, "completed", execution.message);
 }
 
-async function continueTask(
+async function executeIntent(
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "intent" }>,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  const bootstrapped = await dependencies.bootstrapTask({
+    taskId: null,
+    goal: command.text,
+    environment: request.sourceEnvironment,
+    workspacePath: dependencies.workspacePath,
+    repositoryPath: dependencies.repositoryPath,
+  }, dependencies.store);
+  return registry.serializeMutation(
+    bootstrapped.taskId,
+    () => executeIntentExclusive(request, bootstrapped, dependencies, registry),
+  );
+}
+
+async function continueTaskExclusive(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "continue" }>,
   dependencies: DAIRuntimeDependencies,
@@ -742,7 +758,7 @@ async function continueTask(
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
   }
   const owner = registry.owner(state.taskId);
-  if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
+  if (registry.isBlocked(state.taskId) || (owner !== null && (owner !== state.environment || owner !== request.sourceEnvironment))) {
     return response(state, "blocked", `Task ${state.taskId} ownership changed while continue was loading durable state`);
   }
   if (state.handoffState === "pending" || state.handoffState === "acknowledged" || state.handoffState === "rejected") {
@@ -750,6 +766,22 @@ async function continueTask(
   }
   registry.transfer(state.taskId, state.environment);
   return response(state, "accepted", `Continuing task ${state.taskId}`);
+}
+
+async function continueTask(
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "continue" }>,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  const state = await dependencies.store.load(command.taskIdOrProject);
+  if (state === null) {
+    return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
+  }
+  return registry.serializeMutation(
+    state.taskId,
+    () => continueTaskExclusive(request, command, dependencies, registry),
+  );
 }
 
 async function finalizeFailedHandoff(
@@ -817,8 +849,8 @@ async function handoffTaskExclusive(
   let envelope: HandoffEnvelope | null = null;
   let pendingState = pendingCandidate;
   const handoffOutcome = connectorOutcome(async () => {
-    envelope = await dependencies.handoffService.create({ state, targetEnvironment: command.target });
     pendingState = await persistState(dependencies.store, pendingCandidate);
+    envelope = await dependencies.handoffService.create({ state, targetEnvironment: command.target });
     await dependencies.adapters[command.target].receive(envelope);
     const activeCandidate: TaskState = {
       ...pendingState,
@@ -858,24 +890,28 @@ async function handoffTask(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
-  if (state === null) {
+  const taskId = registry.activeTaskId(request.sourceEnvironment);
+  if (taskId === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for handoff");
   }
-  return registry.serializeHandoff(
-    state.taskId,
-    () => handoffTaskExclusive(state.taskId, request, command, dependencies, registry),
+  return registry.serializeMutation(
+    taskId,
+    () => handoffTaskExclusive(taskId, request, command, dependencies, registry),
   );
 }
 
-async function closeActiveTask(
+async function closeActiveTaskExclusive(
+  taskId: string,
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
-  if (state === null) {
-    return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for close");
+  if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
+  }
+  const state = await dependencies.store.load(taskId);
+  if (state === null || !registry.isActiveOwner(taskId, request.sourceEnvironment)) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} became unavailable while close was loading durable state`);
   }
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
@@ -901,6 +937,21 @@ async function closeActiveTask(
     evidence: verdict.evidence.map(redactEvidence),
     message: redactSensitiveText(message),
   };
+}
+
+async function closeActiveTask(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  const taskId = registry.activeTaskId(request.sourceEnvironment);
+  if (taskId === null) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for close");
+  }
+  return registry.serializeMutation(
+    taskId,
+    () => closeActiveTaskExclusive(taskId, request, dependencies, registry),
+  );
 }
 
 export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request: ExternalDAIRequest) => Promise<DAIResponse> {
