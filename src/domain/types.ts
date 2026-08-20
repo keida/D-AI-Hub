@@ -1,0 +1,103 @@
+export type Environment = "chat" | "work" | "codex";
+
+export type Stage =
+  | "bootstrap"
+  | "route"
+  | "plan"
+  | "execute"
+  | "inspect"
+  | "verify"
+  | "debug"
+  | "recover"
+  | "handoff"
+  | "close";
+
+export type Role =
+  | "analyst"
+  | "planner"
+  | "implementer"
+  | "evidence-collector"
+  | "reviewer"
+  | "debugger"
+  | "recovery-operator";
+
+export interface RoutingDecision {
+  readonly stage: Stage;
+  readonly environment: Environment;
+  readonly role: Role;
+  readonly selectedModel: string;
+  readonly selectedCapabilities: readonly string[];
+  readonly reason: string;
+  readonly overrideSource: "default" | "user";
+}
+
+export interface VerificationEvidence {
+  readonly evidenceId: string;
+  readonly stage: Stage;
+  readonly environment: Environment;
+  readonly role: Role;
+  readonly selectedModel: string;
+  readonly command: string;
+  readonly observedOutput: string;
+  readonly exitCode: number | null;
+  readonly interpretation: string;
+  readonly passed: boolean;
+  readonly recoveryPointId: string | null;
+  readonly recordedAt: string;
+}
+
+export interface DurableContextManifest {
+  readonly manifestId: string;
+  readonly taskId: string;
+  readonly stage: Stage;
+  readonly environment: Environment;
+  readonly role: Role;
+  readonly durablePaths: readonly string[];
+  readonly hashes: Readonly<Record<string, string>>;
+  readonly recoveryPointId: string | null;
+  readonly recordedAt: string;
+}
+
+export interface RecoveryPoint {
+  readonly recoveryPointId: string;
+  readonly taskId: string;
+  readonly stage: Stage;
+  readonly environment: Environment;
+  readonly role: Role;
+  readonly durablePaths: readonly string[];
+  readonly hashes: Readonly<Record<string, string>>;
+  readonly restorationInstructions: string;
+  readonly createdAt: string;
+}
+
+export interface CloseVerdict {
+  readonly taskId: string;
+  readonly status: "YES" | "NO" | "BLOCKED";
+  readonly stage: Stage;
+  readonly environment: Environment;
+  readonly role: Role;
+  readonly selectedModel: string;
+  readonly evidence: readonly VerificationEvidence[];
+  readonly recoveryPoint: RecoveryPoint | null;
+  readonly durablePaths: readonly string[];
+  readonly hashes: Readonly<Record<string, string>>;
+  readonly reasons: readonly string[];
+}
+
+export interface TaskState {
+  readonly taskId: string;
+  readonly goal: string;
+  readonly constraints: readonly string[];
+  readonly environment: Environment;
+  readonly stage: Stage;
+  readonly role: Role;
+  readonly routingDecision: RoutingDecision | null;
+  readonly selectedCapabilities: readonly string[];
+  readonly contextManifest: readonly string[];
+  readonly handoffState: "none" | "pending" | "acknowledged" | "active" | "completed" | "rejected";
+  readonly verificationEvidence: readonly VerificationEvidence[];
+  readonly recoveryPoint: RecoveryPoint | null;
+  readonly approvalState: "not-required" | "pending" | "approved" | "rejected";
+  readonly criticalUnsavedContext: readonly string[];
+  readonly durableContext: DurableContextManifest | null;
+}

@@ -1,0 +1,20 @@
+{
+  "name": "d-ai-orchestrator-v1",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run",
+    "test:integration": "vitest run tests/integration --passWithNoTests",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "yaml": "^2.8.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
