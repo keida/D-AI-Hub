@@ -8,10 +8,12 @@ import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-ada
 import { bootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
 import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../../src/domain/errors.js";
-import type { CloseVerdict, DurableContextManifest, Environment, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
-import { InMemoryHandoffPersistence, PersistentHandoffService } from "../../src/handoff/handoff-service.js";
+import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
+import type { HandoffEnvelope } from "../../src/handoff/envelope.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
+import type { EnvironmentCapabilities } from "../../src/routing/environment-capabilities.js";
 import { selectEnvironment } from "../../src/routing/environment-router.js";
 import { resolveModelRoute, type ModelPolicy } from "../../src/routing/model-router.js";
 import { createDebugSession } from "../../src/debugging/debug-session.js";
@@ -46,6 +48,7 @@ const executionGateNames = [
   "task-state",
   "quality",
   "failure-handling",
+  "recovery",
   "durable-context",
   "critical-unsaved-context",
 ] as const;
@@ -63,7 +66,7 @@ interface RuntimeHarness {
   readonly store: DurableContextStore;
 }
 
-function memoryStore(savedStates: TaskState[]): DurableContextStore {
+function memoryStore(savedStates: TaskState[], durablePath: string): DurableContextStore {
   const states = new Map<string, TaskState>();
   return {
     load: async (taskId: string): Promise<TaskState | null> => states.get(taskId) ?? null,
@@ -75,8 +78,8 @@ function memoryStore(savedStates: TaskState[]): DurableContextStore {
         stage: state.stage,
         environment: state.environment,
         role: state.role,
-        durablePaths: ["state.json"],
-        hashes: { "state.json": "a".repeat(64) },
+        durablePaths: [durablePath],
+        hashes: { [durablePath]: "a".repeat(64) },
         recoveryPointId: state.recoveryPoint?.recoveryPointId ?? null,
         recordedAt: "2026-08-21T00:00:00.000Z",
       };
@@ -93,6 +96,22 @@ function memoryStore(savedStates: TaskState[]): DurableContextStore {
       if (state === undefined) throw new InvalidTaskStateError(`Missing task ${taskId}`);
       states.set(taskId, { ...state, criticalUnsavedContext: [] });
     },
+  };
+}
+
+function adapterWithReceiveProbe(
+  adapter: DAIEnvironmentAdapter,
+  probe: (envelope: HandoffEnvelope) => void,
+): DAIEnvironmentAdapter {
+  return {
+    capabilities: (): EnvironmentCapabilities => adapter.capabilities(),
+    execute: (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> => adapter.execute(request),
+    receive: async (envelope: HandoffEnvelope): Promise<void> => {
+      probe(envelope);
+      await adapter.receive(envelope);
+    },
+    complete: (handoffId: string): Promise<void> => adapter.complete(handoffId),
+    status: (handoffId: string): HandoffStatus => adapter.status(handoffId),
   };
 }
 
@@ -153,13 +172,19 @@ function secretExecution(request: EnvironmentExecutionRequest): EnvironmentExecu
 }
 
 function passingGates(input: HardGateInput): readonly GateResult[] {
-  return ["scope", "environment-capability", "task-state", "quality", "failure-handling", "durable-context", "critical-unsaved-context"].map((gate) => ({
+  return ["scope", "environment-capability", "task-state", "quality", "failure-handling", "recovery", "durable-context", "critical-unsaved-context"].map((gate) => ({
     gate,
     passed: true,
     observedOutput: input.state.verificationEvidence[0]?.observedOutput ?? "passed",
     exitCode: 0,
     reason: "passed",
   }));
+}
+
+function failedRecoveryGates(input: HardGateInput): readonly GateResult[] {
+  return passingGates(input).map((result) => result.gate === "recovery"
+    ? { ...result, passed: false, exitCode: 1, reason: "recovery verification failed" }
+    : result);
 }
 
 function blockedGates(input: HardGateInput): readonly GateResult[] {
@@ -195,7 +220,7 @@ function harness(
 ): RuntimeHarness {
   const savedStates: TaskState[] = [];
   const closedStates: TaskState[] = [];
-  const store = memoryStore(savedStates);
+  const store = memoryStore(savedStates, "state.json");
   const handoffService = new PersistentHandoffService(new InMemoryHandoffPersistence());
   const executed: EnvironmentExecutionRequest[] = [];
   const loadedSkills: string[] = [];
@@ -362,6 +387,95 @@ describe("D-AI runtime", () => {
     expect(repeated.status).toBe("blocked");
   });
 
+  it("serializes handoffs, persists pending before acknowledgement, and blocks source operations", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handoffStates: TaskState["handoffState"][] = [];
+    const receivedTargets: Environment[] = [];
+    let releaseFirstSave: () => void = () => {};
+    let markFirstSaveStarted: () => void = () => {};
+    const firstSaveStarted = new Promise<void>((resolve) => { markFirstSaveStarted = resolve; });
+    const firstSaveRelease = new Promise<void>((resolve) => { releaseFirstSave = resolve; });
+    const delayedStore: DurableContextStore = {
+      load: (taskId: string): Promise<TaskState | null> => runtimeHarness.store.load(taskId),
+      save: async (state: TaskState): Promise<DurableContextManifest> => {
+        if (state.stage === "handoff") {
+          handoffStates.push(state.handoffState);
+          if (handoffStates.length === 1) {
+            markFirstSaveStarted();
+            await firstSaveRelease;
+          }
+        }
+        return runtimeHarness.store.save(state);
+      },
+      recordCriticalUnsavedContext: (taskId: string, items: readonly string[]): Promise<void> =>
+        runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
+      clearCriticalUnsavedContext: (taskId: string): Promise<void> => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+    };
+    const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
+      chat: adapterWithReceiveProbe(runtimeHarness.dependencies.adapters.chat, () => { receivedTargets.push("chat"); }),
+      work: adapterWithReceiveProbe(runtimeHarness.dependencies.adapters.work, () => { receivedTargets.push("work"); }),
+      codex: runtimeHarness.dependencies.adapters.codex,
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: delayedStore, adapters });
+    await handle(intentRequest("chat", noOverrides));
+
+    const firstHandoff = handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    await firstSaveStarted;
+    const sourceStatus = await handle({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const secondHandoff = handle({ command: { kind: "handoff", target: "chat" }, sourceEnvironment: "codex", overrides: noOverrides });
+    releaseFirstSave();
+    const [firstResponse, secondResponse] = await Promise.all([firstHandoff, secondHandoff]);
+
+    expect(handoffStates[0]).toBe("pending");
+    expect(receivedTargets).toEqual(["work"]);
+    expect(sourceStatus.status).toBe("blocked");
+    expect(firstResponse.status).toBe("accepted");
+    expect(secondResponse.status).toBe("blocked");
+  });
+
+  it("rejects an acknowledged handoff when active-state persistence fails and blocks both runtime lanes", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const receivedHandoffIds: string[] = [];
+    let failActiveSave = true;
+    const failingStore: DurableContextStore = {
+      load: (taskId: string): Promise<TaskState | null> => runtimeHarness.store.load(taskId),
+      save: async (state: TaskState): Promise<DurableContextManifest> => {
+        if (state.stage === "handoff" && state.handoffState === "active" && failActiveSave) {
+          failActiveSave = false;
+          throw new InvalidTaskStateError("handoff active persistence failed token=handoff-store-secret");
+        }
+        return runtimeHarness.store.save(state);
+      },
+      recordCriticalUnsavedContext: (taskId: string, items: readonly string[]): Promise<void> =>
+        runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
+      clearCriticalUnsavedContext: (taskId: string): Promise<void> => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+    };
+    const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
+      ...runtimeHarness.dependencies.adapters,
+      work: adapterWithReceiveProbe(runtimeHarness.dependencies.adapters.work, (envelope) => { receivedHandoffIds.push(envelope.handoffId); }),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: failingStore, adapters });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+
+    const result = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    const handoffId = receivedHandoffIds[0];
+    if (handoffId === undefined) throw new InvalidTaskStateError("Failing handoff did not reach the target adapter");
+    expect(result.status).toBe("blocked");
+    expect(result.message).toContain("[REDACTED]");
+    expect(result.message).not.toContain("handoff-store-secret");
+    expect(runtimeHarness.handoffService.status(handoffId).state).toBe("rejected");
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "handoff", handoffState: "rejected" });
+    const sourceStatus = await handle({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const targetStatus = await handle({ command: { kind: "status" }, sourceEnvironment: "work", overrides: noOverrides });
+    expect(sourceStatus.status).toBe("blocked");
+    expect(targetStatus.status).toBe("blocked");
+    expect(runtimeHarness.savedStates.filter((state) => state.stage === "handoff").map((state) => state.handoffState)).toEqual([
+      "pending",
+      "rejected",
+    ]);
+  });
+
   it("propagates a blocked gate and enters debug/recovery without claiming completion", async () => {
     const runtimeHarness = harness(completedExecution, blockedGates, "YES");
     const response = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("chat", noOverrides));
@@ -381,6 +495,38 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.recoveredReasons).toEqual([expect.stringMatching(/missing.*scope.*gate/i)]);
   });
 
+  it("blocks when the applicable recovery gate fails after recovery capture", async () => {
+    const runtimeHarness = harness(completedExecution, failedRecoveryGates, "YES");
+
+    const result = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.stage).toBe("recover");
+    expect(result.message).toMatch(/recovery verification failed/i);
+    expect(runtimeHarness.recoveredReasons).toEqual(["recovery verification failed"]);
+  });
+
+  it.each([
+    ["malformed", "not-a-timestamp"],
+    ["future", "2026-08-21T00:02:00.000Z"],
+  ] as const)("blocks a %s injected recovery-point timestamp before persisting it", async (_label, createdAt) => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => ({
+        ...await captureRecoveryPoint(state),
+        createdAt,
+      }),
+    });
+
+    const result = await handle(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/timestamp|future|malformed/i);
+    expect(runtimeHarness.savedStates.some((state) => state.recoveryPoint?.createdAt === createdAt)).toBe(false);
+  });
+
   it("propagates execution failure through debug/recovery", async () => {
     const runtimeHarness = harness(failedExecution, evaluateHardGates, "YES");
     const response = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("work", noOverrides));
@@ -389,6 +535,49 @@ describe("D-AI runtime", () => {
     expect(response.stage).toBe("recover");
     expect(response.evidence).toEqual([expect.objectContaining({ passed: false, exitCode: 1 })]);
     expect(runtimeHarness.recoveredReasons).toEqual(["execution did not complete"]);
+  });
+
+  it.each([
+    [
+      "invalid task state",
+      (): Error => new InvalidTaskStateError("recovery connector unavailable token=recovery-state-secret"),
+      "recovery-state-secret",
+      /recovery connector unavailable/i,
+    ],
+    [
+      "close blocked",
+      (): Error => new CloseBlockedError("recovery close blocked token=recovery-close-secret"),
+      "recovery-close-secret",
+      /recovery close blocked/i,
+    ],
+    [
+      "command execution",
+      (): Error => new CommandExecutionError({
+        command: "recover token=recovery-command-secret",
+        arguments: [],
+        stdout: "",
+        stderr: "authorization: Bearer recovery-output-secret",
+        exitCode: 9,
+      }),
+      "recovery-output-secret",
+      /command execution failed/i,
+    ],
+  ] as const)("returns a redacted blocked response and retains debug state when recovery throws %s", async (_label, errorFactory, secret, message) => {
+    const runtimeHarness = harness(failedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      recover: async (): Promise<TaskState> => { throw errorFactory(); },
+    });
+
+    const result = await handle(intentRequest("work", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.stage).toBe("debug");
+    expect(result.message).toMatch(message);
+    expect(result.message).toContain("[REDACTED]");
+    expect(result.message).not.toContain(secret);
+    expect(runtimeHarness.savedStates.at(-1)?.stage).toBe("debug");
+    await expect(runtimeHarness.store.load(result.taskId)).resolves.toMatchObject({ stage: "debug", role: "debugger" });
   });
 
   it.each([
@@ -500,6 +689,36 @@ describe("D-AI runtime", () => {
     }
     expect(serializedPersistence).toContain("[REDACTED]");
     expect(serializedResponse).toContain("[REDACTED]");
+  });
+
+  it("rejects secret-like text in every injected recovery-point text surface before persistence", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const secretSavedStates: TaskState[] = [];
+    const secretStore = memoryStore(secretSavedStates, "token=path-secret");
+    const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store: secretStore,
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => {
+        const captured = await captureRecoveryPoint(state);
+        return {
+          ...captured,
+          recoveryPointId: "recovery-token=id-secret",
+          hashes: { ...captured.hashes, apiKey: "b".repeat(64) },
+          restorationInstructions: "Restore token=instructions-secret",
+        };
+      },
+    });
+
+    const result = await handle(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/secret-like/i);
+    expect(secretSavedStates.every((state) => state.recoveryPoint === null)).toBe(true);
+    for (const secret of ["path-secret", "id-secret", "instructions-secret", "apiKey"]) {
+      expect(JSON.stringify(secretSavedStates.map((state) => state.recoveryPoint))).not.toContain(secret);
+      expect(JSON.stringify(result)).not.toContain(secret);
+    }
   });
 
   it("rejects malformed external request overrides without alternate interpretation", async () => {

@@ -8,7 +8,14 @@ import { GitHubCliAdapter } from "../adapters/github.js";
 import { bootstrapTask } from "../bootstrap/bootstrap-task.js";
 import { closeTask } from "../close/close-service.js";
 import { createDebugSession, type DebugSession } from "../debugging/debug-session.js";
-import { CapabilityMismatchError, CloseBlockedError, InvalidHandoffError, InvalidTaskStateError } from "../domain/errors.js";
+import {
+  CapabilityMismatchError,
+  CloseBlockedError,
+  InvalidHandoffError,
+  InvalidTaskStateError,
+  UnsavedContextError,
+  VerificationGateError,
+} from "../domain/errors.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, Role, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
@@ -140,8 +147,19 @@ const executionResultSchema = z.object({
   evidence: z.array(evidenceSchema),
   message: z.string().trim().min(1),
 }).strict();
+const recoveryPointSchema = z.object({
+  recoveryPointId: z.string().trim().min(1),
+  taskId: z.string().trim().min(1),
+  stage: stageSchema,
+  environment: environmentSchema,
+  role: roleSchema,
+  durablePaths: z.array(z.string().trim().min(1)).min(1),
+  hashes: z.record(z.string().trim().min(1), z.string().regex(/^[a-f0-9]{64}$/i)),
+  restorationInstructions: z.string().trim().min(1),
+  createdAt: z.string().datetime(),
+}).strict();
 
-const applicableExecutionGates = [
+const baseApplicableExecutionGates = [
   "scope",
   "environment-capability",
   "task-state",
@@ -151,7 +169,8 @@ const applicableExecutionGates = [
   "critical-unsaved-context",
 ] as const;
 
-type ApplicableExecutionGate = typeof applicableExecutionGates[number];
+type ApplicableExecutionGate = typeof baseApplicableExecutionGates[number] | "recovery";
+const secretLikeTextPattern = /\b(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credentials?|cookies?|passwords?|passwd|private[_-]?key|secrets?|session[_-]?token|tokens?)\b/i;
 
 interface ConnectorSuccess<T> {
   readonly kind: "success";
@@ -165,6 +184,84 @@ interface ConnectorBlocked {
 
 type ConnectorOutcome<T> = ConnectorSuccess<T> | ConnectorBlocked;
 type ConnectorFailureMessage = (error: Error) => string | null;
+
+interface RuntimeTaskRegistry {
+  readonly activeTaskId: (environment: Environment) => string | null;
+  readonly owner: (taskId: string) => Environment | null;
+  readonly isActiveOwner: (taskId: string, environment: Environment) => boolean;
+  readonly isBlocked: (taskId: string) => boolean;
+  readonly transfer: (taskId: string, environment: Environment) => void;
+  readonly block: (taskId: string) => void;
+  readonly serializeHandoff: (taskId: string, operation: () => Promise<DAIResponse>) => Promise<DAIResponse>;
+}
+
+function transferredOwners(
+  owners: ReadonlyMap<Environment, string>,
+  taskId: string,
+  environment: Environment,
+): ReadonlyMap<Environment, string> {
+  const nextOwners = new Map(owners);
+  for (const [owner, activeTaskId] of nextOwners) {
+    if (activeTaskId === taskId || owner === environment) nextOwners.delete(owner);
+  }
+  nextOwners.set(environment, taskId);
+  return nextOwners;
+}
+
+function ownersWithoutTask(owners: ReadonlyMap<Environment, string>, taskId: string): ReadonlyMap<Environment, string> {
+  const nextOwners = new Map(owners);
+  for (const [owner, activeTaskId] of nextOwners) {
+    if (activeTaskId === taskId) nextOwners.delete(owner);
+  }
+  return nextOwners;
+}
+
+function createRuntimeTaskRegistry(): RuntimeTaskRegistry {
+  let owners: ReadonlyMap<Environment, string> = new Map<Environment, string>();
+  const blockedTaskIds = new Set<string>();
+  const handoffQueues = new Map<string, Promise<void>>();
+  return {
+    activeTaskId: (environment: Environment): string | null => {
+      const taskId = owners.get(environment);
+      return taskId === undefined || blockedTaskIds.has(taskId) ? null : taskId;
+    },
+    owner: (taskId: string): Environment | null => {
+      const owner = [...owners].find(([, activeTaskId]) => activeTaskId === taskId)?.[0];
+      return owner ?? null;
+    },
+    isActiveOwner: (taskId: string, environment: Environment): boolean =>
+      !blockedTaskIds.has(taskId) && owners.get(environment) === taskId,
+    isBlocked: (taskId: string): boolean => blockedTaskIds.has(taskId),
+    transfer: (taskId: string, environment: Environment): void => {
+      owners = transferredOwners(owners, taskId, environment);
+      blockedTaskIds.delete(taskId);
+    },
+    block: (taskId: string): void => {
+      blockedTaskIds.add(taskId);
+      owners = ownersWithoutTask(owners, taskId);
+    },
+    serializeHandoff: async (taskId: string, operation: () => Promise<DAIResponse>): Promise<DAIResponse> => {
+      const previous = handoffQueues.get(taskId) ?? Promise.resolve();
+      let release: () => void = () => {};
+      const current = new Promise<void>((resolve) => { release = resolve; });
+      const tail = previous.then(() => current);
+      handoffQueues.set(taskId, tail);
+      await previous;
+      try {
+        return await operation();
+      } finally {
+        release();
+        if (handoffQueues.get(taskId) === tail) handoffQueues.delete(taskId);
+      }
+    },
+  };
+}
+
+function applicableExecutionGates(state: TaskState): readonly ApplicableExecutionGate[] {
+  return state.recoveryPoint === null
+    ? baseApplicableExecutionGates
+    : [...baseApplicableExecutionGates, "recovery"];
+}
 
 function validationReason(issues: readonly z.ZodIssue[]): string {
   const issue = issues[0];
@@ -279,6 +376,19 @@ function closeConnectorFailure(error: Error): string | null {
   return error instanceof CloseBlockedError ? error.message : null;
 }
 
+function recoveryConnectorFailure(error: Error): string | null {
+  const executionFailure = executionConnectorFailure(error);
+  if (executionFailure !== null) return executionFailure;
+  if (
+    error instanceof CapabilityMismatchError
+    || error instanceof InvalidHandoffError
+    || error instanceof CloseBlockedError
+    || error instanceof VerificationGateError
+    || error instanceof UnsavedContextError
+  ) return error.message;
+  return null;
+}
+
 function transitionState(state: TaskState, stage: Stage, role: Role, environment: Environment): TaskState {
   assertStageTransition(state.stage, stage);
   return {
@@ -364,15 +474,21 @@ async function routeIntent(
   return { state: await persistState(dependencies.store, executionState), skills };
 }
 
-function gateEvidence(evidence: readonly VerificationEvidence[]): readonly GateEvidence[] {
+function gateEvidence(
+  evidence: readonly VerificationEvidence[],
+  applicableGates: readonly ApplicableExecutionGate[],
+): readonly GateEvidence[] {
   return evidence.flatMap((verification) => {
-    const gate: ApplicableExecutionGate | undefined = applicableExecutionGates.find((candidate) => verification.evidenceId === `gate:${candidate}`);
+    const gate: ApplicableExecutionGate | undefined = applicableGates.find((candidate) => verification.evidenceId === `gate:${candidate}`);
     return gate === undefined ? [] : [{ gate, verification }];
   });
 }
 
-function gateEvidenceFailure(evidence: readonly VerificationEvidence[]): string | null {
-  for (const gate of applicableExecutionGates) {
+function gateEvidenceFailure(
+  evidence: readonly VerificationEvidence[],
+  applicableGates: readonly ApplicableExecutionGate[],
+): string | null {
+  for (const gate of applicableGates) {
     const matches = evidence.filter((verification) => verification.evidenceId === `gate:${gate}`);
     if (matches.length === 0) return `Missing evidence for ${gate} gate`;
     if (matches.length > 1) return `Ambiguous evidence for ${gate} gate`;
@@ -391,27 +507,68 @@ function evidenceIdentityFailure(state: TaskState, evidence: readonly Verificati
   return null;
 }
 
-function recoveryPointFailure(state: TaskState, recoveryPoint: RecoveryPoint): string | null {
-  const manifest = state.durableContext;
-  if (manifest === null) return "Recovery point capture requires a persisted verify manifest";
-  if (
-    recoveryPoint.taskId !== state.taskId
-    || recoveryPoint.stage !== state.stage
-    || recoveryPoint.environment !== state.environment
-    || recoveryPoint.role !== state.role
-  ) return "Captured recovery point identity does not match the verify state";
-  if (recoveryPoint.recoveryPointId.trim().length === 0 || recoveryPoint.restorationInstructions.trim().length === 0) {
-    return "Captured recovery point is incomplete";
-  }
-  if (
-    recoveryPoint.durablePaths.length !== manifest.durablePaths.length
-    || recoveryPoint.durablePaths.some((path, index) => path !== manifest.durablePaths[index] || recoveryPoint.hashes[path] !== manifest.hashes[path])
-  ) return "Captured recovery point does not match the persisted verify artifacts";
-  return null;
+function secretLikeRecoveryPointField(recoveryPoint: RecoveryPoint): string | null {
+  const fields: readonly { readonly label: string; readonly value: string }[] = [
+    { label: "id", value: recoveryPoint.recoveryPointId },
+    { label: "task id", value: recoveryPoint.taskId },
+    { label: "stage", value: recoveryPoint.stage },
+    { label: "environment", value: recoveryPoint.environment },
+    { label: "role", value: recoveryPoint.role },
+    { label: "restoration instructions", value: recoveryPoint.restorationInstructions },
+    { label: "timestamp", value: recoveryPoint.createdAt },
+    ...recoveryPoint.durablePaths.map((value, index) => ({ label: `durable path ${index}`, value })),
+    ...Object.entries(recoveryPoint.hashes).flatMap(([key, value]) => [
+      { label: "hash key", value: key },
+      { label: `hash value for ${key}`, value },
+    ]),
+  ];
+  const secretField = fields.find((field) => redactSensitiveText(field.value) !== field.value || secretLikeTextPattern.test(field.value));
+  return secretField === undefined ? null : `Captured recovery point ${secretField.label} contains secret-like content`;
 }
 
-function failedGateReason(results: readonly GateResult[]): string | null {
-  for (const requiredGate of applicableExecutionGates) {
+function validateCapturedRecoveryPoint(
+  state: TaskState,
+  recoveryPoint: RecoveryPoint,
+  now: Date,
+): ConnectorOutcome<RecoveryPoint> {
+  const parsed = recoveryPointSchema.safeParse(recoveryPoint);
+  if (!parsed.success) {
+    return { kind: "blocked", message: `Captured recovery point is malformed: ${validationReason(parsed.error.issues)}` };
+  }
+  const validated = parsed.data;
+  const secretFailure = secretLikeRecoveryPointField(validated);
+  if (secretFailure !== null) return { kind: "blocked", message: secretFailure };
+  const manifest = state.durableContext;
+  if (manifest === null) return { kind: "blocked", message: "Recovery point capture requires a persisted verify manifest" };
+  if (
+    validated.taskId !== state.taskId
+    || validated.stage !== state.stage
+    || validated.environment !== state.environment
+    || validated.role !== state.role
+  ) return { kind: "blocked", message: "Captured recovery point identity does not match the verify state" };
+  const createdAt = Date.parse(validated.createdAt);
+  if (Number.isNaN(now.getTime()) || createdAt > now.getTime()) {
+    return { kind: "blocked", message: "Captured recovery point timestamp is malformed or in the future" };
+  }
+  const recoveryHashKeys = Object.keys(validated.hashes);
+  const manifestHashKeys = Object.keys(manifest.hashes);
+  if (
+    new Set(validated.durablePaths).size !== validated.durablePaths.length
+    || validated.durablePaths.length !== manifest.durablePaths.length
+    || validated.durablePaths.some((path, index) => path !== manifest.durablePaths[index] || validated.hashes[path] !== manifest.hashes[path])
+    || recoveryHashKeys.length !== validated.durablePaths.length
+    || recoveryHashKeys.some((key) => !validated.durablePaths.includes(key))
+    || manifestHashKeys.length !== manifest.durablePaths.length
+    || manifestHashKeys.some((key) => !manifest.durablePaths.includes(key))
+  ) return { kind: "blocked", message: "Captured recovery point does not match the persisted verify artifacts" };
+  return { kind: "success", value: validated };
+}
+
+function failedGateReason(
+  results: readonly GateResult[],
+  applicableGates: readonly ApplicableExecutionGate[],
+): string | null {
+  for (const requiredGate of applicableGates) {
     const matches = results.filter((result) => result.gate === requiredGate);
     if (matches.length === 0) {
       return `Missing applicable ${requiredGate} gate result`;
@@ -444,56 +601,52 @@ async function enterRecovery(
       reason: `Debugging required: ${redactedReason}`,
     },
   });
-  dependencies.createDebugSession(redactedReason, debugState.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
-  const recovered = await dependencies.recover(debugState, redactedReason);
-  if (recovered.taskId !== state.taskId) {
-    throw new InvalidTaskStateError("Recovery changed the stable task id");
-  }
-  if (recovered.environment !== state.environment) {
-    throw new InvalidTaskStateError("Recovery changed the authoritative task environment");
-  }
-  if (recovered.stage !== "recover" || recovered.role !== "recovery-operator") {
-    throw new InvalidTaskStateError("Recovery must return the recover stage and recovery-operator role");
-  }
-  assertStageTransition(debugState.stage, recovered.stage);
-  const recoveredState = await persistState(dependencies.store, {
-    ...recovered,
-    routingDecision: recovered.routingDecision === null ? null : {
-      ...recovered.routingDecision,
-      stage: recovered.stage,
-      environment: recovered.environment,
-      role: recovered.role,
-      reason: `Recovery outcome: ${redactedReason}`,
-    },
-    durableContext: null,
-  });
-  return response(recoveredState, "blocked", redactedReason);
+  const recoveryOutcome = await connectorOutcome(async () => {
+    dependencies.createDebugSession(redactedReason, debugState.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
+    const recovered = await dependencies.recover(debugState, redactedReason);
+    if (recovered.taskId !== state.taskId) {
+      throw new InvalidTaskStateError("Recovery changed the stable task id");
+    }
+    if (recovered.environment !== state.environment) {
+      throw new InvalidTaskStateError("Recovery changed the authoritative task environment");
+    }
+    if (recovered.stage !== "recover" || recovered.role !== "recovery-operator") {
+      throw new InvalidTaskStateError("Recovery must return the recover stage and recovery-operator role");
+    }
+    assertStageTransition(debugState.stage, recovered.stage);
+    return persistState(dependencies.store, {
+      ...recovered,
+      routingDecision: recovered.routingDecision === null ? null : {
+        ...recovered.routingDecision,
+        stage: recovered.stage,
+        environment: recovered.environment,
+        role: recovered.role,
+        reason: `Recovery outcome: ${redactedReason}`,
+      },
+      durableContext: null,
+    });
+  }, recoveryConnectorFailure);
+  return recoveryOutcome.kind === "blocked"
+    ? response(debugState, "blocked", `Recovery connector blocked: ${recoveryOutcome.message}`)
+    : response(recoveryOutcome.value, "blocked", redactedReason);
 }
 
 async function requireActiveState(
   environment: Environment,
-  activeTaskIds: ReadonlyMap<Environment, string>,
+  registry: RuntimeTaskRegistry,
   store: DurableContextStore,
 ): Promise<TaskState | null> {
-  const taskId = activeTaskIds.get(environment);
-  return taskId === undefined ? null : store.load(taskId);
-}
-
-function transferTaskOwnership(activeTaskIds: Map<Environment, string>, taskId: string, environment: Environment): void {
-  const nextOwners = new Map(activeTaskIds);
-  for (const [owner, activeTaskId] of nextOwners) {
-    if (activeTaskId === taskId || owner === environment) nextOwners.delete(owner);
-  }
-  nextOwners.set(environment, taskId);
-  activeTaskIds.clear();
-  for (const [owner, activeTaskId] of nextOwners) activeTaskIds.set(owner, activeTaskId);
+  const taskId = registry.activeTaskId(environment);
+  if (taskId === null) return null;
+  const state = await store.load(taskId);
+  return registry.isActiveOwner(taskId, environment) ? state : null;
 }
 
 async function executeIntent(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "intent" }>,
   dependencies: DAIRuntimeDependencies,
-  activeTaskIds: Map<Environment, string>,
+  registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
   const bootstrapped = await dependencies.bootstrapTask({
     taskId: null,
@@ -503,7 +656,7 @@ async function executeIntent(
     repositoryPath: dependencies.repositoryPath,
   }, dependencies.store);
   const routed = await routeIntent(bootstrapped, request, dependencies);
-  transferTaskOwnership(activeTaskIds, routed.state.taskId, routed.state.environment);
+  registry.transfer(routed.state.taskId, routed.state.environment);
   const executionOutcome = await connectorOutcome(
     () => dependencies.adapters[routed.state.environment].execute({ state: routed.state, skills: routed.skills }),
     executionConnectorFailure,
@@ -540,30 +693,35 @@ async function executeIntent(
   if (recoveryPointOutcome.kind === "blocked") {
     return enterRecovery(preliminaryVerifyState, recoveryPointOutcome.message, dependencies);
   }
-  const recoveryFailure = recoveryPointFailure(preliminaryVerifyState, recoveryPointOutcome.value);
-  if (recoveryFailure !== null) {
-    return enterRecovery(preliminaryVerifyState, recoveryFailure, dependencies);
+  const recoveryPointValidation = validateCapturedRecoveryPoint(
+    preliminaryVerifyState,
+    recoveryPointOutcome.value,
+    dependencies.now(),
+  );
+  if (recoveryPointValidation.kind === "blocked") {
+    return enterRecovery(preliminaryVerifyState, recoveryPointValidation.message, dependencies);
   }
   const verifiedState = await persistState(dependencies.store, {
     ...preliminaryVerifyState,
     verificationEvidence: preliminaryVerifyState.verificationEvidence.map((verification) => ({
       ...verification,
-      recoveryPointId: recoveryPointOutcome.value.recoveryPointId,
+      recoveryPointId: recoveryPointValidation.value.recoveryPointId,
     })),
-    recoveryPoint: recoveryPointOutcome.value,
+    recoveryPoint: recoveryPointValidation.value,
     durableContext: null,
   });
-  const exactEvidenceFailure = gateEvidenceFailure(verifiedState.verificationEvidence);
+  const applicableGates = applicableExecutionGates(verifiedState);
+  const exactEvidenceFailure = gateEvidenceFailure(verifiedState.verificationEvidence, applicableGates);
   if (exactEvidenceFailure !== null) {
     return enterRecovery(verifiedState, exactEvidenceFailure, dependencies);
   }
   const gates = dependencies.evaluateHardGates({
     state: verifiedState,
-    evidence: gateEvidence(verifiedState.verificationEvidence),
+    evidence: gateEvidence(verifiedState.verificationEvidence, applicableGates),
     now: dependencies.now(),
     maximumEvidenceAgeMs: dependencies.maximumEvidenceAgeMs,
   });
-  const gateFailure = failedGateReason(gates);
+  const gateFailure = failedGateReason(gates, applicableGates);
   if (gateFailure !== null) {
     return enterRecovery(verifiedState, gateFailure, dependencies);
   }
@@ -574,57 +732,148 @@ async function continueTask(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "continue" }>,
   dependencies: DAIRuntimeDependencies,
-  activeTaskIds: Map<Environment, string>,
+  registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
+  if (registry.isBlocked(command.taskIdOrProject)) {
+    return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task ${command.taskIdOrProject} is blocked by a failed handoff`);
+  }
   const state = await dependencies.store.load(command.taskIdOrProject);
   if (state === null) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
   }
-  transferTaskOwnership(activeTaskIds, state.taskId, state.environment);
+  const owner = registry.owner(state.taskId);
+  if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
+    return response(state, "blocked", `Task ${state.taskId} ownership changed while continue was loading durable state`);
+  }
+  if (state.handoffState === "pending" || state.handoffState === "acknowledged" || state.handoffState === "rejected") {
+    return response(state, "blocked", `Task ${state.taskId} cannot continue from handoff state ${state.handoffState}`);
+  }
+  registry.transfer(state.taskId, state.environment);
   return response(state, "accepted", `Continuing task ${state.taskId}`);
+}
+
+async function finalizeFailedHandoff(
+  pendingState: TaskState,
+  envelope: HandoffEnvelope | null,
+  reason: string,
+  dependencies: DAIRuntimeDependencies,
+): Promise<{ readonly state: TaskState; readonly message: string }> {
+  let message = redactSensitiveText(reason);
+  if (envelope !== null) {
+    const rejectionOutcome = await connectorOutcome(
+      () => dependencies.handoffService.reject(envelope.handoffId, message),
+      handoffConnectorFailure,
+    );
+    if (rejectionOutcome.kind === "blocked") {
+      message = `${message}; handoff rejection blocked: ${rejectionOutcome.message}`;
+    }
+  }
+  const rejectedCandidate: TaskState = {
+    ...pendingState,
+    handoffState: "rejected",
+    routingDecision: pendingState.routingDecision === null ? null : {
+      ...pendingState.routingDecision,
+      reason: `Handoff failed: ${message}`,
+    },
+    durableContext: null,
+  };
+  const persistenceOutcome = await connectorOutcome(
+    () => persistState(dependencies.store, rejectedCandidate),
+    handoffConnectorFailure,
+  );
+  return persistenceOutcome.kind === "blocked"
+    ? { state: pendingState, message: `${message}; rejected handoff persistence blocked: ${persistenceOutcome.message}` }
+    : { state: persistenceOutcome.value, message };
+}
+
+async function handoffTaskExclusive(
+  taskId: string,
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "handoff" }>,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Source operations are blocked while task ${taskId} changes handoff ownership`);
+  }
+  const state = await dependencies.store.load(taskId);
+  if (state === null) {
+    registry.block(taskId);
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is unavailable for handoff`);
+  }
+  if (state.handoffState !== "none") {
+    return response(state, "blocked", `Task ${state.taskId} cannot hand off from state ${state.handoffState}`);
+  }
+  const handoffTransition = transitionState(state, "handoff", state.role, state.environment);
+  const pendingCandidate: TaskState = {
+    ...handoffTransition,
+    handoffState: "pending",
+    routingDecision: handoffTransition.routingDecision === null ? null : {
+      ...handoffTransition.routingDecision,
+      reason: `Handoff pending acknowledgement from ${command.target}`,
+    },
+  };
+  registry.block(taskId);
+  let envelope: HandoffEnvelope | null = null;
+  let pendingState = pendingCandidate;
+  const handoffOutcome = connectorOutcome(async () => {
+    envelope = await dependencies.handoffService.create({ state, targetEnvironment: command.target });
+    pendingState = await persistState(dependencies.store, pendingCandidate);
+    await dependencies.adapters[command.target].receive(envelope);
+    const activeCandidate: TaskState = {
+      ...pendingState,
+      environment: command.target,
+      handoffState: "active",
+      routingDecision: pendingState.routingDecision === null ? null : {
+        ...pendingState.routingDecision,
+        environment: command.target,
+        reason: `Handoff ownership transferred to ${command.target}`,
+      },
+      durableContext: null,
+    };
+    return {
+      envelope,
+      state: await persistState(dependencies.store, activeCandidate),
+    };
+  }, handoffConnectorFailure);
+  return handoffOutcome.then(
+    async (outcome): Promise<DAIResponse> => {
+      if (outcome.kind === "blocked") {
+        const failed = await finalizeFailedHandoff(pendingState, envelope, outcome.message, dependencies);
+        return response(failed.state, "blocked", failed.message);
+      }
+      registry.transfer(taskId, command.target);
+      return response(outcome.value.state, "accepted", `Handoff ${outcome.value.envelope.handoffId} is owned by ${command.target}`);
+    },
+    async (error: Error): Promise<DAIResponse> => {
+      await finalizeFailedHandoff(pendingState, envelope, error.message, dependencies);
+      return Promise.reject(error);
+    },
+  );
 }
 
 async function handoffTask(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "handoff" }>,
   dependencies: DAIRuntimeDependencies,
-  activeTaskIds: Map<Environment, string>,
+  registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const state = await requireActiveState(request.sourceEnvironment, activeTaskIds, dependencies.store);
+  const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
   if (state === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for handoff");
   }
-  if (state.handoffState !== "none") {
-    return response(state, "blocked", `Task ${state.taskId} cannot hand off from state ${state.handoffState}`);
-  }
-  assertStageTransition(state.stage, "handoff");
-  const handoffOutcome = await connectorOutcome(async () => {
-    const envelope = await dependencies.handoffService.create({ state, targetEnvironment: command.target });
-    await dependencies.adapters[command.target].receive(envelope);
-    return envelope;
-  }, handoffConnectorFailure);
-  if (handoffOutcome.kind === "blocked") {
-    return response(state, "blocked", handoffOutcome.message);
-  }
-  const handoffTransition = transitionState(state, "handoff", state.role, command.target);
-  const handoffState = await persistState(dependencies.store, {
-    ...handoffTransition,
-    handoffState: "active",
-    routingDecision: handoffTransition.routingDecision === null ? null : {
-      ...handoffTransition.routingDecision,
-      reason: `Handoff ownership transferred to ${command.target}`,
-    },
-  });
-  transferTaskOwnership(activeTaskIds, state.taskId, command.target);
-  return response(handoffState, "accepted", `Handoff ${handoffOutcome.value.handoffId} is owned by ${command.target}`);
+  return registry.serializeHandoff(
+    state.taskId,
+    () => handoffTaskExclusive(state.taskId, request, command, dependencies, registry),
+  );
 }
 
 async function closeActiveTask(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
-  activeTaskIds: ReadonlyMap<Environment, string>,
+  registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const state = await requireActiveState(request.sourceEnvironment, activeTaskIds, dependencies.store);
+  const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
   if (state === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for close");
   }
@@ -656,14 +905,14 @@ async function closeActiveTask(
 
 export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request: ExternalDAIRequest) => Promise<DAIResponse> {
   validateDependencies(dependencies);
-  const activeTaskIds = new Map<Environment, string>();
+  const registry = createRuntimeTaskRegistry();
   return async (externalRequest: ExternalDAIRequest): Promise<DAIResponse> => {
     const request = validateRequest(externalRequest);
-    if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, activeTaskIds);
-    if (request.command.kind === "continue") return continueTask(request, request.command, dependencies, activeTaskIds);
-    if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, activeTaskIds);
-    if (request.command.kind === "close") return closeActiveTask(request, dependencies, activeTaskIds);
-    const state = await requireActiveState(request.sourceEnvironment, activeTaskIds, dependencies.store);
+    if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, registry);
+    if (request.command.kind === "continue") return continueTask(request, request.command, dependencies, registry);
+    if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, registry);
+    if (request.command.kind === "close") return closeActiveTask(request, dependencies, registry);
+    const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
     return state === null
       ? blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for status")
       : response(state, "accepted", `Task ${state.taskId} is ${state.stage} in ${state.environment}`);
