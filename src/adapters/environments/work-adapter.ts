@@ -13,6 +13,10 @@ export class WorkEnvironmentAdapter {
     await this.handoffService.acknowledge(envelope, this.capabilities());
   }
 
+  public async ready(): Promise<void> {
+    await this.handoffService.ready();
+  }
+
   public async complete(handoffId: string): Promise<void> {
     await this.handoffService.complete(handoffId, "work");
   }

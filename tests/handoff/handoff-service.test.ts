@@ -7,7 +7,8 @@ import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-ada
 import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-adapter.js";
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../../src/domain/errors.js";
 import type { Environment, TaskState } from "../../src/domain/types.js";
-import { FileHandoffPersistence, InMemoryHandoffPersistence, PersistentHandoffService } from "../../src/handoff/handoff-service.js";
+import { FileHandoffPersistence, InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistence, type HandoffPersistenceRecord } from "../../src/handoff/handoff-service.js";
+import { validateHandoffCreateInput } from "../../src/handoff/envelope.js";
 
 function state(environment: Environment): TaskState {
   return { taskId: "task-handoff", goal: "Transfer the portable task state", constraints: ["keep scope narrow"], environment, stage: "execute", role: "implementer", routingDecision: null, selectedCapabilities: [], contextManifest: ["workspace:src"], handoffState: "none", verificationEvidence: [], recoveryPoint: null, approvalState: "approved", criticalUnsavedContext: [], durableContext: null };
@@ -15,7 +16,49 @@ function state(environment: Environment): TaskState {
 
 function service(): PersistentHandoffService { return new PersistentHandoffService(new InMemoryHandoffPersistence()); }
 
+class BlockingHandoffPersistence implements HandoffPersistence {
+  private readonly delegate = new InMemoryHandoffPersistence();
+  private blocked = false;
+  private saveStarted: (() => void) | null = null;
+  private releaseSave: (() => void) | null = null;
+  private readonly saveStartedPromise = new Promise<void>((resolve) => { this.saveStarted = resolve; });
+
+  public blockNextSave(): void { this.blocked = true; }
+  public async waitForBlockedSave(): Promise<void> { await this.saveStartedPromise; }
+  public releaseBlockedSave(): void {
+    if (this.releaseSave === null) throw new Error("No persistence save is blocked");
+    this.releaseSave();
+    this.releaseSave = null;
+  }
+  public async load(): Promise<readonly HandoffPersistenceRecord[]> { return this.delegate.load(); }
+  public async save(records: readonly HandoffPersistenceRecord[]): Promise<void> {
+    if (this.blocked) {
+      this.blocked = false;
+      this.saveStarted?.();
+      await new Promise<void>((resolve) => { this.releaseSave = resolve; });
+    }
+    await this.delegate.save(records);
+  }
+}
+
 describe("PersistentHandoffService", () => {
+  it.each<[Environment, Environment]>([
+    ["chat", "work"],
+    ["work", "codex"],
+    ["codex", "work"],
+    ["codex", "chat"],
+    ["work", "chat"],
+    ["chat", "codex"],
+  ])("transfers the compatible %s to %s path", async (source, target) => {
+    const handoffService = service();
+    const envelope = await handoffService.create({ state: state(source), targetEnvironment: target });
+    const targetAdapter = target === "chat" ? new ChatEnvironmentAdapter(handoffService) : target === "work" ? new WorkEnvironmentAdapter(handoffService) : new CodexEnvironmentAdapter(handoffService);
+
+    await targetAdapter.receive(envelope);
+
+    expect(targetAdapter.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: target });
+  });
+
   it("redacts every secret-like value, including bearer tokens and nested durable data", async () => {
     const source: TaskState = {
       ...state("codex"), goal: "Authorization: Bearer bearer-secret-value", constraints: ["apiKey=api-secret-value"],
@@ -33,10 +76,9 @@ describe("PersistentHandoffService", () => {
   });
 
   it("validates malformed create input before dereferencing state or counters", async () => {
-    const handoffService = service();
-    await expect(handoffService.create(null as never)).rejects.toThrow(InvalidTaskStateError);
-    await expect(handoffService.create({ state: null as never, targetEnvironment: "work" })).rejects.toThrow(InvalidTaskStateError);
-    await expect(handoffService.create({ state: state("chat"), targetEnvironment: null as never })).rejects.toThrow(InvalidTaskStateError);
+    expect(() => validateHandoffCreateInput(null)).toThrow(InvalidTaskStateError);
+    expect(() => validateHandoffCreateInput({ state: null, targetEnvironment: "work" })).toThrow(InvalidTaskStateError);
+    expect(() => validateHandoffCreateInput({ state: state("chat"), targetEnvironment: null })).toThrow(InvalidTaskStateError);
   });
 
   it("rejects malformed envelopes and nested identity mismatches", async () => {
@@ -97,5 +139,83 @@ describe("PersistentHandoffService", () => {
     expect([...new WorkEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["durable-context"]);
     expect([...new CodexEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["local-execution", "codex-evidence"]);
     await expect(new CodexEnvironmentAdapter(handoffService).receive(envelope)).rejects.toThrow(InvalidHandoffError);
+  });
+
+  it("serializes concurrent acknowledgements so exactly one owner succeeds", async () => {
+    const persistence = new BlockingHandoffPersistence();
+    const handoffService = new PersistentHandoffService(persistence);
+    const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    const work = new WorkEnvironmentAdapter(handoffService);
+    persistence.blockNextSave();
+
+    const first = work.receive(envelope);
+    await persistence.waitForBlockedSave();
+    const second = work.receive(envelope);
+    persistence.releaseBlockedSave();
+    const results = await Promise.allSettled([first, second]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  });
+
+  it("serializes concurrent creation so each successful handoff gets a unique sequence", async () => {
+    const persistence = new BlockingHandoffPersistence();
+    const handoffService = new PersistentHandoffService(persistence);
+    persistence.blockNextSave();
+
+    const first = handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    await persistence.waitForBlockedSave();
+    const second = handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    persistence.releaseBlockedSave();
+    const envelopes = await Promise.all([first, second]);
+
+    expect(envelopes.map((envelope) => envelope.handoffId)).toEqual(["handoff-task-handoff-1", "handoff-task-handoff-2"]);
+  });
+
+  it("serializes concurrent completion and rejection so only one terminal transition succeeds", async () => {
+    const persistence = new BlockingHandoffPersistence();
+    const handoffService = new PersistentHandoffService(persistence);
+    const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    const work = new WorkEnvironmentAdapter(handoffService);
+    await work.receive(envelope);
+    persistence.blockNextSave();
+
+    const completion = work.complete(envelope.handoffId);
+    await persistence.waitForBlockedSave();
+    const rejection = handoffService.reject(envelope.handoffId, "Requires review");
+    persistence.releaseBlockedSave();
+    const results = await Promise.allSettled([completion, rejection]);
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(work.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "completed", reason: "Completed by work", owner: "work" });
+  });
+
+  it("exposes restarted adapter status only after adapter ready", async () => {
+    const persistence = new InMemoryHandoffPersistence();
+    const first = new PersistentHandoffService(persistence);
+    const envelope = await first.create({ state: state("chat"), targetEnvironment: "work" });
+    const restarted = new WorkEnvironmentAdapter(new PersistentHandoffService(persistence));
+
+    expect(() => restarted.status(envelope.handoffId)).toThrow(InvalidHandoffError);
+    await restarted.ready();
+    expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "pending", reason: null, owner: null });
+  });
+
+  it("restarts a file-backed adapter through ready before receive and status", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    try {
+      const first = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
+      const envelope = await first.create({ state: state("chat"), targetEnvironment: "work" });
+      const restartedWork = new WorkEnvironmentAdapter(new PersistentHandoffService(new FileHandoffPersistence(persistencePath)));
+
+      expect(() => restartedWork.status(envelope.handoffId)).toThrow(InvalidHandoffError);
+      await restartedWork.ready();
+      await restartedWork.receive(envelope);
+      expect(restartedWork.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, state: "active", reason: null, owner: "work" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

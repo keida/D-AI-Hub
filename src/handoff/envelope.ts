@@ -37,9 +37,8 @@ const recoveryPointSchema = z.object({ recoveryPointId: z.string().min(1), taskI
 const routingDecisionSchema = z.object({ stage: stageSchema, environment: environmentSchema, role: roleSchema, selectedModel: z.string(), selectedCapabilities: z.array(z.string()), reason: z.string(), overrideSource: z.enum(["default", "user"]) }).strict();
 const evidenceSchema = z.object({ evidenceId: z.string().min(1), stage: stageSchema, environment: environmentSchema, role: roleSchema, selectedModel: z.string(), command: z.string(), observedOutput: z.string(), exitCode: z.number().int().nullable(), interpretation: z.string(), passed: z.boolean(), recoveryPointId: z.string().min(1).nullable(), recordedAt: z.string().datetime() }).strict();
 const taskStateSchema = z.object({ taskId: z.string().min(1), goal: z.string().min(1), constraints: z.array(z.string()), environment: environmentSchema, stage: stageSchema, role: roleSchema, routingDecision: routingDecisionSchema.nullable(), selectedCapabilities: z.array(z.string()), contextManifest: z.array(z.string()), handoffState: z.enum(["none", "pending", "acknowledged", "active", "completed", "rejected"]), verificationEvidence: z.array(evidenceSchema), recoveryPoint: recoveryPointSchema.nullable(), approvalState: z.enum(["not-required", "pending", "approved", "rejected"]), criticalUnsavedContext: z.array(z.string()), durableContext: manifestSchema.nullable() }).strict();
-const envelopeSchema = z.object({ schemaVersion: z.literal(1), handoffId: z.string().regex(/^handoff-[A-Za-z0-9._-]+-[1-9][0-9]*$/), taskId: z.string().min(1), sourceEnvironment: environmentSchema, targetEnvironment: environmentSchema, stage: stageSchema, role: roleSchema, taskState: taskStateSchema, capabilitySnapshot: z.object({ chat: z.array(z.string()), work: z.array(z.string()), codex: z.array(z.string()) }).strict(), durableContextManifest: manifestSchema.nullable(), unsavedContext: z.array(z.string()), redactions: z.array(z.string()), integrityHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+export const handoffEnvelopeSchema = z.object({ schemaVersion: z.literal(1), handoffId: z.string().regex(/^handoff-[A-Za-z0-9._-]+-[1-9][0-9]*$/), taskId: z.string().min(1), sourceEnvironment: environmentSchema, targetEnvironment: environmentSchema, stage: stageSchema, role: roleSchema, taskState: taskStateSchema, capabilitySnapshot: z.object({ chat: z.array(z.string()), work: z.array(z.string()), codex: z.array(z.string()) }).strict(), durableContextManifest: manifestSchema.nullable(), unsavedContext: z.array(z.string()), redactions: z.array(z.string()), integrityHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const capabilitySnapshot: Readonly<Record<Environment, readonly string[]>> = { chat: ["approval", "status"], work: ["durable-context"], codex: ["local-execution", "codex-evidence"] };
-type CanonicalJson = string | number | boolean | null | readonly CanonicalJson[] | { readonly [key: string]: CanonicalJson };
 
 function issueReason(result: z.ZodSafeParseError<object>): string {
   const issue = result.error.issues[0];
@@ -78,16 +77,9 @@ function copyPortableState(state: TaskState, redactions: string[]): TaskState {
   return { taskId: redactString(state.taskId, "taskState.taskId", redactions), goal: redactString(state.goal, "taskState.goal", redactions), constraints: copyStringArray(state.constraints, "taskState.constraints", redactions), environment: state.environment, stage: state.stage, role: state.role, routingDecision: state.routingDecision === null ? null : { stage: state.routingDecision.stage, environment: state.routingDecision.environment, role: state.routingDecision.role, selectedModel: redactString(state.routingDecision.selectedModel, "taskState.routingDecision.selectedModel", redactions), selectedCapabilities: copyStringArray(state.routingDecision.selectedCapabilities, "taskState.routingDecision.selectedCapabilities", redactions), reason: redactString(state.routingDecision.reason, "taskState.routingDecision.reason", redactions), overrideSource: state.routingDecision.overrideSource }, selectedCapabilities: copyStringArray(state.selectedCapabilities, "taskState.selectedCapabilities", redactions), contextManifest: copyStringArray(state.contextManifest, "taskState.contextManifest", redactions), handoffState: "pending", verificationEvidence: state.verificationEvidence.map((value, index) => copyEvidence(value, `taskState.verificationEvidence[${index}]`, redactions)), recoveryPoint: copyRecoveryPoint(state.recoveryPoint, "taskState.recoveryPoint", redactions), approvalState: state.approvalState, criticalUnsavedContext: copyStringArray(state.criticalUnsavedContext, "taskState.criticalUnsavedContext", redactions), durableContext: copyManifest(state.durableContext, "taskState.durableContext", redactions) };
 }
 
-function canonicalJson(value: CanonicalJson): string {
-  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const objectValue = value as { readonly [key: string]: CanonicalJson };
-  return `{${Object.keys(objectValue).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(objectValue[key] as CanonicalJson)}`).join(",")}}`;
-}
+function envelopeContent(envelope: Omit<HandoffEnvelope, "integrityHash">): string { return JSON.stringify(envelope); }
 
-function canonicalEnvelope(envelope: Omit<HandoffEnvelope, "integrityHash">): string { return canonicalJson(envelope as never as CanonicalJson); }
-
-function integrityHash(envelope: Omit<HandoffEnvelope, "integrityHash">): string { return createHash("sha256").update(canonicalEnvelope(envelope), "utf8").digest("hex"); }
+function integrityHash(envelope: Omit<HandoffEnvelope, "integrityHash">): string { return createHash("sha256").update(envelopeContent(envelope), "utf8").digest("hex"); }
 
 function assertNestedIdentity(envelope: HandoffEnvelope): void {
   const state = envelope.taskState;
@@ -103,7 +95,7 @@ function cloneEnvelope(envelope: HandoffEnvelope): HandoffEnvelope {
   return { ...envelope, taskState: copyPortableState(envelope.taskState, redactions), capabilitySnapshot: { chat: [...envelope.capabilitySnapshot.chat], work: [...envelope.capabilitySnapshot.work], codex: [...envelope.capabilitySnapshot.codex] }, durableContextManifest: copyManifest(envelope.durableContextManifest, "durableContextManifest", redactions), unsavedContext: copyStringArray(envelope.unsavedContext, "unsavedContext", redactions), redactions: [...envelope.redactions] };
 }
 
-export function validateHandoffCreateInput(value: CreateHandoffEnvelopeInput): CreateHandoffEnvelopeInput {
+export function validateHandoffCreateInput(value: CreateHandoffEnvelopeInput | object | null): CreateHandoffEnvelopeInput {
   const inputSchema = z.object({ handoffId: z.string().regex(/^handoff-[A-Za-z0-9._-]+-[1-9][0-9]*$/), state: taskStateSchema, targetEnvironment: environmentSchema }).strict();
   const result = inputSchema.safeParse(value);
   if (!result.success) throw new InvalidTaskStateError(`Invalid handoff create input: ${issueReason(result)}`);
@@ -120,7 +112,7 @@ export function createHandoffEnvelope(input: CreateHandoffEnvelopeInput): Handof
 }
 
 export function parseHandoffEnvelope(value: HandoffEnvelope): HandoffEnvelope {
-  const result = envelopeSchema.safeParse(value);
+  const result = handoffEnvelopeSchema.safeParse(value);
   if (!result.success) throw new InvalidHandoffError(`Invalid handoff envelope: ${issueReason(result)}`);
   const envelope = result.data;
   const { integrityHash: suppliedHash, ...content } = envelope;
@@ -131,4 +123,7 @@ export function parseHandoffEnvelope(value: HandoffEnvelope): HandoffEnvelope {
   return cloneEnvelope(envelope);
 }
 
-export function handoffEnvelopeSignature(envelope: HandoffEnvelope): string { return canonicalEnvelope(parseHandoffEnvelope(envelope)); }
+export function handoffEnvelopeSignature(envelope: HandoffEnvelope): string {
+  const { integrityHash: ignoredIntegrityHash, ...content } = parseHandoffEnvelope(envelope);
+  return envelopeContent(content);
+}
