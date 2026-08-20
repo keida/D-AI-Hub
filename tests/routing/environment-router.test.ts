@@ -67,10 +67,8 @@ describe("selectEnvironment", () => {
   });
 
   it("rejects unknown environment declarations before routing", () => {
-    const unknownEnvironment = {
-      environment: "unknown",
-      capabilities: new Set(["stage-routing"]),
-    } as unknown as EnvironmentCapabilities;
+    const unknownEnvironment = environment("chat", ["stage-routing"]);
+    Object.defineProperty(unknownEnvironment, "environment", { value: "unknown" });
 
     expect(() => route("route", [unknownEnvironment, environment("chat", ["stage-routing"])], ["stage-routing"])).toThrowError(
       "Unknown environment declaration: unknown",
@@ -78,10 +76,18 @@ describe("selectEnvironment", () => {
   });
 
   it("rejects malformed environment capability collections before routing", () => {
-    const malformedCapabilities = {
-      environment: "chat",
-      capabilities: ["stage-routing"],
-    } as unknown as EnvironmentCapabilities;
+    const malformedCapabilities = environment("chat", []);
+    Object.defineProperty(malformedCapabilities, "capabilities", { value: ["stage-routing"] });
+
+    expect(() => route("route", [malformedCapabilities], ["stage-routing"])).toThrow(CapabilityMismatchError);
+    expect(() => route("route", [malformedCapabilities], ["stage-routing"])).toThrowError(
+      "Environment chat must declare capabilities as a ReadonlySet-compatible collection",
+    );
+  });
+
+  it("rejects capability collections with non-string values before routing", () => {
+    const malformedCapabilities = environment("chat", []);
+    Object.defineProperty(malformedCapabilities, "capabilities", { value: new Set([1]) });
 
     expect(() => route("route", [malformedCapabilities], ["stage-routing"])).toThrow(CapabilityMismatchError);
     expect(() => route("route", [malformedCapabilities], ["stage-routing"])).toThrowError(

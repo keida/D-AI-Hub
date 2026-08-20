@@ -28,21 +28,34 @@ const defaultEnvironmentsByStage: ReadonlyMap<Stage, readonly Environment[]> = n
   ["close", ["work"]],
 ]);
 
-const knownEnvironments: ReadonlySet<Environment> = new Set(["chat", "work", "codex"]);
-
-function isEnvironment(value: unknown): value is Environment {
-  return typeof value === "string" && knownEnvironments.has(value as Environment);
+interface EnvironmentCapabilityDeclaration {
+  readonly environment: string;
+  readonly capabilities: object;
 }
 
-function isReadonlySetCompatible(value: unknown): value is ReadonlySet<string> {
-  return value instanceof Set && Array.from(value).every((capability) => typeof capability === "string");
+const knownEnvironments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
+
+function isEnvironment(value: string): value is Environment {
+  return knownEnvironments.has(value);
 }
 
-function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
-  return typeof value === "object" && value !== null;
+function isReadonlySetCompatible(value: object): value is ReadonlySet<string> {
+  if (!(value instanceof Set)) {
+    return false;
+  }
+
+  for (const capability of value) {
+    if (typeof capability !== "string") {
+      return false;
+    }
+  }
+
+  return true;
 }
 
-function assertAvailableEnvironments(available: unknown): asserts available is readonly EnvironmentCapabilities[] {
+function assertAvailableEnvironments(
+  available: readonly EnvironmentCapabilityDeclaration[],
+): asserts available is readonly EnvironmentCapabilities[] {
   if (!Array.isArray(available)) {
     throw new CapabilityMismatchError("Available environments must be an array of environment capability declarations");
   }
@@ -50,7 +63,7 @@ function assertAvailableEnvironments(available: unknown): asserts available is r
   const declaredEnvironments = new Set<Environment>();
 
   for (const candidate of available) {
-    if (!isRecord(candidate)) {
+    if (candidate === null || typeof candidate !== "object") {
       throw new CapabilityMismatchError("Available environments must contain environment capability declarations");
     }
 
