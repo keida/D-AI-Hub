@@ -3,7 +3,7 @@ import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError } from "../domain/errors.js";
-import { assertSafeManifestId, containsSecretShapedValue } from "../domain/manifest-id.js";
+import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
 import type { DurableContextManifest, TaskState } from "../domain/types.js";
 import type { DurableContextStore } from "./durable-context-store.js";
 
@@ -32,6 +32,7 @@ const roleSchema = z.enum([
   "debugger",
   "recovery-operator",
 ]);
+const safeManifestIdSchema = z.string().refine(isSafeManifestId, "must be a UUID or manifest-UUID");
 const verificationEvidenceSchema = z
   .object({
     evidenceId: z.string().min(1),
@@ -50,7 +51,7 @@ const verificationEvidenceSchema = z
   .strict();
 const manifestSchema = z
   .object({
-    manifestId: z.string().regex(/^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|manifest-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i),
+    manifestId: safeManifestIdSchema,
     taskId: z.string().min(1),
     stage: stageSchema,
     environment: environmentSchema,
@@ -72,7 +73,7 @@ const recoveryPointSchema = z
     hashes: z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)),
     restorationInstructions: z.string(),
     createdAt: z.string().datetime(),
-    snapshotManifestId: z.string().min(1).optional(),
+    snapshotManifestId: safeManifestIdSchema.optional(),
   })
   .strict();
 const taskStateSchema = z

@@ -20,6 +20,14 @@ afterEach(async () => {
 });
 
 describe("discoverSkillMetadata", () => {
+  it("discovers the production .agents/skills root and selects a matching intent", async () => {
+    const productionRoot = join(process.cwd(), ".agents", "skills");
+    const descriptors = await discoverSkillMetadata([productionRoot]);
+
+    expect(descriptors.map((descriptor) => descriptor.name)).toEqual(["knowledge-manager", "project-memory"]);
+    expect(selectCapabilities("resume project memory", "bootstrap", "codex", descriptors).map((descriptor) => descriptor.name)).toEqual(["project-memory"]);
+  });
+
   it("discovers only frontmatter and returns absolute normalized Skill paths", async () => {
     const descriptors = await discoverSkillMetadata([fixtureRoot]);
 

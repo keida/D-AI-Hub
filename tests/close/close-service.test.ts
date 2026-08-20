@@ -287,6 +287,35 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/artifact correspondence/i);
   });
 
+  it.each(["state.json", "manifest.json", "recovery.json"] as const)("does not push when recovery correspondence omits %s", async (omittedPath) => {
+    const state = closeReadyState(new Date().toISOString());
+    const recoveryPoint = state.recoveryPoint;
+    if (recoveryPoint === null) throw new Error("Expected recovery point");
+    let pushCalled = false;
+    const mismatchedState = {
+      ...state,
+      recoveryPoint: {
+        ...recoveryPoint,
+        durablePaths: recoveryPoint.durablePaths.filter((path) => path !== omittedPath),
+        hashes: Object.fromEntries(Object.entries(recoveryPoint.hashes).filter(([path]) => path !== omittedPath)),
+      },
+    };
+
+    const verdict = await closeTask(mismatchedState, {
+      store: storeFor(mismatchedState),
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          pushCalled = true;
+          return successfulPush();
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState("e".repeat(40)),
+      },
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(pushCalled).toBe(false);
+  });
+
   it("returns NO when durable and recovery hashes differ for the same paths", async () => {
     const state = closeReadyState(new Date().toISOString());
     const recoveryPoint = state.recoveryPoint;

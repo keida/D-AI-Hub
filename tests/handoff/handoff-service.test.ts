@@ -9,7 +9,7 @@ import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-ada
 import { CapabilityMismatchError, InvalidHandoffError, InvalidTaskStateError } from "../../src/domain/errors.js";
 import type { Environment, TaskState } from "../../src/domain/types.js";
 import { FILE_HANDOFF_LOCK_LEASE_MS, FileHandoffPersistence, InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistence, type HandoffPersistenceRecord } from "../../src/handoff/handoff-service.js";
-import { validateHandoffCreateInput } from "../../src/handoff/envelope.js";
+import { handoffEnvelopeSignature, validateHandoffCreateInput } from "../../src/handoff/envelope.js";
 
 function state(environment: Environment): TaskState {
   return { taskId: "task-handoff", goal: "Transfer the portable task state", constraints: ["keep scope narrow"], environment, stage: "execute", role: "implementer", routingDecision: null, selectedCapabilities: [], contextManifest: ["workspace:src"], handoffState: "none", verificationEvidence: [], recoveryPoint: null, approvalState: "approved", criticalUnsavedContext: [], durableContext: null };
@@ -83,6 +83,22 @@ describe("PersistentHandoffService", () => {
     const serialized = JSON.stringify(envelope);
     for (const secret of ["bearer-secret-value", "api-secret-value", "router-secret", "capability-secret", "reason-secret", "command-secret-value", "output-secret", "interpretation-secret", "path-secret", "hash-secret", "restore-secret", "durable-path-secret", "manifest-hash-secret", "unsaved-secret", "private conversation"]) expect(serialized).not.toContain(secret);
     expect(envelope.redactions.length).toBeGreaterThan(10);
+  });
+
+  it("redacts raw credential signatures before handoff integrity and persistence", async () => {
+    const persistence = new InMemoryHandoffPersistence();
+    const service = new PersistentHandoffService(persistence);
+    const rawSignature = "github_pat_1234567890123456789012345678901234567890";
+    const envelope = await service.create({
+      state: { ...state("codex"), goal: `Review ${rawSignature}`, contextManifest: [`evidence:${rawSignature}`] },
+      targetEnvironment: "work",
+    });
+    const serialized = JSON.stringify(envelope);
+
+    expect(serialized).not.toContain(rawSignature);
+    expect(serialized).toContain("[REDACTED]");
+    expect(handoffEnvelopeSignature(envelope)).not.toContain(rawSignature);
+    expect((await persistence.load())[0]?.envelope).toEqual(expect.objectContaining({ taskId: envelope.taskId }));
   });
 
   it("validates malformed create input before dereferencing state or counters", async () => {

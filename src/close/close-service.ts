@@ -4,6 +4,7 @@ import type { GitFailureCategory } from "../adapters/git.js";
 import { CloseBlockedError } from "../domain/errors.js";
 import type { CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
 import { isSafeManifestId } from "../domain/manifest-id.js";
+import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import type { DurableContextStore } from "../state/durable-context-store.js";
 import { evaluateHardGates, type GateEvidence, type GateName } from "../verification/gates.js";
 
@@ -94,18 +95,12 @@ function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState, s
   if (recoveryPoint === null || recoveryPoint.recoveryPointId !== manifest.recoveryPointId) {
     return false;
   }
-  const manifestPaths = new Set(manifest.durablePaths);
-  const recoveryPaths = new Set(recoveryPoint.durablePaths);
-  const manifestHashPaths = Object.keys(manifest.hashes);
-  const recoveryHashPaths = Object.keys(recoveryPoint.hashes);
+  if (!isSafeManifestId(manifest.manifestId)) return false;
+  const artifactManifest = snapshotManifest === null ? manifest : snapshotManifest;
   if (
     manifest.durablePaths.length === 0
-    || manifestPaths.size !== manifest.durablePaths.length
-    || recoveryPaths.size !== recoveryPoint.durablePaths.length
-    || manifestHashPaths.length !== manifestPaths.size
-    || recoveryHashPaths.length !== recoveryPaths.size
-    || recoveryPaths.size === 0
-    || [...recoveryPaths].some((path) => !manifestPaths.has(path))
+    || artifactManifest.durablePaths.length === 0
+    || recoveryPoint.durablePaths.length === 0
   ) {
     return false;
   }
@@ -113,13 +108,7 @@ function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState, s
     return false;
   }
   if (recoveryPoint.snapshotManifestId !== undefined && !isSafeManifestId(recoveryPoint.snapshotManifestId)) return false;
-  const artifactManifest = snapshotManifest === null ? manifest : snapshotManifest;
-  if (recoveryPoint.durablePaths.some((path) => {
-    if (!manifestPaths.has(path) || !artifactManifest.durablePaths.includes(path)) return true;
-    return recoveryPoint.hashes[path] !== artifactManifest.hashes[path];
-  })) {
-    return false;
-  }
+  if (!hasExactPathHashEquality(artifactManifest.durablePaths, artifactManifest.hashes, recoveryPoint.durablePaths, recoveryPoint.hashes)) return false;
   return state.verificationEvidence.every((evidence) => evidence.recoveryPointId === recoveryPoint.recoveryPointId);
 }
 

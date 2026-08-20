@@ -195,6 +195,22 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it.each(["manifest.json", "recovery.json"] as const)("rejects recovery when the required %s artifact is missing", async (artifact) => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState(`task-missing-${artifact.replace(".json", "")}`, `Require ${artifact}`);
+    const artifactPath = join(rootPath, state.taskId, artifact);
+
+    try {
+      await store.save(state);
+      await rm(artifactPath);
+
+      await expect(store.load(state.taskId)).rejects.toThrow(/required durable artifact|missing|integrity/i);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("rejects invalid persisted state during recovery", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
@@ -226,7 +242,7 @@ describe("FileDurableContextStore", () => {
     }
   });
 
-  it.each(["ghp_123456789012345678901234567890", "sk_123456789012345678901234567890", "-----BEGIN PRIVATE KEY-----"]) (
+  it.each(["github_pat_123456789012345678901234567890", "ghp_123456789012345678901234567890", "sk-123456789012345678901234567890", "-----BEGIN PRIVATE KEY-----"]) (
     "rejects secret-shaped values before writing %s",
     async (secret) => {
       const rootPath = await createStoreRoot();

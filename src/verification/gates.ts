@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
+import { isSafeManifestId } from "../domain/manifest-id.js";
 import type { TaskState, VerificationEvidence } from "../domain/types.js";
 
 export interface GateResult {
@@ -72,6 +73,7 @@ function recoveryStateFailure(state: TaskState, now: Date): string | null {
   if (!hasNonEmptyValues(recoveryPoint.durablePaths) || recoveryPoint.restorationInstructions.trim().length === 0) {
     return "Recovery point paths or restoration instructions are incomplete";
   }
+  if (recoveryPoint.snapshotManifestId !== undefined && !isSafeManifestId(recoveryPoint.snapshotManifestId)) return "Recovery point snapshot manifest id is unsafe";
   if (recoveryPoint.durablePaths.some((path) => !/^[a-f0-9]{64}$/i.test(recoveryPoint.hashes[path] ?? ""))) {
     return "Recovery point is missing a valid hash for a durable path";
   }
@@ -90,6 +92,7 @@ function durableContextStateFailure(state: TaskState, now: Date, maximumEvidence
     || manifest.role !== state.role
   ) return "Durable context identity does not match the current task state";
   if (manifest.manifestId.trim().length === 0 || !hasNonEmptyValues(manifest.durablePaths)) return "Durable context manifest is incomplete";
+  if (!isSafeManifestId(manifest.manifestId)) return "Durable context manifest id is unsafe";
   if (manifest.durablePaths.some((path) => !/^[a-f0-9]{64}$/i.test(manifest.hashes[path] ?? ""))) {
     return "Durable context is missing a valid hash for a durable path";
   }

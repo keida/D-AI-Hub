@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { InvalidHandoffError, InvalidTaskStateError } from "../domain/errors.js";
-import { isSafeManifestId } from "../domain/manifest-id.js";
+import { isSafeManifestId, redactSecretShapedValues } from "../domain/manifest-id.js";
 import type { DurableContextManifest, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../domain/types.js";
 
 export interface HandoffEnvelope {
@@ -48,7 +48,7 @@ function issueReason(result: z.ZodSafeParseError<object>): string {
 }
 
 function redactString(value: string, path: string, redactions: string[]): string {
-  const redacted = value.replace(bearerTokenPattern, "$1[REDACTED]").replace(secretAssignmentPattern, "$1[REDACTED]");
+  const redacted = redactSecretShapedValues(value).replace(bearerTokenPattern, "$1[REDACTED]").replace(secretAssignmentPattern, "$1[REDACTED]");
   if (redacted !== value) redactions.push(path);
   return redacted;
 }

@@ -16,7 +16,8 @@ import {
   UnsavedContextError,
   VerificationGateError,
 } from "../domain/errors.js";
-import { isSafeManifestId } from "../domain/manifest-id.js";
+import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
+import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, Role, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
@@ -174,7 +175,6 @@ const baseApplicableExecutionGates = [
 
 type ApplicableExecutionGate = typeof baseApplicableExecutionGates[number] | "recovery";
 const secretLikeTextPattern = /\b(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credentials?|cookies?|passwords?|passwd|private[_-]?key|secrets?|session[_-]?token|tokens?)\b/i;
-const unlabelledCredentialPattern = /(?:\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b|-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----)/i;
 
 interface ConnectorSuccess<T> {
   readonly kind: "success";
@@ -538,7 +538,7 @@ function secretLikeRecoveryPointField(recoveryPoint: RecoveryPoint): string | nu
   const secretField = fields.find((field) =>
     redactSensitiveText(field.value) !== field.value
     || secretLikeTextPattern.test(field.value)
-    || unlabelledCredentialPattern.test(field.value));
+    || containsSecretShapedValue(field.value));
   return secretField === undefined ? null : `Captured recovery point ${secretField.label} contains secret-like content`;
 }
 
@@ -556,6 +556,7 @@ function validateCapturedRecoveryPoint(
   if (secretFailure !== null) return { kind: "blocked", message: secretFailure };
   const manifest = state.durableContext;
   if (manifest === null) return { kind: "blocked", message: "Recovery point capture requires a persisted verify manifest" };
+  if (!isSafeManifestId(manifest.manifestId)) return { kind: "blocked", message: "Persisted verify manifest id is unsafe" };
   if (
     validated.taskId !== state.taskId
     || validated.stage !== state.stage
@@ -575,6 +576,7 @@ function validateCapturedRecoveryPoint(
     || recoveryHashKeys.length !== validated.durablePaths.length
     || recoveryHashKeys.some((key) => !validated.durablePaths.includes(key))
     || manifestHashKeys.some((key) => !manifest.durablePaths.includes(key))
+    || !hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, validated.durablePaths, validated.hashes)
   ) return { kind: "blocked", message: "Captured recovery point does not match the persisted verify artifacts" };
   return { kind: "success", value: validated };
 }
