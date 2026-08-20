@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -41,6 +41,14 @@ class BlockingHandoffPersistence implements HandoffPersistence {
     await this.delegate.save(records);
   }
   public async withExclusive<T>(operation: () => Promise<T>): Promise<T> { return this.delegate.withExclusive(operation); }
+}
+
+class StaticHandoffPersistence implements HandoffPersistence {
+  public constructor(private readonly records: readonly HandoffPersistenceRecord[]) {}
+
+  public async load(): Promise<readonly HandoffPersistenceRecord[]> { return this.records; }
+  public async save(_records: readonly HandoffPersistenceRecord[]): Promise<void> { throw new Error("Static persistence must not save records"); }
+  public async withExclusive<T>(operation: () => Promise<T>): Promise<T> { return operation(); }
 }
 
 describe("PersistentHandoffService", () => {
@@ -252,6 +260,20 @@ describe("PersistentHandoffService", () => {
     }
   });
 
+  it("rejects an invalid lifecycle record at the in-memory persistence save boundary", async () => {
+    const persistence = new InMemoryHandoffPersistence();
+    const envelope = await service().create({ state: state("chat"), targetEnvironment: "work" });
+
+    await expect(persistence.save([{ envelope, owner: "work", state: "pending", reason: null }])).rejects.toThrow(InvalidHandoffError);
+  });
+
+  it("rejects invalid lifecycle records returned by custom persistence during refresh", async () => {
+    const envelope = await service().create({ state: state("chat"), targetEnvironment: "work" });
+    const persistence = new StaticHandoffPersistence([{ envelope, owner: null, state: "active", reason: null }]);
+
+    await expect(new PersistentHandoffService(persistence).ready()).rejects.toThrow(InvalidHandoffError);
+  });
+
   it("recovers an expired file lock before running a lifecycle operation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
     const persistencePath = join(directory, "handoffs.json");
@@ -287,6 +309,45 @@ describe("PersistentHandoffService", () => {
       firstLock.release();
       await Promise.all([first, second]);
       expect(secondEntered).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("prevents a reclaimed lock holder from saving or removing its successor lock", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "d-ai-handoff-"));
+    const persistencePath = join(directory, "handoffs.json");
+    const lockPath = `${persistencePath}.lock`;
+    const firstPersistence = new FileHandoffPersistence(persistencePath);
+    const secondPersistence = new FileHandoffPersistence(persistencePath);
+    const controls = { firstStarted: null as (() => void) | null, releaseFirst: null as (() => void) | null, secondStarted: null as (() => void) | null, releaseSecond: null as (() => void) | null };
+    const firstStartedPromise = new Promise<void>((resolve) => { controls.firstStarted = resolve; });
+    const releaseFirstPromise = new Promise<void>((resolve) => { controls.releaseFirst = resolve; });
+    const secondStartedPromise = new Promise<void>((resolve) => { controls.secondStarted = resolve; });
+    const releaseSecondPromise = new Promise<void>((resolve) => { controls.releaseSecond = resolve; });
+    try {
+      const first = firstPersistence.withExclusive(async () => {
+        controls.firstStarted?.();
+        await releaseFirstPromise;
+        await firstPersistence.save([]);
+      });
+      await firstStartedPromise;
+      const expiredAt = new Date(Date.now() - FILE_HANDOFF_LOCK_LEASE_MS - 1_000);
+      await utimes(join(lockPath, "lease"), expiredAt, expiredAt);
+
+      const second = secondPersistence.withExclusive(async () => {
+        controls.secondStarted?.();
+        await releaseSecondPromise;
+      });
+      await secondStartedPromise;
+      if (controls.releaseFirst === null) throw new Error("The first lock operation did not start");
+      controls.releaseFirst();
+
+      await expect(first).rejects.toThrow(InvalidHandoffError);
+      expect((await stat(lockPath)).isDirectory()).toBe(true);
+      if (controls.releaseSecond === null) throw new Error("The successor lock operation did not start");
+      controls.releaseSecond();
+      await second;
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
