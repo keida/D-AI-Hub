@@ -3,10 +3,12 @@ name: verification-execution
 description: Collects execution verification evidence.
 triggers:
   - verify
-  - execute
   - evidence
 compatibleEnvironments:
   - codex
+compatibleStages:
+  - execute
+  - verify
 ---
 
 # Verification execution

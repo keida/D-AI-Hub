@@ -1,4 +1,4 @@
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import type { SkillDescriptor } from "./registry.js";
@@ -8,6 +8,8 @@ export interface LoadedSkill {
   readonly instructions: string;
   readonly loadedResources: readonly string[];
 }
+
+const maximumSelectedFileBytes = 1_048_576;
 
 function isPathInside(parentPath: string, childPath: string): boolean {
   const pathRelative = relative(parentPath, childPath);
@@ -23,6 +25,33 @@ async function assertRegularFile(path: string, label: string): Promise<void> {
   }
   if (status.isSymbolicLink() || !status.isFile()) {
     throw new InvalidTaskStateError(`${label} must be a non-symlink regular file: ${path}.`);
+  }
+}
+
+async function readBoundedUtf8File(path: string, label: string): Promise<string> {
+  const handle = await open(path, "r");
+  try {
+    const status = await handle.stat();
+    if (!status.isFile()) {
+      throw new InvalidTaskStateError(`${label} must be a regular file: ${path}.`);
+    }
+    if (status.size > maximumSelectedFileBytes) {
+      throw new InvalidTaskStateError(`${label} exceeds the ${maximumSelectedFileBytes}-byte limit: ${path}.`);
+    }
+
+    const content = Buffer.alloc(status.size);
+    const readResult = await handle.read(content, 0, status.size, 0);
+    if (readResult.bytesRead !== status.size) {
+      throw new InvalidTaskStateError(`${label} changed while being read: ${path}.`);
+    }
+    const trailingByte = Buffer.alloc(1);
+    const trailingReadResult = await handle.read(trailingByte, 0, 1, status.size);
+    if (trailingReadResult.bytesRead !== 0) {
+      throw new InvalidTaskStateError(`${label} changed while being read: ${path}.`);
+    }
+    return content.toString("utf8");
+  } finally {
+    await handle.close();
   }
 }
 
@@ -72,14 +101,14 @@ export async function loadSelectedSkill(
     throw new InvalidTaskStateError("Skill resource requests must not contain duplicates.");
   }
 
-  const instructions = await readFile(descriptor.skillPath, "utf8");
+  const instructions = await readBoundedUtf8File(descriptor.skillPath, "Selected Skill file");
   for (const resourcePath of resourcePaths) {
     await assertRegularFile(resourcePath, "Skill resource");
     const resolvedResourcePath = await realpath(resourcePath);
     if (!isPathInside(skillDirectory, resolvedResourcePath)) {
       throw new InvalidTaskStateError(`Skill resource escapes the Skill directory: ${resourcePath}.`);
     }
-    await readFile(resolvedResourcePath, "utf8");
+    await readBoundedUtf8File(resolvedResourcePath, "Skill resource");
   }
 
   return {
@@ -87,6 +116,7 @@ export async function loadSelectedSkill(
       ...descriptor,
       triggers: [...descriptor.triggers],
       compatibleEnvironments: [...descriptor.compatibleEnvironments],
+      compatibleStages: [...descriptor.compatibleStages],
     },
     instructions,
     loadedResources: [...resourcePaths],

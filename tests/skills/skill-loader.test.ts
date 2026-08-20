@@ -1,4 +1,4 @@
-import { copyFile, mkdtemp, rm, symlink } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -61,5 +61,28 @@ describe("loadSelectedSkill", () => {
     await copyFile(descriptor.skillPath, linkedDescriptor.skillPath);
 
     await expect(loadSelectedSkill(linkedDescriptor, ["references/notes.md"])).rejects.toThrow(InvalidTaskStateError);
+  });
+
+  it("rejects oversized selected instructions and resources before loading them", async () => {
+    const temporaryDirectory = await createTemporaryDirectory();
+    const skillDirectory = join(temporaryDirectory, "oversized-loader");
+    await mkdir(join(skillDirectory, "references"), { recursive: true });
+    const skillPath = join(skillDirectory, "SKILL.md");
+    await writeFile(skillPath, "x".repeat(1_048_577), "utf8");
+    const descriptor = {
+      name: "oversized-loader",
+      description: "Loads within an explicit size limit.",
+      triggers: ["load"],
+      compatibleEnvironments: ["codex"] as const,
+      compatibleStages: ["execute"] as const,
+      skillPath,
+    };
+
+    await expect(loadSelectedSkill(descriptor, [])).rejects.toThrow(InvalidTaskStateError);
+
+    await writeFile(skillPath, "Small instructions.", "utf8");
+    await writeFile(join(skillDirectory, "references", "oversized.md"), "y".repeat(1_048_577), "utf8");
+
+    await expect(loadSelectedSkill(descriptor, ["references/oversized.md"])).rejects.toThrow(InvalidTaskStateError);
   });
 });

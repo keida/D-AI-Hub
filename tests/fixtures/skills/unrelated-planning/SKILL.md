@@ -6,6 +6,8 @@ triggers:
   - plan
 compatibleEnvironments:
   - chat
+compatibleStages:
+  - plan
 ---
 
 # Unrelated body sentinel

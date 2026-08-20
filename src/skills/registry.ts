@@ -9,6 +9,7 @@ export interface SkillDescriptor {
   readonly description: string;
   readonly triggers: readonly string[];
   readonly compatibleEnvironments: readonly Environment[];
+  readonly compatibleStages: readonly Stage[];
   readonly skillPath: string;
 }
 
@@ -17,6 +18,7 @@ interface ParsedSkillFrontmatter {
   readonly description?: string;
   readonly triggers?: readonly string[];
   readonly compatibleEnvironments?: readonly string[];
+  readonly compatibleStages?: readonly string[];
 }
 
 const knownEnvironments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
@@ -41,7 +43,7 @@ function assertEnvironment(value: string, context: string): asserts value is Env
   }
 }
 
-function assertStage(value: Stage): void {
+function assertStage(value: string): asserts value is Stage {
   if (!knownStages.has(value)) {
     throw new InvalidTaskStateError(`Invalid Skill selection stage: ${value}.`);
   }
@@ -175,12 +177,17 @@ function parseDescriptor(skillPath: string, frontmatter: string): SkillDescripto
   for (const environment of compatibleEnvironments) {
     assertEnvironment(environment, `Skill metadata at ${skillPath}`);
   }
+  const compatibleStages = assertStringArray(metadata.compatibleStages, "compatibleStages", skillPath);
+  for (const stage of compatibleStages) {
+    assertStage(stage);
+  }
 
   return {
     name,
     description,
     triggers,
     compatibleEnvironments: compatibleEnvironments as readonly Environment[],
+    compatibleStages: compatibleStages as readonly Stage[],
     skillPath,
   };
 }
@@ -198,14 +205,20 @@ function assertDescriptor(descriptor: SkillDescriptor, index: number): void {
   assertString(descriptor.description, "description", descriptor.skillPath);
   const triggers = assertStringArray(descriptor.triggers, "triggers", descriptor.skillPath);
   const environments = assertStringArray(descriptor.compatibleEnvironments, "compatibleEnvironments", descriptor.skillPath);
+  const stages = assertStringArray(descriptor.compatibleStages, "compatibleStages", descriptor.skillPath);
   for (const environment of environments) {
     assertEnvironment(environment, `Skill descriptor at index=${index}`);
+  }
+  for (const stage of stages) {
+    assertStage(stage);
   }
   if (
     triggers.length !== descriptor.triggers.length ||
     environments.length !== descriptor.compatibleEnvironments.length ||
+    stages.length !== descriptor.compatibleStages.length ||
     !triggers.every((trigger, triggerIndex) => trigger === descriptor.triggers[triggerIndex]) ||
-    !environments.every((compatibleEnvironment, environmentIndex) => compatibleEnvironment === descriptor.compatibleEnvironments[environmentIndex])
+    !environments.every((compatibleEnvironment, environmentIndex) => compatibleEnvironment === descriptor.compatibleEnvironments[environmentIndex]) ||
+    !stages.every((compatibleStage, stageIndex) => compatibleStage === descriptor.compatibleStages[stageIndex])
   ) {
     throw new InvalidTaskStateError(`Skill descriptor at index=${index} contains invalid metadata.`);
   }
@@ -301,7 +314,12 @@ export async function discoverSkillMetadata(roots: readonly string[]): Promise<r
       descriptors.push(descriptor);
     }
   }
-  return descriptors.sort((left, right) => left.name.localeCompare(right.name)).map((descriptor) => ({ ...descriptor, triggers: [...descriptor.triggers], compatibleEnvironments: [...descriptor.compatibleEnvironments] }));
+  return descriptors.sort((left, right) => left.name.localeCompare(right.name)).map((descriptor) => ({
+    ...descriptor,
+    triggers: [...descriptor.triggers],
+    compatibleEnvironments: [...descriptor.compatibleEnvironments],
+    compatibleStages: [...descriptor.compatibleStages],
+  }));
 }
 
 export function selectCapabilities(
@@ -327,7 +345,7 @@ export function selectCapabilities(
   }
 
   const compatibleCandidates = descriptors.filter(
-    (descriptor) => descriptor.compatibleEnvironments.includes(environment) && descriptor.triggers.includes(stage),
+    (descriptor) => descriptor.compatibleEnvironments.includes(environment) && descriptor.compatibleStages.includes(stage),
   );
   const tokens = intentTokens(intent);
   const matchedTokens = tokens.filter((token) => compatibleCandidates.some((descriptor) => coversToken(descriptor, token)));
@@ -338,5 +356,6 @@ export function selectCapabilities(
     ...descriptor,
     triggers: [...descriptor.triggers],
     compatibleEnvironments: [...descriptor.compatibleEnvironments],
+    compatibleStages: [...descriptor.compatibleStages],
   }));
 }
