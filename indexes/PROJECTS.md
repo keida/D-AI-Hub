@@ -4,7 +4,7 @@ Canonical project state lives under `projects/`.
 
 ## Active projects
 
-_No active projects registered yet._
+- [D-AI-Hub](../projects/d-ai-hub/)
 
 ## Archived projects
 

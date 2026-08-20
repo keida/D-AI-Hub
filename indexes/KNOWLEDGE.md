@@ -5,6 +5,7 @@ Canonical durable knowledge lives under `knowledge/`.
 ## Domains
 
 - [AI](../knowledge/ai/)
+  - [D-AI-Hub Operating Model](../knowledge/ai/d-ai-hub-operating-model.md)
 - [Data](../knowledge/data/)
 - [Development](../knowledge/development/)
 - [Banking](../knowledge/banking/)
