@@ -671,16 +671,17 @@ function validateCapturedRecoveryPoint(
 function persistedRecoverySnapshotFailure(state: TaskState): string | null {
   const snapshot = state.recoverySnapshot;
   const manifest = state.durableContext;
+  const recoveryPoint = state.recoveryPoint;
   if (snapshot === null || snapshot === undefined) return "Rollback requires a persisted complete recovery snapshot";
-  if (manifest === null) return "Rollback requires a persisted durable context";
-  if (snapshot.stateManifest.manifestId !== manifest.manifestId || snapshot.stateManifest.taskId !== state.taskId) {
-    return "Persisted recovery snapshot does not match the active durable manifest";
+  if (manifest === null || recoveryPoint === null) return "Rollback requires a persisted durable context and recovery point";
+  if (recoveryPoint.snapshotManifestId !== snapshot.stateManifest.manifestId || snapshot.stateManifest.taskId !== state.taskId) {
+    return "Persisted recovery snapshot does not match the recovery-point generation";
   }
-  if (!hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, snapshot.stateManifest.durablePaths, snapshot.stateManifest.hashes)) {
-    return "Persisted recovery snapshot hashes do not match the active durable manifest";
+  if (!hasExactPathHashEquality(recoveryPoint.durablePaths, recoveryPoint.hashes, snapshot.stateManifest.durablePaths, snapshot.stateManifest.hashes)) {
+    return "Persisted recovery snapshot hashes do not match the recovery-point generation";
   }
-  if (Object.keys(snapshot.durableArtifacts).length !== manifest.durablePaths.length || manifest.durablePaths.some((path) => snapshot.durableArtifacts[path] !== manifest.hashes[path])) {
-    return "Persisted recovery snapshot artifacts do not match the active durable manifest";
+  if (Object.keys(snapshot.durableArtifacts).length !== snapshot.stateManifest.durablePaths.length || snapshot.stateManifest.durablePaths.some((path) => snapshot.durableArtifacts[path] !== snapshot.stateManifest.hashes[path])) {
+    return "Persisted recovery snapshot artifacts do not match its recovery-point generation";
   }
   if (!/^[a-f0-9]{40,64}$/i.test(snapshot.head) || snapshot.branch.trim().length === 0 || snapshot.workspacePath.trim().length === 0) {
     return "Persisted recovery snapshot has invalid Git identity or workspace metadata";
