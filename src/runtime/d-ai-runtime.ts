@@ -13,6 +13,7 @@ import {
   CloseBlockedError,
   InvalidHandoffError,
   InvalidTaskStateError,
+  TaskOwnershipError,
   UnsavedContextError,
   VerificationGateError,
 } from "../domain/errors.js";
@@ -383,9 +384,28 @@ function executionConnectorFailure(error: Error): string | null {
 }
 
 function handoffConnectorFailure(error: Error): string | null {
-  return error instanceof InvalidHandoffError || error instanceof CapabilityMismatchError || error instanceof InvalidTaskStateError
+  return error instanceof InvalidHandoffError || error instanceof CapabilityMismatchError || error instanceof InvalidTaskStateError || error instanceof TaskOwnershipError
     ? error.message
     : null;
+}
+
+async function withDurableTaskOwnership(
+  taskId: string,
+  environment: Environment,
+  store: DurableContextStore,
+  operation: (transfer: (targetEnvironment: Environment) => Promise<void>) => Promise<DAIResponse>,
+): Promise<DAIResponse> {
+  try {
+    if (store.withTaskOwnership === undefined) {
+      throw new InvalidTaskStateError("Durable task ownership is unavailable for a mutating runtime command");
+    }
+    return await store.withTaskOwnership(taskId, environment, async (_lease, transfer) => operation(transfer));
+  } catch (error: unknown) {
+    if (error instanceof TaskOwnershipError) {
+      return blockedWithoutState(taskId, environment, error.message);
+    }
+    throw error;
+  }
 }
 
 function completionConnectorFailure(error: Error): string | null {
@@ -862,7 +882,12 @@ async function continueTask(
   }
   return registry.serializeMutation(
     state.taskId,
-    () => continueTaskExclusive(request, command, dependencies, registry),
+    () => withDurableTaskOwnership(
+      state.taskId,
+      request.sourceEnvironment,
+      dependencies.store,
+      async () => continueTaskExclusive(request, command, dependencies, registry),
+    ),
   );
 }
 
@@ -906,6 +931,7 @@ async function handoffTaskExclusive(
   command: Extract<DAICommand, { readonly kind: "handoff" }>,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  transferOwnership: (targetEnvironment: Environment) => Promise<void>,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Source operations are blocked while task ${taskId} changes handoff ownership`);
@@ -946,9 +972,11 @@ async function handoffTaskExclusive(
       },
       durableContext: null,
     };
+    const activeState = await persistState(dependencies.store, activeCandidate);
+    await transferOwnership(command.target);
     return {
       envelope,
-      state: await persistState(dependencies.store, activeCandidate),
+      state: activeState,
     };
   }, handoffConnectorFailure);
   return handoffOutcome.then(
@@ -979,7 +1007,12 @@ async function handoffTask(
   }
   return registry.serializeMutation(
     taskId,
-    () => handoffTaskExclusive(taskId, request, command, dependencies, registry),
+    () => withDurableTaskOwnership(
+      taskId,
+      request.sourceEnvironment,
+      dependencies.store,
+      async (transfer) => handoffTaskExclusive(taskId, request, command, dependencies, registry, transfer),
+    ),
   );
 }
 
@@ -1098,7 +1131,15 @@ async function completeHandoff(
   if (taskId === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active durable task is available for handoff completion");
   }
-  return registry.serializeMutation(taskId, () => completeHandoffExclusive(taskId, request, command, dependencies, registry));
+  return registry.serializeMutation(
+    taskId,
+    () => withDurableTaskOwnership(
+      taskId,
+      request.sourceEnvironment,
+      dependencies.store,
+      async () => completeHandoffExclusive(taskId, request, command, dependencies, registry),
+    ),
+  );
 }
 
 async function closeActiveTaskExclusive(

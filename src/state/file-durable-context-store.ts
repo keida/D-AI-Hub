@@ -1,14 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import type { Dirent } from "node:fs";
+import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
-import { InvalidTaskStateError } from "../domain/errors.js";
+import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
-import type { DurableContextManifest, TaskState } from "../domain/types.js";
-import type { DurableContextStore } from "./durable-context-store.js";
+import type { DurableContextManifest, Environment, TaskState } from "../domain/types.js";
+import type { DurableContextStore, TaskOwnershipLease } from "./durable-context-store.js";
 
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const credentialFieldPattern = /(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credential|cookie|password|private[_-]?key|secret|session[_-]?token)/i;
+export const FILE_DURABLE_CONTEXT_LEASE_MS = 30_000;
+const ownershipDirectoryName = "ownership";
+const ownershipOwnerFile = "owner.json";
+const ownershipLeaseFile = "lease";
+const ownershipReleasedFile = "released";
+const ownershipTransferFile = "transfer.json";
 
 const stageSchema = z.enum([
   "bootstrap",
@@ -33,6 +40,11 @@ const roleSchema = z.enum([
   "recovery-operator",
 ]);
 const safeManifestIdSchema = z.string().refine(isSafeManifestId, "must be a UUID or manifest-UUID");
+const ownershipRecordSchema = z.object({
+  taskId: z.string().min(1),
+  environment: environmentSchema,
+  ownerToken: z.string().uuid(),
+}).strict();
 const verificationEvidenceSchema = z
   .object({
     evidenceId: z.string().min(1),
@@ -133,6 +145,16 @@ interface SnapshotPaths {
   readonly handoff: string;
   readonly recovery: string;
   readonly manifest: string;
+}
+
+interface FileTaskOwnershipLease extends TaskOwnershipLease {
+  readonly generationPath: string;
+  readonly ownershipRoot: string;
+}
+
+interface FileTaskOwnershipGeneration {
+  readonly generation: bigint;
+  readonly generationPath: string;
 }
 
 function createHashForContent(content: string): string {
@@ -531,6 +553,183 @@ export class FileDurableContextStore implements DurableContextStore {
     await this.save({ ...state, criticalUnsavedContext: [] });
   }
 
+  public async withTaskOwnership<T>(
+    taskId: string,
+    environment: Environment,
+    operation: (lease: TaskOwnershipLease, transfer: (targetEnvironment: Environment) => Promise<void>) => Promise<T>,
+  ): Promise<T> {
+    assertTaskId(taskId);
+    let lease = await this.acquireTaskOwnership(taskId, environment);
+    const transfer = async (targetEnvironment: Environment): Promise<void> => {
+      lease = await this.transferTaskOwnership(lease, targetEnvironment);
+    };
+    try {
+      return await operation(lease, transfer);
+    } finally {
+      await this.releaseTaskOwnership(lease);
+    }
+  }
+
+  private async acquireTaskOwnership(taskId: string, environment: Environment): Promise<FileTaskOwnershipLease> {
+    const ownershipRoot = join(createSnapshotPaths(this.rootPath, taskId).taskRoot, ownershipDirectoryName);
+    try {
+      await mkdir(ownershipRoot, { recursive: true });
+      while (true) {
+        const latest = await this.latestOwnershipGeneration(ownershipRoot);
+        if (latest !== null && !await this.isOwnershipReleased(latest) && !await this.isOwnershipExpired(latest)) {
+          const owner = await this.readOwnershipRecord(latest.generationPath);
+          throw new TaskOwnershipError(`Task ${taskId} is actively owned by ${owner.environment}`);
+        }
+        const generation = (latest?.generation ?? 0n) + 1n;
+        const generationPath = join(ownershipRoot, generation.toString());
+        const ownerToken = randomUUID();
+        try {
+          await mkdir(generationPath);
+          await writeFile(
+            join(generationPath, ownershipOwnerFile),
+            serialize({ taskId, environment, ownerToken }),
+            { encoding: "utf8", flag: "wx" },
+          );
+          await writeFile(join(generationPath, ownershipLeaseFile), ownerToken, { encoding: "utf8", flag: "wx" });
+          return { taskId, environment, generation, ownerToken, generationPath, ownershipRoot };
+        } catch (error: unknown) {
+          if (isAlreadyExistsError(error)) continue;
+          throw error;
+        }
+      }
+    } catch (error: unknown) {
+      if (error instanceof TaskOwnershipError) throw error;
+      throw new TaskOwnershipError(`Unable to acquire durable ownership for task ${taskId}: ${describeError(error)}`);
+    }
+  }
+
+  private async transferTaskOwnership(lease: FileTaskOwnershipLease, targetEnvironment: Environment): Promise<FileTaskOwnershipLease> {
+    try {
+      await this.assertCurrentTaskOwnership(lease);
+      const temporaryPath = join(lease.generationPath, `.${ownershipTransferFile}.${randomUUID()}.tmp`);
+      await writeFile(
+        temporaryPath,
+        serialize({
+          taskId: lease.taskId,
+          ownerToken: lease.ownerToken,
+          sourceEnvironment: lease.environment,
+          targetEnvironment,
+        }),
+        { encoding: "utf8", flag: "wx" },
+      );
+      await this.assertCurrentTaskOwnership(lease);
+      await rename(temporaryPath, join(lease.generationPath, ownershipTransferFile));
+      return { ...lease, environment: targetEnvironment };
+    } catch (error: unknown) {
+      if (error instanceof TaskOwnershipError) throw error;
+      throw new TaskOwnershipError(`Unable to transfer durable ownership for task ${lease.taskId}: ${describeError(error)}`);
+    }
+  }
+
+  private async releaseTaskOwnership(lease: FileTaskOwnershipLease): Promise<void> {
+    try {
+      const latest = await this.latestOwnershipGeneration(lease.ownershipRoot);
+      if (latest === null || latest.generation !== lease.generation) return;
+      if (await this.isOwnershipReleased(latest)) return;
+      await this.assertTaskOwnershipToken(lease);
+      const temporaryPath = join(lease.generationPath, `.${ownershipReleasedFile}.${randomUUID()}.tmp`);
+      await writeFile(temporaryPath, lease.ownerToken, { encoding: "utf8", flag: "wx" });
+      await rename(temporaryPath, join(lease.generationPath, ownershipReleasedFile));
+    } catch (error: unknown) {
+      if (isAlreadyExistsError(error)) return;
+      if (error instanceof TaskOwnershipError) throw error;
+      throw new TaskOwnershipError(`Unable to release durable ownership for task ${lease.taskId}: ${describeError(error)}`);
+    }
+  }
+
+  private async latestOwnershipGeneration(ownershipRoot: string): Promise<FileTaskOwnershipGeneration | null> {
+    let entries: Dirent<string>[];
+    try {
+      entries = await readdir(ownershipRoot, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) return null;
+      throw error;
+    }
+    const generations: FileTaskOwnershipGeneration[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) {
+        throw new TaskOwnershipError(`Invalid durable ownership generation at ${ownershipRoot}: ${entry.name}`);
+      }
+      generations.push({ generation: BigInt(entry.name), generationPath: join(ownershipRoot, entry.name) });
+    }
+    return generations.sort((left, right) => left.generation === right.generation ? 0 : left.generation > right.generation ? -1 : 1)[0] ?? null;
+  }
+
+  private async isOwnershipReleased(generation: FileTaskOwnershipGeneration): Promise<boolean> {
+    let releasedToken: string;
+    try {
+      releasedToken = await readFile(join(generation.generationPath, ownershipReleasedFile), "utf8");
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) return false;
+      throw error;
+    }
+    const [owner, leaseToken] = await Promise.all([
+      this.readOwnershipRecord(generation.generationPath),
+      readFile(join(generation.generationPath, ownershipLeaseFile), "utf8"),
+    ]);
+    if (releasedToken !== owner.ownerToken || releasedToken !== leaseToken) {
+      throw new TaskOwnershipError(`Invalid released durable ownership marker at ${generation.generationPath}`);
+    }
+    return true;
+  }
+
+  private async isOwnershipExpired(generation: FileTaskOwnershipGeneration): Promise<boolean> {
+    try {
+      const leaseStats = await stat(join(generation.generationPath, ownershipLeaseFile));
+      if (!leaseStats.isFile()) throw new TaskOwnershipError(`Invalid durable ownership lease at ${generation.generationPath}`);
+      return Date.now() - leaseStats.mtimeMs > FILE_DURABLE_CONTEXT_LEASE_MS;
+    } catch (error: unknown) {
+      if (error instanceof TaskOwnershipError) throw error;
+      if (!isMissingFileError(error)) throw error;
+    }
+    const generationStats = await stat(generation.generationPath);
+    if (!generationStats.isDirectory()) throw new TaskOwnershipError(`Invalid durable ownership generation at ${generation.generationPath}`);
+    return Date.now() - generationStats.mtimeMs > FILE_DURABLE_CONTEXT_LEASE_MS;
+  }
+
+  private async assertCurrentTaskOwnership(lease: FileTaskOwnershipLease): Promise<void> {
+    const latest = await this.latestOwnershipGeneration(lease.ownershipRoot);
+    if (latest === null || latest.generation !== lease.generation) {
+      throw new TaskOwnershipError(`Durable ownership for task ${lease.taskId} was superseded`);
+    }
+    if (await this.isOwnershipReleased(latest) || await this.isOwnershipExpired(latest)) {
+      throw new TaskOwnershipError(`Durable ownership for task ${lease.taskId} is no longer active`);
+    }
+    await this.assertTaskOwnershipToken(lease);
+  }
+
+  private async assertTaskOwnershipToken(lease: FileTaskOwnershipLease): Promise<void> {
+    const [owner, leaseToken] = await Promise.all([
+      this.readOwnershipRecord(lease.generationPath),
+      readFile(join(lease.generationPath, ownershipLeaseFile), "utf8"),
+    ]);
+    if (owner.taskId !== lease.taskId || owner.ownerToken !== lease.ownerToken || leaseToken !== lease.ownerToken) {
+      throw new TaskOwnershipError(`Durable ownership token mismatch for task ${lease.taskId}`);
+    }
+  }
+
+  private async readOwnershipRecord(generationPath: string): Promise<z.infer<typeof ownershipRecordSchema>> {
+    const targetPath = join(generationPath, ownershipOwnerFile);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(targetPath, "utf8"));
+    } catch (error: unknown) {
+      throw new TaskOwnershipError(`Unable to read durable ownership record at ${targetPath}: ${describeError(error)}`);
+    }
+    const result = ownershipRecordSchema.safeParse(parsed);
+    if (!result.success) {
+      const issue = result.error.issues[0];
+      const reason = issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
+      throw new TaskOwnershipError(`Invalid durable ownership record at ${targetPath}: ${reason}`);
+    }
+    return result.data;
+  }
+
   private async requireState(taskId: string): Promise<TaskState> {
     const state = await this.load(taskId);
     if (state === null) {
@@ -542,6 +741,10 @@ export class FileDurableContextStore implements DurableContextStore {
 
 function isMissingFileError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
 }
 
 function describeError(error: unknown): string {
