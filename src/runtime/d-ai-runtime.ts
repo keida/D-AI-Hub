@@ -499,6 +499,9 @@ async function routeIntent(
     role: "planner",
     routingDecision: {
       ...routingDecision,
+      ...(request.overrides.stage === null || request.overrides.stage === undefined
+        ? {}
+        : { requestedStage: request.overrides.stage }),
       stage: "route",
       environment: route.environment,
       role: "planner",

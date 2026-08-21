@@ -295,9 +295,11 @@ const noOverrides: DAIRequest["overrides"] = { model: null, role: null, environm
 
 const stageMatrixPolicies: readonly ModelPolicy[] = [
   ...policies,
+  { stage: "execute", role: "implementer", model: "work-model", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
   { stage: "route", role: "planner", model: "chat-router", requiredCapabilities: [], compatibleEnvironments: ["chat"] },
   { stage: "plan", role: "planner", model: "work-planner", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
   { stage: "verify", role: "reviewer", model: "work-reviewer", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
+  { stage: "verify", role: "reviewer", model: "codex-reviewer", requiredCapabilities: ["codex-evidence"], compatibleEnvironments: ["codex"] },
 ];
 
 describe("D-AI runtime", () => {
@@ -371,7 +373,79 @@ describe("D-AI runtime", () => {
 
     expect(response.status).toBe(status);
     expect(response.environment).toBe(environment);
-    expect(runtimeHarness.executed[0]?.state.routingDecision).toMatchObject({ stage: "execute", environment, selectedModel: model });
+    expect(runtimeHarness.executed[0]?.state.routingDecision).toMatchObject({
+      stage: "execute",
+      requestedStage: stage,
+      environment,
+      selectedModel: model,
+    });
+    expect(runtimeHarness.savedStates.some((state) => state.routingDecision?.requestedStage === stage)).toBe(true);
+  });
+
+  it.each([
+    {
+      label: "Chat to Work execute",
+      sourceEnvironment: "chat",
+      stage: "execute",
+      environment: "work",
+      model: "work-model",
+      skill: "typescript-execution",
+      overrides: { model: null, role: null, environment: "work", stage: "execute" },
+      request: (overrides: DAIRequest["overrides"]): DAIRequest => intentRequest("chat", overrides),
+    },
+    {
+      label: "Work to Codex execute",
+      sourceEnvironment: "work",
+      stage: "execute",
+      environment: "codex",
+      model: "codex-model",
+      skill: "typescript-execution",
+      overrides: { model: null, role: null, environment: "codex", stage: "execute" },
+      request: (overrides: DAIRequest["overrides"]): DAIRequest => intentRequest("work", overrides),
+    },
+    {
+      label: "Codex to Codex verify",
+      sourceEnvironment: "codex",
+      stage: "verify",
+      environment: "codex",
+      model: "codex-reviewer",
+      skill: "verification-execution",
+      overrides: { model: null, role: null, environment: "codex", stage: "verify" },
+      request: (overrides: DAIRequest["overrides"]): DAIRequest => ({
+        ...intentRequest("codex", overrides),
+        command: parseDAICommand("@D-AI verify evidence"),
+      }),
+    },
+  ] as const)("routes explicit $label through the requested policy and compatible Skill", async ({
+    sourceEnvironment,
+    stage,
+    environment,
+    model,
+    skill,
+    overrides,
+    request,
+  }) => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, modelPolicies: stageMatrixPolicies });
+
+    const response = await handle(request(overrides));
+
+    expect(response.status).toBe("completed");
+    expect(response.environment).toBe(environment);
+    expect(runtimeHarness.executed[0]?.state.environment).toBe(environment);
+    expect(runtimeHarness.executed[0]?.state.routingDecision).toMatchObject({
+      stage: "execute",
+      requestedStage: stage,
+      environment,
+      selectedModel: model,
+    });
+    expect(runtimeHarness.executed[0]?.skills.map((selectedSkill) => selectedSkill.descriptor.name)).toEqual([skill]);
+    expect(runtimeHarness.executed[0]?.skills[0]?.descriptor.compatibleEnvironments).toContain(environment);
+    expect(runtimeHarness.executed[0]?.skills[0]?.descriptor.compatibleStages).toContain(stage);
+    expect((await handle({ command: { kind: "status" }, sourceEnvironment: environment, overrides: noOverrides })).status).toBe("accepted");
+    if (sourceEnvironment !== environment) {
+      expect((await handle({ command: { kind: "status" }, sourceEnvironment, overrides: noOverrides })).status).toBe("blocked");
+    }
   });
 
   it("honors routing overrides and loads only the minimum selected Skill", async () => {

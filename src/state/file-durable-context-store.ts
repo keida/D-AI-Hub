@@ -87,6 +87,7 @@ const taskStateSchema = z
     routingDecision: z
       .object({
         stage: stageSchema,
+        requestedStage: stageSchema.optional(),
         environment: environmentSchema,
         role: roleSchema,
         selectedModel: z.string(),
