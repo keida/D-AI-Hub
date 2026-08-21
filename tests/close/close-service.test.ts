@@ -151,19 +151,27 @@ function gitHubFor(pushEvidence: GitPushEvidence, remoteState: RemoteState): Git
   };
 }
 
-const secretSignatures = [
-  "github_pat_" + "a".repeat(30),
-  "ghp_" + "b".repeat(30),
-  "sk-proj-" + "c".repeat(20),
-  "sk-" + "d".repeat(20),
-  "-----BEGIN PRIVATE KEY-----",
+interface SecretSignature {
+  readonly label: string;
+  readonly value: string;
+  readonly leakedFragments: readonly string[];
+}
+
+const secretSignatures: readonly SecretSignature[] = [
+  { label: "GitHub personal access token", value: "github_pat_" + "a".repeat(30), leakedFragments: ["github_pat_" + "a".repeat(30)] },
+  { label: "GitHub token", value: "ghp_" + "b".repeat(30), leakedFragments: ["ghp_" + "b".repeat(30)] },
+  { label: "OpenAI project key", value: "sk-proj-" + "c".repeat(20), leakedFragments: ["sk-proj-" + "c".repeat(20)] },
+  { label: "OpenAI key", value: "sk-" + "d".repeat(20), leakedFragments: ["sk-" + "d".repeat(20)] },
+  { label: "PKCS#8 private key", value: "-----BEGIN PRIVATE KEY-----\nTUlJRVJvdW5kOVBLS1M4Qk9EWQ==\n-----END PRIVATE KEY-----", leakedFragments: ["TUlJRVJvdW5kOVBLS1M4Qk9EWQ==", "-----END PRIVATE KEY-----"] },
+  { label: "RSA private key", value: "-----BEGIN RSA PRIVATE KEY-----\nTUlJRVJvdW5kOVJTQV9CT0RZ\n-----END RSA PRIVATE KEY-----", leakedFragments: ["TUlJRVJvdW5kOVJTQV9CT0RZ", "-----END RSA PRIVATE KEY-----"] },
+  { label: "EC private key", value: "-----BEGIN EC PRIVATE KEY-----\nTUlJRVJvdW5kOUVDX0JPRFk=\n-----END EC PRIVATE KEY-----", leakedFragments: ["TUlJRVJvdW5kOUVDX0JPRFk=", "-----END EC PRIVATE KEY-----"] },
+  { label: "OpenSSH private key", value: "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktcm91bmQ5LWJvZHk=\n-----END OPENSSH PRIVATE KEY-----", leakedFragments: ["b3BlbnNzaC1rZXktcm91bmQ5LWJvZHk=", "-----END OPENSSH PRIVATE KEY-----"] },
 ] as const;
 
-function expectNoRawSecretSignatures(value: unknown): void {
+function expectNoRawSecretSignatures(value: unknown, secret: SecretSignature): void {
   const serialized = JSON.stringify(value);
-  for (const secret of secretSignatures) {
-    expect(serialized).not.toContain(secret);
-  }
+  expect(serialized).not.toContain(secret.value);
+  for (const leakedFragment of secret.leakedFragments) expect(serialized).not.toContain(leakedFragment);
 }
 
 function unexpectedGitHub(): GitHubAdapter {
@@ -264,7 +272,7 @@ describe("closeTask", () => {
     expect(gitHubCalled).toBe(false);
   });
 
-  it.each(secretSignatures)("redacts raw secret-shaped generation-loader errors: %s", async (secret) => {
+  it.each(secretSignatures)("redacts raw secret-shaped generation-loader errors: $label", async (secret) => {
     const state = closeReadyState(new Date().toISOString());
     const recoveryPoint = state.recoveryPoint;
     if (recoveryPoint === null) throw new Error("Expected recovery point");
@@ -275,13 +283,13 @@ describe("closeTask", () => {
 
     const verdict = await closeTask(stateWithSnapshot, {
       store: storeWithGeneration(stateWithSnapshot, async (): Promise<DurableContextManifest> => {
-        throw new Error(`generation loader failed: ${secret}`);
+        throw new Error(`generation loader failed: ${secret.value}`);
       }),
       gitHub: unexpectedGitHub(),
     });
 
     expect(verdict.status).toBe("BLOCKED");
-    expectNoRawSecretSignatures(verdict);
+    expectNoRawSecretSignatures(verdict, secret);
   });
 
   it("accepts an exact 64-character commit artifact and matching adapter evidence", async () => {
@@ -345,11 +353,11 @@ describe("closeTask", () => {
     expect(verdict.status).toBe("BLOCKED");
   });
 
-  it.each(secretSignatures)("redacts raw secret-shaped GitHub-push errors: %s", async (secret) => {
+  it.each(secretSignatures)("redacts raw secret-shaped GitHub-push errors: $label", async (secret) => {
     const state = closeReadyState(new Date().toISOString());
     const gitHub: GitHubAdapter = {
       pushExpectedCommit: async (): Promise<GitPushEvidence> => {
-        throw new Error(`GitHub push failed: ${secret}`);
+        throw new Error(`GitHub push failed: ${secret.value}`);
       },
       verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState("e".repeat(40)),
     };
@@ -357,23 +365,23 @@ describe("closeTask", () => {
     const verdict = await closeTask(state, { store: storeFor(state), gitHub });
 
     expect(verdict.status).toBe("BLOCKED");
-    expectNoRawSecretSignatures(verdict);
+    expectNoRawSecretSignatures(verdict, secret);
   });
 
-  it.each(secretSignatures)("redacts raw secret-shaped failed GitHub-push evidence: %s", async (secret) => {
+  it.each(secretSignatures)("redacts raw secret-shaped failed GitHub-push evidence: $label", async (secret) => {
     const state = closeReadyState(new Date().toISOString());
     const failedPush = {
       ...successfulPush(),
       pushed: false,
       exitCode: 1,
-      observedOutput: `GitHub push failed: ${secret}`,
+      observedOutput: `GitHub push failed: ${secret.value}`,
       failureCategory: "ambiguous" as const,
     };
 
     const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) });
 
     expect(verdict.status).toBe("BLOCKED");
-    expectNoRawSecretSignatures(verdict);
+    expectNoRawSecretSignatures(verdict, secret);
   });
 
   it("returns NO when the remote SHA differs from the pushed SHA", async () => {
@@ -555,20 +563,20 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/remote/i);
   });
 
-  it.each(secretSignatures)("redacts raw secret-shaped remote-verification errors: %s", async (secret) => {
+  it.each(secretSignatures)("redacts raw secret-shaped remote-verification errors: $label", async (secret) => {
     const state = closeReadyState(new Date().toISOString());
     const pushEvidence = successfulPush();
     const gitHub: GitHubAdapter = {
       pushExpectedCommit: async (): Promise<GitPushEvidence> => pushEvidence,
       verifyRemoteState: async (): Promise<RemoteState> => {
-        throw new Error(`Remote verification failed: ${secret}`);
+        throw new Error(`Remote verification failed: ${secret.value}`);
       },
     };
 
     const verdict = await closeTask(state, { store: storeFor(state), gitHub });
 
     expect(verdict.status).toBe("BLOCKED");
-    expectNoRawSecretSignatures(verdict);
+    expectNoRawSecretSignatures(verdict, secret);
   });
 
   it("returns BLOCKED when adapter push evidence does not match the configured remote or ref", async () => {
