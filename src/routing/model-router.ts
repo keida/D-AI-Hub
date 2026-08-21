@@ -121,6 +121,9 @@ function assertOverrides(overrides: RoutingOverrides): void {
   if (overrides.environment !== null && !environments.has(overrides.environment)) {
     throw new InvalidTaskStateError("Routing override environment must be null or a known environment.");
   }
+  if (overrides.stage !== null && overrides.stage !== undefined && !stages.has(overrides.stage)) {
+    throw new InvalidTaskStateError("Routing override stage must be null or a known stage.");
+  }
 }
 
 function selectedRole(role: Role, overrides: RoutingOverrides): Role {
@@ -167,15 +170,16 @@ export function resolveModelRoute(
   assertEnvironment(environment);
   assertUniquePolicies(policies);
   assertOverrides(overrides);
+  const routedStage = overrides.stage ?? stage;
   const routedRole = selectedRole(role, overrides);
   const routedEnvironment = selectedEnvironment(environment, overrides);
-  const policy = findPolicy(stage, routedRole, overrides.model, policies, routedEnvironment);
+  const policy = findPolicy(routedStage, routedRole, overrides.model, policies, routedEnvironment);
 
   if (policy === undefined) {
     const requestedPolicy = policies
       .filter(
         (candidate) =>
-          candidate.stage === stage &&
+          candidate.stage === routedStage &&
           candidate.role === routedRole &&
           (overrides.model === null || candidate.model === overrides.model),
       )
@@ -186,23 +190,23 @@ export function resolveModelRoute(
       );
     if (requestedPolicy !== undefined && (overrides.model !== null || overrides.environment !== null)) {
       throw new CapabilityMismatchError(
-        `Model policy for stage=${stage}, role=${routedRole}, model=${requestedPolicy.model} is incompatible with environment=${routedEnvironment}.`,
+        `Model policy for stage=${routedStage}, role=${routedRole}, model=${requestedPolicy.model} is incompatible with environment=${routedEnvironment}.`,
       );
     }
     throw new CapabilityMismatchError(
-      `No model policy can satisfy stage=${stage}, role=${routedRole}, environment=${routedEnvironment}, model=${requestedModel(overrides.model)}.`,
+      `No model policy can satisfy stage=${routedStage}, role=${routedRole}, environment=${routedEnvironment}, model=${requestedModel(overrides.model)}.`,
     );
   }
 
   const overrideSource =
-    overrides.model === null && overrides.role === null && overrides.environment === null ? "default" : "user";
+    overrides.model === null && overrides.role === null && overrides.environment === null && overrides.stage == null ? "default" : "user";
   const reason =
     overrideSource === "user"
-      ? `User override selected ${policy.model} for ${stage}/${routedRole} in ${routedEnvironment}.`
-      : `Default model policy selected ${policy.model} for ${stage}/${routedRole} in ${routedEnvironment}.`;
+      ? `User override selected ${policy.model} for ${routedStage}/${routedRole} in ${routedEnvironment}.`
+      : `Default model policy selected ${policy.model} for ${routedStage}/${routedRole} in ${routedEnvironment}.`;
 
   return {
-    stage,
+    stage: routedStage,
     role: routedRole,
     environment: routedEnvironment,
     selectedModel: policy.model,

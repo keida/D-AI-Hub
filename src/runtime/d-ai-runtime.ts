@@ -52,6 +52,7 @@ export interface ExternalRoutingOverrides {
   readonly model: string | null;
   readonly role: string | null;
   readonly environment: string | null;
+  readonly stage?: string | null;
 }
 
 export interface ExternalDAIRequest {
@@ -129,6 +130,7 @@ const overridesSchema = z.object({
   model: z.string().trim().min(1).nullable(),
   role: roleSchema.nullable(),
   environment: environmentSchema.nullable(),
+  stage: stageSchema.nullable().optional(),
 }).strict();
 const requestSchema = z.object({ command: commandSchema, sourceEnvironment: environmentSchema, overrides: overridesSchema }).strict();
 const evidenceSchema = z.object({
@@ -277,7 +279,13 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
-  return result.data;
+  return {
+    ...result.data,
+    overrides: {
+      ...result.data.overrides,
+      stage: result.data.overrides.stage ?? null,
+    },
+  };
 }
 
 function validateDependencies(dependencies: DAIRuntimeDependencies): void {
@@ -418,19 +426,44 @@ function transitionState(state: TaskState, stage: Stage, role: Role, environment
   };
 }
 
+const defaultRolesByStage: ReadonlyMap<Stage, Role> = new Map([
+  ["bootstrap", "analyst"],
+  ["route", "planner"],
+  ["plan", "planner"],
+  ["execute", "implementer"],
+  ["inspect", "evidence-collector"],
+  ["verify", "reviewer"],
+  ["debug", "debugger"],
+  ["recover", "recovery-operator"],
+  ["handoff", "planner"],
+  ["close", "reviewer"],
+]);
+
 function preferredEnvironment(
   sourceEnvironment: Environment,
+  stage: Stage,
+  role: Role,
   overrides: RoutingOverrides,
   policies: readonly ModelPolicy[],
 ): Environment {
   if (overrides.environment !== null) return overrides.environment;
-  const role: Role = overrides.role ?? "implementer";
   const policy = policies.find((candidate) =>
-    candidate.stage === "execute"
+    candidate.stage === stage
     && candidate.role === role
     && (overrides.model === null || candidate.model === overrides.model),
   );
   return policy?.compatibleEnvironments[0] ?? sourceEnvironment;
+}
+
+function requestedStage(overrides: RoutingOverrides): Stage {
+  return overrides.stage ?? "execute";
+}
+
+function requestedRole(stage: Stage, overrides: RoutingOverrides): Role {
+  if (overrides.role !== null) return overrides.role;
+  const role = defaultRolesByStage.get(stage);
+  if (role === undefined) throw new InvalidTaskStateError(`No default role is declared for stage=${stage}`);
+  return role;
 }
 
 async function routeIntent(
@@ -438,23 +471,25 @@ async function routeIntent(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
 ): Promise<{ readonly state: TaskState; readonly skills: readonly LoadedSkill[] }> {
-  const candidateEnvironment = preferredEnvironment(request.sourceEnvironment, request.overrides, dependencies.modelPolicies);
+  const stage = requestedStage(request.overrides);
+  const role = requestedRole(stage, request.overrides);
+  const candidateEnvironment = preferredEnvironment(request.sourceEnvironment, stage, role, request.overrides, dependencies.modelPolicies);
   const modelDecision = dependencies.resolveModelRoute(
-    "execute",
-    "implementer",
+    stage,
+    role,
     candidateEnvironment,
     dependencies.modelPolicies,
     request.overrides,
   );
   const route = dependencies.selectEnvironment({
-    stage: "execute",
+    stage,
     requiredCapabilities: modelDecision.selectedCapabilities,
     available: environmentSchema.options.map((environment) => dependencies.adapters[environment].capabilities()),
     userEnvironmentOverride: request.overrides.environment,
   });
   const routingDecision = route.environment === modelDecision.environment
     ? modelDecision
-    : dependencies.resolveModelRoute("execute", "implementer", route.environment, dependencies.modelPolicies, request.overrides);
+    : dependencies.resolveModelRoute(stage, role, route.environment, dependencies.modelPolicies, request.overrides);
   assertStageTransition(state.stage, "route");
   const routedState = await persistState(dependencies.store, {
     ...state,
@@ -472,7 +507,7 @@ async function routeIntent(
     durableContext: null,
   });
   const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
-  const selected = dependencies.selectCapabilities(routedState.goal, "execute", route.environment, descriptors);
+  const selected = dependencies.selectCapabilities(routedState.goal, stage, route.environment, descriptors);
   const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
   const contextManifest = [
     ...routedState.contextManifest,

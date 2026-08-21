@@ -293,6 +293,13 @@ function intentRequest(sourceEnvironment: Environment, overrides: DAIRequest["ov
 
 const noOverrides: DAIRequest["overrides"] = { model: null, role: null, environment: null };
 
+const stageMatrixPolicies: readonly ModelPolicy[] = [
+  ...policies,
+  { stage: "route", role: "planner", model: "chat-router", requiredCapabilities: [], compatibleEnvironments: ["chat"] },
+  { stage: "plan", role: "planner", model: "work-planner", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
+  { stage: "verify", role: "reviewer", model: "work-reviewer", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
+];
+
 describe("D-AI runtime", () => {
   it("fails closed when exact gate:<name> evidence is missing", async () => {
     const runtimeHarness = harness(genericCompletedExecution, evaluateHardGates, "YES");
@@ -349,6 +356,22 @@ describe("D-AI runtime", () => {
     expect(response.environment).toBe("codex");
     expect(runtimeHarness.executed).toHaveLength(1);
     expect(runtimeHarness.executed[0]?.state.goal).toBe("implement typescript");
+  });
+
+  it.each([
+    ["route", "chat", "chat-router", "blocked"],
+    ["plan", "work", "work-planner", "completed"],
+    ["execute", "codex", "codex-model", "completed"],
+    ["verify", "work", "work-reviewer", "completed"],
+  ] as const)("routes an ordinary intent through the requested %s stage matrix", async (stage, environment, model, status) => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, modelPolicies: stageMatrixPolicies });
+
+    const response = await handle(intentRequest("chat", { model: null, role: null, environment: null, stage }));
+
+    expect(response.status).toBe(status);
+    expect(response.environment).toBe(environment);
+    expect(runtimeHarness.executed[0]?.state.routingDecision).toMatchObject({ stage: "execute", environment, selectedModel: model });
   });
 
   it("honors routing overrides and loads only the minimum selected Skill", async () => {
