@@ -79,6 +79,21 @@ describe("resolveModelRoute", () => {
     });
   });
 
+  it("applies a stage override before policy matching", () => {
+    const policies = [policy("verify", "implementer", "gpt-5-review", ["verification"], ["work"])];
+    const overrides: RoutingOverrides = { model: null, role: null, environment: null, stage: "verify" };
+
+    expect(resolveModelRoute("execute", "implementer", "work", policies, overrides)).toEqual({
+      stage: "verify",
+      role: "implementer",
+      environment: "work",
+      selectedModel: "gpt-5-review",
+      selectedCapabilities: ["verification"],
+      reason: "User override selected gpt-5-review for verify/implementer in work.",
+      overrideSource: "user",
+    });
+  });
+
   it("rejects an unavailable model override instead of substituting a policy", () => {
     const policies = [policy("execute", "implementer", "gpt-5-codex", ["code"], ["codex"])];
     const overrides: RoutingOverrides = { model: "unavailable-model", role: null, environment: null };

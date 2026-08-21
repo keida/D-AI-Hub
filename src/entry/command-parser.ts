@@ -46,8 +46,10 @@ export function parseDAICommand(input: string): DAICommand {
   const arguments_ = tokens.slice(2);
 
   if (command === "continue") {
-    assertArgumentCount(command, arguments_, 1);
-    return { kind: "continue", taskIdOrProject: arguments_[0]! };
+    if (arguments_.length === 0) {
+      throw new InvalidTaskStateError("continue requires a task or project name");
+    }
+    return { kind: "continue", taskIdOrProject: arguments_.join(" ") };
   }
   if (command === "status") {
     assertArgumentCount(command, arguments_, 0);
