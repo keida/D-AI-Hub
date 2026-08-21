@@ -3,7 +3,7 @@ import { lstat, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { bootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
+import { bootstrapTask, prepareBootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
 async function createDirectory(prefix: string): Promise<string> {
@@ -25,6 +25,25 @@ async function hashWorkspace(path: string): Promise<string> {
 }
 
 describe("bootstrapTask", () => {
+  it("prepares a new task without persisting before ownership is acquired", async () => {
+    const storeRoot = await createDirectory("d-ai-bootstrap-store-");
+    const workspacePath = await createDirectory("d-ai-bootstrap-workspace-");
+    const store = new FileDurableContextStore(storeRoot);
+
+    try {
+      const state = await prepareBootstrapTask(
+        { taskId: null, goal: "Prepare without writing", environment: "work", workspacePath, repositoryPath: null },
+        store,
+      );
+
+      expect(state.durableContext).toBeNull();
+      await expect(store.load(state.taskId)).resolves.toBeNull();
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+      await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+
   it("creates and persists a new bootstrap task without changing workspace content", async () => {
     const storeRoot = await createDirectory("d-ai-bootstrap-store-");
     const workspacePath = await createDirectory("d-ai-bootstrap-workspace-");
