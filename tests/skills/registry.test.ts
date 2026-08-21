@@ -36,10 +36,10 @@ describe("discoverSkillMetadata", () => {
       expect(metadata).toEqual(expect.objectContaining({ name: expect.any(String), description: expect.any(String) }));
       expect(metadata).toEqual(expect.objectContaining({
         metadata: expect.objectContaining({
-          triggers: expect.any(Array),
-          compatibleEnvironments: expect.any(Array),
-          compatibleStages: expect.any(Array),
-          requiredResources: expect.any(Array),
+          triggers: expect.any(String),
+          compatibleEnvironments: expect.any(String),
+          compatibleStages: expect.any(String),
+          requiredResources: expect.any(String),
         }),
       }));
       expect(metadata).not.toHaveProperty("triggers");
@@ -49,6 +49,15 @@ describe("discoverSkillMetadata", () => {
     }
 
     const descriptors = await discoverSkillMetadata([productionRoot]);
+    expect(descriptors).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: "project-memory",
+        triggers: ["project", "memory", "resume"],
+        compatibleEnvironments: ["chat", "work", "codex"],
+        compatibleStages: ["bootstrap", "plan", "execute", "inspect", "verify", "handoff", "close"],
+        requiredResources: [],
+      }),
+    ]));
     expect(selectCapabilities("resume project memory", "bootstrap", "codex", descriptors).map((descriptor) => descriptor.name)).toEqual([
       "project-memory",
     ]);
@@ -80,7 +89,7 @@ describe("discoverSkillMetadata", () => {
     await mkdir(join(skillDirectory, "references"), { recursive: true });
     await writeFile(
       join(skillDirectory, "SKILL.md"),
-      "---\nname: metadata-only\ndescription: Discovers metadata only.\nmetadata:\n  triggers:\n    - metadata\n  compatibleEnvironments:\n    - codex\n  compatibleStages:\n    - inspect\n---\n" + "x".repeat(1_048_577),
+      "---\nname: metadata-only\ndescription: Discovers metadata only.\nmetadata:\n  triggers: '[\"metadata\"]'\n  compatibleEnvironments: '[\"codex\"]'\n  compatibleStages: '[\"inspect\"]'\n---\n" + "x".repeat(1_048_577),
       "utf8",
     );
     await writeFile(join(skillDirectory, "references", "oversized.md"), "y".repeat(1_048_577), "utf8");
@@ -95,10 +104,12 @@ describe("discoverSkillMetadata", () => {
     await mkdir(join(malformedRoot, "wrong-name"));
     await writeFile(
       join(malformedRoot, "wrong-name", "SKILL.md"),
-      "---\nname: correct-name\ndescription: Valid description\ntriggers:\n  - execute\ncompatibleEnvironments:\n  - codex\n---\n",
+      "---\nname: correct-name\ndescription: Valid description\nmetadata:\n  triggers: '[\"execute\"]'\n  compatibleEnvironments: '[\"codex\"]'\n  compatibleStages: '[\"execute\"]'\n---\n",
       "utf8",
     );
-    await expect(discoverSkillMetadata([malformedRoot])).rejects.toThrow(InvalidTaskStateError);
+    await expect(discoverSkillMetadata([malformedRoot])).rejects.toThrowError(
+      "Skill directory wrong-name must match metadata name correct-name.",
+    );
 
     const duplicateRoot = await createTemporarySkillRoot();
     await cp(join(fixtureRoot, "typescript-execution"), join(duplicateRoot, "typescript-execution"), { recursive: true });
@@ -112,20 +123,22 @@ describe("discoverSkillMetadata", () => {
     await mkdir(invalidStageDirectory);
     await writeFile(
       join(invalidStageDirectory, "SKILL.md"),
-      "---\nname: invalid-stage\ndescription: Has an invalid stage.\ntriggers:\n  - invalid\ncompatibleEnvironments:\n  - codex\ncompatibleStages:\n  - unknown\n---\n",
+      "---\nname: invalid-stage\ndescription: Has an invalid stage.\nmetadata:\n  triggers: '[\"invalid\"]'\n  compatibleEnvironments: '[\"codex\"]'\n  compatibleStages: '[\"unknown\"]'\n---\n",
       "utf8",
     );
-    await expect(discoverSkillMetadata([invalidStageRoot])).rejects.toThrow(InvalidTaskStateError);
+    await expect(discoverSkillMetadata([invalidStageRoot])).rejects.toThrowError("Invalid Skill selection stage: unknown.");
 
     const duplicateStageRoot = await createTemporarySkillRoot();
     const duplicateStageDirectory = join(duplicateStageRoot, "duplicate-stage");
     await mkdir(duplicateStageDirectory);
     await writeFile(
       join(duplicateStageDirectory, "SKILL.md"),
-      "---\nname: duplicate-stage\ndescription: Has duplicate stages.\ntriggers:\n  - duplicate\ncompatibleEnvironments:\n  - codex\ncompatibleStages:\n  - execute\n  - execute\n---\n",
+      "---\nname: duplicate-stage\ndescription: Has duplicate stages.\nmetadata:\n  triggers: '[\"duplicate\"]'\n  compatibleEnvironments: '[\"codex\"]'\n  compatibleStages: '[\"execute\",\"execute\"]'\n---\n",
       "utf8",
     );
-    await expect(discoverSkillMetadata([duplicateStageRoot])).rejects.toThrow(InvalidTaskStateError);
+    await expect(discoverSkillMetadata([duplicateStageRoot])).rejects.toThrowError(
+      /contains duplicate compatibleStages values\./u,
+    );
   });
 });
 

@@ -50,8 +50,8 @@ const skillDefinitions: readonly SkillFixtureDefinition[] = [
   },
 ];
 
-function frontmatterList(values: readonly string[], indent: string): string {
-  return values.map((value) => `${indent}- ${value}`).join("\n");
+function frontmatterString(values: readonly string[]): string {
+  return JSON.stringify(values);
 }
 
 function skillDocument(definition: SkillFixtureDefinition): string {
@@ -60,13 +60,10 @@ function skillDocument(definition: SkillFixtureDefinition): string {
     `name: ${definition.name}`,
     `description: ${definition.description}`,
     "metadata:",
-    "  triggers:",
-    frontmatterList(definition.triggers, "    "),
-    "  compatibleEnvironments:",
-    frontmatterList(definition.compatibleEnvironments, "    "),
-    "  compatibleStages:",
-    frontmatterList(definition.compatibleStages, "    "),
-    ...(definition.requiredResources === undefined ? [] : ["  requiredResources:", frontmatterList(definition.requiredResources, "    ")]),
+    `  triggers: '${frontmatterString(definition.triggers)}'`,
+    `  compatibleEnvironments: '${frontmatterString(definition.compatibleEnvironments)}'`,
+    `  compatibleStages: '${frontmatterString(definition.compatibleStages)}'`,
+    ...(definition.requiredResources === undefined ? [] : [`  requiredResources: '${frontmatterString(definition.requiredResources)}'`]),
     "---",
     "",
     `# ${definition.name}`,
