@@ -15,6 +15,13 @@ function state(environment: Environment): TaskState {
   return { taskId: "task-handoff", goal: "Transfer the portable task state", constraints: ["keep scope narrow"], environment, stage: "execute", role: "implementer", routingDecision: null, selectedCapabilities: [], contextManifest: ["workspace:src"], handoffState: "none", verificationEvidence: [], recoveryPoint: null, approvalState: "approved", criticalUnsavedContext: [], durableContext: null };
 }
 
+const pemPrivateKeys = [
+  { label: "PKCS#8 private key", value: "-----BEGIN PRIVATE KEY-----\nTUlJRVJvdW5kOVBLS1M4Qk9EWQ==\n-----END PRIVATE KEY-----", body: "TUlJRVJvdW5kOVBLS1M4Qk9EWQ==", footer: "-----END PRIVATE KEY-----" },
+  { label: "RSA private key", value: "-----BEGIN RSA PRIVATE KEY-----\nTUlJRVJvdW5kOVJTQV9CT0RZ\n-----END RSA PRIVATE KEY-----", body: "TUlJRVJvdW5kOVJTQV9CT0RZ", footer: "-----END RSA PRIVATE KEY-----" },
+  { label: "EC private key", value: "-----BEGIN EC PRIVATE KEY-----\nTUlJRVJvdW5kOUVDX0JPRFk=\n-----END EC PRIVATE KEY-----", body: "TUlJRVJvdW5kOUVDX0JPRFk=", footer: "-----END EC PRIVATE KEY-----" },
+  { label: "OpenSSH private key", value: "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktcm91bmQ5LWJvZHk=\n-----END OPENSSH PRIVATE KEY-----", body: "b3BlbnNzaC1rZXktcm91bmQ5LWJvZHk=", footer: "-----END OPENSSH PRIVATE KEY-----" },
+] as const;
+
 function service(): PersistentHandoffService { return new PersistentHandoffService(new InMemoryHandoffPersistence()); }
 
 class BlockingHandoffPersistence implements HandoffPersistence {
@@ -98,6 +105,23 @@ describe("PersistentHandoffService", () => {
     expect(serialized).not.toContain(rawSignature);
     expect(serialized).toContain("[REDACTED]");
     expect(handoffEnvelopeSignature(envelope)).not.toContain(rawSignature);
+    expect((await persistence.load())[0]?.envelope).toEqual(expect.objectContaining({ taskId: envelope.taskId }));
+  });
+
+  it.each(pemPrivateKeys)("redacts the complete $label block before handoff integrity and persistence", async (pem) => {
+    const persistence = new InMemoryHandoffPersistence();
+    const handoffService = new PersistentHandoffService(persistence);
+    const envelope = await handoffService.create({
+      state: { ...state("codex"), goal: `Review ${pem.value}`, contextManifest: [`evidence:${pem.value}`] },
+      targetEnvironment: "work",
+    });
+    const serialized = JSON.stringify(envelope);
+
+    expect(serialized).not.toContain(pem.value);
+    expect(serialized).not.toContain(pem.body);
+    expect(serialized).not.toContain(pem.footer);
+    expect(serialized).toContain("[REDACTED]");
+    expect(handoffEnvelopeSignature(envelope)).not.toContain(pem.body);
     expect((await persistence.load())[0]?.envelope).toEqual(expect.objectContaining({ taskId: envelope.taskId }));
   });
 
