@@ -18,6 +18,8 @@ import type { EnvironmentCapabilities } from "../../src/routing/environment-capa
 import { selectEnvironment } from "../../src/routing/environment-router.js";
 import { resolveModelRoute, type ModelPolicy } from "../../src/routing/model-router.js";
 import { createDebugSession } from "../../src/debugging/debug-session.js";
+import type { CapturedRecoveryPoint } from "../../src/recovery/recovery-point-service.js";
+import type { RollbackResult } from "../../src/recovery/rollback.js";
 import {
   createDAIRuntime,
   type DAIEnvironmentAdapter,
@@ -173,6 +175,27 @@ function failedExecution(request: EnvironmentExecutionRequest): EnvironmentExecu
   };
 }
 
+function successfulRollbackResult(): RollbackResult {
+  return {
+    preservedUserWork: {
+      archiveId: "archive-1",
+      patchDigest: "a".repeat(64),
+    },
+    actions: [{
+      command: "git",
+      arguments: ["apply"],
+      stdout: "applied",
+      stderr: "",
+      exitCode: 0,
+    }],
+    verification: {
+      passed: true,
+      observedOutput: "recovery point verified",
+      reason: "recovery point matches",
+    },
+  };
+}
+
 function secretExecution(request: EnvironmentExecutionRequest): EnvironmentExecutionResult {
   return {
     status: "completed",
@@ -301,6 +324,7 @@ function harness(
       recoveredReasons.push(reason);
       return { ...state, stage: "recover", role: "recovery-operator" };
     },
+    rollbackTask: async (): Promise<RollbackResult> => successfulRollbackResult(),
     closeTask: async (state): Promise<CloseVerdict> => {
       closedStates.push(state);
       return closeVerdict(state, closeStatus);
@@ -724,7 +748,7 @@ describe("D-AI runtime", () => {
     let captureAttempts = 0;
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
-      captureRecoveryPoint: async (state): Promise<RecoveryPoint> => {
+      captureRecoveryPoint: async (state): Promise<RecoveryPoint | CapturedRecoveryPoint> => {
         captureAttempts += 1;
         if (captureAttempts === 2) throw new InvalidTaskStateError("recovery capture failed once");
         return originalCapture(state);
@@ -767,7 +791,7 @@ describe("D-AI runtime", () => {
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
       store: failingStore,
-      captureRecoveryPoint: async (state): Promise<RecoveryPoint> => {
+      captureRecoveryPoint: async (state): Promise<RecoveryPoint | CapturedRecoveryPoint> => {
         captureAttempts.push(state);
         return runtimeHarness.dependencies.captureRecoveryPoint(state);
       },
@@ -1146,7 +1170,7 @@ describe("D-AI runtime", () => {
     const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
-      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => ({
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint | CapturedRecoveryPoint> => ({
         ...await captureRecoveryPoint(state),
         createdAt,
       }),
@@ -1167,6 +1191,193 @@ describe("D-AI runtime", () => {
     expect(response.stage).toBe("recover");
     expect(response.evidence).toEqual([expect.objectContaining({ passed: false, exitCode: 1 })]);
     expect(runtimeHarness.recoveredReasons).toEqual(["execution did not complete"]);
+  });
+
+  it("persists debug session across a fresh runtime after execution failure", async () => {
+    const durableRoot = await mkdtemp(join(tmpdir(), "d-ai-debug-session-runtime-"));
+    let executionAttempts = 0;
+    const runtimeHarness = harness((request) => {
+      executionAttempts += 1;
+      const result = executionAttempts === 1 ? failedExecution(request) : completedExecution(request);
+      const recordedAt = new Date().toISOString();
+      return { ...result, evidence: result.evidence.map((evidence) => ({ ...evidence, recordedAt })) };
+    }, evaluateHardGates, "YES");
+    const firstStore = new FileDurableContextStore(durableRoot);
+    const dependencies = { ...runtimeHarness.dependencies, store: firstStore, now: (): Date => new Date() };
+
+    try {
+      const firstResponse = await createDAIRuntime(dependencies)(intentRequest("work", noOverrides));
+      expect(firstResponse.status).toBe("blocked");
+
+      const persisted = await firstStore.load(firstResponse.taskId);
+      expect(persisted).toMatchObject({
+        debugSession: {
+          phase: "reproduce",
+          originalFailure: "execution did not complete",
+          preservedRecoveryPointId: expect.any(String),
+        },
+      });
+
+      const freshStore = new FileDurableContextStore(durableRoot);
+      const freshRuntime = createDAIRuntime({ ...dependencies, store: freshStore });
+      const reloaded = await freshStore.load(firstResponse.taskId);
+      expect(reloaded?.debugSession).toEqual(persisted?.debugSession);
+
+      const continued = await freshRuntime({
+        command: { kind: "continue", taskIdOrProject: firstResponse.taskId },
+        sourceEnvironment: persisted?.environment ?? "codex",
+        overrides: noOverrides,
+      });
+      expect(continued.status, continued.message).toBe("completed");
+
+      await expect(freshStore.load(firstResponse.taskId)).resolves.toMatchObject({
+        debugSession: persisted?.debugSession,
+      });
+    } finally {
+      await rm(durableRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks rollback when no active task exists", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let rollbackCalls = 0;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      rollbackTask: async (): Promise<RollbackResult> => {
+        rollbackCalls += 1;
+        return successfulRollbackResult();
+      },
+    });
+
+    const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(result).toMatchObject({ taskId: "unassigned", status: "blocked", stage: "bootstrap" });
+    expect(result.message).toMatch(/no active task/i);
+    expect(rollbackCalls).toBe(0);
+  });
+
+  it("blocks rollback from an environment that does not own the active task", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    let rollbackCalls = 0;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      rollbackTask: async (): Promise<RollbackResult> => {
+        rollbackCalls += 1;
+        return successfulRollbackResult();
+      },
+    });
+    await handle(intentRequest("chat", noOverrides));
+
+    const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "work", overrides: noOverrides });
+
+    expect(result).toMatchObject({ status: "blocked", taskId: "unassigned" });
+    expect(result.message).toMatch(/no active task/i);
+    expect(rollbackCalls).toBe(0);
+  });
+
+  it("blocks rollback when the active task has no recovery point", async () => {
+    const runtimeHarness = harness(failedExecution, evaluateHardGates, "YES");
+    const rollbackCalls: TaskState[] = [];
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      rollbackTask: async (state): Promise<RollbackResult> => {
+        rollbackCalls.push(state);
+        return successfulRollbackResult();
+      },
+    });
+    const failed = await handle(intentRequest("chat", noOverrides));
+
+    const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(failed.status).toBe("blocked");
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/recovery point/i);
+    expect(rollbackCalls).toHaveLength(0);
+  });
+
+  it("returns a redacted blocked response when the rollback adapter fails", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      rollbackTask: async (): Promise<RollbackResult> => {
+        throw new InvalidTaskStateError("rollback adapter failed token=rollback-secret");
+      },
+    });
+    const accepted = await handle(intentRequest("codex", noOverrides));
+    const acceptedState = await runtimeHarness.store.load(accepted.taskId);
+    if (acceptedState?.durableContext === null || acceptedState?.durableContext === undefined || acceptedState.recoveryPoint === null) throw new InvalidTaskStateError("Rollback fixture did not persist recovery context");
+    await runtimeHarness.store.save({
+      ...acceptedState,
+      recoverySnapshot: {
+        head: "0123456789abcdef0123456789abcdef01234567",
+        branch: "main",
+        workspacePath: "C:/workspace",
+        status: "clean",
+        binaryPatch: "no patch required",
+        stateManifest: acceptedState.durableContext,
+        verificationResults: acceptedState.verificationEvidence,
+        durableArtifacts: acceptedState.durableContext.hashes,
+      },
+    });
+    const acceptedSnapshotState = await runtimeHarness.store.load(accepted.taskId);
+    if (acceptedSnapshotState?.durableContext === null || acceptedSnapshotState?.durableContext === undefined || acceptedSnapshotState.recoverySnapshot === null || acceptedSnapshotState.recoverySnapshot === undefined) throw new InvalidTaskStateError("Rollback fixture snapshot was not persisted");
+    await runtimeHarness.store.save({ ...acceptedSnapshotState, recoverySnapshot: { ...acceptedSnapshotState.recoverySnapshot, stateManifest: acceptedSnapshotState.durableContext, durableArtifacts: acceptedSnapshotState.durableContext.hashes } });
+
+    const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(accepted.status).toBe("completed");
+    expect(result.status).toBe("blocked");
+    expect(result.stage).toBe("verify");
+    expect(result.message).toMatch(/rollback adapter failed/i);
+    expect(result.message).toContain("[REDACTED]");
+    expect(result.message).not.toContain("rollback-secret");
+  });
+
+  it("persists a verified rollback as recover while preserving debugSession and ownership lease", async () => {
+    let executionAttempts = 0;
+    const runtimeHarness = harness((request) => {
+      executionAttempts += 1;
+      return executionAttempts === 1 ? failedExecution(request) : completedExecution(request);
+    }, evaluateHardGates, "YES");
+    const rollbackCalls: Array<{ readonly state: TaskState; readonly lease: TaskOwnershipLease }> = [];
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      rollbackTask: async (state, lease): Promise<RollbackResult> => {
+        rollbackCalls.push({ state, lease });
+        return successfulRollbackResult();
+      },
+    });
+    const failed = await handle(intentRequest("codex", noOverrides));
+    const recovered = await handle({ command: { kind: "continue", taskIdOrProject: failed.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+    const beforeRollback = await runtimeHarness.store.load(failed.taskId);
+    if (beforeRollback?.durableContext === null || beforeRollback?.durableContext === undefined || beforeRollback.recoveryPoint === null) throw new InvalidTaskStateError("Rollback fixture did not persist recovery context");
+    await runtimeHarness.store.save({
+      ...beforeRollback,
+      recoverySnapshot: {
+        head: "0123456789abcdef0123456789abcdef01234567",
+        branch: "main",
+        workspacePath: "C:/workspace",
+        status: "clean",
+        binaryPatch: "no patch required",
+        stateManifest: beforeRollback.durableContext,
+        verificationResults: beforeRollback.verificationEvidence,
+        durableArtifacts: beforeRollback.durableContext.hashes,
+      },
+    });
+    const beforeVerifiedRollback = await runtimeHarness.store.load(failed.taskId);
+    if (beforeVerifiedRollback?.durableContext === null || beforeVerifiedRollback?.durableContext === undefined || beforeVerifiedRollback.recoverySnapshot === null || beforeVerifiedRollback.recoverySnapshot === undefined) throw new InvalidTaskStateError("Rollback fixture snapshot was not persisted");
+    await runtimeHarness.store.save({ ...beforeVerifiedRollback, recoverySnapshot: { ...beforeVerifiedRollback.recoverySnapshot, stateManifest: beforeVerifiedRollback.durableContext, durableArtifacts: beforeVerifiedRollback.durableContext.hashes } });
+
+    const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const afterRollback = await runtimeHarness.store.load(failed.taskId);
+
+    expect(recovered.status).toBe("completed");
+    expect(beforeRollback?.debugSession).not.toBeNull();
+    expect(result).toMatchObject({ taskId: failed.taskId, stage: "recover", status: "completed" });
+    expect(rollbackCalls).toHaveLength(1);
+    expect(rollbackCalls[0]?.state.taskId).toBe(failed.taskId);
+    expect(rollbackCalls[0]?.lease).toMatchObject({ taskId: failed.taskId, environment: "codex" });
+    expect(afterRollback).toMatchObject({ stage: "recover", role: "recovery-operator", debugSession: beforeRollback?.debugSession, rollbackAudit: { archiveId: "archive-1", patchDigest: "a".repeat(64), verification: { passed: true } } });
   });
 
   it.each([
@@ -1378,7 +1589,7 @@ describe("D-AI runtime", () => {
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
       store: secretStore,
-      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => inject(await captureRecoveryPoint(state)),
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint | CapturedRecoveryPoint> => inject(await captureRecoveryPoint(state) as RecoveryPoint),
     });
 
     const result = await handle(intentRequest("chat", noOverrides));
@@ -1421,7 +1632,7 @@ describe("D-AI runtime", () => {
     const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
-      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint> => inject(await captureRecoveryPoint(state), secret),
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint | CapturedRecoveryPoint> => inject(await captureRecoveryPoint(state) as RecoveryPoint, secret),
     });
 
     const savedBeforeCapture = runtimeHarness.savedStates.length;

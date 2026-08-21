@@ -1,15 +1,7 @@
 import { InvalidTaskStateError } from "../domain/errors.js";
+import type { DebugPhase, DebugSession } from "../domain/types.js";
 
-export type DebugPhase =
-  | "reproduce" | "capture" | "isolate" | "hypothesize"
-  | "change" | "reverify" | "regress" | "stop";
-
-export interface DebugSession {
-  readonly phase: DebugPhase;
-  readonly originalFailure: string;
-  readonly hypothesis: string | null;
-  readonly preservedRecoveryPointId: string;
-}
+export type { DebugPhase, DebugSession } from "../domain/types.js";
 
 export interface DebugTransition {
   readonly session: DebugSession;

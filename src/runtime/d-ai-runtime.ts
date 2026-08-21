@@ -20,10 +20,13 @@ import {
 import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { assertStageTransition } from "../domain/transitions.js";
-import type { CloseVerdict, Environment, RecoveryPoint, Role, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
+import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
 import { FileHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../handoff/envelope.js";
+import type { CapturedRecoveryPoint } from "../recovery/recovery-point-service.js";
+import { createGitRollbackTask } from "../recovery/git-rollback-adapter.js";
+import type { RollbackResult } from "../recovery/rollback.js";
 import type { EnvironmentCapabilities } from "../routing/environment-capabilities.js";
 import { selectEnvironment, type EnvironmentRoute, type EnvironmentRouteInput } from "../routing/environment-router.js";
 import { resolveModelRoute, type ModelPolicy } from "../routing/model-router.js";
@@ -92,8 +95,9 @@ type SelectCapabilities = typeof selectCapabilities;
 type LoadSelectedSkill = typeof loadSelectedSkill;
 type EvaluateHardGates = (input: HardGateInput) => readonly GateResult[];
 type CreateDebugSession = (originalFailure: string, preservedRecoveryPointId: string) => DebugSession;
-type CaptureRecoveryPoint = (state: TaskState) => Promise<RecoveryPoint>;
+type CaptureRecoveryPoint = (state: TaskState) => Promise<RecoveryPoint | CapturedRecoveryPoint>;
 type Recover = (state: TaskState, reason: string) => Promise<TaskState>;
+type RollbackTask = (state: TaskState, lease: TaskOwnershipLease) => Promise<RollbackResult>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
   readonly workspacePath: string | null;
@@ -113,6 +117,7 @@ export interface DAIRuntimeDependencies {
   readonly createDebugSession: CreateDebugSession;
   readonly captureRecoveryPoint: CaptureRecoveryPoint;
   readonly recover: Recover;
+  readonly rollbackTask?: RollbackTask | undefined;
   readonly closeTask: (state: TaskState) => Promise<CloseVerdict>;
   readonly maximumEvidenceAgeMs: number;
   readonly now: () => Date;
@@ -128,6 +133,7 @@ const commandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("handoff"), target: environmentSchema }).strict(),
   z.object({ kind: z.literal("complete"), handoffId: z.string().trim().min(1) }).strict(),
   z.object({ kind: z.literal("close") }).strict(),
+  z.object({ kind: z.literal("rollback") }).strict(),
 ]);
 const overridesSchema = z.object({
   model: z.string().trim().min(1).nullable(),
@@ -434,6 +440,10 @@ function recoveryConnectorFailure(error: Error): string | null {
   return null;
 }
 
+function rollbackConnectorFailure(error: Error): string | null {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function transitionState(state: TaskState, stage: Stage, role: Role, environment: Environment): TaskState {
   assertStageTransition(state.stage, stage);
   return {
@@ -608,10 +618,12 @@ function secretLikeRecoveryPointField(recoveryPoint: RecoveryPoint): string | nu
 
 function validateCapturedRecoveryPoint(
   state: TaskState,
-  recoveryPoint: RecoveryPoint,
+  recoveryPoint: RecoveryPoint | CapturedRecoveryPoint,
   now: Date,
-): ConnectorOutcome<RecoveryPoint> {
-  const parsed = recoveryPointSchema.safeParse(recoveryPoint);
+): ConnectorOutcome<{ readonly recoveryPoint: RecoveryPoint; readonly recoverySnapshot: RecoverySnapshot | null }> {
+  const candidate = "recoveryPoint" in recoveryPoint ? recoveryPoint.recoveryPoint : recoveryPoint;
+  const snapshot = "recoveryPoint" in recoveryPoint ? recoveryPoint.snapshot : null;
+  const parsed = recoveryPointSchema.safeParse(candidate);
   if (!parsed.success) {
     return { kind: "blocked", message: `Captured recovery point is malformed: ${validationReason(parsed.error.issues)}` };
   }
@@ -642,7 +654,48 @@ function validateCapturedRecoveryPoint(
     || manifestHashKeys.some((key) => !manifest.durablePaths.includes(key))
     || !hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, validated.durablePaths, validated.hashes)
   ) return { kind: "blocked", message: "Captured recovery point does not match the persisted verify artifacts" };
-  return { kind: "success", value: validated };
+  if (snapshot !== null) {
+    if (snapshot.stateManifest.manifestId !== manifest.manifestId
+      || snapshot.stateManifest.taskId !== state.taskId
+      || snapshot.verificationResults.length === 0
+      || snapshot.durableArtifacts[validated.durablePaths[0] ?? ""] === undefined) {
+      return { kind: "blocked", message: "Captured recovery snapshot does not match the persisted verify manifest" };
+    }
+    if (snapshot.head.trim().length === 0 || snapshot.branch.trim().length === 0 || snapshot.workspacePath.trim().length === 0) {
+      return { kind: "blocked", message: "Captured recovery snapshot is missing Git identity or workspace metadata" };
+    }
+  }
+  return { kind: "success", value: { recoveryPoint: validated, recoverySnapshot: snapshot } };
+}
+
+function persistedRecoverySnapshotFailure(state: TaskState): string | null {
+  const snapshot = state.recoverySnapshot;
+  const manifest = state.durableContext;
+  if (snapshot === null || snapshot === undefined) return "Rollback requires a persisted complete recovery snapshot";
+  if (manifest === null) return "Rollback requires a persisted durable context";
+  if (snapshot.stateManifest.manifestId !== manifest.manifestId || snapshot.stateManifest.taskId !== state.taskId) {
+    return "Persisted recovery snapshot does not match the active durable manifest";
+  }
+  if (!hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, snapshot.stateManifest.durablePaths, snapshot.stateManifest.hashes)) {
+    return "Persisted recovery snapshot hashes do not match the active durable manifest";
+  }
+  if (Object.keys(snapshot.durableArtifacts).length !== manifest.durablePaths.length || manifest.durablePaths.some((path) => snapshot.durableArtifacts[path] !== manifest.hashes[path])) {
+    return "Persisted recovery snapshot artifacts do not match the active durable manifest";
+  }
+  if (!/^[a-f0-9]{40,64}$/i.test(snapshot.head) || snapshot.branch.trim().length === 0 || snapshot.workspacePath.trim().length === 0) {
+    return "Persisted recovery snapshot has invalid Git identity or workspace metadata";
+  }
+  return null;
+}
+
+function rollbackAudit(result: RollbackResult, recordedAt: string): RollbackAudit {
+  return {
+    archiveId: result.preservedUserWork.archiveId,
+    patchDigest: result.preservedUserWork.patchDigest,
+    actions: result.actions.map((item) => ({ command: item.command, arguments: [...item.arguments], stdout: item.stdout, stderr: item.stderr, exitCode: item.exitCode })),
+    verification: { passed: result.verification.passed, observedOutput: result.verification.observedOutput, reason: result.verification.reason },
+    recordedAt,
+  };
 }
 
 function failedGateReason(
@@ -676,15 +729,16 @@ async function enterRecovery(
 ): Promise<DAIResponse> {
   const redactedReason = redactSensitiveText(reason);
   const debugTransition = transitionState(state, "debug", "debugger", state.environment);
+  const debugSession = dependencies.createDebugSession(redactedReason, debugTransition.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
   const debugState = await persistState(dependencies.store, {
     ...debugTransition,
+    debugSession,
     routingDecision: debugTransition.routingDecision === null ? null : {
       ...debugTransition.routingDecision,
       reason: `Debugging required: ${redactedReason}`,
     },
   }, lease);
   const recoveryOutcome = await connectorOutcome(async () => {
-    dependencies.createDebugSession(redactedReason, debugState.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
     const recovered = await dependencies.recover(debugState, redactedReason);
     if (recovered.taskId !== state.taskId) {
       throw new InvalidTaskStateError("Recovery changed the stable task id");
@@ -781,9 +835,10 @@ async function executeRoutedState(
     ...preliminaryVerifyState,
     verificationEvidence: preliminaryVerifyState.verificationEvidence.map((verification) => ({
       ...verification,
-      recoveryPointId: recoveryPointValidation.value.recoveryPointId,
+      recoveryPointId: recoveryPointValidation.value.recoveryPoint.recoveryPointId,
     })),
-    recoveryPoint: recoveryPointValidation.value,
+    recoveryPoint: recoveryPointValidation.value.recoveryPoint,
+    recoverySnapshot: recoveryPointValidation.value.recoverySnapshot,
     durableContext: null,
   }, lease);
   const applicableGates = applicableExecutionGates(verifiedState);
@@ -913,6 +968,74 @@ async function continueTask(
       request.sourceEnvironment,
       dependencies.store,
       async (lease) => continueTaskExclusive(request, command, dependencies, registry, lease),
+    ),
+  );
+}
+
+async function rollbackActiveTaskExclusive(
+  taskId: string,
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
+): Promise<DAIResponse> {
+  if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
+  }
+  const state = await dependencies.store.load(taskId);
+  if (state === null || !registry.isActiveOwner(taskId, request.sourceEnvironment)) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} became unavailable while rollback was loading durable state`);
+  }
+  if (state.recoveryPoint === null) {
+    return response(state, "blocked", "Rollback requires a persisted recovery point");
+  }
+  if (state.durableContext === null) {
+    return response(state, "blocked", "Rollback requires a persisted durable context");
+  }
+  const snapshotFailure = persistedRecoverySnapshotFailure(state);
+  if (snapshotFailure !== null) return response(state, "blocked", snapshotFailure);
+  if (dependencies.rollbackTask === undefined) {
+    return response(state, "blocked", "Rollback connector is not configured");
+  }
+  const rollbackOutcome = await connectorOutcome(
+    () => dependencies.rollbackTask!(state, lease),
+    rollbackConnectorFailure,
+  );
+  if (rollbackOutcome.kind === "blocked") {
+    return response(state, "blocked", `Rollback blocked: ${rollbackOutcome.message}`);
+  }
+  if (!rollbackOutcome.value.verification.passed) {
+    return response(state, "blocked", `Rollback verification failed: ${rollbackOutcome.value.verification.reason}`);
+  }
+  const recoveredState = await persistState(
+    dependencies.store,
+    {
+      ...transitionState(state, "recover", "recovery-operator", state.environment),
+      recoveryPoint: state.recoveryPoint,
+      debugSession: state.debugSession ?? null,
+      rollbackAudit: rollbackAudit(rollbackOutcome.value, dependencies.now().toISOString()),
+    },
+    lease,
+  );
+  return response(recoveredState, "completed", "Rollback completed and recovery point verified");
+}
+
+async function rollbackActiveTask(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse> {
+  const taskId = registry.activeTaskId(request.sourceEnvironment);
+  if (taskId === null) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for rollback");
+  }
+  return registry.serializeMutation(
+    taskId,
+    () => withDurableTaskOwnership(
+      taskId,
+      request.sourceEnvironment,
+      dependencies.store,
+      async (lease) => rollbackActiveTaskExclusive(taskId, request, dependencies, registry, lease),
     ),
   );
 }
@@ -1133,7 +1256,7 @@ async function completeHandoffExclusive(
   if (recoveryPoint.kind === "blocked") {
     return response(completedState.value, "blocked", `Handoff completion recovery capture blocked: ${recoveryPoint.message}`);
   }
-  if (recoveryPoint.value.recoveryPointId !== priorRecoveryPointId) {
+  if (("recoveryPoint" in recoveryPoint.value ? recoveryPoint.value.recoveryPoint.recoveryPointId : recoveryPoint.value.recoveryPointId) !== priorRecoveryPointId) {
     return response(completedState.value, "blocked", "Handoff completion recovery capture returned a new identity");
   }
   const recoveryValidation = validateCapturedRecoveryPoint(completedState.value, recoveryPoint.value, dependencies.now());
@@ -1141,7 +1264,11 @@ async function completeHandoffExclusive(
     return response(completedState.value, "blocked", `Handoff completion recovery capture blocked: ${recoveryValidation.message}`);
   }
   const persisted = await connectorOutcome(
-    () => persistState(dependencies.store, { ...completedState.value, recoveryPoint: recoveryValidation.value }, lease),
+    () => persistState(dependencies.store, {
+      ...completedState.value,
+      recoveryPoint: recoveryValidation.value.recoveryPoint,
+      recoverySnapshot: recoveryValidation.value.recoverySnapshot,
+    }, lease),
     completionConnectorFailure,
   );
   if (persisted.kind === "blocked") {
@@ -1276,6 +1403,7 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
     if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, registry);
     if (request.command.kind === "complete") return completeHandoff(request, request.command, dependencies, registry);
     if (request.command.kind === "close") return closeActiveTask(request, dependencies, registry);
+    if (request.command.kind === "rollback") return rollbackActiveTask(request, dependencies, registry);
     const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
     return state === null
       ? blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for status")
@@ -1341,6 +1469,7 @@ function createDefaultDependencies(): DAIRuntimeDependencies {
     createDebugSession,
     captureRecoveryPoint: defaultCaptureRecoveryPoint,
     recover: defaultRecovery,
+    rollbackTask: createGitRollbackTask(root),
     closeTask: (state: TaskState): Promise<CloseVerdict> => closeTask(state, { store, gitHub }),
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),

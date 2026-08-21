@@ -5,7 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
-import type { CloseCandidate, DurableContextManifest, Environment, TaskState } from "../domain/types.js";
+import type { CloseCandidate, DebugSession, DurableContextManifest, Environment, TaskState } from "../domain/types.js";
 import type { DurableContextStore, TaskOwnershipLease } from "./durable-context-store.js";
 
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -40,6 +40,14 @@ const roleSchema = z.enum([
   "debugger",
   "recovery-operator",
 ]);
+const debugSessionSchema = z
+  .object({
+    phase: z.enum(["reproduce", "capture", "isolate", "hypothesize", "change", "reverify", "regress", "stop"]),
+    originalFailure: z.string().min(1),
+    hypothesis: z.string().min(1).nullable(),
+    preservedRecoveryPointId: z.string().min(1),
+  })
+  .strict();
 const safeManifestIdSchema = z.string().refine(isSafeManifestId, "must be a UUID or manifest-UUID");
 const ownershipRecordSchema = z.object({
   taskId: z.string().min(1),
@@ -75,6 +83,25 @@ const manifestSchema = z
     recordedAt: z.string().datetime(),
   })
   .strict();
+const recoverySnapshotSchema = z
+  .object({
+    head: z.string(),
+    branch: z.string(),
+    workspacePath: z.string(),
+    status: z.string(),
+    binaryPatch: z.string(),
+    stateManifest: manifestSchema,
+    verificationResults: z.array(verificationEvidenceSchema),
+    durableArtifacts: z.record(z.string().min(1), z.string().regex(/^[a-f0-9]{64}$/)),
+  })
+  .strict();
+const rollbackAuditSchema = z.object({
+  archiveId: z.string().min(1),
+  patchDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  actions: z.array(z.object({ command: z.string().min(1), arguments: z.array(z.string()), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable() }).strict()),
+  verification: z.object({ passed: z.boolean(), observedOutput: z.string(), reason: z.string() }).strict(),
+  recordedAt: z.string().datetime(),
+}).strict();
 const recoveryPointSchema = z
   .object({
     recoveryPointId: z.string().min(1),
@@ -141,10 +168,13 @@ const taskStateSchema = z
     verificationEvidence: z.array(verificationEvidenceSchema),
     verificationHistory: z.array(verificationEvidenceSchema).optional(),
     recoveryPoint: recoveryPointSchema.nullable(),
+    recoverySnapshot: recoverySnapshotSchema.nullable().optional(),
+    rollbackAudit: rollbackAuditSchema.nullable().optional(),
     approvalState: z.enum(["not-required", "pending", "approved", "rejected"]),
     criticalUnsavedContext: z.array(z.string()),
     durableContext: manifestSchema.nullable(),
     closeCandidate: closeCandidateSchema.optional(),
+    debugSession: debugSessionSchema.nullable().optional(),
   })
   .strict();
 const contextRecordSchema = z
@@ -161,7 +191,13 @@ const approvalRecordSchema = z
 const handoffRecordSchema = z
   .object({ handoffState: z.enum(["none", "pending", "acknowledged", "active", "completed", "rejected"]) })
   .strict();
-const recoveryRecordSchema = z.object({ recoveryPoint: recoveryPointSchema.nullable() }).strict();
+const recoveryRecordSchema = z
+  .object({
+    recoveryPoint: recoveryPointSchema.nullable(),
+    recoverySnapshot: recoverySnapshotSchema.nullable().optional(),
+    rollbackAudit: rollbackAuditSchema.nullable().optional(),
+  })
+  .strict();
 
 interface SnapshotPaths {
   readonly taskRoot: string;
@@ -593,7 +629,7 @@ export class FileDurableContextStore implements DurableContextStore {
       [paths.evidence, serialize({ verificationEvidence: validatedState.verificationEvidence, ...(validatedState.verificationHistory === undefined ? {} : { verificationHistory: validatedState.verificationHistory }) })],
       [paths.approval, serialize({ approvalState: validatedState.approvalState, criticalUnsavedContext: validatedState.criticalUnsavedContext })],
       [paths.handoff, serialize({ handoffState: validatedState.handoffState })],
-      [paths.recovery, serialize({ recoveryPoint: validatedState.recoveryPoint })],
+      [paths.recovery, serialize({ recoveryPoint: validatedState.recoveryPoint, recoverySnapshot: validatedState.recoverySnapshot ?? null, rollbackAudit: validatedState.rollbackAudit ?? null })],
     ]);
     const manifest: DurableContextManifest = {
       manifestId: randomUUID(),

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TaskOwnershipError } from "../../src/domain/errors.js";
-import type { TaskState } from "../../src/domain/types.js";
+import type { RecoverySnapshot, TaskState } from "../../src/domain/types.js";
 import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
 function createState(taskId: string, goal: string): TaskState {
@@ -23,6 +23,44 @@ function createState(taskId: string, goal: string): TaskState {
     approvalState: "not-required",
     criticalUnsavedContext: [],
     durableContext: null,
+  };
+}
+
+function createRecoverySnapshot(taskId: string): RecoverySnapshot {
+  return {
+    head: "0123456789abcdef0123456789abcdef01234567",
+    branch: "feat/recovery",
+    workspacePath: "C:/workspace",
+    status: " M src/example.ts",
+    binaryPatch: "diff --git a/src/example.ts b/src/example.ts",
+    stateManifest: {
+      manifestId: "00000000-0000-4000-8000-000000000001",
+      taskId,
+      stage: "execute",
+      environment: "work",
+      role: "implementer",
+      durablePaths: ["context.json"],
+      hashes: { "context.json": "a".repeat(64) },
+      recoveryPointId: null,
+      recordedAt: "2026-08-21T00:00:00.000Z",
+    },
+    verificationResults: [
+      {
+        evidenceId: "evidence-recovery",
+        stage: "verify",
+        environment: "work",
+        role: "evidence-collector",
+        selectedModel: "model",
+        command: "npm test",
+        observedOutput: "all tests passed",
+        exitCode: 0,
+        interpretation: "Quality passed",
+        passed: true,
+        recoveryPointId: null,
+        recordedAt: "2026-08-21T00:00:00.000Z",
+      },
+    ],
+    durableArtifacts: { "context.json": "a".repeat(64) },
   };
 }
 
@@ -419,6 +457,93 @@ describe("FileDurableContextStore", () => {
 
       releaseSecond();
       await second;
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("round-trips a validated debug session with durable task state", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state: TaskState = {
+      ...createState("task-debug-session", "Persist debugging progress"),
+      debugSession: {
+        phase: "hypothesize",
+        originalFailure: "build exits 1",
+        hypothesis: "manifest mismatch",
+        preservedRecoveryPointId: "recovery-1",
+      },
+    };
+
+    try {
+      await store.save(state);
+      const recovered = await store.load(state.taskId);
+
+      expect(recovered?.debugSession).toEqual(state.debugSession);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("round-trips and integrity-protects a recovery snapshot in state and recovery records", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const snapshot = createRecoverySnapshot("task-recovery-snapshot");
+    const state: TaskState = { ...createState("task-recovery-snapshot", "Persist recovery snapshot"), recoverySnapshot: snapshot };
+
+    try {
+      const manifest = await store.save(state);
+      const recovered = await store.load(state.taskId);
+      expect(recovered?.recoverySnapshot).toEqual(snapshot);
+
+      const recoveryPath = join(rootPath, state.taskId, "recovery.json");
+      const recoveryContent = await readFile(recoveryPath, "utf8");
+      expect(JSON.parse(recoveryContent)).toMatchObject({ recoverySnapshot: snapshot });
+
+      const statePath = join(rootPath, state.taskId, "state.json");
+      const persistedState = JSON.parse(await readFile(statePath, "utf8")) as { recoverySnapshot: { status: string } };
+      persistedState.recoverySnapshot.status = "tampered";
+      await writeFile(statePath, `${JSON.stringify(persistedState, null, 2)}\n`, "utf8");
+      await expect(store.load(state.taskId)).rejects.toThrow(/canonical state hash mismatch|content hash mismatch/i);
+      expect(manifest.hashes[statePath]).toMatch(/^[a-f0-9]{64}$/);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an unknown recovery snapshot field before persistence", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const snapshot = createRecoverySnapshot("task-invalid-recovery-snapshot");
+    const state = {
+      ...createState("task-invalid-recovery-snapshot", "Reject invalid recovery snapshot"),
+      recoverySnapshot: { ...snapshot, unexpected: true },
+    } as TaskState;
+
+    try {
+      await expect(store.save(state)).rejects.toThrow(/recoverySnapshot.*unrecognized|unrecognized.*recoverySnapshot/i);
+      await expect(store.load(state.taskId)).resolves.toBeNull();
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("round-trips a rollback audit with the recovery record", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const audit = {
+      archiveId: "stash@{0}",
+      patchDigest: "b".repeat(64),
+      actions: [{ command: "git", arguments: ["revert", "--no-edit"], stdout: "reverted", stderr: "", exitCode: 0 }],
+      verification: { passed: true, observedOutput: "tree verified", reason: "Recovery tree matches" },
+      recordedAt: "2026-08-21T00:00:00.000Z",
+    } as const;
+    const state: TaskState = { ...createState("task-rollback-audit", "Persist rollback audit"), rollbackAudit: audit };
+
+    try {
+      await store.save(state);
+      await expect(store.load(state.taskId)).resolves.toMatchObject({ rollbackAudit: audit });
+      await expect(readFile(join(rootPath, state.taskId, "recovery.json"), "utf8")).resolves.toContain("stash@{0}");
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }

@@ -1,20 +1,9 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue } from "../domain/manifest-id.js";
-import type { DurableContextManifest, Environment, RecoveryPoint, Role, Stage, VerificationEvidence } from "../domain/types.js";
+import type { DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, Role, Stage, VerificationEvidence } from "../domain/types.js";
 
 export type RecoveryTrigger = "risky-work" | "handoff" | "recovery" | "close";
-
-export interface RecoverySnapshot {
-  readonly head: string;
-  readonly branch: string;
-  readonly workspacePath: string;
-  readonly status: string;
-  readonly binaryPatch: string;
-  readonly stateManifest: DurableContextManifest;
-  readonly verificationResults: readonly VerificationEvidence[];
-  readonly durableArtifacts: Readonly<Record<string, string>>;
-}
 
 export interface CapturedRecoveryPoint {
   readonly trigger: RecoveryTrigger;
