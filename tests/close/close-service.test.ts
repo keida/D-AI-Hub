@@ -4,7 +4,7 @@ import { closeTask } from "../../src/close/close-service.js";
 import type { DurableContextStore } from "../../src/state/durable-context-store.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
 import type { GitFailureCategory } from "../../src/adapters/git.js";
-import type { DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { CloseCandidate, DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 
 const gateNames = [
   "scope",
@@ -101,11 +101,16 @@ function closeReadyState(now: string): TaskState {
 }
 
 function storeFor(state: TaskState | null): DurableContextStore {
+  let closeCandidate: CloseCandidate | null = null;
   return {
     load: async (): Promise<TaskState | null> => state,
     save: async (): Promise<DurableContextManifest> => {
       throw new Error("The close workflow must not save durable context");
     },
+    saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+      closeCandidate = candidate;
+    },
+    loadCloseCandidate: async (): Promise<CloseCandidate | null> => closeCandidate,
     recordCriticalUnsavedContext: async (): Promise<void> => {
       throw new Error("The close workflow must not record unsaved context");
     },
@@ -198,6 +203,117 @@ describe("closeTask", () => {
 
     expect(verdict.status).toBe("YES");
     expect(verdict.reasons).toEqual([]);
+  });
+
+  it("persists and validates the exact close candidate before push and exposes it on YES", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    let persistedCandidate: CloseCandidate | null = null;
+    const store = {
+      ...storeFor(state),
+      saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+        persistedCandidate = candidate;
+      },
+      loadCloseCandidate: async (): Promise<CloseCandidate | null> => persistedCandidate,
+    };
+    const pushEvidence = successfulPush();
+
+    const verdict = await closeTask(state, {
+      store,
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          expect(persistedCandidate).not.toBeNull();
+          return pushEvidence;
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState(pushEvidence.localSha),
+      },
+    });
+
+    expect(verdict.status).toBe("YES");
+    expect(verdict).toHaveProperty("closeCandidate");
+  });
+
+  it("returns NO when the persisted close candidate changes after the pre-push binding", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    let persistedCandidate: CloseCandidate | null = null;
+    let candidateLoads = 0;
+    const store = {
+      ...storeFor(state),
+      saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+        persistedCandidate = candidate;
+      },
+      loadCloseCandidate: async (): Promise<CloseCandidate | null> => {
+        candidateLoads += 1;
+        if (candidateLoads === 1) return persistedCandidate;
+        return persistedCandidate === null ? null : { ...persistedCandidate, ref: "refs/heads/other" };
+      },
+    };
+    const pushEvidence = successfulPush();
+
+    const verdict = await closeTask(state, {
+      store,
+      gitHub: gitHubFor(pushEvidence, matchingRemoteState(pushEvidence.localSha)),
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/candidate|context/i);
+  });
+
+  it("returns NO when critical unsaved context appears after the pre-push binding", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    let persistedState = state;
+    let persistedCandidate: CloseCandidate | null = null;
+    const store = {
+      ...storeFor(state),
+      load: async (): Promise<TaskState> => persistedState,
+      saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+        persistedCandidate = candidate;
+      },
+      loadCloseCandidate: async (): Promise<CloseCandidate | null> => persistedCandidate,
+    };
+    const pushEvidence = successfulPush();
+
+    const verdict = await closeTask(state, {
+      store,
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          persistedState = { ...state, criticalUnsavedContext: ["late unsaved context"] };
+          return pushEvidence;
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState(pushEvidence.localSha),
+      },
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/context|candidate/i);
+  });
+
+  it("returns NO when task context changes after the remote SHA is verified", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    let persistedState = state;
+    let persistedCandidate: CloseCandidate | null = null;
+    const store = {
+      ...storeFor(state),
+      load: async (): Promise<TaskState> => persistedState,
+      saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+        persistedCandidate = candidate;
+      },
+      loadCloseCandidate: async (): Promise<CloseCandidate | null> => persistedCandidate,
+    };
+    const pushEvidence = successfulPush();
+
+    const verdict = await closeTask(state, {
+      store,
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => pushEvidence,
+        verifyRemoteState: async (): Promise<RemoteState> => {
+          persistedState = { ...state, contextManifest: [...state.contextManifest, "post-candidate-change"] };
+          return matchingRemoteState(pushEvidence.localSha);
+        },
+      },
+    });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/context|candidate/i);
   });
 
   it.each([

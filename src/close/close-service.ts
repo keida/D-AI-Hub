@@ -2,7 +2,7 @@ import { redactSensitiveText } from "../adapters/command-runner.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../adapters/github.js";
 import type { GitFailureCategory } from "../adapters/git.js";
 import { CloseBlockedError } from "../domain/errors.js";
-import type { CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
+import type { CloseCandidate, CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
 import { isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import type { DurableContextStore } from "../state/durable-context-store.js";
@@ -49,6 +49,7 @@ function createVerdict(state: TaskState, status: CloseVerdict["status"], reasons
     recoveryPoint: state.recoveryPoint,
     durablePaths: state.durableContext?.durablePaths ?? [],
     hashes: state.durableContext?.hashes ?? {},
+    closeCandidate: null,
     reasons: reasons.map(redactSensitiveText),
   };
 }
@@ -172,6 +173,64 @@ function preflight(state: TaskState, now: Date, snapshotManifest: DurableContext
     return { reasons, configuration: null };
   }
   return { reasons, configuration: { repositoryPath, remote, ref, commitSha } };
+}
+
+function createCloseCandidate(state: TaskState, configuration: CloseConfiguration, recordedAt: string): CloseCandidate {
+  if (state.durableContext === null) {
+    throw new CloseBlockedError("Close candidate requires a durable context manifest");
+  }
+  return {
+    taskId: state.taskId,
+    durableContext: state.durableContext,
+    contextManifest: [...state.contextManifest],
+    repositoryPath: configuration.repositoryPath,
+    remote: configuration.remote,
+    ref: configuration.ref,
+    commitSha: configuration.commitSha,
+    criticalUnsavedContext: [...state.criticalUnsavedContext],
+    recordedAt,
+  };
+}
+
+function closeCandidateFailure(candidate: CloseCandidate | null, state: TaskState, configuration: CloseConfiguration): string | null {
+  if (candidate === null) return "Durable close candidate is missing";
+  if (candidate.taskId !== state.taskId) return "Durable close candidate task does not match the close task";
+  if (state.durableContext === null || JSON.stringify(candidate.durableContext) !== JSON.stringify(state.durableContext)) {
+    return "Durable close candidate does not match the current durable manifest";
+  }
+  if (JSON.stringify(candidate.contextManifest) !== JSON.stringify(state.contextManifest)) {
+    return "Durable close candidate does not match the current context manifest";
+  }
+  if (candidate.repositoryPath !== configuration.repositoryPath) return "Durable close candidate repository path does not match the configured repository";
+  if (candidate.remote !== configuration.remote) return "Durable close candidate remote does not match the configured remote";
+  if (candidate.ref !== configuration.ref) return "Durable close candidate ref does not match the configured ref";
+  if (candidate.commitSha !== configuration.commitSha) return "Durable close candidate commit does not match the durable commit artifact";
+  if (JSON.stringify(candidate.criticalUnsavedContext) !== JSON.stringify(state.criticalUnsavedContext)) {
+    return "Durable close candidate does not match critical unsaved context";
+  }
+  if (candidate.criticalUnsavedContext.length > 0) return "Durable close candidate contains critical unsaved context";
+  return null;
+}
+
+async function loadCloseState(store: DurableContextStore, taskId: string): Promise<TaskState | null> {
+  try {
+    return await store.load(taskId);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CloseBlockedError(`Durable task state could not be reloaded for close: ${redactSensitiveText(message)}`);
+  }
+}
+
+async function loadCloseCandidate(store: DurableContextStore, taskId: string): Promise<CloseCandidate | null> {
+  if (store.loadCloseCandidate === undefined) {
+    throw new CloseBlockedError("Durable close candidate loader is unavailable");
+  }
+  try {
+    return await store.loadCloseCandidate(taskId);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new CloseBlockedError(`Durable close candidate could not be loaded: ${redactSensitiveText(message)}`);
+  }
 }
 
 const gitFailureCategories = [
@@ -335,6 +394,21 @@ export async function closeTask(
     return createVerdict(state, "NO", preflightResult.reasons, state.verificationEvidence);
   }
   const configuration = preflightResult.configuration;
+  if (dependencies.store.saveCloseCandidate === undefined || dependencies.store.loadCloseCandidate === undefined) {
+    return createVerdict(state, "BLOCKED", [failure("Durable close candidate persistence is unavailable", "use the real durable context store before close")], state.verificationEvidence);
+  }
+  const candidate = createCloseCandidate(state, configuration, now.toISOString());
+  try {
+    await dependencies.store.saveCloseCandidate(candidate);
+    const persistedCandidate = await loadCloseCandidate(dependencies.store, state.taskId);
+    const candidateFailure = closeCandidateFailure(persistedCandidate, state, configuration);
+    if (candidateFailure !== null) {
+      return createVerdict(state, "NO", [failure(candidateFailure, "restore the exact durable close candidate and rerun close")], state.verificationEvidence);
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Durable close candidate could not be persisted or verified: ${redactSensitiveText(message)}`, "restore durable candidate storage and rerun close")], state.verificationEvidence);
+  }
   const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as GitPushEvidence | null, error }),
@@ -360,6 +434,20 @@ export async function closeTask(
   if (pushResult.value.localSha !== configuration.commitSha) {
     return createVerdict(state, "NO", [failure("Durable artifact manifest does not identify the pushed commit", "record artifact:commit:<full-sha> in durable context and rerun verification")], [...state.verificationEvidence, recordedPushEvidence]);
   }
+  try {
+    const persistedState = await loadCloseState(dependencies.store, state.taskId);
+    if (persistedState === null) {
+      return createVerdict(state, "BLOCKED", [failure("Durable task state disappeared after the close candidate was persisted", "restore durable task state and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
+    }
+    const persistedCandidate = await loadCloseCandidate(dependencies.store, state.taskId);
+    const candidateFailure = closeCandidateFailure(persistedCandidate, state, configuration);
+    if (JSON.stringify(persistedState) !== JSON.stringify(state) || candidateFailure !== null) {
+      return createVerdict(state, "NO", [failure("Task context changed after the close candidate was persisted", "restore the candidate-bound task state and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Close candidate binding could not be reverified: ${redactSensitiveText(message)}`, "restore durable task and candidate state before retrying close")], [...state.verificationEvidence, recordedPushEvidence]);
+  }
   const remoteResult = await dependencies.gitHub.verifyRemoteState(pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as RemoteState | null, error }),
@@ -375,5 +463,16 @@ export async function closeTask(
   if (!remoteResult.value.matchesExpectedSha || remoteResult.value.remoteSha !== pushResult.value.localSha) {
     return createVerdict(state, "NO", [failure("Remote SHA does not match the pushed commit", "inspect the remote ref and push the intended commit again")], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]);
   }
-  return createVerdict(state, "YES", [], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]);
+  try {
+    const persistedState = await loadCloseState(dependencies.store, state.taskId);
+    const persistedCandidate = await loadCloseCandidate(dependencies.store, state.taskId);
+    const candidateFailure = closeCandidateFailure(persistedCandidate, state, configuration);
+    if (persistedState === null || JSON.stringify(persistedState) !== JSON.stringify(state) || candidateFailure !== null) {
+      return createVerdict(state, "NO", [failure("Task context changed after the remote SHA was verified", "restore the candidate-bound task state and rerun close")], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]);
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Final close candidate binding could not be reverified: ${redactSensitiveText(message)}`, "restore durable task and candidate state before retrying close")], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]);
+  }
+  return { ...createVerdict(state, "YES", [], [...state.verificationEvidence, recordedPushEvidence, recordedRemoteEvidence]), closeCandidate: candidate };
 }

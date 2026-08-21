@@ -5,7 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
-import type { DurableContextManifest, Environment, TaskState } from "../domain/types.js";
+import type { CloseCandidate, DurableContextManifest, Environment, TaskState } from "../domain/types.js";
 import type { DurableContextStore, TaskOwnershipLease } from "./durable-context-store.js";
 
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -88,6 +88,25 @@ const recoveryPointSchema = z
     snapshotManifestId: safeManifestIdSchema.optional(),
   })
   .strict();
+const closeCandidateSchema = z
+  .object({
+    taskId: z.string().min(1),
+    durableContext: manifestSchema,
+    contextManifest: z.array(z.string()),
+    repositoryPath: z.string().min(1),
+    remote: z.string().min(1),
+    ref: z.string().min(1),
+    commitSha: z.string().regex(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/),
+    criticalUnsavedContext: z.array(z.string()),
+    recordedAt: z.string().datetime(),
+  })
+  .strict();
+const persistedCloseCandidateSchema = z
+  .object({
+    candidate: closeCandidateSchema,
+    hash: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
 const taskStateSchema = z
   .object({
     taskId: z.string().min(1),
@@ -118,6 +137,7 @@ const taskStateSchema = z
     approvalState: z.enum(["not-required", "pending", "approved", "rejected"]),
     criticalUnsavedContext: z.array(z.string()),
     durableContext: manifestSchema.nullable(),
+    closeCandidate: closeCandidateSchema.optional(),
   })
   .strict();
 const contextRecordSchema = z
@@ -145,6 +165,7 @@ interface SnapshotPaths {
   readonly handoff: string;
   readonly recovery: string;
   readonly manifest: string;
+  readonly closeCandidate: string;
 }
 
 interface FileTaskOwnershipLease extends TaskOwnershipLease {
@@ -218,6 +239,16 @@ function parseManifest(value: unknown, taskId: string, targetPath: string): Dura
   return result.data;
 }
 
+function parseCloseCandidate(value: unknown, taskId: string, targetPath: string): CloseCandidate {
+  const result = closeCandidateSchema.safeParse(value);
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const reason = issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
+    throw new InvalidTaskStateError(`Invalid durable close candidate for task ${taskId} at ${targetPath}: ${reason}`);
+  }
+  return result.data;
+}
+
 function parseCompanionRecord(value: unknown, taskId: string, targetPath: string, schema: z.ZodType): void {
   const result = schema.safeParse(value);
   if (!result.success) {
@@ -246,6 +277,7 @@ function createSnapshotPaths(rootPath: string, taskId: string): SnapshotPaths {
     handoff: join(taskRoot, "handoff.json"),
     recovery: join(taskRoot, "recovery.json"),
     manifest: join(taskRoot, "manifest.json"),
+    closeCandidate: join(taskRoot, "close-candidate.json"),
   };
 }
 
@@ -287,6 +319,10 @@ function createCanonicalStateContent(state: TaskState): string {
     throw new InvalidTaskStateError(`Cannot hash durable task state ${state.taskId}: durable context is missing`);
   }
   return serialize({ ...state, durableContext: { ...state.durableContext, hashes: {} } });
+}
+
+function createCanonicalCloseCandidateContent(candidate: CloseCandidate): string {
+  return serialize(candidate);
 }
 
 function throwIntegrityError(
@@ -521,6 +557,51 @@ export class FileDurableContextStore implements DurableContextStore {
     await writeAtomically(paths.state, stateContent);
     if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     return persistedManifest;
+  }
+
+  public async saveCloseCandidate(candidate: CloseCandidate): Promise<void> {
+    assertTaskId(candidate.taskId);
+    const paths = createSnapshotPaths(this.rootPath, candidate.taskId);
+    assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate");
+    const validatedCandidate = parseCloseCandidate(candidate, candidate.taskId, paths.closeCandidate);
+    assertSafeManifestId(validatedCandidate.durableContext.manifestId, "Close candidate durable manifest id");
+    if (validatedCandidate.durableContext.taskId !== validatedCandidate.taskId) {
+      throw new InvalidTaskStateError(`Close candidate durable manifest task mismatch for task ${validatedCandidate.taskId}`);
+    }
+    await mkdir(paths.taskRoot, { recursive: true });
+    const candidateContent = createCanonicalCloseCandidateContent(validatedCandidate);
+    await writeAtomically(paths.closeCandidate, serialize({
+      candidate: validatedCandidate,
+      hash: createHashForContent(candidateContent),
+    }));
+  }
+
+  public async loadCloseCandidate(taskId: string): Promise<CloseCandidate | null> {
+    assertTaskId(taskId);
+    const paths = createSnapshotPaths(this.rootPath, taskId);
+    let content: string;
+    try {
+      content = await readFile(paths.closeCandidate, "utf8");
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) return null;
+      throw new InvalidTaskStateError(`Unable to read durable close candidate for task ${taskId} at ${paths.closeCandidate}: ${describeError(error)}`);
+    }
+    const parsedRecord = persistedCloseCandidateSchema.safeParse(parseJson(content, taskId, paths.closeCandidate));
+    if (!parsedRecord.success) {
+      const issue = parsedRecord.error.issues[0];
+      const reason = issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
+      throw new InvalidTaskStateError(`Invalid persisted close candidate for task ${taskId} at ${paths.closeCandidate}: ${reason}`);
+    }
+    const candidate = parseCloseCandidate(parsedRecord.data.candidate, taskId, paths.closeCandidate);
+    assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate");
+    const observedHash = createHashForContent(createCanonicalCloseCandidateContent(candidate));
+    if (observedHash !== parsedRecord.data.hash) {
+      throwIntegrityError(taskId, paths.closeCandidate, parsedRecord.data.hash, observedHash, "close candidate content hash mismatch");
+    }
+    if (candidate.taskId !== taskId || candidate.durableContext.taskId !== taskId) {
+      throw new InvalidTaskStateError(`Persisted close candidate task mismatch for task ${taskId}`);
+    }
+    return candidate;
   }
 
   public async loadGenerationManifest(taskId: string, manifestId: string): Promise<DurableContextManifest> {

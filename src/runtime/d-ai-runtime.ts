@@ -1194,11 +1194,30 @@ async function closeActiveTaskExclusive(
       message: redactSensitiveText(message),
     };
   }
+  const closeCandidate = verdict.closeCandidate;
+  if (closeCandidate === null) {
+    return response(state, "blocked", "Close verification returned YES without a durable close candidate");
+  }
   const closeState = await connectorOutcome(
-    () => persistState(dependencies.store, {
-      ...transitionState(state, "close", "evidence-collector", state.environment),
-      verificationEvidence: [...verdict.evidence],
-    }, lease),
+    async () => {
+      const latestState = await dependencies.store.load(taskId);
+      if (latestState === null || JSON.stringify(latestState) !== JSON.stringify(state)) {
+        throw new CloseBlockedError("Task context changed after close verification and before final close persistence");
+      }
+      if (
+        closeCandidate.taskId !== state.taskId
+        || JSON.stringify(closeCandidate.durableContext) !== JSON.stringify(state.durableContext)
+        || JSON.stringify(closeCandidate.contextManifest) !== JSON.stringify(state.contextManifest)
+        || JSON.stringify(closeCandidate.criticalUnsavedContext) !== JSON.stringify(state.criticalUnsavedContext)
+      ) {
+        throw new CloseBlockedError("Durable close candidate does not match the task being persisted after verification");
+      }
+      return persistState(dependencies.store, {
+        ...transitionState(state, "close", "evidence-collector", state.environment),
+        verificationEvidence: [...verdict.evidence],
+        closeCandidate,
+      }, lease);
+    },
     closeConnectorFailure,
   );
   if (closeState.kind === "blocked") {

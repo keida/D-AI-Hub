@@ -72,6 +72,18 @@ export interface RecoveryPoint {
   readonly snapshotManifestId?: string | undefined;
 }
 
+export interface CloseCandidate {
+  readonly taskId: string;
+  readonly durableContext: DurableContextManifest;
+  readonly contextManifest: readonly string[];
+  readonly repositoryPath: string;
+  readonly remote: string;
+  readonly ref: string;
+  readonly commitSha: string;
+  readonly criticalUnsavedContext: readonly string[];
+  readonly recordedAt: string;
+}
+
 export interface CloseVerdict {
   readonly taskId: string;
   readonly status: "YES" | "NO" | "BLOCKED";
@@ -83,6 +95,7 @@ export interface CloseVerdict {
   readonly recoveryPoint: RecoveryPoint | null;
   readonly durablePaths: readonly string[];
   readonly hashes: Readonly<Record<string, string>>;
+  readonly closeCandidate: CloseCandidate | null;
   readonly reasons: readonly string[];
 }
 
@@ -103,4 +116,5 @@ export interface TaskState {
   readonly approvalState: "not-required" | "pending" | "approved" | "rejected";
   readonly criticalUnsavedContext: readonly string[];
   readonly durableContext: DurableContextManifest | null;
+  readonly closeCandidate?: CloseCandidate | null | undefined;
 }

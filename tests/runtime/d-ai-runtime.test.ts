@@ -9,7 +9,7 @@ import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-ada
 import { bootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
 import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../../src/domain/errors.js";
-import type { CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
 import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../../src/handoff/envelope.js";
@@ -213,6 +213,19 @@ function omittedGates(input: HardGateInput): readonly GateResult[] {
 }
 
 function closeVerdict(state: TaskState, status: CloseVerdict["status"]): CloseVerdict {
+  const closeCandidate: CloseCandidate | null = status === "YES" && state.durableContext !== null
+    ? {
+      taskId: state.taskId,
+      durableContext: state.durableContext,
+      contextManifest: [...state.contextManifest],
+      repositoryPath: "C:/repo",
+      remote: "origin",
+      ref: "refs/heads/main",
+      commitSha: "e".repeat(40),
+      criticalUnsavedContext: [...state.criticalUnsavedContext],
+      recordedAt: "2026-08-21T00:01:00.000Z",
+    }
+    : null;
   return {
     taskId: state.taskId,
     status,
@@ -224,6 +237,7 @@ function closeVerdict(state: TaskState, status: CloseVerdict["status"]): CloseVe
     recoveryPoint: state.recoveryPoint,
     durablePaths: state.durableContext?.durablePaths ?? [],
     hashes: state.durableContext?.hashes ?? {},
+    closeCandidate,
     reasons: status === "YES" ? [] : [`close returned ${status}`],
   };
 }
