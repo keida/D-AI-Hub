@@ -30,7 +30,7 @@ import {
 } from "../../src/runtime/d-ai-runtime.js";
 import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/registry.js";
 import { loadSelectedSkill } from "../../src/skills/skill-loader.js";
-import type { DurableContextStore } from "../../src/state/durable-context-store.js";
+import type { DurableContextStore, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateResult, type HardGateInput } from "../../src/verification/gates.js";
 
@@ -69,6 +69,17 @@ interface RuntimeHarness {
   readonly store: DurableContextStore;
 }
 
+function inMemoryTaskOwnership<T>(
+  taskId: string,
+  environment: Environment,
+  operation: (lease: TaskOwnershipLease, transfer: (targetEnvironment: Environment) => Promise<void>) => Promise<T>,
+): Promise<T> {
+  return operation(
+    { taskId, environment, generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" },
+    async (_targetEnvironment: Environment): Promise<void> => {},
+  );
+}
+
 function memoryStore(savedStates: TaskState[], durablePath: string): DurableContextStore {
   const states = new Map<string, TaskState>();
   return {
@@ -99,6 +110,7 @@ function memoryStore(savedStates: TaskState[], durablePath: string): DurableCont
       if (state === undefined) throw new InvalidTaskStateError(`Missing task ${taskId}`);
       states.set(taskId, { ...state, criticalUnsavedContext: [] });
     },
+    withTaskOwnership: inMemoryTaskOwnership,
   };
 }
 
@@ -674,6 +686,7 @@ describe("D-AI runtime", () => {
       },
       recordCriticalUnsavedContext: (taskId, items) => runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
       clearCriticalUnsavedContext: (taskId) => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+      withTaskOwnership: inMemoryTaskOwnership,
     };
     const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: failingStore });
     const accepted = await handle(intentRequest("chat", noOverrides));
@@ -734,6 +747,7 @@ describe("D-AI runtime", () => {
       },
       recordCriticalUnsavedContext: (taskId, items) => runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
       clearCriticalUnsavedContext: (taskId) => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+      withTaskOwnership: inMemoryTaskOwnership,
     };
     const captureAttempts: TaskState[] = [];
     const handle = createDAIRuntime({
@@ -809,6 +823,58 @@ describe("D-AI runtime", () => {
     expect(ownerContinuation.status).toBe("accepted");
   });
 
+  it("blocks a second runtime from continuing while the first holds durable task ownership", async () => {
+    const durableRoot = await mkdtemp(join(tmpdir(), "d-ai-runtime-ownership-"));
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const firstStore = new FileDurableContextStore(durableRoot);
+    const secondStore = new FileDurableContextStore(durableRoot);
+    let releaseFirstExecution: () => void = () => {};
+    let markFirstExecutionStarted: () => void = () => {};
+    let delayNextExecution = false;
+    const firstExecutionStarted = new Promise<void>((resolve) => { markFirstExecutionStarted = resolve; });
+    const firstExecutionRelease = new Promise<void>((resolve) => { releaseFirstExecution = resolve; });
+    const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
+      ...runtimeHarness.dependencies.adapters,
+      codex: {
+        capabilities: (): EnvironmentCapabilities => runtimeHarness.dependencies.adapters.codex.capabilities(),
+        execute: async (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> => {
+          if (delayNextExecution) {
+            delayNextExecution = false;
+            markFirstExecutionStarted();
+            await firstExecutionRelease;
+          }
+          return completedExecution(request);
+        },
+        receive: (envelope: HandoffEnvelope): Promise<void> => runtimeHarness.dependencies.adapters.codex.receive(envelope),
+        complete: (handoffId: string): Promise<void> => runtimeHarness.dependencies.adapters.codex.complete(handoffId),
+        status: (handoffId: string): HandoffStatus => runtimeHarness.dependencies.adapters.codex.status(handoffId),
+      },
+    };
+
+    try {
+      const seedRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: firstStore, adapters });
+      const accepted = await seedRuntime(intentRequest("codex", noOverrides));
+      const durableState = await firstStore.load(accepted.taskId);
+      if (durableState === null) throw new InvalidTaskStateError("Expected a durable task state");
+      await firstStore.save({ ...durableState, stage: "recover", role: "recovery-operator", durableContext: null });
+      delayNextExecution = true;
+
+      const firstRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: firstStore, adapters });
+      const secondRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: secondStore, adapters });
+      const first = firstRuntime({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+      await firstExecutionStarted;
+
+      const second = await secondRuntime({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(second).toMatchObject({ status: "blocked", taskId: accepted.taskId });
+      expect(second.message).toMatch(/actively owned/i);
+
+      releaseFirstExecution();
+      await first;
+    } finally {
+      await rm(durableRoot, { recursive: true, force: true });
+    }
+  });
+
   it("serializes handoffs, persists pending before acknowledgement, and blocks source operations", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const handoffStates: TaskState["handoffState"][] = [];
@@ -832,6 +898,7 @@ describe("D-AI runtime", () => {
       recordCriticalUnsavedContext: (taskId: string, items: readonly string[]): Promise<void> =>
         runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
       clearCriticalUnsavedContext: (taskId: string): Promise<void> => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+      withTaskOwnership: inMemoryTaskOwnership,
     };
     const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
       chat: adapterWithReceiveProbe(runtimeHarness.dependencies.adapters.chat, () => { receivedTargets.push("chat"); }),
@@ -906,6 +973,7 @@ describe("D-AI runtime", () => {
       recordCriticalUnsavedContext: (taskId: string, items: readonly string[]): Promise<void> =>
         runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
       clearCriticalUnsavedContext: (taskId: string): Promise<void> => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+      withTaskOwnership: inMemoryTaskOwnership,
     };
     const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: delayedStore });
     const accepted = await handle(intentRequest("chat", noOverrides));
@@ -947,6 +1015,7 @@ describe("D-AI runtime", () => {
       recordCriticalUnsavedContext: (taskId: string, items: readonly string[]): Promise<void> =>
         runtimeHarness.store.recordCriticalUnsavedContext(taskId, items),
       clearCriticalUnsavedContext: (taskId: string): Promise<void> => runtimeHarness.store.clearCriticalUnsavedContext(taskId),
+      withTaskOwnership: inMemoryTaskOwnership,
     };
     const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
       ...runtimeHarness.dependencies.adapters,

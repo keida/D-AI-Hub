@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { TaskOwnershipError } from "../../src/domain/errors.js";
 import type { TaskState } from "../../src/domain/types.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
@@ -289,6 +290,93 @@ describe("FileDurableContextStore", () => {
 
       await store.clearCriticalUnsavedContext(state.taskId);
       await expect(store.load(state.taskId)).resolves.toMatchObject({ criticalUnsavedContext: [] });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a second runtime while a task ownership lease is active", async () => {
+    const rootPath = await createStoreRoot();
+    const firstStore = new FileDurableContextStore(rootPath);
+    const secondStore = new FileDurableContextStore(rootPath);
+    let releaseFirst: () => void = () => {};
+    let markFirstActive: () => void = () => {};
+    const firstActive = new Promise<void>((resolve) => { markFirstActive = resolve; });
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+
+    try {
+      const first = firstStore.withTaskOwnership("task-contention", "codex", async () => {
+        markFirstActive();
+        await firstRelease;
+      });
+      await firstActive;
+
+      await expect(secondStore.withTaskOwnership("task-contention", "codex", async () => {})).rejects.toThrow(TaskOwnershipError);
+
+      releaseFirst();
+      await first;
+      await expect(secondStore.withTaskOwnership("task-contention", "codex", async () => {})).resolves.toBeUndefined();
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("records an explicit ownership transfer before releasing a handoff command", async () => {
+    const rootPath = await createStoreRoot();
+    const sourceStore = new FileDurableContextStore(rootPath);
+    const targetStore = new FileDurableContextStore(rootPath);
+
+    try {
+      await sourceStore.withTaskOwnership("task-transfer", "codex", async (_lease, transfer) => {
+        await transfer("work");
+      });
+
+      const transfer = JSON.parse(await readFile(join(rootPath, "task-transfer", "ownership", "1", "transfer.json"), "utf8")) as {
+        readonly sourceEnvironment: string;
+        readonly targetEnvironment: string;
+      };
+      expect(transfer).toMatchObject({ sourceEnvironment: "codex", targetEnvironment: "work" });
+      await expect(targetStore.withTaskOwnership("task-transfer", "work", async () => {})).resolves.toBeUndefined();
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let a stale release clear a successor ownership generation", async () => {
+    const rootPath = await createStoreRoot();
+    const firstStore = new FileDurableContextStore(rootPath);
+    const secondStore = new FileDurableContextStore(rootPath);
+    const thirdStore = new FileDurableContextStore(rootPath);
+    let releaseFirst: () => void = () => {};
+    let releaseSecond: () => void = () => {};
+    let markFirstActive: () => void = () => {};
+    let markSecondActive: () => void = () => {};
+    const firstActive = new Promise<void>((resolve) => { markFirstActive = resolve; });
+    const secondActive = new Promise<void>((resolve) => { markSecondActive = resolve; });
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondRelease = new Promise<void>((resolve) => { releaseSecond = resolve; });
+
+    try {
+      const first = firstStore.withTaskOwnership("task-stale-release", "codex", async () => {
+        markFirstActive();
+        await firstRelease;
+      });
+      await firstActive;
+      const expiredAt = new Date(Date.now() - 30_001);
+      await utimes(join(rootPath, "task-stale-release", "ownership", "1", "lease"), expiredAt, expiredAt);
+
+      const second = secondStore.withTaskOwnership("task-stale-release", "work", async () => {
+        markSecondActive();
+        await secondRelease;
+      });
+      await secondActive;
+      releaseFirst();
+      await first;
+
+      await expect(thirdStore.withTaskOwnership("task-stale-release", "work", async () => {})).rejects.toThrow(TaskOwnershipError);
+
+      releaseSecond();
+      await second;
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }

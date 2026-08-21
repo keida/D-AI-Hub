@@ -39,3 +39,10 @@ export class CloseBlockedError extends Error {
     this.name = "CloseBlockedError";
   }
 }
+
+export class TaskOwnershipError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "TaskOwnershipError";
+  }
+}
