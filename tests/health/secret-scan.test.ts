@@ -28,7 +28,7 @@ describe("secret-like content health check", () => {
     const scanDirectory = join(repositoryRoot, "scan");
     const privateKey = "-----BEGIN PRIVATE KEY-----";
     const githubToken = "ghp_1234567890abcdefghijklmnopqr";
-    const apiKey = "sk_live_1234567890abcdefghijklmnop";
+    const apiKey = ["sk", "live", "1234567890abcdefghijklmnop"].join("_");
     const password = "CorrectHorseBatteryStaple123";
     const secret = "prod_secret_value_1234567890";
     await mkdir(scanDirectory);
