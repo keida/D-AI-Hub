@@ -117,7 +117,7 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
     resolveModelRoute: (await import("../../src/routing/model-router.js")).resolveModelRoute,
     discoverSkillMetadata, selectCapabilities,
     loadSelectedSkill: async (descriptor, resources) => { trace.requestedResources.push({ name: descriptor.name, resources: [...resources] }); const skill = await loadSelectedSkill(descriptor, resources); trace.loadedSkills.push(skill); return skill; },
-    evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture", recoveryPointId: "fixture" }), recover: async (state) => { await rm(fixture.recoveryMarkerPath); return { ...state, stage: "recover", role: "recovery-operator" }; },
+    evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture" }), recover: async (state) => { await rm(fixture.recoveryMarkerPath); return { ...state, stage: "recover", role: "recovery-operator" }; },
     closeTask: async (state): Promise<CloseVerdict> => closeTask(state, { store, gitHub: localGitHubAdapter(fixture) }), maximumEvidenceAgeMs: 300_000, now: () => new Date(),
   };
   Object.defineProperty(trace, "failedResult", { get: () => failedResult });

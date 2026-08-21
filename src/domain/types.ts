@@ -21,6 +21,23 @@ export type Role =
   | "debugger"
   | "recovery-operator";
 
+export type DebugPhase =
+  | "reproduce"
+  | "capture"
+  | "isolate"
+  | "hypothesize"
+  | "change"
+  | "reverify"
+  | "regress"
+  | "stop";
+
+export interface DebugSession {
+  readonly phase: DebugPhase;
+  readonly originalFailure: string;
+  readonly hypothesis: string | null;
+  readonly preservedRecoveryPointId: string;
+}
+
 export interface RoutingDecision {
   readonly stage: Stage;
   readonly requestedStage?: Stage | undefined;
@@ -72,6 +89,37 @@ export interface RecoveryPoint {
   readonly snapshotManifestId?: string | undefined;
 }
 
+export interface RecoverySnapshot {
+  readonly head: string;
+  readonly branch: string;
+  readonly workspacePath: string;
+  readonly status: string;
+  readonly binaryPatch: string;
+  readonly stateManifest: DurableContextManifest;
+  readonly verificationResults: readonly VerificationEvidence[];
+  readonly durableArtifacts: Readonly<Record<string, string>>;
+}
+
+export interface RollbackAuditAction {
+  readonly command: string;
+  readonly arguments: readonly string[];
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+}
+
+export interface RollbackAudit {
+  readonly archiveId: string;
+  readonly patchDigest: string;
+  readonly actions: readonly RollbackAuditAction[];
+  readonly verification: {
+    readonly passed: boolean;
+    readonly observedOutput: string;
+    readonly reason: string;
+  };
+  readonly recordedAt: string;
+}
+
 export interface CloseCandidate {
   readonly taskId: string;
   readonly durableContext: DurableContextManifest;
@@ -113,8 +161,11 @@ export interface TaskState {
   readonly verificationEvidence: readonly VerificationEvidence[];
   readonly verificationHistory?: readonly VerificationEvidence[] | undefined;
   readonly recoveryPoint: RecoveryPoint | null;
+  readonly recoverySnapshot?: RecoverySnapshot | null | undefined;
+  readonly rollbackAudit?: RollbackAudit | null | undefined;
   readonly approvalState: "not-required" | "pending" | "approved" | "rejected";
   readonly criticalUnsavedContext: readonly string[];
   readonly durableContext: DurableContextManifest | null;
   readonly closeCandidate?: CloseCandidate | null | undefined;
+  readonly debugSession?: DebugSession | null | undefined;
 }

@@ -7,11 +7,12 @@ export type DAICommand =
   | { readonly kind: "status" }
   | { readonly kind: "handoff"; readonly target: Environment }
   | { readonly kind: "complete"; readonly handoffId: string }
-  | { readonly kind: "close" };
+  | { readonly kind: "close" }
+  | { readonly kind: "rollback" };
 
 const commandPrefix = "@D-AI";
 const environments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
-const reservedCommands: ReadonlySet<string> = new Set(["continue", "status", "handoff", "complete", "close"]);
+const reservedCommands: ReadonlySet<string> = new Set(["continue", "status", "handoff", "complete", "close", "rollback"]);
 
 function normalizedTokens(input: string): readonly string[] {
   if (typeof input !== "string") {
@@ -66,6 +67,10 @@ export function parseDAICommand(input: string): DAICommand {
   if (command === "close") {
     assertArgumentCount(command, arguments_, 0);
     return { kind: "close" };
+  }
+  if (command === "rollback") {
+    assertArgumentCount(command, arguments_, 0);
+    return { kind: "rollback" };
   }
   if (reservedCommands.has(command)) {
     throw new InvalidTaskStateError(`Malformed D-AI command: ${command}`);

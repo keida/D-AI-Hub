@@ -14,6 +14,7 @@ describe("parseDAICommand", () => {
     ["@D-AI handoff codex", { kind: "handoff", target: "codex" }],
     ["@D-AI complete handoff-task-1", { kind: "complete", handoffId: "handoff-task-1" }],
     ["@D-AI close", { kind: "close" }],
+    ["@D-AI rollback", { kind: "rollback" }],
   ] as const)("normalizes %s", (input, expected) => {
     expect(parseDAICommand(input)).toEqual(expected);
   });
@@ -31,7 +32,14 @@ describe("parseDAICommand", () => {
     "@D-AI complete",
     "@D-AI complete handoff-task-1 extra",
     "@D-AI close now",
+    "@D-AI rollback extra",
   ])("rejects malformed or non-prefixed input: %s", (input) => {
     expect(() => parseDAICommand(input)).toThrow(InvalidTaskStateError);
+  });
+
+  it("rejects rollback arguments with an exact argument-count error", () => {
+    expect(() => parseDAICommand("@D-AI rollback extra")).toThrow(
+      "rollback requires exactly 0 arguments",
+    );
   });
 });

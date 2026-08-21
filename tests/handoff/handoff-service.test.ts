@@ -92,6 +92,29 @@ describe("PersistentHandoffService", () => {
     expect(envelope.redactions.length).toBeGreaterThan(10);
   });
 
+  it("includes a redacted debug session in the handoff envelope", async () => {
+    const source: TaskState = {
+      ...state("chat"),
+      debugSession: {
+        phase: "hypothesize",
+        originalFailure: "build exits 1",
+        hypothesis: "apiKey=debug-secret",
+        preservedRecoveryPointId: "recovery-1",
+      },
+    };
+
+    const envelope = await service().create({ state: source, targetEnvironment: "work" });
+
+    expect(envelope.taskState.debugSession).toEqual({
+      phase: "hypothesize",
+      originalFailure: "build exits 1",
+      hypothesis: "apiKey=[REDACTED]",
+      preservedRecoveryPointId: "recovery-1",
+    });
+    expect(JSON.stringify(envelope)).not.toContain("debug-secret");
+    expect(envelope.redactions).toContain("taskState.debugSession.hypothesis");
+  });
+
   it("redacts raw credential signatures before handoff integrity and persistence", async () => {
     const persistence = new InMemoryHandoffPersistence();
     const service = new PersistentHandoffService(persistence);

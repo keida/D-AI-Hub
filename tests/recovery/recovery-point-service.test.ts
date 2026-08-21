@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DurableContextManifest, VerificationEvidence } from "../../src/domain/types.js";
+import type { DurableContextManifest, RecoverySnapshot, VerificationEvidence } from "../../src/domain/types.js";
 import type { RecoveryPointCaptureInput } from "../../src/recovery/recovery-point-service.js";
 
 function createManifest(): DurableContextManifest {
@@ -56,13 +56,15 @@ describe("createRecoveryPoint", () => {
   it("captures the complete known-good state before risky work", async () => {
     const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
     const point = createRecoveryPoint(createCaptureInput([createVerification()], "2026-08-21T00:00:00.000Z"));
+    const snapshot: RecoverySnapshot = point.snapshot;
 
     expect(point).toMatchObject({
       trigger: "risky-work",
       snapshot: expect.objectContaining({ head: "0123456789abcdef0123456789abcdef01234567", branch: "feat/task-7", workspacePath: "C:/workspace" }),
       recoveryPoint: expect.objectContaining({ recoveryPointId: "recovery-1", taskId: "task-recovery" }),
     });
-    expect(point.snapshot.durableArtifacts).toEqual(point.recoveryPoint.hashes);
+    expect(snapshot.durableArtifacts).toEqual(point.recoveryPoint.hashes);
+    expect(snapshot.verificationResults).toEqual(point.snapshot.verificationResults);
   });
 
   it("rejects capture without verification evidence", async () => {
