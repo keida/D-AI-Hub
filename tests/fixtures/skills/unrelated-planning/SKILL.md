@@ -1,13 +1,14 @@
 ---
 name: unrelated-planning
 description: Plans unrelated marketing work.
-triggers:
-  - campaign
-  - plan
-compatibleEnvironments:
-  - chat
-compatibleStages:
-  - plan
+metadata:
+  triggers:
+    - campaign
+    - plan
+  compatibleEnvironments:
+    - chat
+  compatibleStages:
+    - plan
 ---
 
 # Unrelated body sentinel

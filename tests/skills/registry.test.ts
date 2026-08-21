@@ -1,7 +1,8 @@
-import { cp, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { parse } from "yaml";
 import { CapabilityMismatchError, InvalidTaskStateError } from "../../src/domain/errors.js";
 import type { SkillDescriptor } from "../../src/skills/registry.js";
 import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/registry.js";
@@ -20,6 +21,39 @@ afterEach(async () => {
 });
 
 describe("discoverSkillMetadata", () => {
+  it("uses standard Agent Skills frontmatter with D-AI routing under metadata", async () => {
+    const productionRoot = join(process.cwd(), ".agents", "skills");
+    const skillNames = ["knowledge-manager", "project-memory"];
+    const frontmatter = await Promise.all(skillNames.map(async (skillName) => {
+      const skillPath = join(productionRoot, skillName, "SKILL.md");
+      const content = await readFile(skillPath, "utf8");
+      const closingMarker = content.search(/\r?\n---/u);
+      if (closingMarker === -1) throw new Error(`Missing frontmatter closing marker for ${skillName}.`);
+      return parse(content.slice(4, closingMarker));
+    }));
+
+    for (const metadata of frontmatter) {
+      expect(metadata).toEqual(expect.objectContaining({ name: expect.any(String), description: expect.any(String) }));
+      expect(metadata).toEqual(expect.objectContaining({
+        metadata: expect.objectContaining({
+          triggers: expect.any(Array),
+          compatibleEnvironments: expect.any(Array),
+          compatibleStages: expect.any(Array),
+          requiredResources: expect.any(Array),
+        }),
+      }));
+      expect(metadata).not.toHaveProperty("triggers");
+      expect(metadata).not.toHaveProperty("compatibleEnvironments");
+      expect(metadata).not.toHaveProperty("compatibleStages");
+      expect(metadata).not.toHaveProperty("requiredResources");
+    }
+
+    const descriptors = await discoverSkillMetadata([productionRoot]);
+    expect(selectCapabilities("resume project memory", "bootstrap", "codex", descriptors).map((descriptor) => descriptor.name)).toEqual([
+      "project-memory",
+    ]);
+  });
+
   it("discovers the production .agents/skills root and selects a matching intent", async () => {
     const productionRoot = join(process.cwd(), ".agents", "skills");
     const descriptors = await discoverSkillMetadata([productionRoot]);
@@ -46,7 +80,7 @@ describe("discoverSkillMetadata", () => {
     await mkdir(join(skillDirectory, "references"), { recursive: true });
     await writeFile(
       join(skillDirectory, "SKILL.md"),
-      "---\nname: metadata-only\ndescription: Discovers metadata only.\ntriggers:\n  - metadata\ncompatibleEnvironments:\n  - codex\ncompatibleStages:\n  - inspect\n---\n" + "x".repeat(1_048_577),
+      "---\nname: metadata-only\ndescription: Discovers metadata only.\nmetadata:\n  triggers:\n    - metadata\n  compatibleEnvironments:\n    - codex\n  compatibleStages:\n    - inspect\n---\n" + "x".repeat(1_048_577),
       "utf8",
     );
     await writeFile(join(skillDirectory, "references", "oversized.md"), "y".repeat(1_048_577), "utf8");

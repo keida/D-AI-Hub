@@ -17,6 +17,10 @@ export interface SkillDescriptor {
 interface ParsedSkillFrontmatter {
   readonly name?: string;
   readonly description?: string;
+  readonly metadata?: ParsedSkillMetadata;
+}
+
+interface ParsedSkillMetadata {
   readonly triggers?: readonly string[];
   readonly compatibleEnvironments?: readonly string[];
   readonly compatibleStages?: readonly string[];
@@ -169,24 +173,29 @@ async function assertRegularSkillFile(skillPath: string): Promise<void> {
 }
 
 function parseDescriptor(skillPath: string, frontmatter: string): SkillDescriptor {
-  let metadata: ParsedSkillFrontmatter | null;
+  let frontmatterMetadata: ParsedSkillFrontmatter | null;
   try {
-    metadata = parse(frontmatter) as ParsedSkillFrontmatter | null;
+    frontmatterMetadata = parse(frontmatter) as ParsedSkillFrontmatter | null;
   } catch {
     throw new InvalidTaskStateError(`Skill metadata at ${skillPath} is not valid YAML.`);
   }
-  if (metadata === null || typeof metadata !== "object") {
+  if (frontmatterMetadata === null || typeof frontmatterMetadata !== "object" || Array.isArray(frontmatterMetadata)) {
     throw new InvalidTaskStateError(`Skill metadata at ${skillPath} must be a YAML object.`);
   }
 
-  const name = assertString(metadata.name, "name", skillPath);
+  const metadata = frontmatterMetadata.metadata;
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new InvalidTaskStateError(`Skill metadata at ${skillPath} must declare a metadata object.`);
+  }
+
+  const name = assertString(frontmatterMetadata.name, "name", skillPath);
   if (!skillNamePattern.test(name)) {
     throw new InvalidTaskStateError(`Skill metadata at ${skillPath} has an unsafe name: ${name}.`);
   }
   if (basename(dirname(skillPath)) !== name) {
     throw new InvalidTaskStateError(`Skill directory ${basename(dirname(skillPath))} must match metadata name ${name}.`);
   }
-  const description = assertString(metadata.description, "description", skillPath);
+  const description = assertString(frontmatterMetadata.description, "description", skillPath);
   const triggers = assertStringArray(metadata.triggers, "triggers", skillPath);
   const compatibleEnvironments = assertStringArray(metadata.compatibleEnvironments, "compatibleEnvironments", skillPath);
   for (const environment of compatibleEnvironments) {
