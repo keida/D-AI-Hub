@@ -21,10 +21,10 @@ interface ParsedSkillFrontmatter {
 }
 
 interface ParsedSkillMetadata {
-  readonly triggers?: readonly string[];
-  readonly compatibleEnvironments?: readonly string[];
-  readonly compatibleStages?: readonly string[];
-  readonly requiredResources?: readonly string[];
+  readonly triggers?: string;
+  readonly compatibleEnvironments?: string;
+  readonly compatibleStages?: string;
+  readonly requiredResources?: string;
 }
 
 const knownEnvironments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
@@ -86,6 +86,27 @@ function assertStringArray(
     throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} contains duplicate ${field} values.`);
   }
   return normalized;
+}
+
+function parseMetadataArray(value: string | undefined, field: string, sourcePath: string): readonly string[] {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} must declare ${field} as a JSON array string.`);
+  }
+
+  const serialized = value.trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized) as unknown;
+  } catch {
+    throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} has an invalid ${field} JSON array string.`);
+  }
+  if (!Array.isArray(parsed) || !parsed.every((item): item is string => typeof item === "string")) {
+    throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} has an invalid ${field} JSON array string.`);
+  }
+  if (JSON.stringify(parsed) !== serialized) {
+    throw new InvalidTaskStateError(`Skill metadata at ${sourcePath} must use a canonical ${field} JSON array string.`);
+  }
+  return parsed;
 }
 
 function assertResourcePaths(values: readonly string[] | undefined, sourcePath: string): readonly string[] | undefined {
@@ -196,16 +217,26 @@ function parseDescriptor(skillPath: string, frontmatter: string): SkillDescripto
     throw new InvalidTaskStateError(`Skill directory ${basename(dirname(skillPath))} must match metadata name ${name}.`);
   }
   const description = assertString(frontmatterMetadata.description, "description", skillPath);
-  const triggers = assertStringArray(metadata.triggers, "triggers", skillPath);
-  const compatibleEnvironments = assertStringArray(metadata.compatibleEnvironments, "compatibleEnvironments", skillPath);
+  const triggers = assertStringArray(parseMetadataArray(metadata.triggers, "triggers", skillPath), "triggers", skillPath);
+  const compatibleEnvironments = assertStringArray(
+    parseMetadataArray(metadata.compatibleEnvironments, "compatibleEnvironments", skillPath),
+    "compatibleEnvironments",
+    skillPath,
+  );
   for (const environment of compatibleEnvironments) {
     assertEnvironment(environment, `Skill metadata at ${skillPath}`);
   }
-  const compatibleStages = assertStringArray(metadata.compatibleStages, "compatibleStages", skillPath);
+  const compatibleStages = assertStringArray(
+    parseMetadataArray(metadata.compatibleStages, "compatibleStages", skillPath),
+    "compatibleStages",
+    skillPath,
+  );
   for (const stage of compatibleStages) {
     assertStage(stage);
   }
-  const requiredResources = assertResourcePaths(metadata.requiredResources, skillPath);
+  const requiredResources = metadata.requiredResources === undefined
+    ? undefined
+    : assertResourcePaths(parseMetadataArray(metadata.requiredResources, "requiredResources", skillPath), skillPath);
 
   return {
     name,
