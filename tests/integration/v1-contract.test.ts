@@ -63,9 +63,13 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
   let failedResult: CommandResult | null = null;
   let passingResult: CommandResult | null = null;
   let regressionResult: CommandResult | null = null;
-  const { bootstrapTask } = await import("../../src/bootstrap/bootstrap-task.js");
+  const { bootstrapTask, prepareBootstrapTask } = await import("../../src/bootstrap/bootstrap-task.js");
   const bootstrap = async (input: Parameters<typeof bootstrapTask>[0], targetStore: Parameters<typeof bootstrapTask>[1]): Promise<TaskState> => {
     const state = await bootstrapTask(input, targetStore);
+    return { ...state, constraints: ["Use only the disposable Task 10 repository"], contextManifest: [...state.contextManifest, "remote:origin", `ref:${fixture.ref}`, "local-state:clean-required", `artifact:commit:${fixture.commitSha}`], durableContext: null };
+  };
+  const prepareBootstrap = async (input: Parameters<typeof prepareBootstrapTask>[0], targetStore: Parameters<typeof prepareBootstrapTask>[1]): Promise<TaskState> => {
+    const state = await prepareBootstrapTask(input, targetStore);
     return { ...state, constraints: ["Use only the disposable Task 10 repository"], contextManifest: [...state.contextManifest, "remote:origin", `ref:${fixture.ref}`, "local-state:clean-required", `artifact:commit:${fixture.commitSha}`], durableContext: null };
   };
   const executor = async (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> => {
@@ -108,7 +112,7 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
     return createRecoveryPoint({ recoveryPointId: `recovery-${state.taskId}`, taskId: state.taskId, trigger: state.contextManifest.some((entry) => entry.startsWith("handoff-source:")) ? "handoff" : "recovery", stage: state.stage, environment: state.environment, role: state.role, head, branch: fixture.branch, workspacePath: fixture.repositoryPath, status: status || "clean", binaryPatch: "no patch required", stateManifest: state.durableContext!, verificationResults: state.verificationEvidence, createdAt: new Date().toISOString() }).recoveryPoint;
   };
   const dependencies: DAIRuntimeDependencies = {
-    store, workspacePath: fixture.repositoryPath, repositoryPath: fixture.repositoryPath, skillRoots: [fixture.skillLibrary.rootPath], modelPolicies: [{ stage: "execute", role: "implementer", model: "codex-default", requiredCapabilities: ["local-execution"], compatibleEnvironments: ["codex"] }], adapters, handoffService: handoffs, bootstrapTask: bootstrap,
+    store, workspacePath: fixture.repositoryPath, repositoryPath: fixture.repositoryPath, skillRoots: [fixture.skillLibrary.rootPath], modelPolicies: [{ stage: "execute", role: "implementer", model: "codex-default", requiredCapabilities: ["local-execution"], compatibleEnvironments: ["codex"] }], adapters, handoffService: handoffs, bootstrapTask: bootstrap, prepareBootstrapTask: prepareBootstrap,
     selectEnvironment: (await import("../../src/routing/environment-router.js")).selectEnvironment,
     resolveModelRoute: (await import("../../src/routing/model-router.js")).resolveModelRoute,
     discoverSkillMetadata, selectCapabilities,

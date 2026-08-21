@@ -5,7 +5,7 @@ import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
 import { GitHubCliAdapter } from "../adapters/github.js";
-import { bootstrapTask } from "../bootstrap/bootstrap-task.js";
+import { bootstrapTask, prepareBootstrapTask } from "../bootstrap/bootstrap-task.js";
 import { closeTask } from "../close/close-service.js";
 import { createDebugSession, type DebugSession } from "../debugging/debug-session.js";
 import {
@@ -84,6 +84,7 @@ export interface DAIEnvironmentAdapter {
 }
 
 type BootstrapTask = typeof bootstrapTask;
+type PrepareBootstrapTask = typeof prepareBootstrapTask;
 type SelectEnvironment = (input: EnvironmentRouteInput) => EnvironmentRoute;
 type ResolveModelRoute = typeof resolveModelRoute;
 type DiscoverSkillMetadata = typeof discoverSkillMetadata;
@@ -102,6 +103,7 @@ export interface DAIRuntimeDependencies {
   readonly adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>>;
   readonly handoffService: HandoffService;
   readonly bootstrapTask: BootstrapTask;
+  readonly prepareBootstrapTask?: PrepareBootstrapTask | undefined;
   readonly selectEnvironment: SelectEnvironment;
   readonly resolveModelRoute: ResolveModelRoute;
   readonly discoverSkillMetadata: DiscoverSkillMetadata;
@@ -819,7 +821,8 @@ async function executeIntent(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
-  const bootstrapped = await dependencies.bootstrapTask({
+  const prepare = dependencies.prepareBootstrapTask ?? prepareBootstrapTask;
+  const bootstrapped = await prepare({
     taskId: null,
     goal: command.text,
     environment: request.sourceEnvironment,
@@ -832,7 +835,15 @@ async function executeIntent(
       bootstrapped.taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (lease) => executeIntentExclusive(request, bootstrapped, dependencies, registry, lease),
+      async (lease) => {
+        const existing = await dependencies.store.load(bootstrapped.taskId);
+        const ownedBootstrap = existing ?? (
+          bootstrapped.durableContext === null
+            ? await persistState(dependencies.store, bootstrapped, lease)
+            : bootstrapped
+        );
+        return executeIntentExclusive(request, ownedBootstrap, dependencies, registry, lease);
+      },
     ),
   );
 }
@@ -1320,6 +1331,7 @@ function createDefaultDependencies(): DAIRuntimeDependencies {
     },
     handoffService,
     bootstrapTask,
+    prepareBootstrapTask,
     selectEnvironment,
     resolveModelRoute,
     discoverSkillMetadata,

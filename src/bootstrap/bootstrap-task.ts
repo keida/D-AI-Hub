@@ -85,7 +85,7 @@ function assertRecoveredIdentity(state: TaskState, identities: readonly string[]
   }
 }
 
-export async function bootstrapTask(input: BootstrapInput, store: DurableContextStore): Promise<TaskState> {
+export async function prepareBootstrapTask(input: BootstrapInput, store: DurableContextStore): Promise<TaskState> {
   assertBootstrapInput(input);
   const identities = [
     ...(input.workspacePath === null ? [] : [await inspectIdentity("workspace", input.workspacePath)]),
@@ -118,6 +118,12 @@ export async function bootstrapTask(input: BootstrapInput, store: DurableContext
     criticalUnsavedContext: [],
     durableContext: null,
   };
+  return state;
+}
+
+export async function bootstrapTask(input: BootstrapInput, store: DurableContextStore): Promise<TaskState> {
+  const state = await prepareBootstrapTask(input, store);
+  if (state.durableContext !== null) return state;
   const manifest = await store.save(state);
   return { ...state, durableContext: manifest };
 }
