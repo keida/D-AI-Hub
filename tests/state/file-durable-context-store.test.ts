@@ -424,6 +424,55 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("publishes owned saves through an immutable generation pointer", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-active-pointer", "Publish through a fenced pointer");
+
+    try {
+      await store.withTaskOwnership(state.taskId, "work", async (lease) => {
+        await store.save(state, lease);
+      });
+
+      const activeRoot = join(rootPath, state.taskId, "active");
+      const activeEntries = await readdir(activeRoot);
+      expect(activeEntries).toHaveLength(1);
+      expect(activeEntries[0]).toBe("00000000000000000001.json");
+      await expect(store.load(state.taskId)).resolves.toMatchObject({ goal: state.goal });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("fences a late lower-generation pointer behind the successor pointer", async () => {
+    const rootPath = await createStoreRoot();
+    const firstStore = new FileDurableContextStore(rootPath);
+    const secondStore = new FileDurableContextStore(rootPath);
+    const firstState = createState("task-pointer-fencing", "First generation");
+    const secondState = { ...firstState, goal: "Successor generation" };
+
+    try {
+      await firstStore.withTaskOwnership(firstState.taskId, "codex", async (lease) => {
+        await firstStore.save(firstState, lease);
+      });
+      await secondStore.withTaskOwnership(secondState.taskId, "work", async (lease) => {
+        await secondStore.save(secondState, lease);
+      });
+
+      const activeRoot = join(rootPath, firstState.taskId, "active");
+      const activeEntries = (await readdir(activeRoot)).sort();
+      expect(activeEntries).toHaveLength(2);
+      const stalePointerPath = join(activeRoot, activeEntries[0]!);
+      const stalePointer = JSON.parse(await readFile(stalePointerPath, "utf8")) as { readonly manifestId: string; readonly ownershipGeneration: string };
+      await rm(stalePointerPath);
+      await writeFile(stalePointerPath, `${JSON.stringify(stalePointer)}\n`, "utf8");
+
+      await expect(secondStore.load(firstState.taskId)).resolves.toMatchObject({ goal: secondState.goal });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("propagates a heartbeat renewal failure after the operation finishes", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
