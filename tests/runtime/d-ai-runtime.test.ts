@@ -1,15 +1,15 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { CommandExecutionError } from "../../src/adapters/command-runner.js";
+import { CommandExecutionError, runCommand } from "../../src/adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-adapter.js";
 import { CodexEnvironmentAdapter } from "../../src/adapters/environments/codex-adapter.js";
 import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-adapter.js";
 import { bootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
 import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../../src/domain/errors.js";
-import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
 import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../../src/handoff/envelope.js";
@@ -19,6 +19,7 @@ import { selectEnvironment } from "../../src/routing/environment-router.js";
 import { resolveModelRoute, type ModelPolicy } from "../../src/routing/model-router.js";
 import { createDebugSession } from "../../src/debugging/debug-session.js";
 import type { CapturedRecoveryPoint } from "../../src/recovery/recovery-point-service.js";
+import { createGitRollbackTask } from "../../src/recovery/git-rollback-adapter.js";
 import type { RollbackResult } from "../../src/recovery/rollback.js";
 import {
   createDAIRuntime,
@@ -1308,6 +1309,7 @@ describe("D-AI runtime", () => {
     if (acceptedState?.durableContext === null || acceptedState?.durableContext === undefined || acceptedState.recoveryPoint === null) throw new InvalidTaskStateError("Rollback fixture did not persist recovery context");
     await runtimeHarness.store.save({
       ...acceptedState,
+      recoveryPoint: { ...acceptedState.recoveryPoint, snapshotManifestId: acceptedState.durableContext.manifestId },
       recoverySnapshot: {
         head: "0123456789abcdef0123456789abcdef01234567",
         branch: "main",
@@ -1319,10 +1321,6 @@ describe("D-AI runtime", () => {
         durableArtifacts: acceptedState.durableContext.hashes,
       },
     });
-    const acceptedSnapshotState = await runtimeHarness.store.load(accepted.taskId);
-    if (acceptedSnapshotState?.durableContext === null || acceptedSnapshotState?.durableContext === undefined || acceptedSnapshotState.recoverySnapshot === null || acceptedSnapshotState.recoverySnapshot === undefined) throw new InvalidTaskStateError("Rollback fixture snapshot was not persisted");
-    await runtimeHarness.store.save({ ...acceptedSnapshotState, recoverySnapshot: { ...acceptedSnapshotState.recoverySnapshot, stateManifest: acceptedSnapshotState.durableContext, durableArtifacts: acceptedSnapshotState.durableContext.hashes } });
-
     const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
 
     expect(accepted.status).toBe("completed");
@@ -1353,6 +1351,7 @@ describe("D-AI runtime", () => {
     if (beforeRollback?.durableContext === null || beforeRollback?.durableContext === undefined || beforeRollback.recoveryPoint === null) throw new InvalidTaskStateError("Rollback fixture did not persist recovery context");
     await runtimeHarness.store.save({
       ...beforeRollback,
+      recoveryPoint: { ...beforeRollback.recoveryPoint, snapshotManifestId: beforeRollback.durableContext.manifestId },
       recoverySnapshot: {
         head: "0123456789abcdef0123456789abcdef01234567",
         branch: "main",
@@ -1364,10 +1363,6 @@ describe("D-AI runtime", () => {
         durableArtifacts: beforeRollback.durableContext.hashes,
       },
     });
-    const beforeVerifiedRollback = await runtimeHarness.store.load(failed.taskId);
-    if (beforeVerifiedRollback?.durableContext === null || beforeVerifiedRollback?.durableContext === undefined || beforeVerifiedRollback.recoverySnapshot === null || beforeVerifiedRollback.recoverySnapshot === undefined) throw new InvalidTaskStateError("Rollback fixture snapshot was not persisted");
-    await runtimeHarness.store.save({ ...beforeVerifiedRollback, recoverySnapshot: { ...beforeVerifiedRollback.recoverySnapshot, stateManifest: beforeVerifiedRollback.durableContext, durableArtifacts: beforeVerifiedRollback.durableContext.hashes } });
-
     const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
     const afterRollback = await runtimeHarness.store.load(failed.taskId);
 
@@ -1378,6 +1373,77 @@ describe("D-AI runtime", () => {
     expect(rollbackCalls[0]?.state.taskId).toBe(failed.taskId);
     expect(rollbackCalls[0]?.lease).toMatchObject({ taskId: failed.taskId, environment: "codex" });
     expect(afterRollback).toMatchObject({ stage: "recover", role: "recovery-operator", debugSession: beforeRollback?.debugSession, rollbackAudit: { archiveId: "archive-1", patchDigest: "a".repeat(64), verification: { passed: true } } });
+  });
+
+  it("executes @D-AI rollback through the real Git adapter and persists its audit", async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), "d-ai-runtime-git-rollback-"));
+    const git = async (argumentsList: readonly string[]): Promise<string> => (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
+    try {
+      await git(["init", "--initial-branch=main"]);
+      await git(["config", "user.email", "d-ai-runtime@example.test"]);
+      await git(["config", "user.name", "D-AI Runtime Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "known good\n", "utf8");
+      await git(["add", "artifact.txt"]);
+      await git(["commit", "-m", "known good"]);
+      const recoveryHead = await git(["rev-parse", "HEAD"]);
+      const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+      const handle = createDAIRuntime({
+        ...runtimeHarness.dependencies,
+        workspacePath: repositoryPath,
+        repositoryPath,
+        rollbackTask: createGitRollbackTask(repositoryPath),
+        captureRecoveryPoint: async (state): Promise<CapturedRecoveryPoint> => {
+          if (state.durableContext === null) throw new InvalidTaskStateError("Recovery capture requires durable context");
+          const snapshot: RecoverySnapshot = {
+            head: recoveryHead,
+            branch: "main",
+            workspacePath: repositoryPath,
+            status: "",
+            binaryPatch: "",
+            stateManifest: state.durableContext,
+            verificationResults: state.verificationEvidence,
+            durableArtifacts: state.durableContext.hashes,
+          };
+          return {
+            trigger: "recovery",
+            recoveryPoint: {
+              recoveryPointId: `recovery-${state.taskId}`,
+              taskId: state.taskId,
+              stage: state.stage,
+              environment: state.environment,
+              role: state.role,
+              durablePaths: state.durableContext.durablePaths,
+              hashes: state.durableContext.hashes,
+              restorationInstructions: "Restore the known-good tree and preserve user work.",
+              createdAt: "2026-08-21T00:01:00.000Z",
+              snapshotManifestId: state.durableContext.manifestId,
+            },
+            snapshot,
+          };
+        },
+      });
+
+      const accepted = await handle(intentRequest("codex", noOverrides));
+      expect(accepted.status).toBe("completed");
+      await writeFile(join(repositoryPath, "artifact.txt"), "regression\n", "utf8");
+      await git(["add", "artifact.txt"]);
+      await git(["commit", "-m", "regression"]);
+      await writeFile(join(repositoryPath, "user-work.txt"), "preserve me\n", "utf8");
+
+      const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(result).toMatchObject({ status: "completed", stage: "recover" });
+      expect(await git(["show", "HEAD:artifact.txt"])).toBe("known good");
+      expect(await git(["status", "--porcelain=v1"])).toBe("");
+      expect(await git(["stash", "list"])).toMatch(/d-ai-rollback-/);
+      const persisted = await runtimeHarness.store.load(accepted.taskId);
+      expect(persisted?.rollbackAudit?.verification.passed).toBe(true);
+      expect(persisted?.rollbackAudit?.actions).toEqual(expect.arrayContaining([
+        expect.objectContaining({ command: "git", arguments: ["revert", "--no-edit", expect.any(String)] }),
+        expect.objectContaining({ command: "git", arguments: ["apply", "--binary", "--allow-empty", expect.any(String)] }),
+      ]));
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true });
+    }
   });
 
   it.each([
