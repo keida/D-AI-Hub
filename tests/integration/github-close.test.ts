@@ -1,15 +1,16 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { GitHubCliAdapter, GitRemoteBlockedError } from "../../src/adapters/github.js";
-import { pushGitRef, readRemoteRef, type GitTransport } from "../../src/adapters/git.js";
+import { pushGitRef, readRemoteRef, type GitPushResult, type GitTransport } from "../../src/adapters/git.js";
 import { closeTask } from "../../src/close/close-service.js";
-import type { DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { CloseCandidate, DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import type { DurableContextStore } from "../../src/state/durable-context-store.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
+import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
 const gateNames = [
   "scope",
@@ -133,12 +134,86 @@ function stateFor(repositoryPath: string, commitSha: string, now: string, remote
   };
 }
 
+interface RealCloseFixture {
+  readonly store: FileDurableContextStore;
+  readonly state: TaskState;
+  readonly commitSha: string;
+}
+
+async function createRealCloseFixture(
+  durableContextRoot: string,
+  repositoryPath: string,
+  commitSha: string,
+  now: string,
+  remote: string,
+  ref: string,
+): Promise<RealCloseFixture> {
+  const store = new FileDurableContextStore(durableContextRoot);
+  const initial = stateFor(repositoryPath, commitSha, now, remote, ref);
+  const baseState: TaskState = {
+    ...initial,
+    verificationEvidence: verificationEvidence(now).map((item) => ({ ...item, recoveryPointId: null })),
+    recoveryPoint: null,
+    durableContext: null,
+  };
+  const snapshotManifest = await store.save(baseState);
+  const verifiedState: TaskState = {
+    ...baseState,
+    verificationEvidence: verificationEvidence(now),
+    recoveryPoint: {
+      recoveryPointId: "recovery-integration",
+      taskId: baseState.taskId,
+      stage: baseState.stage,
+      environment: baseState.environment,
+      role: baseState.role,
+      durablePaths: snapshotManifest.durablePaths,
+      hashes: snapshotManifest.hashes,
+      restorationInstructions: "Restore the recorded recovery state without deleting user work.",
+      createdAt: now,
+      snapshotManifestId: snapshotManifest.manifestId,
+    },
+  };
+  await store.save(verifiedState);
+  const state = await store.load(verifiedState.taskId);
+  if (state === null) throw new Error("Expected the real durable close fixture to load");
+  return { store, state, commitSha };
+}
+
+interface BareCloseFixture {
+  readonly root: string;
+  readonly repositoryPath: string;
+  readonly bareRemotePath: string;
+  readonly close: RealCloseFixture;
+}
+
+async function createBareCloseFixture(prefix: string): Promise<BareCloseFixture> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const repositoryPath = join(root, "repository");
+  const bareRemotePath = join(root, "remote.git");
+  await git(null, ["init", "--bare", bareRemotePath]);
+  await git(null, ["init", "--initial-branch=main", repositoryPath]);
+  await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+  await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+  await writeFile(join(repositoryPath, "artifact.txt"), "verified artifact\n", "utf8");
+  await git(repositoryPath, ["add", "artifact.txt"]);
+  await git(repositoryPath, ["commit", "-m", "integration artifact"]);
+  const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
+  await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+  const close = await createRealCloseFixture(join(root, "durable"), repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+  return { root, repositoryPath, bareRemotePath, close };
+}
+
 function storeFor(state: TaskState): DurableContextStore {
+  let closeCandidate: CloseCandidate | null = null;
   return {
     load: async (): Promise<TaskState> => state,
     save: async (): Promise<DurableContextManifest> => {
       throw new Error("Close integration must not save durable context");
     },
+    saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+      closeCandidate = candidate;
+    },
+    loadCloseCandidate: async (): Promise<CloseCandidate | null> => closeCandidate,
     recordCriticalUnsavedContext: async (): Promise<void> => {
       throw new Error("Close integration must not record unsaved context");
     },
@@ -150,34 +225,108 @@ function storeFor(state: TaskState): DurableContextStore {
 
 describe("GitHub close integration", () => {
   it("pushes to a temporary bare remote and verifies its exact SHA through the GitHub adapter", async () => {
-    const root = await mkdtemp(join(tmpdir(), "d-ai-github-close-"));
-    const repositoryPath = join(root, "repository");
-    const bareRemotePath = join(root, "remote.git");
+    const fixture = await createBareCloseFixture("d-ai-github-close-");
+    const { root, repositoryPath, bareRemotePath, close } = fixture;
     try {
-      await git(null, ["init", "--bare", bareRemotePath]);
-      await git(null, ["init", "--initial-branch=main", repositoryPath]);
-      await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
-      await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
-      await writeFile(join(repositoryPath, "artifact.txt"), "verified artifact\n", "utf8");
-      await git(repositoryPath, ["add", "artifact.txt"]);
-      await git(repositoryPath, ["commit", "-m", "integration artifact"]);
-      const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
-      await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      const candidatePath = join(root, "durable", close.state.taskId, "close-candidate.json");
+      let pushResult: GitPushResult | null = null;
       const localBareTransport: GitTransport = {
-        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, bareRemotePath, ref, head),
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => {
+          const candidateRecord = JSON.parse(await readFile(candidatePath, "utf8")) as { candidate: { taskId: string; durableContext: { hashes: Readonly<Record<string, string>> }; commitSha: string }; hash: string };
+          expect(candidateRecord.candidate.taskId).toBe(close.state.taskId);
+          expect(candidateRecord.candidate.commitSha).toBe(close.commitSha);
+          expect(candidateRecord.candidate.durableContext.hashes).toEqual(close.state.durableContext?.hashes);
+          expect(candidateRecord.hash).toMatch(/^[a-f0-9]{64}$/);
+          pushResult = await pushGitRef(localRepositoryPath, bareRemotePath, ref, head);
+          return pushResult;
+        },
         readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(bareRemotePath, ref, null),
       };
 
-      const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const verdict = await closeTask(closeState, {
-        store: storeFor(closeState),
+      const verdict = await closeTask(close.state, {
+        store: close.store,
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
       });
 
       expect(verdict).toMatchObject({ status: "YES", reasons: [] });
-      expect(await git(bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(commitSha);
+      expect(pushResult).toMatchObject({ pushed: true, exitCode: 0 });
+      expect(await git(bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(close.commitSha);
+      expect(await close.store.loadCloseCandidate(close.state.taskId)).toEqual(verdict.closeCandidate);
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks YES when the real durable close candidate is mutated after push", async () => {
+    const fixture = await createBareCloseFixture("d-ai-github-candidate-mutation-");
+    try {
+      const candidatePath = join(fixture.root, "durable", fixture.close.state.taskId, "close-candidate.json");
+      const localBareTransport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => {
+          const result = await pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head);
+          const candidateRecord = JSON.parse(await readFile(candidatePath, "utf8")) as { candidate: { ref: string }; hash: string };
+          await writeFile(candidatePath, `${JSON.stringify({ candidate: { ...candidateRecord.candidate, ref: "refs/heads/other" }, hash: candidateRecord.hash }, null, 2)}\n`, "utf8");
+          return result;
+        },
+        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
+      };
+      const verdict = await closeTask(fixture.close.state, {
+        store: fixture.close.store,
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+      });
+
+      expect(verdict.status).toBe("BLOCKED");
+      expect(await git(fixture.bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(fixture.close.commitSha);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns NO when critical unsaved context appears after the real candidate is persisted", async () => {
+    const fixture = await createBareCloseFixture("d-ai-github-unsaved-context-");
+    try {
+      const localBareTransport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => {
+          const result = await pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head);
+          await fixture.close.store.recordCriticalUnsavedContext(fixture.close.state.taskId, ["late unsaved context"]);
+          return result;
+        },
+        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
+      };
+      const verdict = await closeTask(fixture.close.state, {
+        store: fixture.close.store,
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+      });
+
+      expect(verdict.status).toBe("NO");
+      expect(await git(fixture.bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(fixture.close.commitSha);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns NO when real durable task context changes after remote verification", async () => {
+    const fixture = await createBareCloseFixture("d-ai-github-post-candidate-change-");
+    try {
+      const localBareTransport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head),
+        readRef: async (_localRepositoryPath, _endpoint, ref) => {
+          const remoteState = await readRemoteRef(fixture.bareRemotePath, ref, null);
+          const current = await fixture.close.store.load(fixture.close.state.taskId);
+          if (current === null) throw new Error("Expected durable state during remote verification");
+          await fixture.close.store.save({ ...current, contextManifest: [...current.contextManifest, "post-candidate-change"] });
+          return remoteState;
+        },
+      };
+      const verdict = await closeTask(fixture.close.state, {
+        store: fixture.close.store,
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+      });
+
+      expect(verdict.status).toBe("NO");
+      expect(await git(fixture.bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(fixture.close.commitSha);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
     }
   });
 

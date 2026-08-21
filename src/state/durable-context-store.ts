@@ -1,4 +1,4 @@
-import type { DurableContextManifest, Environment, TaskState } from "../domain/types.js";
+import type { CloseCandidate, DurableContextManifest, Environment, TaskState } from "../domain/types.js";
 
 export interface TaskOwnershipLease {
   readonly taskId: string;
@@ -11,6 +11,8 @@ export interface DurableContextStore {
   load(taskId: string): Promise<TaskState | null>;
   loadGenerationManifest?(taskId: string, manifestId: string): Promise<DurableContextManifest>;
   save(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest>;
+  saveCloseCandidate?(candidate: CloseCandidate): Promise<void>;
+  loadCloseCandidate?(taskId: string): Promise<CloseCandidate | null>;
   recordCriticalUnsavedContext(taskId: string, items: readonly string[]): Promise<void>;
   clearCriticalUnsavedContext(taskId: string): Promise<void>;
   withTaskOwnership?<T>(
