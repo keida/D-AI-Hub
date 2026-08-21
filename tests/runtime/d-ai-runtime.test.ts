@@ -1,5 +1,6 @@
 import { join } from "node:path";
-import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { CommandExecutionError } from "../../src/adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-adapter.js";
@@ -30,6 +31,7 @@ import {
 import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/registry.js";
 import { loadSelectedSkill } from "../../src/skills/skill-loader.js";
 import type { DurableContextStore } from "../../src/state/durable-context-store.js";
+import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateResult, type HardGateInput } from "../../src/verification/gates.js";
 
 const skillRoot = join(process.cwd(), "tests", "fixtures", "skills");
@@ -298,6 +300,7 @@ const stageMatrixPolicies: readonly ModelPolicy[] = [
   { stage: "execute", role: "implementer", model: "work-model", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
   { stage: "route", role: "planner", model: "chat-router", requiredCapabilities: [], compatibleEnvironments: ["chat"] },
   { stage: "plan", role: "planner", model: "work-planner", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
+  { stage: "plan", role: "planner", model: "chat-planner", requiredCapabilities: ["approval"], compatibleEnvironments: ["chat"] },
   { stage: "verify", role: "reviewer", model: "work-reviewer", requiredCapabilities: ["durable-context"], compatibleEnvironments: ["work"] },
   { stage: "verify", role: "reviewer", model: "codex-reviewer", requiredCapabilities: ["codex-evidence"], compatibleEnvironments: ["codex"] },
 ];
@@ -379,10 +382,38 @@ describe("D-AI runtime", () => {
       environment,
       selectedModel: model,
     });
-    expect(runtimeHarness.savedStates.some((state) => state.routingDecision?.requestedStage === stage)).toBe(true);
+    const reloaded = await runtimeHarness.store.load(response.taskId);
+    expect(reloaded).toMatchObject({
+      taskId: response.taskId,
+      routingDecision: { requestedStage: stage },
+    });
+    if (status === "completed") {
+      expect(reloaded).toMatchObject({
+        stage: "verify",
+        routingDecision: {
+          stage: "verify",
+          requestedStage: stage,
+          environment,
+          selectedModel: model,
+        },
+      });
+    }
   });
 
   it.each([
+    {
+      label: "Codex to Chat plan",
+      sourceEnvironment: "codex",
+      stage: "plan",
+      environment: "chat",
+      model: "chat-planner",
+      skill: "unrelated-planning",
+      overrides: { model: null, role: null, environment: "chat", stage: "plan" },
+      request: (overrides: DAIRequest["overrides"]): DAIRequest => ({
+        ...intentRequest("codex", overrides),
+        command: parseDAICommand("@D-AI plan campaign"),
+      }),
+    },
     {
       label: "Chat to Work execute",
       sourceEnvironment: "chat",
@@ -445,6 +476,85 @@ describe("D-AI runtime", () => {
     expect((await handle({ command: { kind: "status" }, sourceEnvironment: environment, overrides: noOverrides })).status).toBe("accepted");
     if (sourceEnvironment !== environment) {
       expect((await handle({ command: { kind: "status" }, sourceEnvironment, overrides: noOverrides })).status).toBe("blocked");
+    }
+  });
+
+  it("preserves requestedStage in the final durable verify state and serialized handoff target", async () => {
+    const durableRoot = await mkdtemp(join(tmpdir(), "d-ai-routing-review-"));
+    const runtimeHarness = harness((request) => {
+      const result = completedExecution(request);
+      const recordedAt = new Date().toISOString();
+      return { ...result, evidence: result.evidence.map((evidence) => ({ ...evidence, recordedAt })) };
+    }, evaluateHardGates, "YES");
+    const store = new FileDurableContextStore(durableRoot);
+    const receivedEnvelopes: HandoffEnvelope[] = [];
+    const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
+      ...runtimeHarness.dependencies.adapters,
+      work: adapterWithReceiveProbe(runtimeHarness.dependencies.adapters.work, (envelope) => { receivedEnvelopes.push(envelope); }),
+    };
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store,
+      adapters,
+      modelPolicies: stageMatrixPolicies,
+      now: (): Date => new Date(),
+    });
+
+    try {
+      const accepted = await handle(intentRequest("codex", { model: null, role: null, environment: "chat", stage: "plan" }));
+      expect(accepted.status).toBe("completed");
+
+      const handoff = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "chat", overrides: noOverrides });
+      expect(handoff).toMatchObject({ taskId: accepted.taskId, stage: "handoff", environment: "work", status: "accepted" });
+      expect(receivedEnvelopes).toHaveLength(1);
+      expect(receivedEnvelopes[0]).toMatchObject({
+        taskId: accepted.taskId,
+        sourceEnvironment: "chat",
+        targetEnvironment: "work",
+        stage: "verify",
+        taskState: {
+          stage: "verify",
+          environment: "chat",
+          routingDecision: {
+            stage: "verify",
+            requestedStage: "plan",
+            environment: "chat",
+            selectedModel: "chat-planner",
+          },
+        },
+      });
+
+      const handoffId = /^Handoff (handoff-\S+) is owned/.exec(handoff.message)?.[1];
+      if (handoffId === undefined) throw new InvalidTaskStateError("Handoff response did not include its id");
+      expect(runtimeHarness.handoffService.status(handoffId)).toMatchObject({ target: "work", state: "active", owner: "work" });
+      const completed = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+      expect(completed).toMatchObject({ taskId: accepted.taskId, stage: "verify", environment: "work", status: "completed" });
+
+      const finalState = await store.load(accepted.taskId);
+      const reloadedState = await new FileDurableContextStore(durableRoot).load(accepted.taskId);
+      expect(reloadedState).toEqual(finalState);
+      expect(finalState).toMatchObject({
+        taskId: accepted.taskId,
+        stage: "verify",
+        environment: "work",
+        role: "evidence-collector",
+        handoffState: "completed",
+        routingDecision: {
+          stage: "verify",
+          requestedStage: "plan",
+          environment: "work",
+          role: "evidence-collector",
+          selectedModel: "chat-planner",
+        },
+        durableContext: {
+          stage: "verify",
+          environment: "work",
+          role: "evidence-collector",
+        },
+      });
+      expect(finalState?.routingDecision?.requestedStage).toBe("plan");
+    } finally {
+      await rm(durableRoot, { recursive: true, force: true });
     }
   });
 
