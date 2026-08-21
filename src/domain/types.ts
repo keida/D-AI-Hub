@@ -23,6 +23,7 @@ export type Role =
 
 export interface RoutingDecision {
   readonly stage: Stage;
+  readonly requestedStage?: Stage | undefined;
   readonly environment: Environment;
   readonly role: Role;
   readonly selectedModel: string;
