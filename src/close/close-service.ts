@@ -342,26 +342,21 @@ export async function closeTask(
   const now = new Date();
   const persistedState = await dependencies.store.load(state.taskId).then(
     (loaded) => loaded,
-    (error: Error) => {
-      if (error instanceof CloseBlockedError) {
-        return Promise.reject(error);
-      }
-      return Promise.reject(new CloseBlockedError(`Durable context could not be loaded for close: ${redactSensitiveText(error.message)}`));
-    },
-  ).then(
-    (loaded) => loaded,
-    (error: Error) => {
-      if (!(error instanceof CloseBlockedError)) {
-        throw error;
-      }
-      return null;
-    },
+    () => null,
   );
   if (persistedState === null) {
     return createVerdict(state, "BLOCKED", [failure("Durable task state is unavailable or could not be read", "restore durable task state and rerun close")], state.verificationEvidence);
   }
   if (JSON.stringify(persistedState) !== JSON.stringify(state)) {
     return createVerdict(state, "BLOCKED", [failure("Persisted task state does not match the state submitted for close", "reload the task from durable storage before close")], state.verificationEvidence);
+  }
+  if (dependencies.store.verifyDurableSnapshot !== undefined && state.durableContext !== null) {
+    try {
+      await dependencies.store.verifyDurableSnapshot(state.durableContext);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return createVerdict(state, "BLOCKED", [failure(`Durable snapshot integrity could not be verified: ${redactSensitiveText(message)}`, "restore the exact durable artifacts and rerun close")], state.verificationEvidence);
+    }
   }
   if (state.durableContext !== null && !isSafeManifestId(state.durableContext.manifestId)) {
     return createVerdict(state, "BLOCKED", [failure("Durable context manifest id is unsafe", "reload the task with a UUID or manifest-UUID durable context manifest")], state.verificationEvidence);

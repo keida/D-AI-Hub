@@ -10,6 +10,7 @@ export interface TaskOwnershipLease {
 export interface DurableContextStore {
   load(taskId: string): Promise<TaskState | null>;
   loadGenerationManifest?(taskId: string, manifestId: string): Promise<DurableContextManifest>;
+  verifyDurableSnapshot?(manifest: DurableContextManifest): Promise<void>;
   save(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest>;
   saveCloseCandidate?(candidate: CloseCandidate): Promise<void>;
   loadCloseCandidate?(taskId: string): Promise<CloseCandidate | null>;

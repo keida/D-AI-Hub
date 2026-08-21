@@ -16,6 +16,7 @@ const ownershipOwnerFile = "owner.json";
 const ownershipLeaseFile = "lease";
 const ownershipReleasedFile = "released";
 const ownershipTransferFile = "transfer.json";
+const activeDirectoryName = "active";
 
 const stageSchema = z.enum([
   "bootstrap",
@@ -107,6 +108,12 @@ const persistedCloseCandidateSchema = z
     hash: z.string().regex(/^[a-f0-9]{64}$/),
   })
   .strict();
+const activePointerSchema = z
+  .object({
+    manifestId: safeManifestIdSchema,
+    ownershipGeneration: z.string().regex(/^[1-9][0-9]*$/),
+  })
+  .strict();
 const taskStateSchema = z
   .object({
     taskId: z.string().min(1),
@@ -165,6 +172,7 @@ interface SnapshotPaths {
   readonly handoff: string;
   readonly recovery: string;
   readonly manifest: string;
+  readonly activeRoot: string;
   readonly closeCandidate: string;
 }
 
@@ -176,6 +184,11 @@ interface FileTaskOwnershipLease extends TaskOwnershipLease {
 interface FileTaskOwnershipGeneration {
   readonly generation: bigint;
   readonly generationPath: string;
+}
+
+interface ActivePointer {
+  readonly manifestId: string;
+  readonly ownershipGeneration: bigint;
 }
 
 function createHashForContent(content: string): string {
@@ -277,6 +290,7 @@ function createSnapshotPaths(rootPath: string, taskId: string): SnapshotPaths {
     handoff: join(taskRoot, "handoff.json"),
     recovery: join(taskRoot, "recovery.json"),
     manifest: join(taskRoot, "manifest.json"),
+    activeRoot: join(taskRoot, activeDirectoryName),
     closeCandidate: join(taskRoot, "close-candidate.json"),
   };
 }
@@ -287,6 +301,10 @@ function generationRoot(paths: SnapshotPaths, manifestId: string): string {
 
 function generationPath(paths: SnapshotPaths, manifestId: string, activePath: string): string {
   return join(generationRoot(paths, manifestId), basename(activePath));
+}
+
+function activePointerPath(paths: SnapshotPaths, generation: bigint): string {
+  return join(paths.activeRoot, `${generation.toString().padStart(20, "0")}.json`);
 }
 
 function allDurablePaths(paths: SnapshotPaths): readonly string[] {
@@ -406,8 +424,49 @@ async function writeGenerationAtomically(paths: SnapshotPaths, manifestId: strin
   }
 }
 
+async function loadActivePointer(paths: SnapshotPaths, taskId: string): Promise<ActivePointer | null> {
+  let entries: Dirent<string>[];
+  try {
+    entries = await readdir(paths.activeRoot, { withFileTypes: true });
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) return null;
+    throw new InvalidTaskStateError(`Unable to inspect active durable pointers for task ${taskId}: ${describeError(error)}`);
+  }
+  const pointerEntries = entries
+    .filter((entry) => entry.isFile() && /^[0-9]{20}\.json$/.test(entry.name))
+    .sort((left, right) => right.name.localeCompare(left.name));
+  const entry = pointerEntries[0];
+  if (entry === undefined) return null;
+  const path = join(paths.activeRoot, entry.name);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(path, "utf8"));
+  } catch (error: unknown) {
+    throw new InvalidTaskStateError(`Invalid active durable pointer for task ${taskId} at ${path}: ${describeError(error)}`);
+  }
+  const result = activePointerSchema.safeParse(parsed);
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const reason = issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
+    throw new InvalidTaskStateError(`Invalid active durable pointer for task ${taskId} at ${path}: ${reason}`);
+  }
+  return {
+    manifestId: result.data.manifestId,
+    ownershipGeneration: BigInt(result.data.ownershipGeneration),
+  };
+}
+
+async function publishActivePointer(paths: SnapshotPaths, manifestId: string, ownershipGeneration: bigint): Promise<void> {
+  await mkdir(paths.activeRoot, { recursive: true });
+  await writeAtomically(
+    activePointerPath(paths, ownershipGeneration),
+    serialize({ manifestId, ownershipGeneration: ownershipGeneration.toString() }),
+  );
+}
+
 export class FileDurableContextStore implements DurableContextStore {
   private readonly rootPath: string;
+  private readonly saveLocks = new Map<string, Promise<void>>();
 
   public constructor(rootPath: string) {
     this.rootPath = resolve(rootPath);
@@ -416,9 +475,12 @@ export class FileDurableContextStore implements DurableContextStore {
   public async load(taskId: string): Promise<TaskState | null> {
     assertTaskId(taskId);
     const paths = createSnapshotPaths(this.rootPath, taskId);
+    const activePointer = await loadActivePointer(paths, taskId);
     let stateContent: string;
     try {
-      stateContent = await readFile(paths.state, "utf8");
+      stateContent = activePointer === null
+        ? await readFile(paths.state, "utf8")
+        : await readRequiredContent(taskId, generationPath(paths, activePointer.manifestId, paths.state), "active generation state");
     } catch (error: unknown) {
       if (isMissingFileError(error)) {
         if (await hasRemainingSnapshotArtifacts(paths)) {
@@ -431,7 +493,9 @@ export class FileDurableContextStore implements DurableContextStore {
       throw new InvalidTaskStateError(`Unable to read durable task state at ${paths.state}: ${describeError(error)}`);
     }
 
-    const manifestContent = await readRequiredContent(taskId, paths.manifest, "declared SHA-256");
+    const manifestContent = activePointer === null
+      ? await readRequiredContent(taskId, paths.manifest, "declared SHA-256")
+      : await readRequiredContent(taskId, generationPath(paths, activePointer.manifestId, paths.manifest), "active generation manifest");
     const manifest = parseManifest(parseJson(manifestContent, taskId, paths.manifest), taskId, paths.manifest);
     assertSafeManifestId(manifest.manifestId, "Durable manifest id");
     assertManifestContract(manifest, taskId, paths);
@@ -497,6 +561,20 @@ export class FileDurableContextStore implements DurableContextStore {
   }
 
   public async save(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest> {
+    const previous = this.saveLocks.get(state.taskId) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.saveLocks.set(state.taskId, current);
+    await previous;
+    try {
+      return await this.saveInternal(state, lease);
+    } finally {
+      release();
+      if (this.saveLocks.get(state.taskId) === current) this.saveLocks.delete(state.taskId);
+    }
+  }
+
+  private async saveInternal(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest> {
     assertTaskId(state.taskId);
     const paths = createSnapshotPaths(this.rootPath, state.taskId);
     const ownedLease = lease === undefined ? undefined : lease as FileTaskOwnershipLease;
@@ -556,7 +634,34 @@ export class FileDurableContextStore implements DurableContextStore {
     if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     await writeAtomically(paths.state, stateContent);
     if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
+    if (ownedLease !== undefined) await publishActivePointer(paths, manifest.manifestId, ownedLease.generation);
     return persistedManifest;
+  }
+
+  public async verifyDurableSnapshot(manifest: DurableContextManifest): Promise<void> {
+    assertTaskId(manifest.taskId);
+    const paths = createSnapshotPaths(this.rootPath, manifest.taskId);
+    const expectedManifestHash = manifest.hashes[paths.manifest];
+    if (expectedManifestHash === undefined) throw new InvalidTaskStateError(`Durable snapshot is missing its manifest hash for task ${manifest.taskId}`);
+    const manifestContent = await readRequiredContent(manifest.taskId, paths.manifest, expectedManifestHash);
+    const persistedManifest = parseManifest(parseJson(manifestContent, manifest.taskId, paths.manifest), manifest.taskId, paths.manifest);
+    const observedManifestHash = createHashForContent(createCanonicalManifestContent(persistedManifest));
+    if (observedManifestHash !== expectedManifestHash || JSON.stringify(persistedManifest) !== JSON.stringify(manifest)) {
+      throwIntegrityError(manifest.taskId, paths.manifest, expectedManifestHash, observedManifestHash, "durable manifest does not match submitted snapshot");
+    }
+    for (const targetPath of manifest.durablePaths) {
+      const expectedHash = manifest.hashes[targetPath];
+      if (expectedHash === undefined) throw new InvalidTaskStateError(`Durable snapshot is missing a hash for ${targetPath}`);
+      const content = await readRequiredContent(manifest.taskId, targetPath, expectedHash);
+      if (targetPath === paths.manifest) continue;
+      if (targetPath === paths.state) {
+        const persistedState = parseTaskState(parseJson(content, manifest.taskId, targetPath), targetPath);
+        const observedStateHash = createHashForContent(createCanonicalStateContent(persistedState));
+        if (observedStateHash !== expectedHash) throwIntegrityError(manifest.taskId, targetPath, expectedHash, observedStateHash, "canonical state hash mismatch");
+        continue;
+      }
+      assertRawHash(manifest.taskId, targetPath, content, expectedHash);
+    }
   }
 
   public async saveCloseCandidate(candidate: CloseCandidate): Promise<void> {
