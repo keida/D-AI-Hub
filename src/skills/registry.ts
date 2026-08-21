@@ -43,6 +43,10 @@ const knownStages: ReadonlySet<string> = new Set([
 const maximumFrontmatterBytes = 16_384;
 const skillNamePattern = /^[a-z0-9][a-z0-9-]*$/;
 
+export function isSafeSkillName(name: string): boolean {
+  return skillNamePattern.test(name);
+}
+
 function assertEnvironment(value: string, context: string): asserts value is Environment {
   if (!knownEnvironments.has(value)) {
     throw new InvalidTaskStateError(`${context} declares an unknown environment: ${value}.`);
@@ -210,7 +214,7 @@ function parseDescriptor(skillPath: string, frontmatter: string): SkillDescripto
   }
 
   const name = assertString(frontmatterMetadata.name, "name", skillPath);
-  if (!skillNamePattern.test(name)) {
+  if (!isSafeSkillName(name)) {
     throw new InvalidTaskStateError(`Skill metadata at ${skillPath} has an unsafe name: ${name}.`);
   }
   if (basename(dirname(skillPath)) !== name) {
@@ -256,7 +260,7 @@ function assertDescriptor(descriptor: SkillDescriptor, index: number): void {
   if (typeof descriptor.skillPath !== "string" || !isAbsolute(descriptor.skillPath) || resolve(descriptor.skillPath) !== descriptor.skillPath) {
     throw new InvalidTaskStateError(`Skill descriptor at index=${index} must declare an absolute normalized skillPath.`);
   }
-  if (!skillNamePattern.test(descriptor.name) || basename(dirname(descriptor.skillPath)) !== descriptor.name) {
+  if (!isSafeSkillName(descriptor.name) || basename(dirname(descriptor.skillPath)) !== descriptor.name) {
     throw new InvalidTaskStateError(`Skill descriptor at index=${index} has an invalid name or skillPath.`);
   }
   assertString(descriptor.description, "description", descriptor.skillPath);
