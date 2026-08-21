@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TaskOwnershipError } from "../../src/domain/errors.js";
 import type { TaskState } from "../../src/domain/types.js";
-import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
+import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
 function createState(taskId: string, goal: string): TaskState {
   return {
@@ -423,5 +423,24 @@ describe("FileDurableContextStore", () => {
       await rm(rootPath, { recursive: true, force: true });
     }
   });
+
+  it("propagates a heartbeat renewal failure after the operation finishes", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-heartbeat-failure", "Propagate heartbeat failure");
+    await store.save(state);
+    try {
+      await expect(store.withTaskOwnership("task-heartbeat-failure", "work", async () => {
+        const leasePath = join(rootPath, "task-heartbeat-failure", "ownership", "1", "lease");
+        const leaseToken = await readFile(leasePath, "utf8");
+        await rm(leasePath);
+        await new Promise<void>((resolve) => setTimeout(resolve, FILE_DURABLE_CONTEXT_LEASE_MS / 3 + 250));
+        await writeFile(leasePath, leaseToken, "utf8");
+        return "operation-result";
+      })).rejects.toThrow(TaskOwnershipError);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 import { createHash } from "node:crypto";

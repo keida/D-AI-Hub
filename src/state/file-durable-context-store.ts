@@ -667,6 +667,9 @@ export class FileDurableContextStore implements DurableContextStore {
     }, Math.max(1, Math.floor(FILE_DURABLE_CONTEXT_LEASE_MS / 3)));
     try {
       const result = await operation(lease, transfer);
+      if (heartbeatFailure !== null) {
+        throw heartbeatFailure;
+      }
       return result;
     } finally {
       clearInterval(heartbeat);
