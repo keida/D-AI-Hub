@@ -875,6 +875,57 @@ describe("D-AI runtime", () => {
     }
   });
 
+  it("blocks initial intent and close while another runtime holds the lease, then permits continue and handoff", async () => {
+    const durableRoot = await mkdtemp(join(tmpdir(), "d-ai-runtime-lifecycle-ownership-"));
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const firstStore = new FileDurableContextStore(durableRoot);
+    const secondStore = new FileDurableContextStore(durableRoot);
+    const firstRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: firstStore });
+    let releaseLease: () => void = () => {};
+    let markLeaseActive: () => void = () => {};
+    const leaseActive = new Promise<void>((resolve) => { markLeaseActive = resolve; });
+    const leaseRelease = new Promise<void>((resolve) => { releaseLease = resolve; });
+
+    try {
+      const accepted = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("codex", noOverrides));
+      const seedState = await runtimeHarness.store.load(accepted.taskId);
+      if (seedState === null) throw new InvalidTaskStateError("Expected a seeded durable task state");
+      await firstStore.save({ ...seedState, durableContext: null });
+      await expect(firstRuntime({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides })).resolves.toMatchObject({
+        taskId: accepted.taskId,
+        status: "accepted",
+      });
+      const leaseHolder = secondStore.withTaskOwnership(accepted.taskId, "codex", async () => {
+        markLeaseActive();
+        await leaseRelease;
+      });
+      await leaseActive;
+
+      await expect(firstRuntime(intentRequest("codex", noOverrides))).resolves.toMatchObject({
+        taskId: accepted.taskId,
+        status: "blocked",
+      });
+      await expect(firstRuntime({ command: { kind: "close" }, sourceEnvironment: "codex", overrides: noOverrides })).resolves.toMatchObject({
+        taskId: accepted.taskId,
+        status: "blocked",
+      });
+
+      releaseLease();
+      await leaseHolder;
+
+      await expect(firstRuntime({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides })).resolves.toMatchObject({
+        taskId: accepted.taskId,
+        status: "accepted",
+      });
+      await expect(firstRuntime({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides })).resolves.toMatchObject({
+        taskId: accepted.taskId,
+        status: "accepted",
+      });
+    } finally {
+      await rm(durableRoot, { recursive: true, force: true });
+    }
+  });
+
   it("serializes handoffs, persists pending before acknowledgement, and blocks source operations", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const handoffStates: TaskState["handoffState"][] = [];

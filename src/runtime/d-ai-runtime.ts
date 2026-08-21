@@ -30,7 +30,7 @@ import { resolveModelRoute, type ModelPolicy } from "../routing/model-router.js"
 import type { RoutingOverrides } from "../routing/override-parser.js";
 import { discoverSkillMetadata, selectCapabilities } from "../skills/registry.js";
 import { loadSelectedSkill, type LoadedSkill } from "../skills/skill-loader.js";
-import type { DurableContextStore } from "../state/durable-context-store.js";
+import type { DurableContextStore, TaskOwnershipLease } from "../state/durable-context-store.js";
 import { FileDurableContextStore } from "../state/file-durable-context-store.js";
 import { evaluateHardGates, type GateEvidence, type GateResult, type HardGateInput } from "../verification/gates.js";
 
@@ -342,9 +342,9 @@ function redactStateEvidence(state: TaskState): TaskState {
   };
 }
 
-async function persistState(store: DurableContextStore, state: TaskState): Promise<TaskState> {
+async function persistState(store: DurableContextStore, state: TaskState, lease?: TaskOwnershipLease): Promise<TaskState> {
   const redactedState = redactStateEvidence(state);
-  const manifest = await store.save(redactedState);
+  const manifest = await store.save(redactedState, lease);
   return { ...redactedState, durableContext: manifest };
 }
 
@@ -393,13 +393,16 @@ async function withDurableTaskOwnership(
   taskId: string,
   environment: Environment,
   store: DurableContextStore,
-  operation: (transfer: (targetEnvironment: Environment) => Promise<void>) => Promise<DAIResponse>,
+  operation: (
+    lease: TaskOwnershipLease,
+    transfer: (targetEnvironment: Environment) => Promise<void>,
+  ) => Promise<DAIResponse>,
 ): Promise<DAIResponse> {
   try {
     if (store.withTaskOwnership === undefined) {
       throw new InvalidTaskStateError("Durable task ownership is unavailable for a mutating runtime command");
     }
-    return await store.withTaskOwnership(taskId, environment, async (_lease, transfer) => operation(transfer));
+    return await store.withTaskOwnership(taskId, environment, async (lease, transfer) => operation(lease, transfer));
   } catch (error: unknown) {
     if (error instanceof TaskOwnershipError) {
       return blockedWithoutState(taskId, environment, error.message);
@@ -490,6 +493,7 @@ async function routeIntent(
   state: TaskState,
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
+  lease: TaskOwnershipLease,
 ): Promise<{ readonly state: TaskState; readonly skills: readonly LoadedSkill[] }> {
   const stage = requestedStage(request.overrides);
   const role = requestedRole(stage, request.overrides);
@@ -528,7 +532,7 @@ async function routeIntent(
     },
     selectedCapabilities: [...routingDecision.selectedCapabilities],
     durableContext: null,
-  });
+  }, lease);
   const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
   const selected = dependencies.selectCapabilities(routedState.goal, stage, route.environment, descriptors);
   const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
@@ -539,9 +543,9 @@ async function routeIntent(
   const plannedState = await persistState(dependencies.store, {
     ...transitionState(routedState, "plan", "planner", route.environment),
     contextManifest,
-  });
+  }, lease);
   const executionState = transitionState(plannedState, "execute", routingDecision.role, route.environment);
-  return { state: await persistState(dependencies.store, executionState), skills };
+  return { state: await persistState(dependencies.store, executionState, lease), skills };
 }
 
 function gateEvidence(
@@ -666,6 +670,7 @@ async function enterRecovery(
   state: TaskState,
   reason: string,
   dependencies: DAIRuntimeDependencies,
+  lease: TaskOwnershipLease,
 ): Promise<DAIResponse> {
   const redactedReason = redactSensitiveText(reason);
   const debugTransition = transitionState(state, "debug", "debugger", state.environment);
@@ -675,7 +680,7 @@ async function enterRecovery(
       ...debugTransition.routingDecision,
       reason: `Debugging required: ${redactedReason}`,
     },
-  });
+  }, lease);
   const recoveryOutcome = await connectorOutcome(async () => {
     dependencies.createDebugSession(redactedReason, debugState.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
     const recovered = await dependencies.recover(debugState, redactedReason);
@@ -699,7 +704,7 @@ async function enterRecovery(
         reason: `Recovery outcome: ${redactedReason}`,
       },
       durableContext: null,
-    });
+    }, lease);
   }, recoveryConnectorFailure);
   return recoveryOutcome.kind === "blocked"
     ? response(debugState, "blocked", `Recovery connector blocked: ${recoveryOutcome.message}`)
@@ -722,6 +727,7 @@ async function executeRoutedState(
   skills: readonly LoadedSkill[],
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
 ): Promise<DAIResponse> {
   registry.transfer(routedState.taskId, routedState.environment);
   const executionOutcome = await connectorOutcome(
@@ -729,36 +735,37 @@ async function executeRoutedState(
     executionConnectorFailure,
   );
   if (executionOutcome.kind === "blocked") {
-    return enterRecovery(routedState, executionOutcome.message, dependencies);
+    return enterRecovery(routedState, executionOutcome.message, dependencies, lease);
   }
   const execution = validateExecutionResult(executionOutcome.value);
   const identityFailure = evidenceIdentityFailure(routedState, execution.evidence);
   if (identityFailure !== null) {
-    return enterRecovery(routedState, identityFailure, dependencies);
+    return enterRecovery(routedState, identityFailure, dependencies, lease);
   }
   if (execution.status !== "completed") {
     const executedState = await persistState(dependencies.store, {
       ...routedState,
       verificationEvidence: [...routedState.verificationEvidence, ...execution.evidence],
       durableContext: null,
-    });
-    return enterRecovery(executedState, execution.message, dependencies);
+    }, lease);
+    return enterRecovery(executedState, execution.message, dependencies, lease);
   }
   const inspectedTransition = transitionState(routedState, "inspect", "evidence-collector", routedState.environment);
   const inspectedState = await persistState(dependencies.store, {
     ...inspectedTransition,
     verificationEvidence: [...inspectedTransition.verificationEvidence, ...execution.evidence],
-  });
+  }, lease);
   const preliminaryVerifyState = await persistState(
     dependencies.store,
     transitionState(inspectedState, "verify", "evidence-collector", inspectedState.environment),
+    lease,
   );
   const recoveryPointOutcome = await connectorOutcome(
     () => dependencies.captureRecoveryPoint(preliminaryVerifyState),
     executionConnectorFailure,
   );
   if (recoveryPointOutcome.kind === "blocked") {
-    return enterRecovery(preliminaryVerifyState, recoveryPointOutcome.message, dependencies);
+    return enterRecovery(preliminaryVerifyState, recoveryPointOutcome.message, dependencies, lease);
   }
   const recoveryPointValidation = validateCapturedRecoveryPoint(
     preliminaryVerifyState,
@@ -766,7 +773,7 @@ async function executeRoutedState(
     dependencies.now(),
   );
   if (recoveryPointValidation.kind === "blocked") {
-    return enterRecovery(preliminaryVerifyState, recoveryPointValidation.message, dependencies);
+    return enterRecovery(preliminaryVerifyState, recoveryPointValidation.message, dependencies, lease);
   }
   const verifiedState = await persistState(dependencies.store, {
     ...preliminaryVerifyState,
@@ -776,11 +783,11 @@ async function executeRoutedState(
     })),
     recoveryPoint: recoveryPointValidation.value,
     durableContext: null,
-  });
+  }, lease);
   const applicableGates = applicableExecutionGates(verifiedState);
   const exactEvidenceFailure = gateEvidenceFailure(verifiedState.verificationEvidence, applicableGates);
   if (exactEvidenceFailure !== null) {
-    return enterRecovery(verifiedState, exactEvidenceFailure, dependencies);
+    return enterRecovery(verifiedState, exactEvidenceFailure, dependencies, lease);
   }
   const gates = dependencies.evaluateHardGates({
     state: verifiedState,
@@ -790,7 +797,7 @@ async function executeRoutedState(
   });
   const gateFailure = failedGateReason(gates, applicableGates);
   if (gateFailure !== null) {
-    return enterRecovery(verifiedState, gateFailure, dependencies);
+    return enterRecovery(verifiedState, gateFailure, dependencies, lease);
   }
   return response(verifiedState, "completed", execution.message);
 }
@@ -800,9 +807,10 @@ async function executeIntentExclusive(
   bootstrapped: TaskState,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
 ): Promise<DAIResponse> {
-  const routed = await routeIntent(bootstrapped, request, dependencies);
-  return executeRoutedState(routed.state, routed.skills, dependencies, registry);
+  const routed = await routeIntent(bootstrapped, request, dependencies, lease);
+  return executeRoutedState(routed.state, routed.skills, dependencies, registry, lease);
 }
 
 async function executeIntent(
@@ -820,7 +828,12 @@ async function executeIntent(
   }, dependencies.store);
   return registry.serializeMutation(
     bootstrapped.taskId,
-    () => executeIntentExclusive(request, bootstrapped, dependencies, registry),
+    () => withDurableTaskOwnership(
+      bootstrapped.taskId,
+      request.sourceEnvironment,
+      dependencies.store,
+      async (lease) => executeIntentExclusive(request, bootstrapped, dependencies, registry, lease),
+    ),
   );
 }
 
@@ -829,6 +842,7 @@ async function continueTaskExclusive(
   command: Extract<DAICommand, { readonly kind: "continue" }>,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
 ): Promise<DAIResponse> {
   if (registry.isBlocked(command.taskIdOrProject)) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task ${command.taskIdOrProject} is blocked by a failed handoff`);
@@ -862,9 +876,10 @@ async function continueTaskExclusive(
           ? [...state.contextManifest]
           : [...state.contextManifest, `recovered-from-failure:${failedEvidence.map((evidence) => evidence.evidenceId).join(",")}`],
       },
+      lease,
     );
     registry.transfer(state.taskId, state.environment);
-    return executeRoutedState(executionState, skills, dependencies, registry);
+    return executeRoutedState(executionState, skills, dependencies, registry, lease);
   }
   registry.transfer(state.taskId, state.environment);
   return response(state, "accepted", `Continuing task ${state.taskId}`);
@@ -886,7 +901,7 @@ async function continueTask(
       state.taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async () => continueTaskExclusive(request, command, dependencies, registry),
+      async (lease) => continueTaskExclusive(request, command, dependencies, registry, lease),
     ),
   );
 }
@@ -896,6 +911,7 @@ async function finalizeFailedHandoff(
   envelope: HandoffEnvelope | null,
   reason: string,
   dependencies: DAIRuntimeDependencies,
+  lease: TaskOwnershipLease,
 ): Promise<{ readonly state: TaskState; readonly message: string }> {
   let message = redactSensitiveText(reason);
   if (envelope !== null) {
@@ -917,7 +933,7 @@ async function finalizeFailedHandoff(
     durableContext: null,
   };
   const persistenceOutcome = await connectorOutcome(
-    () => persistState(dependencies.store, rejectedCandidate),
+    () => persistState(dependencies.store, rejectedCandidate, lease),
     handoffConnectorFailure,
   );
   return persistenceOutcome.kind === "blocked"
@@ -931,6 +947,7 @@ async function handoffTaskExclusive(
   command: Extract<DAICommand, { readonly kind: "handoff" }>,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
   transferOwnership: (targetEnvironment: Environment) => Promise<void>,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
@@ -957,7 +974,7 @@ async function handoffTaskExclusive(
   let envelope: HandoffEnvelope | null = null;
   let pendingState = pendingCandidate;
   const handoffOutcome = connectorOutcome(async () => {
-    pendingState = await persistState(dependencies.store, pendingCandidate);
+    pendingState = await persistState(dependencies.store, pendingCandidate, lease);
     envelope = await dependencies.handoffService.create({ state, targetEnvironment: command.target });
     await dependencies.adapters[command.target].receive(envelope);
     const activeCandidate: TaskState = {
@@ -972,7 +989,7 @@ async function handoffTaskExclusive(
       },
       durableContext: null,
     };
-    const activeState = await persistState(dependencies.store, activeCandidate);
+    const activeState = await persistState(dependencies.store, activeCandidate, lease);
     await transferOwnership(command.target);
     return {
       envelope,
@@ -982,14 +999,14 @@ async function handoffTaskExclusive(
   return handoffOutcome.then(
     async (outcome): Promise<DAIResponse> => {
       if (outcome.kind === "blocked") {
-        const failed = await finalizeFailedHandoff(pendingState, envelope, outcome.message, dependencies);
+        const failed = await finalizeFailedHandoff(pendingState, envelope, outcome.message, dependencies, lease);
         return response(failed.state, "blocked", failed.message);
       }
       registry.transfer(taskId, command.target);
       return response(outcome.value.state, "accepted", `Handoff ${outcome.value.envelope.handoffId} is owned by ${command.target}`);
     },
     async (error: Error): Promise<DAIResponse> => {
-      await finalizeFailedHandoff(pendingState, envelope, error.message, dependencies);
+      await finalizeFailedHandoff(pendingState, envelope, error.message, dependencies, lease);
       return Promise.reject(error);
     },
   );
@@ -1011,7 +1028,7 @@ async function handoffTask(
       taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (transfer) => handoffTaskExclusive(taskId, request, command, dependencies, registry, transfer),
+      async (lease, transfer) => handoffTaskExclusive(taskId, request, command, dependencies, registry, lease, transfer),
     ),
   );
 }
@@ -1022,6 +1039,7 @@ async function completeHandoffExclusive(
   command: Extract<DAICommand, { readonly kind: "complete" }>,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
@@ -1091,7 +1109,7 @@ async function completeHandoffExclusive(
       handoffState: "completed",
     };
   const completedState = await connectorOutcome(
-    () => persistState(dependencies.store, completedCandidate),
+    () => persistState(dependencies.store, completedCandidate, lease),
     completionConnectorFailure,
   );
   if (completedState.kind === "blocked") {
@@ -1112,7 +1130,7 @@ async function completeHandoffExclusive(
     return response(completedState.value, "blocked", `Handoff completion recovery capture blocked: ${recoveryValidation.message}`);
   }
   const persisted = await connectorOutcome(
-    () => persistState(dependencies.store, { ...completedState.value, recoveryPoint: recoveryValidation.value }),
+    () => persistState(dependencies.store, { ...completedState.value, recoveryPoint: recoveryValidation.value }, lease),
     completionConnectorFailure,
   );
   if (persisted.kind === "blocked") {
@@ -1137,7 +1155,7 @@ async function completeHandoff(
       taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async () => completeHandoffExclusive(taskId, request, command, dependencies, registry),
+      async (lease) => completeHandoffExclusive(taskId, request, command, dependencies, registry, lease),
     ),
   );
 }
@@ -1147,6 +1165,7 @@ async function closeActiveTaskExclusive(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
+  lease: TaskOwnershipLease,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
@@ -1179,7 +1198,7 @@ async function closeActiveTaskExclusive(
     () => persistState(dependencies.store, {
       ...transitionState(state, "close", "evidence-collector", state.environment),
       verificationEvidence: [...verdict.evidence],
-    }),
+    }, lease),
     closeConnectorFailure,
   );
   if (closeState.kind === "blocked") {
@@ -1208,7 +1227,12 @@ async function closeActiveTask(
   }
   return registry.serializeMutation(
     taskId,
-    () => closeActiveTaskExclusive(taskId, request, dependencies, registry),
+    () => withDurableTaskOwnership(
+      taskId,
+      request.sourceEnvironment,
+      dependencies.store,
+      async (lease) => closeActiveTaskExclusive(taskId, request, dependencies, registry, lease),
+    ),
   );
 }
 

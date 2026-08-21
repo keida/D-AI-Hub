@@ -381,5 +381,47 @@ describe("FileDurableContextStore", () => {
       await rm(rootPath, { recursive: true, force: true });
     }
   });
+
+  it("rejects a stale owner write after a successor acquires the lease", async () => {
+    const rootPath = await createStoreRoot();
+    const firstStore = new FileDurableContextStore(rootPath);
+    const secondStore = new FileDurableContextStore(rootPath);
+    const state = createState("task-stale-write", "Original goal");
+    let releaseFirst: () => void = () => {};
+    let releaseSecond: () => void = () => {};
+    let markFirstActive: () => void = () => {};
+    let markSecondActive: () => void = () => {};
+    const firstActive = new Promise<void>((resolve) => { markFirstActive = resolve; });
+    const secondActive = new Promise<void>((resolve) => { markSecondActive = resolve; });
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const secondRelease = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    try {
+      await firstStore.save(state);
+      const first = firstStore.withTaskOwnership("task-stale-write", "codex", async (lease) => {
+        markFirstActive();
+        await firstRelease;
+        await expect(firstStore.save({ ...state, goal: "Stale goal", durableContext: null }, lease)).rejects.toThrow(TaskOwnershipError);
+      });
+      await firstActive;
+      const expiredAt = new Date(Date.now() - 30_001);
+      await utimes(join(rootPath, "task-stale-write", "ownership", "1", "lease"), expiredAt, expiredAt);
+
+      const second = secondStore.withTaskOwnership("task-stale-write", "work", async (lease) => {
+        await secondStore.save({ ...state, goal: "Successor goal", durableContext: null }, lease);
+        markSecondActive();
+        await secondRelease;
+      });
+      await secondActive;
+      releaseFirst();
+      await first;
+
+      await expect(secondStore.load("task-stale-write")).resolves.toMatchObject({ goal: "Successor goal" });
+
+      releaseSecond();
+      await second;
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
 });
 import { createHash } from "node:crypto";
