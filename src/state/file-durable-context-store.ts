@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
@@ -460,9 +460,16 @@ export class FileDurableContextStore implements DurableContextStore {
     return state;
   }
 
-  public async save(state: TaskState): Promise<DurableContextManifest> {
+  public async save(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest> {
     assertTaskId(state.taskId);
     const paths = createSnapshotPaths(this.rootPath, state.taskId);
+    const ownedLease = lease === undefined ? undefined : lease as FileTaskOwnershipLease;
+    if (ownedLease !== undefined) {
+      if (ownedLease.taskId !== state.taskId) {
+        throw new TaskOwnershipError(`Durable ownership task mismatch for task ${state.taskId}`);
+      }
+      await this.assertCurrentTaskOwnership(ownedLease);
+    }
     assertNoCredentialLikeFields(state, paths.state, "state");
     const validatedState = parseTaskState(state, paths.state);
     await mkdir(paths.taskRoot, { recursive: true });
@@ -502,12 +509,17 @@ export class FileDurableContextStore implements DurableContextStore {
       [paths.state, stateContent],
     ]);
 
+    if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     await writeGenerationAtomically(paths, manifest.manifestId, generationContents);
     for (const [path, content] of contents) {
+      if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
       await writeAtomically(path, content);
     }
+    if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     await writeAtomically(paths.manifest, manifestContent);
+    if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     await writeAtomically(paths.state, stateContent);
+    if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     return persistedManifest;
   }
 
@@ -563,11 +575,27 @@ export class FileDurableContextStore implements DurableContextStore {
     const transfer = async (targetEnvironment: Environment): Promise<void> => {
       lease = await this.transferTaskOwnership(lease, targetEnvironment);
     };
+    let heartbeatFailure: TaskOwnershipError | null = null;
+    const heartbeat = setInterval(() => {
+      if (heartbeatFailure !== null) return;
+      void this.renewTaskOwnership(lease).catch((error: unknown) => {
+        heartbeatFailure = error instanceof TaskOwnershipError
+          ? error
+          : new TaskOwnershipError(`Unable to renew durable ownership for task ${taskId}: ${describeError(error)}`);
+      });
+    }, Math.max(1, Math.floor(FILE_DURABLE_CONTEXT_LEASE_MS / 3)));
     try {
-      return await operation(lease, transfer);
+      const result = await operation(lease, transfer);
+      return result;
     } finally {
+      clearInterval(heartbeat);
       await this.releaseTaskOwnership(lease);
     }
+  }
+
+  private async renewTaskOwnership(lease: FileTaskOwnershipLease): Promise<void> {
+    await this.assertCurrentTaskOwnership(lease);
+    await utimes(join(lease.generationPath, ownershipLeaseFile), new Date(), new Date());
   }
 
   private async acquireTaskOwnership(taskId: string, environment: Environment): Promise<FileTaskOwnershipLease> {
