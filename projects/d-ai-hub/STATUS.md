@@ -8,9 +8,9 @@
 ## Current checkpoint
 
 - Current task: Implement and verify progressive loading for the canonical `project-memory` Skill.
-- Working state: Isolated branch `codex/project-memory-progressive` contains the Skill and checkpoint changes; old worktrees remain untouched. No commit or push has been made for this branch.
-- Active plan: Complete Release Gate review, then leave integration to the approved branch workflow. Do not introduce a context pack or second memory source.
-- Latest verified evidence: RED pressure scenarios confirmed the prior fixed six-file order was too broad for narrow continuation. GREEN scenarios confirmed `STATUS.md` first, task-matching files conditionally, direct references as needed, and full order only for close/audit/conflict. Static Skill, compatibility-pointer, AGENTS alignment, and `git diff --check` checks passed.
+- Working state: Isolated branch `codex/project-memory-progressive` contains the Skill, checkpoint, and measurement updates; old worktrees remain untouched. The branch is pushed and tracked by PR #4.
+- Active plan: Await review/integration of the progressive Skill change. Continue measuring real resumptions before considering a context pack. Do not introduce a second memory source.
+- Latest verified evidence: RED pressure scenarios confirmed the prior fixed six-file order was too broad for narrow continuation. GREEN scenarios confirmed `STATUS.md` first, task-matching files conditionally, direct references as needed, and full order only for close/audit/conflict. Static Skill, compatibility-pointer, AGENTS alignment, and `git diff --check` checks passed. Five local read scenarios measured 2 files for narrow bug/roadmap/decision cases versus 6 files for close/audit cases; local character volume was 7,078/5,629/9,097 versus 19,306 for full reads. These are file-read baselines, not real cross-session recovery timings.
 
 ## Last verified progress
 
@@ -31,8 +31,8 @@ BUG-002 blocks treating `@D-AI sync` behavior as verified. Normal local project 
 
 ## Next concrete action
 
-Run Release Gate on the isolated branch, then integrate the approved Skill change. Measure five real resumptions before considering a context pack. Defer P1 context-pack and all P2 automation.
+Collect five real project resumptions and record their file counts, repeated checks, elapsed recovery time, and omissions before considering a context pack. Defer P1 context-pack and all P2 automation.
 
 ## Verification notes
 
-Remote GitHub updates have been successfully performed after the original setup session. The isolated branch was created from verified canonical `main` commit `0ffd770`; no old worktree was modified. Current branch changes remain uncommitted pending Release Gate.
+Remote GitHub updates have been successfully performed after the original setup session. The isolated branch was created from verified canonical `main` commit `0ffd770`; no old worktree was modified. Measurement results are recorded on the PR branch; canonical `main` remains unchanged until review and merge.
