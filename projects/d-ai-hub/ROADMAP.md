@@ -3,9 +3,12 @@
 ## Now
 
 - Apply the safe cross-client sync and write rules in `docs/workflow.md`; new environments must verify GitHub authentication before treating local state as current.
-- Complete the approved P0 consistency work: keep command documentation explicit about ChatGPT Web, Codex, and compatible agents, while retaining `@D-AI update` as an internal workflow.
 - Keep `STATUS.md`, `DECISIONS.md`, `BUGS.md`, and `REFERENCES.md` current after meaningful work.
 - Add durable knowledge only when it has a clear canonical home and a useful retrieval path.
+
+## Completed in current V1.2 scope
+
+- P0 consistency audit and documentation alignment: command documentation is explicit about ChatGPT Web, Codex, and compatible agents, while `@D-AI update` remains an internal workflow.
 
 ## Next
 

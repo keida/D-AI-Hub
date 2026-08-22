@@ -23,8 +23,8 @@ None for normal D-AI-Hub use. New checkouts and environments must still authenti
 
 ## Next concrete action
 
-Review the current P0 documentation changes, then continue only with minimal consistency fixes from the approved V1.2 scope. Do not integrate legacy PRs or worktrees; defer P1 context-pack and all P2 automation until separately approved.
+Use D-AI-Hub in real work with `@D-AI sync` and the relevant project/task name, then finish meaningful sessions with `@D-AI close`. Do not integrate legacy PRs or worktrees; defer P1 context-pack and all P2 automation until separately approved.
 
 ## Verification notes
 
-Remote GitHub updates have been successfully performed after the original setup session. The current Codex environment has verified authenticated fetch, fast-forwardable pull, and clean synchronization without storing credentials or machine-specific identifiers. The current local review state contains uncommitted documentation and project-state changes in `AGENTS.md`, `docs/commands.md`, `projects/d-ai-hub/STATUS.md`, and `projects/d-ai-hub/ROADMAP.md`; no commit or push has been performed for them.
+Remote GitHub updates have been successfully performed after the original setup session. The current Codex environment has verified authenticated fetch, fast-forwardable pull, and clean synchronization without storing credentials or machine-specific identifiers. The P0 documentation and project-state changes were committed and pushed to canonical `main`; the current local worktree is clean.
