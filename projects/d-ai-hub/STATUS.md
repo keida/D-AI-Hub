@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Preserve the verified ownership-repair PR state and continue with independent review or an explicitly authorized merge.
-- Working state: The feature branch is clean except for three pre-existing untracked planning/spec documents, which remain untouched. The merge commit `32e18c2` is pushed to `feat/d-ai-ownership-repair`.
-- Active plan: Keep the PR open for independent review; do not merge it into canonical `main` without a separate explicit approval.
-- Latest verified evidence: GitHub compare now reports `ahead 64 / behind 0`, with merge base equal to current `main` `c958fbc`. PR #2 is open, ready for review, and GitHub reports `mergeable: true`. Post-merge validation passed: 20 test files and 413 tests, TypeScript build, `git diff --check`, and secret-like content scan with no credential values found.
+- Current task: Publish the rewritten PR history after removing hardcoded private-key test fixtures from the commit graph.
+- Working state: The feature branch is rewritten locally at `3180706`; backup branch `backup/pr2-before-secret-history-rewrite` preserves the pre-rewrite tip. Three pre-existing untracked planning/spec documents remain untouched.
+- Active plan: Force-push the rewritten branch after final ancestry and validation checks, then verify GitGuardian and PR mergeability. Do not merge PR #2 without separate approval.
+- Latest verified evidence: Old commits `535d047` and `007bc87` are no longer ancestors of the feature branch. Full validation passed: 20 test files and 413 tests, TypeScript build, `git diff --check`, and secret-like scan with no credential values found. The current branch is intentionally ahead/behind its remote because the remote still has the old history.
 
 ## Last verified progress
 
@@ -31,11 +31,11 @@
 
 ## Current blockers
 
-PR #2 still needs independent review and explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
+PR #2 still needs the rewritten branch pushed and GitGuardian rechecked, followed by independent review and explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
 
 ## Next concrete action
 
-Obtain independent review for PR #2, then decide whether to merge it into canonical `main`. Keep context-pack and additional fabricated samples deferred.
+Force-push the rewritten feature branch, verify GitGuardian and PR #2, then decide whether to merge it into canonical `main`. Keep context-pack and additional fabricated samples deferred.
 
 ## Verification notes
 
