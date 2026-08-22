@@ -1,6 +1,6 @@
 # D-AI-Hub Short Commands
 
-D-AI-Hub defines four natural-language command prefixes for Codex and compatible agents. They are repository conventions, not built-in Codex commands. Their authoritative behavior is defined in the root `AGENTS.md`.
+D-AI-Hub exposes three primary natural-language command prefixes for ChatGPT Web, Codex, and compatible agents. They are repository conventions, not built-in commands. Their authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains available internally when durable outcomes should be captured during a session. The actions each client can perform still depend on its available GitHub access and permissions.
 
 ## Quick reference
 
@@ -8,7 +8,6 @@ D-AI-Hub defines four natural-language command prefixes for Codex and compatible
 | --- | --- |
 | `@D-AI establish` | Establish D-AI-Hub in a new or uncertain environment. |
 | `@D-AI sync` | Refresh canonical context before starting or resuming work. |
-| `@D-AI update` | Persist durable outcomes from the current session without closing it. |
 | `@D-AI close` | Finish the session by updating project memory/knowledge and syncing durable changes. |
 
 ## `@D-AI establish`
@@ -48,9 +47,9 @@ Example:
 @D-AI sync，然后继续开发 DeepSeek Harness Desktop。
 ```
 
-## `@D-AI update`
+## Internal `@D-AI update` workflow
 
-Use during a session when something has become worth keeping.
+Use internally during a session when something has become worth keeping. It is not promoted as a primary daily command.
 
 Good candidates:
 - a durable technical insight;
@@ -101,10 +100,11 @@ Example:
 ```text
 @D-AI sync
 → do the work
-→ @D-AI update (only when useful mid-session)
 → continue working
 → @D-AI close
 ```
+
+When a durable outcome is worth capturing before the session ends, run the internal `@D-AI update` workflow before continuing.
 
 `@D-AI establish` is normally not part of the daily loop once an environment has been successfully established.
 

@@ -4,7 +4,7 @@ This repository is the canonical source of truth for D-AI-Hub across ChatGPT Web
 
 ## D-AI Command Protocol
 
-The following are D-AI-Hub natural-language commands. They are not built-in Codex commands. When the user's message begins with one of these exact prefixes, interpret it as the workflow below and then continue with any task text that follows the command.
+The following are D-AI-Hub natural-language workflows for ChatGPT Web, Codex, and compatible agents. They are not built-in commands. `@D-AI establish`, `@D-AI sync`, and `@D-AI close` are the primary lifecycle commands; `@D-AI update` remains an internal workflow for recording durable outcomes during a session. When the user's message begins with one of these exact prefixes, interpret it as the workflow below and then continue with any task text that follows the command.
 
 ### `@D-AI establish`
 

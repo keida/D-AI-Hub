@@ -3,6 +3,7 @@
 ## Now
 
 - Apply the safe cross-client sync and write rules in `docs/workflow.md`; new environments must verify GitHub authentication before treating local state as current.
+- Complete the approved P0 consistency work: keep command documentation explicit about ChatGPT Web, Codex, and compatible agents, while retaining `@D-AI update` as an internal workflow.
 - Keep `STATUS.md`, `DECISIONS.md`, `BUGS.md`, and `REFERENCES.md` current after meaningful work.
 - Add durable knowledge only when it has a clear canonical home and a useful retrieval path.
 
@@ -12,7 +13,7 @@
 
 ## Deferred to V1.2+
 
-- Optional repository health check for broken links, Skill frontmatter, secret-like files, and stale indexes.
+- Optional automated repository health check for broken links, Skill frontmatter, secret-like files, and stale indexes; the current P0 audit is manual and does not introduce an automation system.
 - Optional GitHub Actions validation after real repository usage justifies it.
 - Optional source-ingestion workflow.
 - Optional semantic search or RAG after file-based retrieval is demonstrably insufficient.
