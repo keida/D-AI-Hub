@@ -33,7 +33,14 @@ import { resolveModelRoute, type ModelPolicy } from "../routing/model-router.js"
 import type { RoutingOverrides } from "../routing/override-parser.js";
 import { discoverSkillMetadata, selectCapabilities } from "../skills/registry.js";
 import { loadSelectedSkill, type LoadedSkill } from "../skills/skill-loader.js";
-import type { DurableContextStore, TaskOwnershipLease } from "../state/durable-context-store.js";
+import type {
+  DurableContextStore,
+  TaskOwnershipGuard,
+  TaskOwnershipLease,
+  TaskOwnershipTransfer,
+  TaskOwnershipTransitionAuthorizer,
+  TaskStateWriteAuthorization,
+} from "../state/durable-context-store.js";
 import { FileDurableContextStore } from "../state/file-durable-context-store.js";
 import { evaluateHardGates, type GateEvidence, type GateResult, type HardGateInput } from "../verification/gates.js";
 
@@ -97,7 +104,7 @@ type EvaluateHardGates = (input: HardGateInput) => readonly GateResult[];
 type CreateDebugSession = (originalFailure: string, preservedRecoveryPointId: string) => DebugSession;
 type CaptureRecoveryPoint = (state: TaskState) => Promise<RecoveryPoint | CapturedRecoveryPoint>;
 type Recover = (state: TaskState, reason: string) => Promise<TaskState>;
-type RollbackTask = (state: TaskState, lease: TaskOwnershipLease) => Promise<RollbackResult>;
+type RollbackTask = (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<RollbackResult>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
   readonly workspacePath: string | null;
@@ -118,7 +125,7 @@ export interface DAIRuntimeDependencies {
   readonly captureRecoveryPoint: CaptureRecoveryPoint;
   readonly recover: Recover;
   readonly rollbackTask?: RollbackTask | undefined;
-  readonly closeTask: (state: TaskState) => Promise<CloseVerdict>;
+  readonly closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<CloseVerdict>;
   readonly maximumEvidenceAgeMs: number;
   readonly now: () => Date;
 }
@@ -350,9 +357,13 @@ function redactStateEvidence(state: TaskState): TaskState {
   };
 }
 
-async function persistState(store: DurableContextStore, state: TaskState, lease?: TaskOwnershipLease): Promise<TaskState> {
+async function persistState(
+  store: DurableContextStore,
+  state: TaskState,
+  authorization?: TaskStateWriteAuthorization,
+): Promise<TaskState> {
   const redactedState = redactStateEvidence(state);
-  const manifest = await store.save(redactedState, lease);
+  const manifest = await store.save(redactedState, authorization);
   return { ...redactedState, durableContext: manifest };
 }
 
@@ -403,14 +414,21 @@ async function withDurableTaskOwnership(
   store: DurableContextStore,
   operation: (
     lease: TaskOwnershipLease,
-    transfer: (targetEnvironment: Environment) => Promise<void>,
+    transfer: TaskOwnershipTransfer,
+    assertOwnership: TaskOwnershipGuard,
+    authorizeTransition: TaskOwnershipTransitionAuthorizer,
   ) => Promise<DAIResponse>,
 ): Promise<DAIResponse> {
   try {
     if (store.withTaskOwnership === undefined) {
       throw new InvalidTaskStateError("Durable task ownership is unavailable for a mutating runtime command");
     }
-    return await store.withTaskOwnership(taskId, environment, async (lease, transfer) => operation(lease, transfer));
+    return await store.withTaskOwnership(taskId, environment, async (lease, transfer, assertOwnership, authorizeTransition) => {
+      if (assertOwnership === undefined || authorizeTransition === undefined) {
+        throw new TaskOwnershipError(`Durable ownership guard is unavailable for task ${taskId}`);
+      }
+      return operation(lease, transfer, assertOwnership, authorizeTransition);
+    });
   } catch (error: unknown) {
     if (error instanceof TaskOwnershipError) {
       return blockedWithoutState(taskId, environment, error.message);
@@ -506,7 +524,8 @@ async function routeIntent(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
   lease: TaskOwnershipLease,
-): Promise<{ readonly state: TaskState; readonly skills: readonly LoadedSkill[] }> {
+  authorizeTransition: TaskOwnershipTransitionAuthorizer,
+): Promise<{ readonly state: TaskState; readonly skills: readonly LoadedSkill[]; readonly authorization: TaskStateWriteAuthorization }> {
   const stage = requestedStage(request.overrides);
   const role = requestedRole(stage, request.overrides);
   const candidateEnvironment = preferredEnvironment(request.sourceEnvironment, stage, role, request.overrides, dependencies.modelPolicies);
@@ -526,6 +545,7 @@ async function routeIntent(
   const routingDecision = route.environment === modelDecision.environment
     ? modelDecision
     : dependencies.resolveModelRoute(stage, role, route.environment, dependencies.modelPolicies, request.overrides);
+  const authorization = route.environment === lease.environment ? lease : authorizeTransition(route.environment);
   assertStageTransition(state.stage, "route");
   const routedState = await persistState(dependencies.store, {
     ...state,
@@ -544,7 +564,7 @@ async function routeIntent(
     },
     selectedCapabilities: [...routingDecision.selectedCapabilities],
     durableContext: null,
-  }, lease);
+  }, authorization);
   const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
   const selected = dependencies.selectCapabilities(routedState.goal, stage, route.environment, descriptors);
   const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
@@ -555,9 +575,9 @@ async function routeIntent(
   const plannedState = await persistState(dependencies.store, {
     ...transitionState(routedState, "plan", "planner", route.environment),
     contextManifest,
-  }, lease);
+  }, authorization);
   const executionState = transitionState(plannedState, "execute", routingDecision.role, route.environment);
-  return { state: await persistState(dependencies.store, executionState, lease), skills };
+  return { state: await persistState(dependencies.store, executionState, authorization), skills, authorization };
 }
 
 function gateEvidence(
@@ -726,7 +746,7 @@ async function enterRecovery(
   state: TaskState,
   reason: string,
   dependencies: DAIRuntimeDependencies,
-  lease: TaskOwnershipLease,
+  authorization: TaskStateWriteAuthorization,
 ): Promise<DAIResponse> {
   const redactedReason = redactSensitiveText(reason);
   const debugTransition = transitionState(state, "debug", "debugger", state.environment);
@@ -738,7 +758,7 @@ async function enterRecovery(
       ...debugTransition.routingDecision,
       reason: `Debugging required: ${redactedReason}`,
     },
-  }, lease);
+  }, authorization);
   const recoveryOutcome = await connectorOutcome(async () => {
     const recovered = await dependencies.recover(debugState, redactedReason);
     if (recovered.taskId !== state.taskId) {
@@ -761,7 +781,7 @@ async function enterRecovery(
         reason: `Recovery outcome: ${redactedReason}`,
       },
       durableContext: null,
-    }, lease);
+    }, authorization);
   }, recoveryConnectorFailure);
   return recoveryOutcome.kind === "blocked"
     ? response(debugState, "blocked", `Recovery connector blocked: ${recoveryOutcome.message}`)
@@ -784,7 +804,7 @@ async function executeRoutedState(
   skills: readonly LoadedSkill[],
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
-  lease: TaskOwnershipLease,
+  authorization: TaskStateWriteAuthorization,
 ): Promise<DAIResponse> {
   registry.transfer(routedState.taskId, routedState.environment);
   const executionOutcome = await connectorOutcome(
@@ -792,37 +812,37 @@ async function executeRoutedState(
     executionConnectorFailure,
   );
   if (executionOutcome.kind === "blocked") {
-    return enterRecovery(routedState, executionOutcome.message, dependencies, lease);
+    return enterRecovery(routedState, executionOutcome.message, dependencies, authorization);
   }
   const execution = validateExecutionResult(executionOutcome.value);
   const identityFailure = evidenceIdentityFailure(routedState, execution.evidence);
   if (identityFailure !== null) {
-    return enterRecovery(routedState, identityFailure, dependencies, lease);
+    return enterRecovery(routedState, identityFailure, dependencies, authorization);
   }
   if (execution.status !== "completed") {
     const executedState = await persistState(dependencies.store, {
       ...routedState,
       verificationEvidence: [...routedState.verificationEvidence, ...execution.evidence],
       durableContext: null,
-    }, lease);
-    return enterRecovery(executedState, execution.message, dependencies, lease);
+    }, authorization);
+    return enterRecovery(executedState, execution.message, dependencies, authorization);
   }
   const inspectedTransition = transitionState(routedState, "inspect", "evidence-collector", routedState.environment);
   const inspectedState = await persistState(dependencies.store, {
     ...inspectedTransition,
     verificationEvidence: [...inspectedTransition.verificationEvidence, ...execution.evidence],
-  }, lease);
+  }, authorization);
   const preliminaryVerifyState = await persistState(
     dependencies.store,
     transitionState(inspectedState, "verify", "evidence-collector", inspectedState.environment),
-    lease,
+    authorization,
   );
   const recoveryPointOutcome = await connectorOutcome(
     () => dependencies.captureRecoveryPoint(preliminaryVerifyState),
     executionConnectorFailure,
   );
   if (recoveryPointOutcome.kind === "blocked") {
-    return enterRecovery(preliminaryVerifyState, recoveryPointOutcome.message, dependencies, lease);
+    return enterRecovery(preliminaryVerifyState, recoveryPointOutcome.message, dependencies, authorization);
   }
   const recoveryPointValidation = validateCapturedRecoveryPoint(
     preliminaryVerifyState,
@@ -830,7 +850,7 @@ async function executeRoutedState(
     dependencies.now(),
   );
   if (recoveryPointValidation.kind === "blocked") {
-    return enterRecovery(preliminaryVerifyState, recoveryPointValidation.message, dependencies, lease);
+    return enterRecovery(preliminaryVerifyState, recoveryPointValidation.message, dependencies, authorization);
   }
   const verifiedState = await persistState(dependencies.store, {
     ...preliminaryVerifyState,
@@ -841,11 +861,11 @@ async function executeRoutedState(
     recoveryPoint: recoveryPointValidation.value.recoveryPoint,
     recoverySnapshot: recoveryPointValidation.value.recoverySnapshot,
     durableContext: null,
-  }, lease);
+  }, authorization);
   const applicableGates = applicableExecutionGates(verifiedState);
   const exactEvidenceFailure = gateEvidenceFailure(verifiedState.verificationEvidence, applicableGates);
   if (exactEvidenceFailure !== null) {
-    return enterRecovery(verifiedState, exactEvidenceFailure, dependencies, lease);
+    return enterRecovery(verifiedState, exactEvidenceFailure, dependencies, authorization);
   }
   const gates = dependencies.evaluateHardGates({
     state: verifiedState,
@@ -855,7 +875,7 @@ async function executeRoutedState(
   });
   const gateFailure = failedGateReason(gates, applicableGates);
   if (gateFailure !== null) {
-    return enterRecovery(verifiedState, gateFailure, dependencies, lease);
+    return enterRecovery(verifiedState, gateFailure, dependencies, authorization);
   }
   return response(verifiedState, "completed", execution.message);
 }
@@ -866,9 +886,14 @@ async function executeIntentExclusive(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
   lease: TaskOwnershipLease,
+  transfer: TaskOwnershipTransfer,
+  authorizeTransition: TaskOwnershipTransitionAuthorizer,
 ): Promise<DAIResponse> {
-  const routed = await routeIntent(bootstrapped, request, dependencies, lease);
-  return executeRoutedState(routed.state, routed.skills, dependencies, registry, lease);
+  const routed = await routeIntent(bootstrapped, request, dependencies, lease, authorizeTransition);
+  const executionLease = routed.state.environment === lease.environment
+    ? lease
+    : await transfer(routed.state.environment);
+  return executeRoutedState(routed.state, routed.skills, dependencies, registry, executionLease);
 }
 
 async function executeIntent(
@@ -891,14 +916,14 @@ async function executeIntent(
       bootstrapped.taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (lease) => {
+      async (lease, transfer, _assertOwnership, authorizeTransition) => {
         const existing = await dependencies.store.load(bootstrapped.taskId);
         const ownedBootstrap = existing ?? (
           bootstrapped.durableContext === null
             ? await persistState(dependencies.store, bootstrapped, lease)
             : bootstrapped
         );
-        return executeIntentExclusive(request, ownedBootstrap, dependencies, registry, lease);
+        return executeIntentExclusive(request, ownedBootstrap, dependencies, registry, lease, transfer, authorizeTransition);
       },
     ),
   );
@@ -979,6 +1004,7 @@ async function rollbackActiveTaskExclusive(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
   lease: TaskOwnershipLease,
+  assertOwnership: TaskOwnershipGuard,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
@@ -998,8 +1024,9 @@ async function rollbackActiveTaskExclusive(
   if (dependencies.rollbackTask === undefined) {
     return response(state, "blocked", "Rollback connector is not configured");
   }
+  await assertOwnership();
   const rollbackOutcome = await connectorOutcome(
-    () => dependencies.rollbackTask!(state, lease),
+    () => dependencies.rollbackTask!(state, lease, assertOwnership),
     rollbackConnectorFailure,
   );
   if (rollbackOutcome.kind === "blocked") {
@@ -1036,7 +1063,7 @@ async function rollbackActiveTask(
       taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (lease) => rollbackActiveTaskExclusive(taskId, request, dependencies, registry, lease),
+      async (lease, _transfer, assertOwnership) => rollbackActiveTaskExclusive(taskId, request, dependencies, registry, lease, assertOwnership),
     ),
   );
 }
@@ -1083,7 +1110,8 @@ async function handoffTaskExclusive(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
   lease: TaskOwnershipLease,
-  transferOwnership: (targetEnvironment: Environment) => Promise<void>,
+  transferOwnership: TaskOwnershipTransfer,
+  authorizeTransition: TaskOwnershipTransitionAuthorizer,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Source operations are blocked while task ${taskId} changes handoff ownership`);
@@ -1124,7 +1152,7 @@ async function handoffTaskExclusive(
       },
       durableContext: null,
     };
-    const activeState = await persistState(dependencies.store, activeCandidate, lease);
+    const activeState = await persistState(dependencies.store, activeCandidate, authorizeTransition(command.target));
     await transferOwnership(command.target);
     return {
       envelope,
@@ -1163,7 +1191,16 @@ async function handoffTask(
       taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (lease, transfer) => handoffTaskExclusive(taskId, request, command, dependencies, registry, lease, transfer),
+      async (lease, transfer, _assertOwnership, authorizeTransition) => handoffTaskExclusive(
+        taskId,
+        request,
+        command,
+        dependencies,
+        registry,
+        lease,
+        transfer,
+        authorizeTransition,
+      ),
     ),
   );
 }
@@ -1305,6 +1342,7 @@ async function closeActiveTaskExclusive(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
   lease: TaskOwnershipLease,
+  assertOwnership: TaskOwnershipGuard,
 ): Promise<DAIResponse> {
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
@@ -1316,7 +1354,8 @@ async function closeActiveTaskExclusive(
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
   }
-  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(state), closeConnectorFailure);
+  await assertOwnership();
+  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(state, lease, assertOwnership), closeConnectorFailure);
   if (closeOutcome.kind === "blocked") {
     return response(state, "blocked", `Close connector blocked: ${closeOutcome.message}`);
   }
@@ -1389,7 +1428,7 @@ async function closeActiveTask(
       taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (lease) => closeActiveTaskExclusive(taskId, request, dependencies, registry, lease),
+      async (lease, _transfer, assertOwnership) => closeActiveTaskExclusive(taskId, request, dependencies, registry, lease, assertOwnership),
     ),
   );
 }
@@ -1471,7 +1510,7 @@ function createDefaultDependencies(): DAIRuntimeDependencies {
     captureRecoveryPoint: defaultCaptureRecoveryPoint,
     recover: defaultRecovery,
     rollbackTask: createGitRollbackTask(root),
-    closeTask: (state: TaskState): Promise<CloseVerdict> => closeTask(state, { store, gitHub }),
+    closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard): Promise<CloseVerdict> => closeTask(state, { store, gitHub }, lease, assertOwnership),
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),
   };

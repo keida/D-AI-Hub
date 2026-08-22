@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
+import { TaskOwnershipError } from "../../src/domain/errors.js";
 import { createGitRollbackTask } from "../../src/recovery/git-rollback-adapter.js";
 import type { RecoverySnapshot, TaskState } from "../../src/domain/types.js";
+import type { TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 
 async function git(repositoryPath: string, argumentsList: readonly string[]): Promise<string> {
   return (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
@@ -60,11 +62,13 @@ function state(snapshot: RecoverySnapshot): TaskState {
   };
 }
 
+const activeOwnershipGuard = async (): Promise<void> => {};
+
 describe("Git rollback adapter", () => {
   it("preserves user work, reverts post-recovery commits, restores the patch, and verifies the snapshot", async () => {
     const fixture = await createRepository();
     try {
-      const result = await createGitRollbackTask(fixture.root)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" });
+      const result = await createGitRollbackTask(fixture.root)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
       expect(result.verification.passed).toBe(true);
       expect(result.actions.map((action) => action.arguments[0])).toEqual(["revert", "apply"]);
       expect(result.preservedUserWork.patchDigest).toBe(createHash("sha256").update("", "utf8").digest("hex"));
@@ -79,7 +83,40 @@ describe("Git rollback adapter", () => {
     const fixture = await createRepository();
     try {
       const mismatched = { ...fixture.snapshot, status: " M artifact.txt" };
-      await expect(createGitRollbackTask(fixture.root)(state(mismatched), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" })).rejects.toThrow(/recovery point verification failed/i);
+      await expect(createGitRollbackTask(fixture.root)(state(mismatched), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/recovery point verification failed/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mutate Git after ownership is lost between rollback operations", async () => {
+    const fixture = await createRepository();
+    const lease: TaskOwnershipLease = { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
+    let checks = 0;
+    const assertOwnership = async (): Promise<void> => {
+      checks += 1;
+      if (checks >= 3) throw new TaskOwnershipError("Rollback ownership was lost");
+    };
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), lease, assertOwnership)).rejects.toThrow(TaskOwnershipError);
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
+      await expect(git(fixture.root, ["status", "--porcelain=v1"])).resolves.toContain("?? user-work.txt");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("stops Git verification when ownership is lost between verification reads", async () => {
+    const fixture = await createRepository();
+    const lease: TaskOwnershipLease = { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
+    let checks = 0;
+    const assertOwnership = async (): Promise<void> => {
+      checks += 1;
+      if (checks >= 10) throw new TaskOwnershipError("Rollback ownership was lost during verification");
+    };
+
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), lease, assertOwnership)).rejects.toThrow(TaskOwnershipError);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

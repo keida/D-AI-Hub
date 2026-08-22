@@ -7,8 +7,9 @@ import { runCommand } from "../../src/adapters/command-runner.js";
 import { GitHubCliAdapter, GitRemoteBlockedError } from "../../src/adapters/github.js";
 import { pushGitRef, readRemoteRef, type GitPushResult, type GitTransport } from "../../src/adapters/git.js";
 import { closeTask } from "../../src/close/close-service.js";
-import type { CloseCandidate, DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
-import type { DurableContextStore } from "../../src/state/durable-context-store.js";
+import { TaskOwnershipError } from "../../src/domain/errors.js";
+import type { CloseCandidate, CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { DurableContextStore, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
@@ -223,7 +224,91 @@ function storeFor(state: TaskState): DurableContextStore {
   };
 }
 
+async function closeWithOwnership(
+  state: TaskState,
+  dependencies: { readonly store: DurableContextStore; readonly gitHub: GitHubAdapter },
+): Promise<CloseVerdict> {
+  if (dependencies.store.withTaskOwnership === undefined) {
+    const lease: TaskOwnershipLease = { taskId: state.taskId, environment: state.environment, generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
+    return closeTask(state, dependencies, lease, async (): Promise<void> => {});
+  }
+  return dependencies.store.withTaskOwnership(
+    state.taskId,
+    state.environment,
+    async (lease, _transfer, assertOwnership) => closeTask(state, dependencies, lease, assertOwnership),
+  );
+}
+
 describe("GitHub close integration", () => {
+  it("does not push after ownership is lost following close-candidate persistence", async () => {
+    const now = new Date().toISOString();
+    const state = stateFor("C:/workspace", "e".repeat(40), now, "origin", "refs/heads/main");
+    const baseStore = storeFor(state);
+    let ownershipLost = false;
+    let pushCalls = 0;
+    let remoteCalls = 0;
+    const store: DurableContextStore = {
+      ...baseStore,
+      saveCloseCandidate: async (candidate: CloseCandidate): Promise<void> => {
+        await baseStore.saveCloseCandidate!(candidate);
+        ownershipLost = true;
+      },
+    };
+    const gitHub: GitHubAdapter = {
+      pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+        pushCalls += 1;
+        throw new Error("Push must not run after ownership loss");
+      },
+      verifyRemoteState: async (): Promise<RemoteState> => {
+        remoteCalls += 1;
+        throw new Error("Remote verification must not run after ownership loss");
+      },
+    };
+    const lease: TaskOwnershipLease = { taskId: state.taskId, environment: state.environment, generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
+    const assertOwnership = async (): Promise<void> => {
+      if (ownershipLost) throw new TaskOwnershipError("Close ownership was lost");
+    };
+    const verdict = await closeTask(state, { store, gitHub }, lease, assertOwnership);
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(pushCalls).toBe(0);
+    expect(remoteCalls).toBe(0);
+  });
+
+  it("does not verify the remote after ownership is lost during push", async () => {
+    const now = new Date().toISOString();
+    const state = stateFor("C:/workspace", "e".repeat(40), now, "origin", "refs/heads/main");
+    let ownershipLost = false;
+    let remoteCalls = 0;
+    const gitHub: GitHubAdapter = {
+      pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+        ownershipLost = true;
+        return {
+          remote: "origin",
+          repository: "github.com/acme/d-ai",
+          ref: "refs/heads/main",
+          localSha: "e".repeat(40),
+          pushed: true,
+          observedOutput: "Push completed",
+          exitCode: 0,
+          failureCategory: null,
+        };
+      },
+      verifyRemoteState: async (): Promise<RemoteState> => {
+        remoteCalls += 1;
+        return { repository: "github.com/acme/d-ai", ref: "refs/heads/main", remoteSha: "e".repeat(40), matchesExpectedSha: true };
+      },
+    };
+    const lease: TaskOwnershipLease = { taskId: state.taskId, environment: state.environment, generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
+    const assertOwnership = async (): Promise<void> => {
+      if (ownershipLost) throw new TaskOwnershipError("Close ownership was lost");
+    };
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub }, lease, assertOwnership);
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(remoteCalls).toBe(0);
+  });
+
   it("pushes to a temporary bare remote and verifies its exact SHA through the GitHub adapter", async () => {
     const fixture = await createBareCloseFixture("d-ai-github-close-");
     const { root, repositoryPath, bareRemotePath, close } = fixture;
@@ -243,7 +328,7 @@ describe("GitHub close integration", () => {
         readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(bareRemotePath, ref, null),
       };
 
-      const verdict = await closeTask(close.state, {
+      const verdict = await closeWithOwnership(close.state, {
         store: close.store,
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
       });
@@ -270,7 +355,7 @@ describe("GitHub close integration", () => {
         },
         readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
       };
-      const verdict = await closeTask(fixture.close.state, {
+      const verdict = await closeWithOwnership(fixture.close.state, {
         store: fixture.close.store,
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
       });
@@ -285,17 +370,19 @@ describe("GitHub close integration", () => {
   it("returns NO when critical unsaved context appears after the real candidate is persisted", async () => {
     const fixture = await createBareCloseFixture("d-ai-github-unsaved-context-");
     try {
-      const localBareTransport: GitTransport = {
-        pushRef: async (localRepositoryPath, _endpoint, ref, head) => {
-          const result = await pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head);
-          await fixture.close.store.recordCriticalUnsavedContext(fixture.close.state.taskId, ["late unsaved context"]);
-          return result;
-        },
-        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
-      };
-      const verdict = await closeTask(fixture.close.state, {
-        store: fixture.close.store,
-        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+      const verdict = await fixture.close.store.withTaskOwnership(fixture.close.state.taskId, fixture.close.state.environment, async (lease, _transfer, assertOwnership) => {
+        const localBareTransport: GitTransport = {
+          pushRef: async (localRepositoryPath, _endpoint, ref, head) => {
+            const result = await pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head);
+            await fixture.close.store.recordCriticalUnsavedContext(fixture.close.state.taskId, ["late unsaved context"], lease);
+            return result;
+          },
+          readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
+        };
+        return closeTask(fixture.close.state, {
+          store: fixture.close.store,
+          gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+        }, lease, assertOwnership);
       });
 
       expect(verdict.status).toBe("NO");
@@ -308,19 +395,21 @@ describe("GitHub close integration", () => {
   it("returns NO when real durable task context changes after remote verification", async () => {
     const fixture = await createBareCloseFixture("d-ai-github-post-candidate-change-");
     try {
-      const localBareTransport: GitTransport = {
-        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head),
-        readRef: async (_localRepositoryPath, _endpoint, ref) => {
-          const remoteState = await readRemoteRef(fixture.bareRemotePath, ref, null);
-          const current = await fixture.close.store.load(fixture.close.state.taskId);
-          if (current === null) throw new Error("Expected durable state during remote verification");
-          await fixture.close.store.save({ ...current, contextManifest: [...current.contextManifest, "post-candidate-change"] });
-          return remoteState;
-        },
-      };
-      const verdict = await closeTask(fixture.close.state, {
-        store: fixture.close.store,
-        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+      const verdict = await fixture.close.store.withTaskOwnership(fixture.close.state.taskId, fixture.close.state.environment, async (lease, _transfer, assertOwnership) => {
+        const localBareTransport: GitTransport = {
+          pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head),
+          readRef: async (_localRepositoryPath, _endpoint, ref) => {
+            const remoteState = await readRemoteRef(fixture.bareRemotePath, ref, null);
+            const current = await fixture.close.store.load(fixture.close.state.taskId);
+            if (current === null) throw new Error("Expected durable state during remote verification");
+            await fixture.close.store.save({ ...current, contextManifest: [...current.contextManifest, "post-candidate-change"] }, lease);
+            return remoteState;
+          },
+        };
+        return closeTask(fixture.close.state, {
+          store: fixture.close.store,
+          gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, localBareTransport),
+        }, lease, assertOwnership);
       });
 
       expect(verdict.status).toBe("NO");
@@ -347,7 +436,7 @@ describe("GitHub close integration", () => {
       await git(repositoryPath, ["remote", "set-url", "--push", "origin", `file://${bareRemotePath.replaceAll("\\", "/")}`]);
 
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const verdict = await closeTask(closeState, {
+      const verdict = await closeWithOwnership(closeState, {
         store: storeFor(closeState),
         gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: true }),
       });
@@ -377,7 +466,7 @@ describe("GitHub close integration", () => {
       await git(repositoryPath, ["config", `url.file://${bareRemotePath.replaceAll("\\", "/")}.insteadOf`, "https://github.com/acme/d-ai.git"]);
 
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const verdict = await closeTask(closeState, {
+      const verdict = await closeWithOwnership(closeState, {
         store: storeFor(closeState),
         gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: true }),
       });
@@ -411,7 +500,7 @@ describe("GitHub close integration", () => {
       await git(repositoryPath, ["config", `url.file://${bareRemotePath.replaceAll("\\", "/")}.insteadOf`, "git@github.com:acme/d-ai.git"]);
 
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const verdict = await closeTask(closeState, {
+      const verdict = await closeWithOwnership(closeState, {
         store: storeFor(closeState),
         gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: true }),
       });
@@ -457,7 +546,7 @@ describe("GitHub close integration", () => {
       };
 
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const verdict = await closeTask(closeState, {
+      const verdict = await closeWithOwnership(closeState, {
         store: storeFor(closeState),
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, malformedRemoteTransport),
       });
@@ -480,7 +569,7 @@ describe("GitHub close integration", () => {
         externalConfiguration.remote,
         externalConfiguration.ref,
       );
-      const verdict = await closeTask(closeState, {
+      const verdict = await closeWithOwnership(closeState, {
         store: storeFor(closeState),
         gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: externalConfiguration.enterpriseHost, credentialsConfigured: true }),
       });
@@ -500,7 +589,7 @@ describe("GitHub close integration", () => {
       await git(repositoryPath, ["commit", "-m", "external integration precondition"]);
       const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
       const closeState = stateFor(repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
-      const verdict = await closeTask(closeState, {
+      const verdict = await closeWithOwnership(closeState, {
         store: storeFor(closeState),
         gitHub: GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: false }),
       });

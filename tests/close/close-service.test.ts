@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { GitRemoteBlockedError } from "../../src/adapters/github.js";
 import { closeTask } from "../../src/close/close-service.js";
-import type { DurableContextStore } from "../../src/state/durable-context-store.js";
+import type { DurableContextStore, TaskOwnershipGuard, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
 import type { GitFailureCategory } from "../../src/adapters/git.js";
 import type { CloseCandidate, DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
@@ -98,6 +98,13 @@ function closeReadyState(now: string): TaskState {
     criticalUnsavedContext: [],
     durableContext,
   };
+}
+
+function validCloseOwnership(): readonly [TaskOwnershipLease, TaskOwnershipGuard] {
+  return [
+    { taskId: "task-close", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" },
+    async (): Promise<void> => {},
+  ];
 }
 
 function storeFor(state: TaskState | null): DurableContextStore {
@@ -199,7 +206,7 @@ describe("closeTask", () => {
     const verdict = await closeTask(state, {
       store: storeFor(state),
       gitHub: gitHubFor(pushEvidence, matchingRemoteState(pushEvidence.localSha)),
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("YES");
     expect(verdict.reasons).toEqual([]);
@@ -226,7 +233,7 @@ describe("closeTask", () => {
         },
         verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState(pushEvidence.localSha),
       },
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("YES");
     expect(verdict).toHaveProperty("closeCandidate");
@@ -252,7 +259,7 @@ describe("closeTask", () => {
     const verdict = await closeTask(state, {
       store,
       gitHub: gitHubFor(pushEvidence, matchingRemoteState(pushEvidence.localSha)),
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/candidate|context/i);
@@ -281,7 +288,7 @@ describe("closeTask", () => {
         },
         verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState(pushEvidence.localSha),
       },
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/context|candidate/i);
@@ -310,7 +317,7 @@ describe("closeTask", () => {
           return matchingRemoteState(pushEvidence.localSha);
         },
       },
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/context|candidate/i);
@@ -415,11 +422,10 @@ describe("closeTask", () => {
     const contextManifest = state.contextManifest.map((entry) => entry.startsWith("artifact:commit:") ? `artifact:commit:${commitSha}` : entry);
     const stateWithSha256 = { ...state, contextManifest };
     const pushEvidence = { ...successfulPush(), localSha: commitSha };
-
     const verdict = await closeTask(stateWithSha256, {
       store: storeFor(stateWithSha256),
       gitHub: gitHubFor(pushEvidence, matchingRemoteState(commitSha)),
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("YES");
   });
@@ -449,7 +455,7 @@ describe("closeTask", () => {
       observedOutput: "rejected by remote",
       failureCategory: "verification-mismatch" as const,
     };
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/push/i);
@@ -464,7 +470,7 @@ describe("closeTask", () => {
   ])("returns BLOCKED for ambiguous or external push failure: %s", async (observedOutput, failureCategory) => {
     const state = closeReadyState(new Date().toISOString());
     const failedPush = { ...successfulPush(), pushed: false, exitCode: 1, observedOutput, failureCategory };
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
   });
@@ -478,7 +484,7 @@ describe("closeTask", () => {
       verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState("e".repeat(40)),
     };
 
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expectNoRawSecretSignatures(verdict, secret);
@@ -494,7 +500,7 @@ describe("closeTask", () => {
       failureCategory: "ambiguous" as const,
     };
 
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(failedPush, matchingRemoteState(failedPush.localSha)) }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expectNoRawSecretSignatures(verdict, secret);
@@ -504,7 +510,7 @@ describe("closeTask", () => {
     const state = closeReadyState(new Date().toISOString());
     const pushEvidence = successfulPush();
     const remoteState = { ...matchingRemoteState(pushEvidence.localSha), remoteSha: "f".repeat(40), matchesExpectedSha: false };
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(pushEvidence, remoteState) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(pushEvidence, remoteState) }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/sha/i);
@@ -514,7 +520,7 @@ describe("closeTask", () => {
     const state = closeReadyState(new Date().toISOString());
     const pushEvidence = successfulPush();
     const contradictoryRemoteState = { ...matchingRemoteState(pushEvidence.localSha), matchesExpectedSha: false };
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(pushEvidence, contradictoryRemoteState) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(pushEvidence, contradictoryRemoteState) }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expect(verdict.reasons.join(" ")).toMatch(/invalid|conflict|sha/i);
@@ -658,7 +664,7 @@ describe("closeTask", () => {
       observedOutput: "Worktree status: M src/close.ts",
       failureCategory: "dirty-worktree" as const,
     };
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(dirtyPush, matchingRemoteState(dirtyPush.localSha)) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(dirtyPush, matchingRemoteState(dirtyPush.localSha)) }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/worktree/i);
@@ -673,7 +679,7 @@ describe("closeTask", () => {
       verifyRemoteState: async (): Promise<RemoteState> => matchingRemoteState("e".repeat(40)),
     };
 
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: unavailableGitHub });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: unavailableGitHub }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expect(verdict.reasons.join(" ")).toMatch(/remote/i);
@@ -689,7 +695,7 @@ describe("closeTask", () => {
       },
     };
 
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expectNoRawSecretSignatures(verdict, secret);
@@ -702,7 +708,7 @@ describe("closeTask", () => {
     const verdict = await closeTask(state, {
       store: storeFor(state),
       gitHub: gitHubFor(mismatchedPush, matchingRemoteState(mismatchedPush.localSha)),
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expect(verdict.reasons.join(" ")).toMatch(/evidence|remote|ref/i);
@@ -715,7 +721,7 @@ describe("closeTask", () => {
     const verdict = await closeTask(state, {
       store: storeFor(state),
       gitHub: gitHubFor(malformedPush, matchingRemoteState(malformedPush.localSha)),
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expect(verdict.reasons.join(" ")).toMatch(/evidence|object id|sha/i);
@@ -733,7 +739,7 @@ describe("closeTask", () => {
     const verdict = await closeTask(state, {
       store: storeFor(state),
       gitHub: gitHubFor(pushEvidence, mismatchedRemoteState),
-    });
+    }, ...validCloseOwnership());
 
     expect(verdict.status).toBe("BLOCKED");
     expect(verdict.reasons.join(" ")).toMatch(/remote state|repository|ref/i);

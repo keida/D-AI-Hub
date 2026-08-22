@@ -33,7 +33,14 @@ import {
 } from "../../src/runtime/d-ai-runtime.js";
 import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/registry.js";
 import { loadSelectedSkill } from "../../src/skills/skill-loader.js";
-import type { DurableContextStore, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
+import type {
+  DurableContextStore,
+  TaskOwnershipGuard,
+  TaskOwnershipLease,
+  TaskOwnershipTransfer,
+  TaskOwnershipTransition,
+  TaskOwnershipTransitionAuthorizer,
+} from "../../src/state/durable-context-store.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateResult, type HardGateInput } from "../../src/verification/gates.js";
 
@@ -75,12 +82,77 @@ interface RuntimeHarness {
 function inMemoryTaskOwnership<T>(
   taskId: string,
   environment: Environment,
-  operation: (lease: TaskOwnershipLease, transfer: (targetEnvironment: Environment) => Promise<void>) => Promise<T>,
+  operation: (
+    lease: TaskOwnershipLease,
+    transfer: TaskOwnershipTransfer,
+    assertOwnership: TaskOwnershipGuard,
+    authorizeTransition: TaskOwnershipTransitionAuthorizer,
+  ) => Promise<T>,
 ): Promise<T> {
+  const lease: TaskOwnershipLease = { taskId, environment, generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
   return operation(
-    { taskId, environment, generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" },
-    async (_targetEnvironment: Environment): Promise<void> => {},
+    lease,
+    async (targetEnvironment: Environment): Promise<TaskOwnershipLease> => ({ ...lease, environment: targetEnvironment }),
+    async (): Promise<void> => {},
+    (targetEnvironment) => targetEnvironment === lease.environment ? lease : { lease, targetEnvironment } as TaskOwnershipTransition,
   );
+}
+
+function observeFileStoreOwnership(fileStore: FileDurableContextStore): {
+  readonly store: DurableContextStore;
+  readonly transitions: () => readonly Environment[];
+  readonly transfers: () => readonly Environment[];
+  readonly events: () => readonly string[];
+} {
+  const transitions: Environment[] = [];
+  const transfers: Environment[] = [];
+  const events: string[] = [];
+  const store: DurableContextStore = {
+    load: (taskId): Promise<TaskState | null> => fileStore.load(taskId),
+    loadGenerationManifest: (taskId, manifestId): Promise<DurableContextManifest> => fileStore.loadGenerationManifest(taskId, manifestId),
+    verifyDurableSnapshot: (manifest): Promise<void> => fileStore.verifyDurableSnapshot(manifest),
+    save: (state, authorization): Promise<DurableContextManifest> => fileStore.save(state, authorization),
+    saveCloseCandidate: (candidate, lease): Promise<void> => fileStore.saveCloseCandidate(candidate, lease),
+    loadCloseCandidate: (taskId): Promise<CloseCandidate | null> => fileStore.loadCloseCandidate(taskId),
+    recordCriticalUnsavedContext: (taskId, items, lease): Promise<void> => fileStore.recordCriticalUnsavedContext(taskId, items, lease),
+    clearCriticalUnsavedContext: (taskId, lease): Promise<void> => fileStore.clearCriticalUnsavedContext(taskId, lease),
+    withTaskOwnership: <T>(
+      taskId: string,
+      environment: Environment,
+      operation: (
+        lease: TaskOwnershipLease,
+        transfer: TaskOwnershipTransfer,
+        assertOwnership: TaskOwnershipGuard,
+        authorizeTransition: TaskOwnershipTransitionAuthorizer,
+      ) => Promise<T>,
+    ): Promise<T> => fileStore.withTaskOwnership(
+      taskId,
+      environment,
+      (lease, transfer, assertOwnership, authorizeTransition): Promise<T> => operation(
+        lease,
+        async (targetEnvironment: Environment): Promise<TaskOwnershipLease> => {
+          transfers.push(targetEnvironment);
+          events.push(`transfer:start:${targetEnvironment}`);
+          return transfer(targetEnvironment).then((targetLease) => {
+            events.push(`transfer:complete:${targetEnvironment}`);
+            return targetLease;
+          });
+        },
+        assertOwnership,
+        (targetEnvironment: Environment) => {
+          transitions.push(targetEnvironment);
+          events.push(`transition:${targetEnvironment}`);
+          return authorizeTransition(targetEnvironment);
+        },
+      ),
+    ),
+  };
+  return {
+    store,
+    transitions: (): readonly Environment[] => [...transitions],
+    transfers: (): readonly Environment[] => [...transfers],
+    events: (): readonly string[] => [...events],
+  };
 }
 
 function memoryStore(savedStates: TaskState[], durablePath: string): DurableContextStore {
@@ -625,6 +697,60 @@ describe("D-AI runtime", () => {
     });
   });
 
+  it("transfers durable ownership before executing in the routed environment", async () => {
+    const executionEvents: string[] = [];
+    const runtimeHarness = harness((request) => {
+      executionEvents.push(`execute:${request.state.environment}`);
+      return completedExecution(request);
+    }, evaluateHardGates, "YES");
+    const baseStore = memoryStore(runtimeHarness.savedStates, "state.json");
+    const events: string[] = [];
+    const store: DurableContextStore = {
+      ...baseStore,
+      withTaskOwnership: <T>(
+        taskId: string,
+        environment: Environment,
+        operation: (
+          lease: TaskOwnershipLease,
+          transfer: TaskOwnershipTransfer,
+          assertOwnership: TaskOwnershipGuard,
+          authorizeTransition: TaskOwnershipTransitionAuthorizer,
+        ) => Promise<T>,
+      ) => baseStore.withTaskOwnership!(
+        taskId,
+        environment,
+        (lease, transfer, assertOwnership, authorizeTransition) => operation(
+          lease,
+          async (targetEnvironment: Environment): Promise<TaskOwnershipLease> => {
+            events.push(`transfer:start:${targetEnvironment}`);
+            const targetLease = await transfer(targetEnvironment);
+            events.push(`transfer:complete:${targetEnvironment}`);
+            return targetLease;
+          },
+          assertOwnership,
+          (targetEnvironment: Environment) => {
+            events.push(`transition:${targetEnvironment}`);
+            return authorizeTransition(targetEnvironment);
+          },
+        ),
+      ),
+    };
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store,
+    });
+
+    const response = await handle(intentRequest("chat", noOverrides));
+
+    expect(response.status, response.message).toBe("completed");
+    expect(events).toEqual([
+      "transition:codex",
+      "transfer:start:codex",
+      "transfer:complete:codex",
+    ]);
+    expect(executionEvents).toEqual(["execute:codex"]);
+  });
+
   it("preserves the task id and transfers single ownership through the existing handoff service", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const handle = createDAIRuntime(runtimeHarness.dependencies);
@@ -919,7 +1045,8 @@ describe("D-AI runtime", () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const firstStore = new FileDurableContextStore(durableRoot);
     const secondStore = new FileDurableContextStore(durableRoot);
-    const firstRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: firstStore });
+    const observedStore = observeFileStoreOwnership(firstStore);
+    const firstRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: observedStore.store });
     let releaseLease: () => void = () => {};
     let markLeaseActive: () => void = () => {};
     const leaseActive = new Promise<void>((resolve) => { markLeaseActive = resolve; });
@@ -956,10 +1083,19 @@ describe("D-AI runtime", () => {
         taskId: accepted.taskId,
         status: "accepted",
       });
-      await expect(firstRuntime({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides })).resolves.toMatchObject({
+      const handoff = await firstRuntime({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(handoff).toMatchObject({
         taskId: accepted.taskId,
+        stage: "handoff",
+        environment: "work",
         status: "accepted",
       });
+      await expect(firstStore.load(accepted.taskId)).resolves.toMatchObject({
+        environment: "work",
+        handoffState: "active",
+      });
+      expect(observedStore.transitions()).toEqual(["work"]);
+      expect(observedStore.transfers()).toEqual(["work"]);
     } finally {
       await rm(durableRoot, { recursive: true, force: true });
     }
@@ -1204,7 +1340,8 @@ describe("D-AI runtime", () => {
       return { ...result, evidence: result.evidence.map((evidence) => ({ ...evidence, recordedAt })) };
     }, evaluateHardGates, "YES");
     const firstStore = new FileDurableContextStore(durableRoot);
-    const dependencies = { ...runtimeHarness.dependencies, store: firstStore, now: (): Date => new Date() };
+    const observedStore = observeFileStoreOwnership(firstStore);
+    const dependencies = { ...runtimeHarness.dependencies, store: observedStore.store, now: (): Date => new Date() };
 
     try {
       const firstResponse = await createDAIRuntime(dependencies)(intentRequest("work", noOverrides));
@@ -1212,12 +1349,15 @@ describe("D-AI runtime", () => {
 
       const persisted = await firstStore.load(firstResponse.taskId);
       expect(persisted).toMatchObject({
+        environment: "codex",
         debugSession: {
           phase: "reproduce",
           originalFailure: "execution did not complete",
           preservedRecoveryPointId: expect.any(String),
         },
       });
+      expect(observedStore.transitions()).toEqual(["codex"]);
+      expect(observedStore.transfers()).toEqual(["codex"]);
 
       const freshStore = new FileDurableContextStore(durableRoot);
       const freshRuntime = createDAIRuntime({ ...dependencies, store: freshStore });
@@ -1523,7 +1663,7 @@ describe("D-AI runtime", () => {
     };
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
-      closeTask: async (state): Promise<CloseVerdict> => closeTask(state, { store: runtimeHarness.store, gitHub }),
+      closeTask: async (state, lease, assertOwnership): Promise<CloseVerdict> => closeTask(state, { store: runtimeHarness.store, gitHub }, lease, assertOwnership),
     });
     await handle(intentRequest("codex", noOverrides));
 

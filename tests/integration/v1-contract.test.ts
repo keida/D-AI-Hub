@@ -11,6 +11,7 @@ import { FileHandoffPersistence, PersistentHandoffService, type HandoffStatus } 
 import { createDAIRuntime, handleDAIRequest, type DAIRuntimeDependencies, type EnvironmentExecutionRequest, type EnvironmentExecutionResult } from "../../src/runtime/d-ai-runtime.js";
 import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/registry.js";
 import { loadSelectedSkill, type LoadedSkill } from "../../src/skills/skill-loader.js";
+import type { TaskOwnershipGuard, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateName } from "../../src/verification/gates.js";
 import { readFile, rm, writeFile } from "node:fs/promises";
@@ -118,7 +119,7 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
     discoverSkillMetadata, selectCapabilities,
     loadSelectedSkill: async (descriptor, resources) => { trace.requestedResources.push({ name: descriptor.name, resources: [...resources] }); const skill = await loadSelectedSkill(descriptor, resources); trace.loadedSkills.push(skill); return skill; },
     evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture" }), recover: async (state) => { await rm(fixture.recoveryMarkerPath); return { ...state, stage: "recover", role: "recovery-operator" }; },
-    closeTask: async (state): Promise<CloseVerdict> => closeTask(state, { store, gitHub: localGitHubAdapter(fixture) }), maximumEvidenceAgeMs: 300_000, now: () => new Date(),
+    closeTask: async (state, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard): Promise<CloseVerdict> => closeTask(state, { store, gitHub: localGitHubAdapter(fixture) }, lease, assertOwnership), maximumEvidenceAgeMs: 300_000, now: () => new Date(),
   };
   Object.defineProperty(trace, "failedResult", { get: () => failedResult });
   Object.defineProperty(trace, "passingResult", { get: () => passingResult });

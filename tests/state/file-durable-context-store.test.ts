@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { TaskOwnershipError } from "../../src/domain/errors.js";
 import type { RecoverySnapshot, TaskState } from "../../src/domain/types.js";
+import type { TaskOwnershipTransition } from "../../src/state/durable-context-store.js";
 import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
 function createState(taskId: string, goal: string): TaskState {
@@ -321,13 +322,15 @@ describe("FileDurableContextStore", () => {
 
     try {
       await store.save(state);
-      await store.recordCriticalUnsavedContext(state.taskId, ["uncommitted migration"]);
-      await expect(store.load(state.taskId)).resolves.toMatchObject({
-        criticalUnsavedContext: ["uncommitted migration"],
-      });
+      await store.withTaskOwnership(state.taskId, state.environment, async (lease) => {
+        await store.recordCriticalUnsavedContext(state.taskId, ["uncommitted migration"], lease);
+        await expect(store.load(state.taskId)).resolves.toMatchObject({
+          criticalUnsavedContext: ["uncommitted migration"],
+        });
 
-      await store.clearCriticalUnsavedContext(state.taskId);
-      await expect(store.load(state.taskId)).resolves.toMatchObject({ criticalUnsavedContext: [] });
+        await store.clearCriticalUnsavedContext(state.taskId, lease);
+        await expect(store.load(state.taskId)).resolves.toMatchObject({ criticalUnsavedContext: [] });
+      });
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }
@@ -363,10 +366,16 @@ describe("FileDurableContextStore", () => {
     const rootPath = await createStoreRoot();
     const sourceStore = new FileDurableContextStore(rootPath);
     const targetStore = new FileDurableContextStore(rootPath);
+    const state = createState("task-transfer", "Transfer durable ownership");
 
     try {
-      await sourceStore.withTaskOwnership("task-transfer", "codex", async (_lease, transfer) => {
-        await transfer("work");
+      await sourceStore.save({ ...state, environment: "codex" });
+      await sourceStore.withTaskOwnership("task-transfer", "codex", async (lease, transfer) => {
+        const targetLease = await transfer("work");
+        await expect(sourceStore.save({ ...state, environment: "work", durableContext: null }, lease)).rejects.toThrow(TaskOwnershipError);
+        await expect(sourceStore.save({ ...state, environment: "work", durableContext: null }, targetLease)).resolves.toMatchObject({
+          environment: "work",
+        });
       });
 
       const transfer = JSON.parse(await readFile(join(rootPath, "task-transfer", "ownership", "1", "transfer.json"), "utf8")) as {
@@ -409,7 +418,7 @@ describe("FileDurableContextStore", () => {
       });
       await secondActive;
       releaseFirst();
-      await first;
+      await expect(first).rejects.toThrow(TaskOwnershipError);
 
       await expect(thirdStore.withTaskOwnership("task-stale-release", "work", async () => {})).rejects.toThrow(TaskOwnershipError);
 
@@ -435,7 +444,7 @@ describe("FileDurableContextStore", () => {
     const secondRelease = new Promise<void>((resolve) => { releaseSecond = resolve; });
     try {
       await firstStore.save(state);
-      const first = firstStore.withTaskOwnership("task-stale-write", "codex", async (lease) => {
+      const first = firstStore.withTaskOwnership("task-stale-write", "work", async (lease) => {
         markFirstActive();
         await firstRelease;
         await expect(firstStore.save({ ...state, goal: "Stale goal", durableContext: null }, lease)).rejects.toThrow(TaskOwnershipError);
@@ -451,12 +460,72 @@ describe("FileDurableContextStore", () => {
       });
       await secondActive;
       releaseFirst();
-      await first;
+      await expect(first).rejects.toThrow(TaskOwnershipError);
 
       await expect(secondStore.load("task-stale-write")).resolves.toMatchObject({ goal: "Successor goal" });
 
       releaseSecond();
       await second;
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("permits only an ownership-authorized transition to its target environment", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-environment-fence", "Keep environment ownership aligned");
+
+    try {
+      await store.save(state);
+      await store.withTaskOwnership(state.taskId, "work", async (lease, _transfer, _assertOwnership, authorizeTransition) => {
+        await expect(store.save({ ...state, environment: "codex", durableContext: null }, lease)).rejects.toThrow(TaskOwnershipError);
+        const forgedTransition = { lease, targetEnvironment: "codex" } as unknown as TaskOwnershipTransition;
+        await expect(store.save({ ...state, environment: "codex", durableContext: null }, forgedTransition)).rejects.toThrow(TaskOwnershipError);
+        const transition = authorizeTransition("codex");
+        if (!("targetEnvironment" in transition)) throw new Error("Expected a cross-environment transition authorization");
+        const staleTransition = { ...transition, lease: { ...transition.lease, generation: transition.lease.generation + 1n } };
+        await expect(store.save({ ...state, environment: "codex", durableContext: null }, staleTransition)).rejects.toThrow(TaskOwnershipError);
+        await expect(store.save({ ...state, environment: "codex", durableContext: null }, transition)).resolves.toMatchObject({
+          environment: "codex",
+        });
+        await expect(store.save({ ...state, environment: "chat", durableContext: null }, transition)).rejects.toThrow(TaskOwnershipError);
+      });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects close-candidate and critical-context writes from a mismatched lease generation", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-lease-bearing-writes", "Fence every auxiliary write");
+
+    try {
+      await store.save(state);
+      const persisted = await store.load(state.taskId);
+      if (persisted?.durableContext === null || persisted?.durableContext === undefined) throw new Error("Expected persisted durable context");
+      await store.withTaskOwnership(state.taskId, "work", async (lease) => {
+        const staleLease = { ...lease, generation: lease.generation + 1n };
+        const candidate = {
+          taskId: state.taskId,
+          durableContext: persisted.durableContext,
+          contextManifest: persisted.contextManifest,
+          repositoryPath: "C:/workspace",
+          remote: "origin",
+          ref: "refs/heads/main",
+          commitSha: "a".repeat(40),
+          criticalUnsavedContext: [],
+          recordedAt: "2026-08-22T00:00:00.000Z",
+        };
+        const saveCloseCandidate = store.saveCloseCandidate.bind(store) as unknown as (value: typeof candidate, owner: typeof staleLease) => Promise<void>;
+        const recordCriticalUnsavedContext = store.recordCriticalUnsavedContext.bind(store) as unknown as (taskId: string, items: readonly string[], owner: typeof staleLease) => Promise<void>;
+        const clearCriticalUnsavedContext = store.clearCriticalUnsavedContext.bind(store) as unknown as (taskId: string, owner: typeof staleLease) => Promise<void>;
+
+        await expect(saveCloseCandidate(candidate, staleLease)).rejects.toThrow(TaskOwnershipError);
+        await expect(recordCriticalUnsavedContext(state.taskId, ["uncommitted migration"], staleLease)).rejects.toThrow(TaskOwnershipError);
+        await expect(clearCriticalUnsavedContext(state.taskId, staleLease)).rejects.toThrow(TaskOwnershipError);
+      });
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }
@@ -577,7 +646,7 @@ describe("FileDurableContextStore", () => {
     const secondState = { ...firstState, goal: "Successor generation" };
 
     try {
-      await firstStore.withTaskOwnership(firstState.taskId, "codex", async (lease) => {
+      await firstStore.withTaskOwnership(firstState.taskId, firstState.environment, async (lease) => {
         await firstStore.save(firstState, lease);
       });
       await secondStore.withTaskOwnership(secondState.taskId, "work", async (lease) => {

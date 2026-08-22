@@ -5,7 +5,7 @@ import { CloseBlockedError } from "../domain/errors.js";
 import type { CloseCandidate, CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
 import { isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
-import type { DurableContextStore } from "../state/durable-context-store.js";
+import type { DurableContextStore, TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
 import { evaluateHardGates, type GateEvidence, type GateName } from "../verification/gates.js";
 
 const maximumEvidenceAgeMs = 5 * 60 * 1_000;
@@ -338,6 +338,8 @@ function blockedReason(error: Error, nextCheck: string): string {
 export async function closeTask(
   state: TaskState,
   dependencies: { readonly store: DurableContextStore; readonly gitHub: GitHubAdapter },
+  lease?: TaskOwnershipLease,
+  assertOwnership?: TaskOwnershipGuard,
 ): Promise<CloseVerdict> {
   const now = new Date();
   const persistedState = await dependencies.store.load(state.taskId).then(
@@ -389,12 +391,20 @@ export async function closeTask(
     return createVerdict(state, "NO", preflightResult.reasons, state.verificationEvidence);
   }
   const configuration = preflightResult.configuration;
+  if (lease === undefined || assertOwnership === undefined) {
+    return createVerdict(state, "BLOCKED", [failure("Close ownership guard is unavailable", "rerun close through the ownership-gated runtime")], state.verificationEvidence);
+  }
+  if (lease.taskId !== state.taskId || lease.environment !== state.environment) {
+    return createVerdict(state, "BLOCKED", [failure("Close ownership does not match the task environment", "reload the task through its authoritative environment")], state.verificationEvidence);
+  }
   if (dependencies.store.saveCloseCandidate === undefined || dependencies.store.loadCloseCandidate === undefined) {
     return createVerdict(state, "BLOCKED", [failure("Durable close candidate persistence is unavailable", "use the real durable context store before close")], state.verificationEvidence);
   }
   const candidate = createCloseCandidate(state, configuration, now.toISOString());
   try {
-    await dependencies.store.saveCloseCandidate(candidate);
+    await assertOwnership();
+    await dependencies.store.saveCloseCandidate(candidate, lease);
+    await assertOwnership();
     const persistedCandidate = await loadCloseCandidate(dependencies.store, state.taskId);
     const candidateFailure = closeCandidateFailure(persistedCandidate, state, configuration);
     if (candidateFailure !== null) {
@@ -404,12 +414,24 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Durable close candidate could not be persisted or verified: ${redactSensitiveText(message)}`, "restore durable candidate storage and rerun close")], state.verificationEvidence);
   }
+  try {
+    await assertOwnership();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before push: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], state.verificationEvidence);
+  }
   const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as GitPushEvidence | null, error }),
   );
   if (pushResult.error !== null || pushResult.value === null) {
     return createVerdict(state, "BLOCKED", [blockedReason(pushResult.error ?? new CloseBlockedError("GitHub push returned no evidence"), "check remote reachability, permissions, and configured host")], state.verificationEvidence);
+  }
+  try {
+    await assertOwnership();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost after push: ${redactSensitiveText(message)}`, "reacquire task ownership before remote verification")], state.verificationEvidence);
   }
   const invalidPushEvidence = pushEvidenceFailure(pushResult.value, configuration);
   if (invalidPushEvidence !== null) {
@@ -443,12 +465,24 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Close candidate binding could not be reverified: ${redactSensitiveText(message)}`, "restore durable task and candidate state before retrying close")], [...state.verificationEvidence, recordedPushEvidence]);
   }
+  try {
+    await assertOwnership();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before remote verification: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
+  }
   const remoteResult = await dependencies.gitHub.verifyRemoteState(pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as RemoteState | null, error }),
   );
   if (remoteResult.error !== null || remoteResult.value === null) {
     return createVerdict(state, "BLOCKED", [blockedReason(remoteResult.error ?? new CloseBlockedError("GitHub remote verification returned no state"), "check remote reachability, permissions, and the configured GitHub host")], [...state.verificationEvidence, recordedPushEvidence]);
+  }
+  try {
+    await assertOwnership();
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost after remote verification: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
   }
   const invalidRemoteEvidence = remoteEvidenceFailure(remoteResult.value, pushResult.value, configuration);
   if (invalidRemoteEvidence !== null) {

@@ -6,7 +6,15 @@ import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
 import type { CloseCandidate, DebugSession, DurableContextManifest, Environment, TaskState } from "../domain/types.js";
-import type { DurableContextStore, TaskOwnershipLease } from "./durable-context-store.js";
+import type {
+  DurableContextStore,
+  TaskOwnershipGuard,
+  TaskOwnershipLease,
+  TaskOwnershipTransfer,
+  TaskOwnershipTransition,
+  TaskOwnershipTransitionAuthorizer,
+  TaskStateWriteAuthorization,
+} from "./durable-context-store.js";
 
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const credentialFieldPattern = /(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credential|cookie|password|private[_-]?key|secret|session[_-]?token)/i;
@@ -101,6 +109,12 @@ const rollbackAuditSchema = z.object({
   actions: z.array(z.object({ command: z.string().min(1), arguments: z.array(z.string()), stdout: z.string(), stderr: z.string(), exitCode: z.number().int().nullable() }).strict()),
   verification: z.object({ passed: z.boolean(), observedOutput: z.string(), reason: z.string() }).strict(),
   recordedAt: z.string().datetime(),
+}).strict();
+const ownershipTransferSchema = z.object({
+  taskId: z.string().min(1),
+  ownerToken: z.string().uuid(),
+  sourceEnvironment: environmentSchema,
+  targetEnvironment: environmentSchema,
 }).strict();
 const recoveryPointSchema = z
   .object({
@@ -229,6 +243,10 @@ interface ActivePointer {
 
 function createHashForContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function isTaskOwnershipTransition(authorization: TaskStateWriteAuthorization): authorization is TaskOwnershipTransition {
+  return "targetEnvironment" in authorization;
 }
 
 function serialize(value: object): string {
@@ -503,6 +521,7 @@ async function publishActivePointer(paths: SnapshotPaths, manifestId: string, ow
 export class FileDurableContextStore implements DurableContextStore {
   private readonly rootPath: string;
   private readonly saveLocks = new Map<string, Promise<void>>();
+  private readonly issuedTransitions = new WeakSet<TaskOwnershipTransition>();
 
   public constructor(rootPath: string) {
     this.rootPath = resolve(rootPath);
@@ -596,27 +615,45 @@ export class FileDurableContextStore implements DurableContextStore {
     return state;
   }
 
-  public async save(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest> {
+  public async save(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest> {
     const previous = this.saveLocks.get(state.taskId) ?? Promise.resolve();
     let release: () => void = () => {};
     const current = new Promise<void>((resolve) => { release = resolve; });
     this.saveLocks.set(state.taskId, current);
     await previous;
     try {
-      return await this.saveInternal(state, lease);
+      return await this.saveInternal(state, authorization);
     } finally {
       release();
       if (this.saveLocks.get(state.taskId) === current) this.saveLocks.delete(state.taskId);
     }
   }
 
-  private async saveInternal(state: TaskState, lease?: TaskOwnershipLease): Promise<DurableContextManifest> {
+  private async saveInternal(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest> {
     assertTaskId(state.taskId);
     const paths = createSnapshotPaths(this.rootPath, state.taskId);
-    const ownedLease = lease === undefined ? undefined : lease as FileTaskOwnershipLease;
+    let transition: TaskOwnershipTransition | null = null;
+    let ownedLease: TaskOwnershipLease | undefined;
+    if (authorization !== undefined) {
+      if (isTaskOwnershipTransition(authorization)) {
+        transition = authorization;
+        if (!this.issuedTransitions.has(transition)) {
+          throw new TaskOwnershipError(`Durable ownership transition is not store-issued for task ${state.taskId}`);
+        }
+        ownedLease = authorization.lease;
+      } else {
+        ownedLease = authorization;
+      }
+    }
     if (ownedLease !== undefined) {
       if (ownedLease.taskId !== state.taskId) {
         throw new TaskOwnershipError(`Durable ownership task mismatch for task ${state.taskId}`);
+      }
+      if (transition !== null && transition.targetEnvironment !== state.environment) {
+        throw new TaskOwnershipError(`Durable ownership transition target mismatch for task ${state.taskId}`);
+      }
+      if (transition === null && ownedLease.environment !== state.environment) {
+        throw new TaskOwnershipError(`Durable ownership environment mismatch for task ${state.taskId}`);
       }
       await this.assertCurrentTaskOwnership(ownedLease);
     }
@@ -700,8 +737,13 @@ export class FileDurableContextStore implements DurableContextStore {
     }
   }
 
-  public async saveCloseCandidate(candidate: CloseCandidate): Promise<void> {
+  public async saveCloseCandidate(candidate: CloseCandidate, lease?: TaskOwnershipLease): Promise<void> {
     assertTaskId(candidate.taskId);
+    if (lease === undefined) throw new TaskOwnershipError(`Durable close candidate write requires ownership for task ${candidate.taskId}`);
+    if (lease.taskId !== candidate.taskId || lease.environment !== candidate.durableContext.environment) {
+      throw new TaskOwnershipError(`Durable close candidate ownership mismatch for task ${candidate.taskId}`);
+    }
+    await this.assertCurrentTaskOwnership(lease);
     const paths = createSnapshotPaths(this.rootPath, candidate.taskId);
     assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate");
     const validatedCandidate = parseCloseCandidate(candidate, candidate.taskId, paths.closeCandidate);
@@ -711,6 +753,7 @@ export class FileDurableContextStore implements DurableContextStore {
     }
     await mkdir(paths.taskRoot, { recursive: true });
     const candidateContent = createCanonicalCloseCandidateContent(validatedCandidate);
+    await this.assertCurrentTaskOwnership(lease);
     await writeAtomically(paths.closeCandidate, serialize({
       candidate: validatedCandidate,
       hash: createHashForContent(candidateContent),
@@ -777,44 +820,80 @@ export class FileDurableContextStore implements DurableContextStore {
     return manifest;
   }
 
-  public async recordCriticalUnsavedContext(taskId: string, items: readonly string[]): Promise<void> {
+  public async recordCriticalUnsavedContext(taskId: string, items: readonly string[], lease?: TaskOwnershipLease): Promise<void> {
+    if (lease === undefined) throw new TaskOwnershipError(`Critical unsaved context write requires ownership for task ${taskId}`);
+    if (lease.taskId !== taskId) throw new TaskOwnershipError(`Critical unsaved context ownership task mismatch for task ${taskId}`);
+    await this.assertCurrentTaskOwnership(lease);
     const state = await this.requireState(taskId);
-    await this.save({ ...state, criticalUnsavedContext: [...items] });
+    if (state.environment !== lease.environment) throw new TaskOwnershipError(`Critical unsaved context ownership environment mismatch for task ${taskId}`);
+    await this.save({ ...state, criticalUnsavedContext: [...items] }, lease);
   }
 
-  public async clearCriticalUnsavedContext(taskId: string): Promise<void> {
+  public async clearCriticalUnsavedContext(taskId: string, lease?: TaskOwnershipLease): Promise<void> {
+    if (lease === undefined) throw new TaskOwnershipError(`Critical unsaved context clear requires ownership for task ${taskId}`);
+    if (lease.taskId !== taskId) throw new TaskOwnershipError(`Critical unsaved context ownership task mismatch for task ${taskId}`);
+    await this.assertCurrentTaskOwnership(lease);
     const state = await this.requireState(taskId);
-    await this.save({ ...state, criticalUnsavedContext: [] });
+    if (state.environment !== lease.environment) throw new TaskOwnershipError(`Critical unsaved context ownership environment mismatch for task ${taskId}`);
+    await this.save({ ...state, criticalUnsavedContext: [] }, lease);
   }
 
   public async withTaskOwnership<T>(
     taskId: string,
     environment: Environment,
-    operation: (lease: TaskOwnershipLease, transfer: (targetEnvironment: Environment) => Promise<void>) => Promise<T>,
+    operation: (
+      lease: TaskOwnershipLease,
+      transfer: TaskOwnershipTransfer,
+      assertOwnership: TaskOwnershipGuard,
+      authorizeTransition: TaskOwnershipTransitionAuthorizer,
+    ) => Promise<T>,
   ): Promise<T> {
     assertTaskId(taskId);
-    let lease = await this.acquireTaskOwnership(taskId, environment);
-    const transfer = async (targetEnvironment: Environment): Promise<void> => {
-      lease = await this.transferTaskOwnership(lease, targetEnvironment);
-    };
+    let currentLease = await this.acquireTaskOwnership(taskId, environment);
     let heartbeatFailure: TaskOwnershipError | null = null;
+    const lease: TaskOwnershipLease = {
+      taskId: currentLease.taskId,
+      environment: currentLease.environment,
+      generation: currentLease.generation,
+      ownerToken: currentLease.ownerToken,
+    };
+    const assertOwnership = async (): Promise<void> => {
+      if (heartbeatFailure !== null) throw heartbeatFailure;
+      await this.assertCurrentTaskOwnership(currentLease);
+      if (heartbeatFailure !== null) throw heartbeatFailure;
+    };
+    const transfer: TaskOwnershipTransfer = async (targetEnvironment: Environment): Promise<TaskOwnershipLease> => {
+      await assertOwnership();
+      currentLease = await this.transferTaskOwnership(currentLease, targetEnvironment);
+      await assertOwnership();
+      return {
+        taskId: currentLease.taskId,
+        environment: currentLease.environment,
+        generation: currentLease.generation,
+        ownerToken: currentLease.ownerToken,
+      };
+    };
+    const authorizeTransition: TaskOwnershipTransitionAuthorizer = (targetEnvironment) => {
+      if (targetEnvironment === lease.environment) return lease;
+      const transition = { lease, targetEnvironment } as TaskOwnershipTransition;
+      this.issuedTransitions.add(transition);
+      return transition;
+    };
     const heartbeat = setInterval(() => {
       if (heartbeatFailure !== null) return;
-      void this.renewTaskOwnership(lease).catch((error: unknown) => {
+      void this.renewTaskOwnership(currentLease).catch((error: unknown) => {
         heartbeatFailure = error instanceof TaskOwnershipError
           ? error
           : new TaskOwnershipError(`Unable to renew durable ownership for task ${taskId}: ${describeError(error)}`);
       });
     }, Math.max(1, Math.floor(FILE_DURABLE_CONTEXT_LEASE_MS / 3)));
     try {
-      const result = await operation(lease, transfer);
-      if (heartbeatFailure !== null) {
-        throw heartbeatFailure;
-      }
+      const result = await operation(lease, transfer, assertOwnership, authorizeTransition);
+      await assertOwnership();
       return result;
     } finally {
       clearInterval(heartbeat);
-      await this.releaseTaskOwnership(lease);
+      await this.releaseTaskOwnership(currentLease);
     }
   }
 
@@ -945,8 +1024,9 @@ export class FileDurableContextStore implements DurableContextStore {
     return Date.now() - generationStats.mtimeMs > FILE_DURABLE_CONTEXT_LEASE_MS;
   }
 
-  private async assertCurrentTaskOwnership(lease: FileTaskOwnershipLease): Promise<void> {
-    const latest = await this.latestOwnershipGeneration(lease.ownershipRoot);
+  private async assertCurrentTaskOwnership(lease: TaskOwnershipLease): Promise<void> {
+    const ownershipRoot = join(createSnapshotPaths(this.rootPath, lease.taskId).taskRoot, ownershipDirectoryName);
+    const latest = await this.latestOwnershipGeneration(ownershipRoot);
     if (latest === null || latest.generation !== lease.generation) {
       throw new TaskOwnershipError(`Durable ownership for task ${lease.taskId} was superseded`);
     }
@@ -956,13 +1036,31 @@ export class FileDurableContextStore implements DurableContextStore {
     await this.assertTaskOwnershipToken(lease);
   }
 
-  private async assertTaskOwnershipToken(lease: FileTaskOwnershipLease): Promise<void> {
+  private async assertTaskOwnershipToken(lease: TaskOwnershipLease): Promise<void> {
+    const generationPath = join(createSnapshotPaths(this.rootPath, lease.taskId).taskRoot, ownershipDirectoryName, lease.generation.toString());
     const [owner, leaseToken] = await Promise.all([
-      this.readOwnershipRecord(lease.generationPath),
-      readFile(join(lease.generationPath, ownershipLeaseFile), "utf8"),
+      this.readOwnershipRecord(generationPath),
+      readFile(join(generationPath, ownershipLeaseFile), "utf8"),
     ]);
     if (owner.taskId !== lease.taskId || owner.ownerToken !== lease.ownerToken || leaseToken !== lease.ownerToken) {
       throw new TaskOwnershipError(`Durable ownership token mismatch for task ${lease.taskId}`);
+    }
+    let authoritativeEnvironment = owner.environment;
+    try {
+      const transferPath = join(generationPath, ownershipTransferFile);
+      const transfer = ownershipTransferSchema.safeParse(parseJson(await readFile(transferPath, "utf8"), lease.taskId, transferPath));
+      if (!transfer.success) throw new TaskOwnershipError(`Invalid durable ownership transfer at ${transferPath}`);
+      if (
+        transfer.data.taskId !== lease.taskId
+        || transfer.data.ownerToken !== lease.ownerToken
+        || transfer.data.sourceEnvironment !== owner.environment
+      ) throw new TaskOwnershipError(`Durable ownership transfer mismatch for task ${lease.taskId}`);
+      authoritativeEnvironment = transfer.data.targetEnvironment;
+    } catch (error: unknown) {
+      if (!isMissingFileError(error)) throw error;
+    }
+    if (authoritativeEnvironment !== lease.environment) {
+      throw new TaskOwnershipError(`Durable ownership environment mismatch for task ${lease.taskId}`);
     }
   }
 
