@@ -31,7 +31,8 @@ BUG-002 remains open for authentication failure and remote-ahead fast-forward ca
 
 ## Next concrete action
 
-Review the five-scenario baseline in a genuinely separate future session before considering a context pack. Do not fabricate additional samples in one run; defer P1 context-pack and all P2 automation.
+- Authorized one real remote-ahead fast-forward validation. Codex should first execute an explicit `@D-AI sync`, then verify fetch, `ff-only` pull, `HEAD`, `origin/main`, and worktree state.
+- Review the five-scenario baseline in a genuinely separate future session before considering a context pack. Do not fabricate additional samples in one run; defer P1 context-pack and all P2 automation.
 
 ## Verification notes
 
