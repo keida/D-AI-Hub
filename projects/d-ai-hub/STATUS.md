@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Complete the remaining BUG-002 verification boundary after the remote-ahead fast-forward test.
+- Current task: Preserve the resolved BUG-002 boundary and review the progressive project-memory baseline.
 - Working state: The canonical `main` fast-forwarded from `526e32f` to `740385b` after a clean remote-ahead check; final `HEAD = origin/main`, ahead/behind `0/0`, and the worktree is clean. Old worktrees remain untouched.
-- Active plan: Keep authentication failure as an explicit, non-destructive limitation; do not invalidate credentials or alter the canonical remote merely to manufacture a failure. Keep the five-scenario baseline under review and do not introduce a second memory source or context pack.
-- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. These are local read baselines, not independent cross-session recovery timings. A targeted repository-wide search found no stale operational fixed-order or sync-prerequisite rule. Clean main no-op, clean and dirty feature branches, unavailable remote, and Web/GitHub handoff are verified; the real remote-ahead path is now verified by fetch `0/1`, successful `pull --ff-only`, final `HEAD = origin/main = 740385b`, and a clean worktree.
+- Active plan: Do not invalidate credentials or alter the canonical remote merely to manufacture an authentication failure. Keep the five-scenario baseline under review and do not introduce a second memory source or context pack.
+- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. These are local read baselines, not independent cross-session recovery timings. Clean main no-op, clean and dirty feature branches, unavailable remote, Web/GitHub handoff, and the real remote-ahead path are verified; the latter used fetch `0/1`, successful `pull --ff-only`, final `HEAD = origin/main = 740385b`, and a clean worktree.
 
 ## Last verified progress
 
@@ -27,13 +27,12 @@
 
 ## Current blockers
 
-BUG-002 remains open only for the authentication-failure scenario. Cross-client handoff is verified when ChatGPT Web is connected to `keida/D-AI-Hub` through GitHub; without that connector, Web cannot see the Codex checkout. Remote freshness and cross-client context availability must still be reported separately. New checkouts and environments must authenticate before treating GitHub state as current.
+BUG-002 is resolved. BUG-001 remains open for authentication behavior in affected environments; the current Codex checkout has valid authenticated GitHub access. New checkouts and environments must authenticate before treating GitHub state as current.
 
 ## Next concrete action
 
-- Decide whether BUG-002 should retain authentication failure as an environment-specific open limitation; do not invalidate the current credentials to manufacture a failure.
 - Review the five-scenario baseline in a genuinely separate future session before considering a context pack. Do not fabricate additional samples in one run; defer P1 context-pack and all P2 automation.
 
 ## Verification notes
 
-Remote GitHub updates have been successfully performed after the original setup session. A fresh `git fetch --prune origin` on 2026-08-22 confirmed `main` matches `origin/main` at `5dd86bc` with ahead/behind `0/0`; no pull was performed because the worktree is dirty. Automated validation on the canonical checkout passed `git diff --check`; no package, test-runner, or build entry point is present, so no code test suite was run. The only current uncommitted changes are these project-memory updates, intentionally left for review.
+Remote GitHub updates have been successfully performed after the original setup session. The remote-ahead validation fast-forwarded clean `main` from `526e32f` to `740385b`; final `HEAD = origin/main`, ahead/behind `0/0`, and the worktree was clean. Automated validation on the canonical checkout passed `git diff --check`; no package, test-runner, or build entry point is present, so no code test suite was run. The current documentation change is uncommitted pending review.
