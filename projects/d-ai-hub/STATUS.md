@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Publish the rewritten PR history after removing hardcoded private-key test fixtures from the commit graph.
-- Working state: The feature branch is rewritten locally at `3180706`; backup branch `backup/pr2-before-secret-history-rewrite` preserves the pre-rewrite tip. Three pre-existing untracked planning/spec documents remain untouched.
-- Active plan: Force-push the rewritten branch after final ancestry and validation checks, then verify GitGuardian and PR mergeability. Do not merge PR #2 without separate approval.
-- Latest verified evidence: Old commits `535d047` and `007bc87` are no longer ancestors of the feature branch. Full validation passed: 20 test files and 413 tests, TypeScript build, `git diff --check`, and secret-like scan with no credential values found. The current branch is intentionally ahead/behind its remote because the remote still has the old history.
+- Current task: Preserve the verified secret-history remediation and keep PR #2 ready for independent review.
+- Working state: The rewritten feature branch is pushed at `c19c680`; backup branch `backup/pr2-before-secret-history-rewrite` preserves the pre-rewrite tip. Three pre-existing untracked planning/spec documents remain untouched.
+- Active plan: Do not merge PR #2 without separate explicit approval. Keep the local backup until the PR is merged or intentionally closed.
+- Latest verified evidence: Old commits `535d047` and `007bc87` are no longer ancestors of the feature branch. Full validation passed: 20 test files and 413 tests, TypeScript build, `git diff --check`, and secret-like scan with no credential values found. GitGuardian scanned 65 commits and reported `No secrets detected`; GitHub reports no conflicts and `mergeable: true`.
 
 ## Last verified progress
 
@@ -31,11 +31,11 @@
 
 ## Current blockers
 
-PR #2 still needs the rewritten branch pushed and GitGuardian rechecked, followed by independent review and explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
+PR #2 still needs independent review and explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
 
 ## Next concrete action
 
-Force-push the rewritten feature branch, verify GitGuardian and PR #2, then decide whether to merge it into canonical `main`. Keep context-pack and additional fabricated samples deferred.
+Obtain independent review for PR #2, then decide whether to merge it into canonical `main`. Keep context-pack and additional fabricated samples deferred.
 
 ## Verification notes
 
