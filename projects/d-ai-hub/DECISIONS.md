@@ -43,3 +43,47 @@ Updates may touch a source file and its index together, but the same content sho
 **Revisit trigger**
 
 Reconsider if real retrieval usage demonstrates that the boundaries cannot support the active workload.
+
+## 2026-08-22 — Match safety work to the risk of the next action
+
+**Context**
+
+Ordinary project continuation already causes Codex to load local repository context. Repeating full synchronization, repository-wide audits, and release checks during read-only work adds time and token cost without proving additional runtime behavior.
+
+**Decision**
+
+Use three safety gates: Fast Read for read-only continuation, Write Gate before the first file modification, and Release Gate before commit, push, merge, PR creation, or close. Treat `@D-AI sync` as an optional explicit canonical-freshness check rather than a prerequisite for normal continuation.
+
+**Rationale**
+
+Risk-based gates preserve fail-closed Git behavior while avoiding repeated high-cost checks when no write or release action is planned. They also separate local context loading from verified GitHub synchronization.
+
+**Consequences**
+
+Agents must state whether remote refs were refreshed and must not claim canonical synchronization from local reads or cached refs. Full diff, test, secret, staging, and remote verification belongs at Release Gate, not Fast Read.
+
+**Revisit trigger**
+
+Reconsider if the manual behavior matrix shows that a client cannot reliably distinguish these gates or if real usage data shows that the lighter Fast Read omits required project context.
+
+## 2026-08-22 — Keep one replace-in-place project progress checkpoint
+
+**Context**
+
+Repeatedly rereading old chat, unchanged project files, and previous plans adds time and token cost. A chronological activity log would create a second history to maintain and would quickly become stale.
+
+**Decision**
+
+Keep one concise current checkpoint inside each active project's canonical `STATUS.md`. Replace it after meaningful changes to the task, working state, verified evidence, blocker, authorized scope, active plan, or next action. Reuse already loaded state during an uninterrupted session and read the checkpoint first after a new session, compaction, or client handoff.
+
+**Rationale**
+
+A replace-in-place checkpoint makes the latest resume state directly discoverable without duplicating canonical decisions, bugs, roadmap, references, or full conversation history.
+
+**Consequences**
+
+The checkpoint must distinguish verified, local, remote, reported, and unverified state. It links to canonical detail rather than copying it, and it must not become a command log, chat archive, or second memory source.
+
+**Revisit trigger**
+
+Reconsider if five measured project resumptions show that the checkpoint is still too large, omits required context, or fails to reduce repeated reads.

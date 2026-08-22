@@ -3,6 +3,10 @@
 ## Now
 
 - Apply the safe cross-client sync and write rules in `docs/workflow.md`; new environments must verify GitHub authentication before treating local state as current.
+- Review and validate the Fast Read, Write Gate, and Release Gate workflow.
+- Validate that one replace-in-place `STATUS.md` checkpoint supports continuation without rereading unchanged context or creating a second memory source.
+- Run a manual behavior matrix that distinguishes ordinary local project continuation from explicit `@D-AI sync`.
+- Keep BUG-002 open until clean/dirty main, clean/dirty feature branch, authentication failure, and cross-client cases have current evidence.
 - Keep `STATUS.md`, `DECISIONS.md`, `BUGS.md`, and `REFERENCES.md` current after meaningful work.
 - Add durable knowledge only when it has a clear canonical home and a useful retrieval path.
 
@@ -12,6 +16,8 @@
 
 ## Next
 
+- Test a progressive-loading revision of the canonical `project-memory` Skill using the required Skill test workflow before editing or deploying it.
+- Measure context-loading time, files read, and repeated checks across at least five real project resumptions before considering a context pack.
 - Register additional project records only when there is active project state to preserve.
 
 ## Deferred to V1.2+

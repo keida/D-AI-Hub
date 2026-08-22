@@ -1,13 +1,13 @@
 # D-AI-Hub Short Commands
 
-D-AI-Hub exposes three primary natural-language command prefixes for ChatGPT Web, Codex, and compatible agents. They are repository conventions, not built-in commands. Their authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains available internally when durable outcomes should be captured during a session. The actions each client can perform still depend on its available GitHub access and permissions.
+D-AI-Hub exposes two primary lifecycle command prefixes and one optional synchronization check for ChatGPT Web, Codex, and compatible agents. They are repository conventions, not built-in commands. Their authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains available internally when durable outcomes should be captured during a session. The actions each client can perform still depend on its available GitHub access and permissions.
 
 ## Quick reference
 
 | Command | Purpose |
 | --- | --- |
 | `@D-AI establish` | Establish D-AI-Hub in a new or uncertain environment. |
-| `@D-AI sync` | Refresh canonical context before starting or resuming work. |
+| `@D-AI sync` | Optionally verify canonical GitHub freshness when remote state matters. |
 | `@D-AI close` | Finish the session by updating project memory/knowledge and syncing durable changes. |
 
 ## `@D-AI establish`
@@ -34,22 +34,25 @@ Then you can continue with a task in the same prompt:
 
 ## `@D-AI sync`
 
-Use at the beginning of normal work sessions.
+Use when canonical GitHub freshness must be explicitly verified, such as after switching clients, after a long pause, or when remote changes are suspected. Normal project continuation does not require this command.
 
 Expected outcome:
-- latest available `main` is obtained or freshness limitations are disclosed;
-- relevant Skill, knowledge, and project state are loaded;
-- project continuation uses repository state rather than remembered chat context.
+- actual checkout, branch, HEAD, worktree, remote, and freshness evidence are distinguished;
+- latest available `main` is obtained only when a safe fast-forward update is possible;
+- dirty, feature-branch, detached, diverged, authentication, and read-only limitations are disclosed;
+- local context reads are not reported as verified GitHub synchronization.
 
 Example:
 
 ```text
-@D-AI sync，然后继续开发 DeepSeek Harness Desktop。
+@D-AI sync，然后核实 D-AI-Hub 的 canonical main 是否有其他客户端更新。
 ```
 
 ## Internal `@D-AI update` workflow
 
 Use internally during a session when something has become worth keeping. It is not promoted as a primary daily command.
+
+For an active project, first replace the current checkpoint in `STATUS.md` when the task, working state, verified evidence, blocker, active plan, file scope, or next action has changed meaningfully. This lets later continuation start from one concise current-state summary rather than rereading old chat or rebuilding the plan.
 
 Good candidates:
 - a durable technical insight;
@@ -60,6 +63,8 @@ Good candidates:
 
 Do not save:
 - casual/transient chat;
+- a command-by-command activity log;
+- repeated unchanged checkpoints;
 - unverified speculation as fact;
 - passwords, tokens, cookies, keys, or credentials;
 - unauthorized employer-confidential information;
@@ -98,22 +103,27 @@ Example:
 ## Recommended daily pattern
 
 ```text
-@D-AI sync
+Continue <project>
+→ Fast Read
+→ Write Gate before the first modification
 → do the work
-→ continue working
-→ @D-AI close
+→ Release Gate and @D-AI close when durable work is ready
 ```
 
 When a durable outcome is worth capturing before the session ends, run the internal `@D-AI update` workflow before continuing.
 
+Within one uninterrupted session, continue from the already loaded state instead of rereading unchanged project files. Refresh the project's current checkpoint only after meaningful change.
+
+Use `@D-AI sync` only when an explicit canonical-freshness check is needed. It is not required merely to make the agent read local project context.
+
 `@D-AI establish` is normally not part of the daily loop once an environment has been successfully established.
 
-## Command composition
+## Request composition
 
-The command prefix can be followed by normal task instructions. For example:
+Ordinary project continuation can name the project and task without a D-AI command prefix. For example:
 
 ```text
-@D-AI sync，然后继续 DeepSeek Harness Desktop，先读取 STATUS 和未解决 BUGS，再决定下一步。
+继续 DeepSeek Harness Desktop，先读取 STATUS 和未解决 BUGS，再决定下一步。
 ```
 
-The agent should execute the command protocol first, then continue the remainder of the user's request.
+When a D-AI command prefix is used, the agent should execute that protocol first and then continue the remainder of the user's request.
