@@ -4,7 +4,7 @@ This repository is the canonical source of truth for D-AI-Hub across ChatGPT Web
 
 ## D-AI Command Protocol
 
-The following are D-AI-Hub natural-language commands. They are not built-in Codex commands. When the user's message begins with one of these exact prefixes, interpret it as the workflow below and then continue with any task text that follows the command.
+The following are D-AI-Hub natural-language workflows for ChatGPT Web, Codex, and compatible agents. They are not built-in commands. `@D-AI establish` and `@D-AI close` are the primary lifecycle commands; `@D-AI sync` is an optional explicit canonical-freshness check, and `@D-AI update` remains an internal workflow for recording durable outcomes during a session. When the user's message begins with one of these exact prefixes, interpret it as the workflow below and then continue with any task text that follows the command.
 
 ### `@D-AI establish`
 
@@ -20,31 +20,34 @@ Use when setting up D-AI-Hub in a new Codex/agent environment or when setup stat
 
 ### `@D-AI sync`
 
-Use before starting or resuming durable work.
+Use when the user explicitly wants canonical GitHub freshness verified, especially after switching clients, after a long pause, or when remote changes are suspected. Ordinary project continuation does not require this command.
 
 1. Read and follow [`docs/workflow.md`](docs/workflow.md) before any sync or write operation.
-2. Get the latest available `main` safely. With local Git, fetch/pull using authenticated access only when the working tree is clean and the branch is fast-forwardable; otherwise stop and report the state.
-3. If freshness cannot be verified, state that limitation before proceeding. Never stash, reset, delete, or force-push automatically.
-4. Read the relevant indexes and identify the narrowest relevant Skill, knowledge note, and/or project.
-5. For a continuing project, read `README.md`, `STATUS.md`, `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, then `REFERENCES.md`.
-6. Continue the user's task using repository state as canonical context instead of relying on old chat history.
+2. Inspect the actual checkout, current branch, HEAD, and working tree before network or integration actions.
+3. With authenticated local Git, refresh remote refs using `git fetch --prune origin`. Fetch may update Git metadata but must not modify the working tree, index, or current branch.
+4. Pull only when the checkout is clean, the current branch is canonical `main`, and the update is fast-forwardable; use `git pull --ff-only origin main`.
+5. On a dirty worktree, feature branch, detached HEAD, divergence, authentication failure, or explicit read-only restriction, do not pull, merge, stash, reset, delete, or overwrite. Report exactly what was and was not verified.
+6. Never describe local file reads or a cached `origin/main` reference as verified GitHub synchronization.
+7. Read only the narrowest relevant index, Skill, knowledge note, and project files required by the task.
+8. Continue the user's task using repository state as canonical context instead of relying on old chat history.
 
 ### `@D-AI update`
 
 Use to persist worthwhile information from the current session without ending the session.
 
-1. Extract only durable knowledge, decisions, verified project state, useful references, and other information that has long-term retrieval value.
-2. Exclude transient conversation, speculation presented as fact, secrets, credentials, authentication artifacts, and unauthorized confidential material.
-3. Search for an existing canonical file before creating anything new; update instead of duplicating.
-4. Route content to the canonical owner:
+1. When project progress, verification, blockers, authorized scope, or the next action changes meaningfully, replace the project's `STATUS.md` current checkpoint with a concise summary.
+2. Extract only durable knowledge, decisions, verified project state, useful references, and other information that has long-term retrieval value.
+3. Exclude transient conversation, repeated unchanged state, speculation presented as fact, secrets, credentials, authentication artifacts, and unauthorized confidential material.
+4. Search for an existing canonical file before creating anything new; update instead of duplicating.
+5. Route content to the canonical owner:
    - workflow instructions -> `skills/custom/`
    - reusable subject knowledge -> `knowledge/`
    - project-specific state/decisions/bugs/roadmap/references -> `projects/<project>/`
    - stable cross-project context -> `memory/`
    - reusable standalone prompt -> `prompts/`
-5. Update relevant indexes when discovery state changes.
-6. Verify the resulting content is internally consistent and source-aware.
-7. Commit/push small durable updates when the environment permits it; otherwise report exactly what remains local/unsynced.
+6. Update relevant indexes when discovery state changes.
+7. Verify the resulting content is internally consistent and source-aware.
+8. Commit/push small durable updates only when explicitly authorized; otherwise report exactly what remains local/unsynced.
 
 ### `@D-AI close`
 
@@ -60,25 +63,37 @@ Use at the end of meaningful work.
 
 Detailed command examples and behavior notes live in `docs/commands.md`; cross-client safety and Git decision rules live in `docs/workflow.md`.
 
+## Risk-based safety gates
+
+Use the smallest gate that matches the action:
+
+- **Fast Read** — for read-only questions and ordinary project continuation: locate the real checkout, inspect branch/status, and read `STATUS.md` plus relevant open bugs. Do not run network sync, full-repository audits, or release checks unless the task needs them.
+- **Write Gate** — before the first file modification: confirm the authorized file scope, preserve existing dirty changes, load the narrowest required Skill, and verify canonical freshness when stale remote state could affect the write.
+- **Release Gate** — before commit, push, merge, PR, or `@D-AI close`: inspect the complete intended diff, run relevant tests and targeted validation, check staged files and secret-like additions, then verify the actual remote result after push.
+
+Do not run Release Gate checks repeatedly during read-only work. A lower gate never authorizes an action that requires a higher gate.
+
+## Progress checkpoints
+
+Keep one replace-in-place current checkpoint in each active project's `STATUS.md`. Update it when a meaningful event changes the current task, working state, verified evidence, blocker, authorized file scope, active plan, or next action.
+
+- Record the latest verified state and a short active plan; link to canonical decisions or bugs instead of copying them.
+- Do not append a command-by-command log, full chat transcript, repeated unchanged state, or speculative reasoning.
+- During the same session, do not reread unchanged context merely to reconstruct the plan. Continue from the current in-session state and refresh the checkpoint after meaningful change.
+- On a new session, context compaction, client handoff, or uncertain state, read the checkpoint first and expand to other files only as needed.
+- A checkpoint is a project-state summary, not a second memory source and not proof of remote synchronization.
+
 ## Session start
 
-Before doing durable work in this repository:
+For ordinary read-only continuation, apply Fast Read. Before the first durable write, complete Write Gate:
 
-1. Read `docs/workflow.md` and confirm you are using the latest available `main` state. If local Git access is available, fetch/pull safely only from a clean, fast-forwardable checkout. If sync cannot be verified, state the limitation instead of assuming freshness.
-2. Read `README.md` for repository purpose, boundaries, and security rules.
-3. Read the relevant discovery indexes:
-   - `indexes/SKILLS.md`
-   - `indexes/KNOWLEDGE.md`
-   - `indexes/PROJECTS.md`
-4. Load the narrowest relevant canonical Skill under `skills/custom/` before modifying durable knowledge or project state.
-5. When continuing a project, read its files in this order:
-   - `README.md`
-   - `STATUS.md`
-   - `DECISIONS.md`
-   - `BUGS.md`
-   - `ROADMAP.md`
-   - `REFERENCES.md`
-6. Prefer repository state over old chat history when the repository contains the canonical answer.
+1. Locate the actual Git checkout and inspect branch/status before using repository state as current evidence.
+2. Read `README.md` when repository purpose, boundaries, or security rules are not already established.
+3. Read only the discovery index needed to locate the relevant Skill, knowledge note, or project.
+4. For project continuation, start with `STATUS.md` and relevant open entries in `BUGS.md`; read `README.md`, `DECISIONS.md`, `ROADMAP.md`, and `REFERENCES.md` only when the task requires their content.
+5. Load the narrowest relevant canonical Skill under `skills/custom/` before modifying durable knowledge or project state.
+6. Before writing, verify canonical freshness when stale remote state could cause conflicts. If freshness cannot be verified, state the limitation and fail closed.
+7. Prefer repository state over old chat history when the repository contains the canonical answer.
 
 ## Canonical ownership
 

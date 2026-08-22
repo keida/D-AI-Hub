@@ -9,14 +9,66 @@ This document defines the safe operating contract between ChatGPT Web, GitHub, C
 - ChatGPT Web and Codex use GitHub as the shared coordination point; local checkouts are working copies.
 - Never store credentials, tokens, cookies, or authentication artifacts in D-AI-Hub.
 
-## Safe `@D-AI sync`
+## Risk-based safety gates
 
-1. Inspect the current branch and working tree before changing anything.
-2. Authenticate and run `git fetch --prune origin` when local Git is available.
-3. If the checkout is clean and local `main` is fast-forwardable to `origin/main`, update it with `git pull --ff-only origin main`. Do not create a backup branch for this normal case.
-4. If the working tree is dirty, stop and report the exact state. Do not automatically stash, reset, delete, or overwrite changes.
-5. If local commits and remote commits have diverged, protect the local work with a non-destructive backup branch or equivalent copy, then stop and report the divergence. Wait for a safety decision before merge, rebase, reset, or other integration.
-6. If authentication or freshness verification fails, report the checkout as unsynced. Do not reconstruct authoritative history from memory or claim that sync succeeded.
+### Fast Read
+
+Use for read-only questions and ordinary project continuation.
+
+1. Locate the real checkout and inspect current branch, HEAD, and working tree.
+2. Read the target project's `STATUS.md` and relevant open bugs.
+3. Read other project files, indexes, or Skills only when required by the task.
+4. Do not fetch, pull, run full-repository audits, or claim remote freshness unless explicitly required.
+
+### Write Gate
+
+Use before the first file modification.
+
+1. Confirm the user's authorized scope and the exact files that may change.
+2. Preserve existing modified and untracked files; do not treat them as disposable agent state.
+3. Load the narrowest required canonical Skill.
+4. Verify canonical freshness when stale remote state could cause a conflicting write.
+5. Stop on dirty-scope overlap, divergence, authentication failure, or uncertain ownership rather than overwriting work.
+
+### Release Gate
+
+Use before commit, push, merge, PR creation, or `@D-AI close`.
+
+1. Inspect the complete intended diff and staged file list.
+2. Run the repository's relevant tests plus validation proportional to the changed files.
+3. Check changed content and filenames for secret-like additions.
+4. Verify branch, remote, ancestry, and the actual push result.
+5. Report local commit and remote synchronization separately.
+
+Do not run Release Gate checks repeatedly during Fast Read work.
+
+## Progress checkpoints
+
+Each active project keeps one current checkpoint inside its canonical `STATUS.md`.
+
+Update the checkpoint when any of these changes meaningfully:
+
+- current task or authorized scope;
+- working state or changed file set;
+- verified result or newly failed check;
+- blocker or risk;
+- active plan or next concrete action;
+- handoff/close readiness.
+
+Replace the checkpoint in place. Keep it concise and link to `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, or `REFERENCES.md` for canonical details. Do not create a chronological command log, duplicate canonical content, save full chat, or record unchanged progress after every tool call.
+
+Within one uninterrupted session, reuse the already loaded current state instead of rereading unchanged files. On a new session, after context compaction, during a client handoff, or when external changes are possible, read the checkpoint first and expand context only as required.
+
+## Explicit `@D-AI sync`
+
+`@D-AI sync` is an optional canonical-freshness check, not a prerequisite for ordinary local project continuation.
+
+1. Inspect the actual checkout, current branch, HEAD, and working tree before network actions.
+2. Authenticate and run `git fetch --prune origin` when local Git is available and the user has not prohibited Git metadata changes.
+3. If the checkout is clean, current branch is canonical `main`, and local `main` is fast-forwardable to refreshed `origin/main`, update with `git pull --ff-only origin main`.
+4. On a dirty worktree, feature branch, detached HEAD, or divergence, do not pull or integrate. Report local HEAD, refreshed or cached remote refs, and the exact limitation.
+5. If authentication or freshness verification fails, report the checkout as unsynced. Do not reconstruct authoritative history from memory or claim that sync succeeded.
+6. Never equate local context loading, a cached `origin/main`, or a feature-branch push with canonical `main` synchronization.
 
 ## Writes, commits, and push
 

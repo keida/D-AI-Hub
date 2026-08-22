@@ -18,4 +18,9 @@
 
 ## Resolved
 
-_None yet._
+### BUG-002 — `@D-AI sync` behavior is distinguished from ordinary local project continuation
+
+- Severity: medium
+- Status: resolved on 2026-08-22
+- Resolution: Ordinary continuation was kept local-only, while explicit sync was verified across dirty and clean `main`, clean and dirty feature branches with and without upstream, unavailable remote fail-closed handling, a real remote-ahead fast-forward (`0/1` fetch followed by successful `pull --ff-only`), and ChatGPT Web handoff through the GitHub connector.
+- Limitation: GitHub authentication failure was not reproduced because the current authenticated credentials were not invalidated. That environment-specific condition remains tracked by BUG-001 and is not claimed as verified here.
