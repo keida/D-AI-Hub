@@ -120,6 +120,19 @@ describe("PersistentHandoffService", () => {
     expect(envelope.redactions).toContain("taskState.debugSession.hypothesis");
   });
 
+  it("removes truncated PEM headers and all residual key material", async () => {
+    const residualKeyMaterial = "TUlJRVJlc2lkdWFsS2V5TWF0ZXJpYWw=";
+    const source = {
+      ...state("chat"),
+      goal: `-----BEGIN PRIVATE KEY-----\n${residualKeyMaterial}`,
+    };
+
+    const envelope = await service().create({ state: source, targetEnvironment: "work" });
+
+    expect(JSON.stringify(envelope)).not.toContain(residualKeyMaterial);
+    expect(envelope.taskState.goal).toBe("[REDACTED]");
+  });
+
   it("redacts raw credential signatures before handoff integrity and persistence", async () => {
     const persistence = new InMemoryHandoffPersistence();
     const service = new PersistentHandoffService(persistence);

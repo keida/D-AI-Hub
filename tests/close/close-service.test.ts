@@ -415,6 +415,22 @@ describe("closeTask", () => {
     expectNoRawSecretSignatures(verdict, secret);
   });
 
+  it("does not publish secret-like context in a blocked close verdict", async () => {
+    const secret = "github_pat_" + "z".repeat(30);
+    const state = {
+      ...closeReadyState(new Date().toISOString()),
+      contextManifest: [...closeReadyState(new Date().toISOString()).contextManifest, `password=${secret}`],
+    };
+
+    const verdict = await closeTask(state, {
+      store: storeFor(state),
+      gitHub: unexpectedGitHub(),
+    });
+
+    expect(verdict.status).not.toBe("YES");
+    expect(JSON.stringify(verdict)).not.toContain(secret);
+  });
+
   it("accepts an exact 64-character commit artifact and matching adapter evidence", async () => {
     const now = new Date().toISOString();
     const state = closeReadyState(now);

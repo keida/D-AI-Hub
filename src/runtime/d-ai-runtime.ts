@@ -636,6 +636,46 @@ function secretLikeRecoveryPointField(recoveryPoint: RecoveryPoint): string | nu
   return secretField === undefined ? null : `Captured recovery point ${secretField.label} contains secret-like content`;
 }
 
+function secretLikeRecoverySnapshotField(snapshot: RecoverySnapshot): string | null {
+  const fields: readonly { readonly label: string; readonly value: string }[] = [
+    { label: "snapshot HEAD", value: snapshot.head },
+    { label: "snapshot branch", value: snapshot.branch },
+    { label: "snapshot workspace path", value: snapshot.workspacePath },
+    { label: "snapshot process status", value: snapshot.status },
+    { label: "snapshot binary patch", value: snapshot.binaryPatch },
+    { label: "snapshot manifest id", value: snapshot.stateManifest.manifestId },
+    { label: "snapshot task id", value: snapshot.stateManifest.taskId },
+    { label: "snapshot manifest stage", value: snapshot.stateManifest.stage },
+    { label: "snapshot manifest environment", value: snapshot.stateManifest.environment },
+    { label: "snapshot manifest role", value: snapshot.stateManifest.role },
+    { label: "snapshot manifest recovery point id", value: snapshot.stateManifest.recoveryPointId ?? "" },
+    { label: "snapshot manifest recorded-at timestamp", value: snapshot.stateManifest.recordedAt },
+    ...snapshot.stateManifest.durablePaths.map((value, index) => ({ label: `snapshot durable path ${index}`, value })),
+    ...Object.entries(snapshot.stateManifest.hashes).flatMap(([key, value]) => [
+      { label: `snapshot hash key ${key}`, value: key },
+      { label: `snapshot hash value ${key}`, value },
+    ]),
+    ...Object.entries(snapshot.durableArtifacts).flatMap(([key, value]) => [
+      { label: `snapshot artifact key ${key}`, value: key },
+      { label: `snapshot artifact value ${key}`, value },
+    ]),
+    ...snapshot.verificationResults.flatMap((verification, index) => [
+      { label: `snapshot evidence ${index} id`, value: verification.evidenceId },
+      { label: `snapshot evidence ${index} selected model`, value: verification.selectedModel },
+      { label: `snapshot evidence ${index} command`, value: verification.command },
+      { label: `snapshot evidence ${index} output`, value: verification.observedOutput },
+      { label: `snapshot evidence ${index} interpretation`, value: verification.interpretation },
+      { label: `snapshot evidence ${index} recorded-at timestamp`, value: verification.recordedAt },
+      ...(verification.recoveryPointId === null ? [] : [{ label: `snapshot evidence ${index} recovery point id`, value: verification.recoveryPointId }]),
+    ]),
+  ];
+  const secretField = fields.find((field) =>
+    redactSensitiveText(field.value) !== field.value
+    || secretLikeTextPattern.test(field.value)
+    || containsSecretShapedValue(field.value));
+  return secretField === undefined ? null : `Captured recovery snapshot ${secretField.label} contains secret-like content`;
+}
+
 function validateCapturedRecoveryPoint(
   state: TaskState,
   recoveryPoint: RecoveryPoint | CapturedRecoveryPoint,
@@ -675,6 +715,8 @@ function validateCapturedRecoveryPoint(
     || !hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, validated.durablePaths, validated.hashes)
   ) return { kind: "blocked", message: "Captured recovery point does not match the persisted verify artifacts" };
   if (snapshot !== null) {
+    const snapshotSecretFailure = secretLikeRecoverySnapshotField(snapshot);
+    if (snapshotSecretFailure !== null) return { kind: "blocked", message: snapshotSecretFailure };
     if (snapshot.stateManifest.manifestId !== manifest.manifestId
       || snapshot.stateManifest.taskId !== state.taskId
       || snapshot.verificationResults.length === 0

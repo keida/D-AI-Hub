@@ -1852,6 +1852,42 @@ describe("D-AI runtime", () => {
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 
+  it.each([
+    ["process status", (snapshot: RecoverySnapshot, secret: string): RecoverySnapshot => ({ ...snapshot, status: `process=token=${secret}` })],
+    ["binary patch", (snapshot: RecoverySnapshot, secret: string): RecoverySnapshot => ({ ...snapshot, binaryPatch: `diff --git a/file b/file\npassword=${secret}` })],
+  ] as const)("rejects secret-like values in the captured recovery snapshot $0 before persistence", async (_label, inject) => {
+    const secret = "snapshot-secret-value";
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const secretSavedStates: TaskState[] = [];
+    const secretStore = memoryStore(secretSavedStates, "state.json");
+    const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store: secretStore,
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint | CapturedRecoveryPoint> => {
+        const captured = await captureRecoveryPoint(state) as RecoveryPoint;
+        if (state.durableContext === null) throw new InvalidTaskStateError("Snapshot fixture requires durable context");
+        const snapshot: RecoverySnapshot = {
+          head: "0123456789abcdef0123456789abcdef01234567",
+          branch: "main",
+          workspacePath: "C:/workspace",
+          status: "",
+          binaryPatch: "",
+          stateManifest: state.durableContext,
+          verificationResults: state.verificationEvidence,
+          durableArtifacts: state.durableContext.hashes,
+        };
+        return { trigger: "recovery", recoveryPoint: captured, snapshot: inject(snapshot, secret) };
+      },
+    });
+
+    const result = await handle(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/snapshot.*secret-like/i);
+    expect(secretSavedStates.every((state) => state.recoveryPoint === null)).toBe(true);
+  });
+
   it("rejects malformed external request overrides without alternate interpretation", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const malformed: ExternalDAIRequest = {
