@@ -6,7 +6,7 @@
 - Review and validate the Fast Read, Write Gate, and Release Gate workflow.
 - Validate that one replace-in-place `STATUS.md` checkpoint supports continuation without rereading unchanged context or creating a second memory source.
 - Run a manual behavior matrix that distinguishes ordinary local project continuation from explicit `@D-AI sync`.
-- Keep BUG-002 open until clean/dirty main, clean/dirty feature branch, authentication failure, and cross-client cases have current evidence.
+- Keep BUG-001 open for authentication behavior in affected environments; BUG-002 sync behavior is resolved for the verified current workflow.
 - Keep `STATUS.md`, `DECISIONS.md`, `BUGS.md`, and `REFERENCES.md` current after meaningful work.
 - Add durable knowledge only when it has a clear canonical home and a useful retrieval path.
 
