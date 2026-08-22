@@ -19,12 +19,12 @@
   - [x] Explicit sync on a clean canonical `main` no-op path: `fetch --prune` and `pull --ff-only` succeeded; `HEAD = origin/main = remote main = ef9a9b0`, ahead/behind `0/0`.
   - [ ] Explicit sync on a clean canonical `main` with a remote-ahead fast-forward update path (not artificially created).
   - [x] Dirty feature branch with upstream: `feat/d-ai-ownership-repair` was fetched while dirty; its upstream was present and ahead/behind was `0/0`, with all uncommitted files preserved.
-  - [ ] Dirty feature branch without upstream: `feat/d-ai-orchestrator-v1` was fetched and confirmed dirty, but has no configured upstream, so ancestry could not be compared and no pull was attempted.
+  - [x] Dirty feature branch without upstream: `feat/d-ai-orchestrator-v1` was fetched while dirty; upstream resolution failed with exit `128`, the status snapshot remained identical before and after, and no pull or overwrite was attempted.
   - [x] Clean feature branch: `codex/project-memory-progressive` was fetched while clean; its upstream was present and ahead/behind was `0/0`.
   - [ ] Authentication failure: not reproduced because doing so would require changing or invalidating the authenticated remote configuration.
   - [x] Unavailable remote fail-closed probe: a direct `ls-remote` to an intentionally unreachable local endpoint failed with exit `128`; `HEAD`, `origin/main`, and the worktree were unchanged. This is not GitHub authentication evidence.
   - [x] ChatGPT Web to Codex handoff through the GitHub connector: Web read `STATUS.md` and `BUGS.md` and confirmed commit `8aab39d`; without the connector, the workspace could not locate the project.
-- Resolution condition: Keep the command and safety-gate documentation aligned, then pass the remaining matrix for the dirty feature branch without upstream, authentication failure, and remote-ahead fast-forward path. Do not claim the bug resolved from Codex-only evidence.
+- Resolution condition: Keep the command and safety-gate documentation aligned, then pass the remaining matrix for authentication failure and remote-ahead fast-forward path. Do not claim the bug resolved from Codex-only evidence.
 
 ### BUG-001 — Local Git CLI authentication may be unavailable in a new environment
 
