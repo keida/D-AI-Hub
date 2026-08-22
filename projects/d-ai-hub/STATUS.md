@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Measure five real project resumptions after progressive `project-memory` integration.
-- Working state: Progressive loading is merged into canonical `main` at `483e06d`; the main worktree is clean. Old worktrees remain untouched.
-- Active plan: Use the five-scenario baseline to decide whether more independent-session evidence is needed before considering a context pack. Do not introduce a second memory source or context pack during measurement.
-- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. These are local read baselines, not independent cross-session recovery timings. A targeted repository-wide search found no stale operational fixed-order or sync-prerequisite rule.
+- Current task: Continue measuring real project resumptions after progressive `project-memory` integration.
+- Working state: This is a separate continuation session. Progressive loading is merged into canonical `main`; after a read-only freshness check, `HEAD = origin/main = 5dd86bc` with ahead/behind `0/0`. The only current change is this checkpoint update. Old worktrees remain untouched.
+- Active plan: Treat this session as one additional independent resumption observation, without fabricating timing data. Keep the five-scenario baseline under review and do not introduce a second memory source or context pack during measurement.
+- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. These are local read baselines, not independent cross-session recovery timings. A targeted repository-wide search found no stale operational fixed-order or sync-prerequisite rule. A read-only worktree inventory on 2026-08-22 confirmed the current dirty `main`, one clean progressive-loading worktree, and separate worktrees with preserved uncommitted implementation changes; it did not verify explicit sync behavior. The clean feature-branch sync scenario is verified at `0/0`; the dirty feature branch remains unverified because it has no upstream; an intentionally unreachable remote probe failed closed without changing local state.
 
 ## Last verified progress
 
@@ -27,7 +27,7 @@
 
 ## Current blockers
 
-BUG-002 blocks treating `@D-AI sync` behavior as verified. Normal local project continuation remains available, but remote freshness must be reported separately. New checkouts and environments must still authenticate before treating GitHub state as current.
+BUG-002 blocks treating `@D-AI sync` behavior as verified. A cross-client handoff failure is now directly observed: ChatGPT Web could not locate `projects/d-ai-hub/STATUS.md` in its current workspace. Normal local project continuation remains available, but remote freshness and cross-client context availability must be reported separately. New checkouts and environments must still authenticate before treating GitHub state as current.
 
 ## Next concrete action
 
@@ -35,4 +35,4 @@ Review the five-scenario baseline in a genuinely separate future session before 
 
 ## Verification notes
 
-Remote GitHub updates have been successfully performed after the original setup session. Canonical `main` is synchronized at `483e06d`; the current Fast Read evidence is recorded locally and remains uncommitted pending review.
+Remote GitHub updates have been successfully performed after the original setup session. A fresh `git fetch --prune origin` on 2026-08-22 confirmed `main` matches `origin/main` at `5dd86bc` with ahead/behind `0/0`; no pull was performed because the worktree is dirty. Automated validation on the canonical checkout passed `git diff --check`; no package, test-runner, or build entry point is present, so no code test suite was run. The only current uncommitted changes are these project-memory updates, intentionally left for review.

@@ -9,7 +9,7 @@
 - First observed: 2026-08-22
 - Reproduction: In an existing Codex checkout, compare starting the same project with `@D-AI sync` and with an ordinary instruction such as `Continue D-AI-Hub`.
 - Expected: Ordinary continuation performs a Fast Read of local project context without claiming remote freshness. Explicit sync produces separate GitHub freshness evidence or a precise unsynced limitation.
-- Actual: User-observed behavior and the supplied screenshot show both paths primarily loading local context. The Codex-side matrix now confirms that Fast Read is local-only and explicit sync performs separate remote freshness checks; cross-client behavior remains unverified.
+- Actual: User-observed behavior and the supplied screenshot show both paths primarily loading local context. The Codex-side matrix now confirms that Fast Read is local-only and explicit sync performs separate remote freshness checks. In the latest user-reported ChatGPT Web handoff, Web inspected a workspace containing only uploaded images and configuration directories and could not find `projects/d-ai-hub/STATUS.md`; it therefore could not report the checkpoint, BUG-002, or next action. This confirms a cross-client workspace/context handoff failure, not loss of the canonical project files in Codex.
 - Impact: Users may spend extra time on repeated safety checks or incorrectly believe local context loading proves canonical GitHub synchronization.
 - Workaround: Treat local file reads as local evidence. Require current fetch, ancestry, or remote-SHA evidence before describing canonical `main` as synchronized.
 - Behavior matrix status:
@@ -18,9 +18,12 @@
   - [x] Fast Read on a clean canonical `main`: loaded branch/status/checkpoint with no network operation.
   - [x] Explicit sync on a clean canonical `main` no-op path: `fetch --prune` and `pull --ff-only` succeeded; `HEAD = origin/main = remote main = ef9a9b0`, ahead/behind `0/0`.
   - [ ] Explicit sync on a clean canonical `main` with a remote-ahead fast-forward update path (not artificially created).
-  - [ ] Dirty feature branch and clean feature branch.
-  - [ ] Authentication failure and unavailable remote.
+  - [ ] Dirty feature branch: `feat/d-ai-orchestrator-v1` was fetched and confirmed dirty, but has no configured upstream, so ancestry could not be compared and no pull was attempted.
+  - [x] Clean feature branch: `codex/project-memory-progressive` was fetched while clean; its upstream was present and ahead/behind was `0/0`.
+  - [ ] Authentication failure: not reproduced because doing so would require changing or invalidating the authenticated remote configuration.
+  - [x] Unavailable remote fail-closed probe: a direct `ls-remote` to an intentionally unreachable local endpoint failed with exit `128`; `HEAD`, `origin/main`, and the worktree were unchanged. This is not GitHub authentication evidence.
   - [ ] ChatGPT Web to Codex handoff.
+    - Latest observed result: ChatGPT Web could not locate the project path in its current workspace; the handoff remains failed until Web is connected to the repository or receives the required project files.
 - Resolution condition: Keep the command and safety-gate documentation aligned, then pass the remaining matrix for clean/dirty feature branches, authentication failure, and ChatGPT Web/Codex handoff. Do not claim the bug resolved from Codex-only evidence.
 
 ### BUG-001 — Local Git CLI authentication may be unavailable in a new environment
