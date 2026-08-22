@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Preserve the resolved BUG-002 boundary and review the progressive project-memory baseline.
+- Current task: Preserve the resolved BUG-002 boundary, review the progressive project-memory baseline, and keep the ordinary-continuation versus explicit-sync boundary documented.
 - Working state: The canonical `main` fast-forwarded from `526e32f` to `740385b` after a clean remote-ahead check, then recorded the resolved BUG-002 state and the independent recovery sample; the latest verified `HEAD = origin/main`, ahead/behind `0/0`, and the worktree is clean. Old worktrees remain untouched.
 - Active plan: Do not invalidate credentials or alter the canonical remote merely to manufacture an authentication failure. Keep the five-scenario baseline under review and do not introduce a second memory source or context pack.
-- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. A later independent Chat recovery read `STATUS.md` only: 1 file, 48.67 ms. These are local read baselines, not five independently measured cross-session recovery timings. Clean main no-op, clean and dirty feature branches, unavailable remote, Web/GitHub handoff, and the real remote-ahead path are verified; the latter used fetch `0/1`, successful `pull --ff-only`, final `HEAD = origin/main = 740385b`, and a clean worktree. Review conclusion: the existing five scenarios plus the later independent sample do not yet justify context-pack work, so it remains deferred.
+- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. A later independent Chat recovery read `STATUS.md` only: 1 file, 48.67 ms. These are local read baselines, not five independently measured cross-session recovery timings. Clean main no-op, clean and dirty feature branches, unavailable remote, Web/GitHub handoff, and the real remote-ahead path are verified; the latter used fetch `0/1`, successful `pull --ff-only`, final `HEAD = origin/main = 740385b`, and a clean worktree. A read-only review of the documented ordinary-continuation versus explicit-sync matrix found no contradiction and added no new end-to-end test evidence. Review conclusion: the existing five scenarios plus the later independent sample do not yet justify context-pack work, so it remains deferred.
 
 ## Last verified progress
 
@@ -31,7 +31,7 @@ BUG-002 is resolved. BUG-001 remains open for authentication behavior in affecte
 
 ## Next concrete action
 
-- Review the five-scenario baseline in a genuinely separate future session before considering a context pack. Do not fabricate additional samples in one run; defer P1 context-pack and all P2 automation.
+- Keep context-pack and additional fabricated samples deferred; revisit only when a genuinely separate real resumption or concrete synchronization need supplies new evidence.
 
 ## Verification notes
 
