@@ -26,7 +26,7 @@ export class CommandExecutionError extends Error {
   }
 }
 
-const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)([^\s"']+)/gi;
+const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s"']+)/gi;
 const authorizationBearerPattern = /(authorization\s*:\s*bearer\s+)([^\s"']+)/gi;
 const bearerTokenPattern = /(bearer\s+)([^\s"']+)/gi;
 

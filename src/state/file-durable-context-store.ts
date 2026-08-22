@@ -600,13 +600,16 @@ export class FileDurableContextStore implements DurableContextStore {
       if (expectedHash === undefined) {
         throw new InvalidTaskStateError(`Manifest contract for task ${taskId} is missing a hash for ${targetPath}`);
       }
-      const content = await readRequiredContent(taskId, targetPath, expectedHash);
-      assertRawHash(taskId, targetPath, content, expectedHash);
-      parseCompanionRecord(parseJson(content, taskId, targetPath), taskId, targetPath, schema);
       const generationTargetPath = generationPath(paths, manifest.manifestId, targetPath);
-      const generationContent = await readRequiredContent(taskId, generationTargetPath, expectedHash);
-      assertRawHash(taskId, generationTargetPath, generationContent, expectedHash);
-      parseCompanionRecord(parseJson(generationContent, taskId, generationTargetPath), taskId, generationTargetPath, schema);
+      const selectedTargetPath = activePointer === null ? targetPath : generationTargetPath;
+      const content = await readRequiredContent(taskId, selectedTargetPath, expectedHash);
+      assertRawHash(taskId, selectedTargetPath, content, expectedHash);
+      parseCompanionRecord(parseJson(content, taskId, selectedTargetPath), taskId, selectedTargetPath, schema);
+      if (activePointer === null) {
+        const generationContent = await readRequiredContent(taskId, generationTargetPath, expectedHash);
+        assertRawHash(taskId, generationTargetPath, generationContent, expectedHash);
+        parseCompanionRecord(parseJson(generationContent, taskId, generationTargetPath), taskId, generationTargetPath, schema);
+      }
     }
 
     if (state.durableContext === null || JSON.stringify(state.durableContext) !== JSON.stringify(manifest)) {

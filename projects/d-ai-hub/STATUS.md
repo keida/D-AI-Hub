@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Preserve the verified secret-history remediation and keep PR #2 ready for independent review.
-- Working state: The rewritten feature branch is pushed at `c19c680`; backup branch `backup/pr2-before-secret-history-rewrite` preserves the pre-rewrite tip. Three pre-existing untracked planning/spec documents remain untouched.
-- Active plan: Do not merge PR #2 without separate explicit approval. Keep the local backup until the PR is merged or intentionally closed.
-- Latest verified evidence: Old commits `535d047` and `007bc87` are no longer ancestors of the feature branch. Full validation passed: 20 test files and 413 tests, TypeScript build, `git diff --check`, and secret-like scan with no credential values found. GitGuardian scanned 65 commits and reported `No secrets detected`; GitHub reports no conflicts and `mergeable: true`.
+- Current task: Publish the two P1 fixes identified during independent review and keep PR #2 ready for re-review.
+- Working state: P1 fixes are implemented locally but not yet committed. The rewritten feature branch remains pushed at `00992e4`; backup branch `backup/pr2-before-secret-history-rewrite` preserves the pre-rewrite tip. Three pre-existing untracked planning/spec documents remain untouched.
+- Active plan: Commit and push only the two P1 fixes and their regression tests, then re-run GitHub checks. Do not merge PR #2 without separate explicit approval.
+- Latest verified evidence: The generation-pointer recovery regression and quoted-secret redaction tests are both green. Full validation passed: 21 test files and 416 tests, TypeScript build, `git diff --check`, and secret-like scan. GitGuardian previously reported `No secrets detected` on the rewritten history.
 
 ## Last verified progress
 

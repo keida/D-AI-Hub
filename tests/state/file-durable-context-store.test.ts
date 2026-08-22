@@ -638,6 +638,24 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("loads the selected generation when a newer top-level companion mirror is unpublished", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const firstState = createState("task-unpublished-companion", "Published generation");
+    const secondState = { ...firstState, goal: "Unpublished generation" };
+
+    try {
+      await store.withTaskOwnership(firstState.taskId, firstState.environment, async (lease) => {
+        await store.save(firstState, lease);
+        await store.save(secondState);
+      });
+
+      await expect(store.load(firstState.taskId)).resolves.toMatchObject({ goal: firstState.goal });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("fences a late lower-generation pointer behind the successor pointer", async () => {
     const rootPath = await createStoreRoot();
     const firstStore = new FileDurableContextStore(rootPath);
