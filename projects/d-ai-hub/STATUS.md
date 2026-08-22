@@ -27,7 +27,7 @@
 
 ## Current blockers
 
-BUG-002 blocks treating `@D-AI sync` behavior as verified. A cross-client handoff failure is now directly observed: ChatGPT Web could not locate `projects/d-ai-hub/STATUS.md` in its current workspace. Normal local project continuation remains available, but remote freshness and cross-client context availability must be reported separately. New checkouts and environments must still authenticate before treating GitHub state as current.
+BUG-002 remains open for the dirty feature branch, authentication failure, and remote-ahead fast-forward cases. Cross-client handoff is verified when ChatGPT Web is connected to `keida/D-AI-Hub` through GitHub; without that connector, Web cannot see the Codex checkout. Remote freshness and cross-client context availability must still be reported separately. New checkouts and environments must authenticate before treating GitHub state as current.
 
 ## Next concrete action
 
