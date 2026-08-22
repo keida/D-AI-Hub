@@ -79,6 +79,25 @@ describe("Git rollback adapter", () => {
     }
   });
 
+  it("blocks divergent history before preserving work or issuing mutation commands", async () => {
+    const fixture = await createRepository();
+    try {
+      await git(fixture.root, ["checkout", "--orphan", "rewritten"]);
+      await git(fixture.root, ["rm", "-rf", "."]);
+      await writeFile(join(fixture.root, "rewritten.txt"), "rewritten history\n", "utf8");
+      await git(fixture.root, ["add", "rewritten.txt"]);
+      await git(fixture.root, ["commit", "-m", "rewritten history"]);
+      const divergentHead = await git(fixture.root, ["rev-parse", "HEAD"]);
+
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/ancestor|divergent|history/i);
+
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(divergentHead);
+      await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed when the restored tree does not match the recovery point", async () => {
     const fixture = await createRepository();
     try {

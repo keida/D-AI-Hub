@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CommandExecutionError, runCommand, type CommandResult } from "../adapters/command-runner.js";
-import { TaskOwnershipError } from "../domain/errors.js";
+import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import type { TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
 import type { CapturedRecoveryPoint } from "./recovery-point-service.js";
 import { safeRollback, type AuditableGitAction, type RollbackResult } from "./rollback.js";
@@ -118,6 +118,11 @@ export function createGitRollbackTask(repositoryPath: string): (
     await assertOwnership();
     const currentHead = output(await git(repositoryPath, ["rev-parse", "HEAD"]));
     await assertOwnership();
+    const ancestry = await gitAllowFailure(repositoryPath, ["merge-base", "--is-ancestor", point.snapshot.head, currentHead]);
+    await assertOwnership();
+    if (ancestry.exitCode !== 0) {
+      throw new InvalidTaskStateError(`Recovery point ${point.snapshot.head} is not an ancestor of current HEAD ${currentHead}; rollback history is divergent`);
+    }
     const commitsToRevert = currentHead === point.snapshot.head
       ? []
       : output(await git(repositoryPath, ["rev-list", `${point.snapshot.head}..${currentHead}`])).split(/\r?\n/).filter((commit) => commit.length > 0);
