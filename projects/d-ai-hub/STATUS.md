@@ -7,10 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: Validate the risk-based safety gates and the replace-in-place project progress checkpoint.
-- Working state: The risk-based gate and checkpoint changes are committed and pushed on canonical `main` at `ef9a9b0`; the worktree is clean. Canonical Skills and old worktrees are unchanged.
-- Active plan: Continue the remaining behavior matrix only in safe, available environments. Registered experimental worktrees were inspected read-only but are not test fixtures; at least two are dirty. Test progressive `project-memory` loading separately when Skill testing support is available.
-- Latest verified evidence: Fast Read on clean `main` loaded branch/status/checkpoint locally. Explicit sync then ran `fetch --prune` and `pull --ff-only` successfully; `HEAD = origin/main = remote main = ef9a9b0`, ahead/behind `0/0`. Release Gate passed for the eight-file diff, commit `ef9a9b0` was pushed, and the final worktree is clean. BUG-002 now has four completed Codex-side scenarios; feature/auth/cross-client cases remain unverified.
+- Current task: Implement and verify progressive loading for the canonical `project-memory` Skill.
+- Working state: Isolated branch `codex/project-memory-progressive` contains the Skill, checkpoint, and measurement updates; old worktrees remain untouched. The branch is pushed and tracked by PR #4.
+- Active plan: Await review/integration of the progressive Skill change. Continue measuring real resumptions before considering a context pack. Do not introduce a second memory source.
+- Latest verified evidence: RED pressure scenarios confirmed the prior fixed six-file order was too broad for narrow continuation. GREEN scenarios confirmed `STATUS.md` first, task-matching files conditionally, direct references as needed, and full order only for close/audit/conflict. Static Skill, compatibility-pointer, AGENTS alignment, and `git diff --check` checks passed. Five local read scenarios measured 2 files for narrow bug/roadmap/decision cases versus 6 files for close/audit cases; local character volume was 7,078/5,629/9,097 versus 19,306 for full reads. These are file-read baselines, not real cross-session recovery timings.
 
 ## Last verified progress
 
@@ -23,7 +23,7 @@
 - The Web operating pattern is now intentionally short-session based: use D-AI-Hub as durable memory rather than relying on very long ChatGPT conversation history. New durable sessions should restore only the narrowest relevant project, Skill, and knowledge context instead of loading the entire Hub.
 - The P0 consistency audit verified the scoped document links, canonical Skill frontmatter and compatibility targets, secret-like filenames/content, and `git diff --check`.
 - The P0 audit was a static documentation and consistency audit; it did not verify command behavior end to end.
-- The current change set introduced Fast Read, Write Gate, Release Gate, and a replace-in-place progress checkpoint; it repositions `@D-AI sync` as an optional explicit canonical-freshness check. These changes were committed and pushed as `ef9a9b0`.
+- The current change set introduced Fast Read, Write Gate, Release Gate, and a replace-in-place progress checkpoint; it repositions `@D-AI sync` as an optional explicit canonical-freshness check. These changes are present on canonical `main` at `0ffd770`.
 
 ## Current blockers
 
@@ -31,8 +31,8 @@ BUG-002 blocks treating `@D-AI sync` behavior as verified. Normal local project 
 
 ## Next concrete action
 
-Run only the remaining safe behavior checks when clean, isolated fixtures and environments are available. Do not modify the canonical `project-memory` Skill until its progressive-loading behavior can be tested with the required Skill test workflow. Defer P1 context-pack and all P2 automation.
+Collect five real project resumptions and record their file counts, repeated checks, elapsed recovery time, and omissions before considering a context pack. Defer P1 context-pack and all P2 automation.
 
 ## Verification notes
 
-Remote GitHub updates have been successfully performed after the original setup session. The current Codex environment has verified authenticated fetch/pull and clean synchronization with `origin/main` at `ef9a9b0`. The risk-based safety-gate and checkpoint changes were committed and pushed; no old worktree was modified.
+Remote GitHub updates have been successfully performed after the original setup session. The isolated branch was created from verified canonical `main` commit `0ffd770`; no old worktree was modified. Measurement results are recorded on the PR branch; canonical `main` remains unchanged until review and merge.

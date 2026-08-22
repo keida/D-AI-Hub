@@ -87,3 +87,25 @@ The checkpoint must distinguish verified, local, remote, reported, and unverifie
 **Revisit trigger**
 
 Reconsider if five measured project resumptions show that the checkpoint is still too large, omits required context, or fails to reduce repeated reads.
+
+## 2026-08-22 — Use progressive project-memory loading for ordinary continuation
+
+**Context**
+
+The fixed six-file project read order caused narrow continuation tasks to reread unchanged context. RED pressure scenarios confirmed that a focused BUG-002 check needed only current status, the matching bug entry, and directly referenced workflow files.
+
+**Decision**
+
+Start ordinary project continuation with `STATUS.md`, then load the task-matching project file and directly referenced files. Reserve the complete project read order for close, status conflicts, full audits, or explicit complete-context requests.
+
+**Rationale**
+
+This reduces repeated reads and token use while keeping canonical project state, explicit expansion rules, and full-context recovery available when risk requires it.
+
+**Consequences**
+
+The canonical `project-memory` Skill is the owner of the progressive read contract. The `.agents/skills/` entry point remains a compatibility pointer. Agents must report skipped files when that affects recovery confidence and must not create a second memory source.
+
+**Revisit trigger**
+
+Reconsider after measuring at least five real project resumptions or if a client demonstrates that the conditional read rules omit required context.

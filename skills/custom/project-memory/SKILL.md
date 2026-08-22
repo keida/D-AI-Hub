@@ -7,16 +7,22 @@ description: Use when starting, resuming, updating, or closing a project in D-AI
 
 Maintain project continuity under `projects/<project>/`.
 
-## Read order when resuming a project
+## Progressive read order when resuming a project
 
-1. `README.md` — purpose, scope, architecture, and repository links.
-2. `STATUS.md` — current state, last completed work, immediate next action, blockers.
-3. `DECISIONS.md` — architectural/product decisions that constrain future work.
-4. `BUGS.md` — unresolved defects and verified fixes.
-5. `ROADMAP.md` — planned milestones and deferred work.
-6. `REFERENCES.md` — external references when needed.
+Start with the smallest current-state read, then expand only when the task requires it:
 
-Do not rely on previous chat history when these files can carry the state explicitly.
+1. `STATUS.md` — current state, checkpoint, blockers, and next action.
+2. Read the one project file that matches the task:
+   - `BUGS.md` for a defect, failed verification, or behavior investigation.
+   - `ROADMAP.md` for milestone sequencing, scope, or deferred work.
+   - `DECISIONS.md` for an architectural or product choice.
+3. Read the directly referenced workflow, source, or project file needed to perform the task.
+4. Read `README.md` only when project purpose, scope, or architecture is unclear.
+5. Read `REFERENCES.md` only when an external source or repository link is needed.
+
+For `@D-AI close`, a status conflict, a full audit, or an explicit request for complete project context, use the full order: `README.md`, `STATUS.md`, `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, then `REFERENCES.md`.
+
+For a narrow continuation, do not reread unchanged project files whose content is not required by the current task. Report which files were read, which were skipped, and why when the distinction affects recovery confidence. Do not rely on previous chat history when the selected project files carry the state explicitly.
 
 ## Update workflow
 
