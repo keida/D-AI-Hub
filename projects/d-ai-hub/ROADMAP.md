@@ -16,7 +16,7 @@
 
 ## Next
 
-- Test a progressive-loading revision of the canonical `project-memory` Skill using the required Skill test workflow before editing or deploying it.
+- Integrate and deploy the verified progressive-loading revision of the canonical `project-memory` Skill after Release Gate review.
 - Measure context-loading time, files read, and repeated checks across at least five real project resumptions before considering a context pack.
 - Register additional project records only when there is active project state to preserve.
 
