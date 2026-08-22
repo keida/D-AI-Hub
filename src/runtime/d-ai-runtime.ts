@@ -7,7 +7,7 @@ import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js
 import { GitHubCliAdapter } from "../adapters/github.js";
 import { bootstrapTask, prepareBootstrapTask } from "../bootstrap/bootstrap-task.js";
 import { closeTask } from "../close/close-service.js";
-import { createDebugSession, type DebugSession } from "../debugging/debug-session.js";
+import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
   CapabilityMismatchError,
   CloseBlockedError,
@@ -750,10 +750,13 @@ async function enterRecovery(
 ): Promise<DAIResponse> {
   const redactedReason = redactSensitiveText(reason);
   const debugTransition = transitionState(state, "debug", "debugger", state.environment);
-  const debugSession = dependencies.createDebugSession(redactedReason, debugTransition.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
+  const initialDebugSession = dependencies.createDebugSession(redactedReason, debugTransition.recoveryPoint?.recoveryPointId ?? "recovery-point-unavailable");
+  const capturedDebugSession = advanceDebugSession(advanceDebugSession(advanceDebugSession(initialDebugSession)));
+  const hypothesizedDebugSession = setDebugHypothesis(capturedDebugSession, `Recovery hypothesis: ${redactedReason}`);
+  const changedDebugSession = advanceDebugSession(hypothesizedDebugSession);
   const debugState = await persistState(dependencies.store, {
     ...debugTransition,
-    debugSession,
+    debugSession: changedDebugSession,
     routingDecision: debugTransition.routingDecision === null ? null : {
       ...debugTransition.routingDecision,
       reason: `Debugging required: ${redactedReason}`,
@@ -771,8 +774,10 @@ async function enterRecovery(
       throw new InvalidTaskStateError("Recovery must return the recover stage and recovery-operator role");
     }
     assertStageTransition(debugState.stage, recovered.stage);
+    const reverifyingDebugSession = advanceDebugSession(changedDebugSession);
     return persistState(dependencies.store, {
       ...recovered,
+      debugSession: reverifyingDebugSession,
       routingDecision: recovered.routingDecision === null ? null : {
         ...recovered.routingDecision,
         stage: recovered.stage,
@@ -1216,6 +1221,13 @@ async function completeHandoffExclusive(
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
   }
+  const readiness = await connectorOutcome(
+    () => dependencies.handoffService.ready(),
+    completionConnectorFailure,
+  );
+  if (readiness.kind === "blocked") {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Handoff completion blocked: ${readiness.message}`);
+  }
   const loadedState = await connectorOutcome(() => dependencies.store.load(taskId), completionConnectorFailure);
   if (loadedState.kind === "blocked") {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Handoff completion blocked: ${loadedState.message}`);
@@ -1321,6 +1333,24 @@ async function completeHandoff(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
+  const readiness = await connectorOutcome(
+    () => dependencies.handoffService.ready(),
+    completionConnectorFailure,
+  );
+  if (readiness.kind === "blocked") {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, `Handoff completion blocked: ${readiness.message}`);
+  }
+  const persistedStatus = await connectorOutcome(
+    () => Promise.resolve(dependencies.adapters[request.sourceEnvironment].status(command.handoffId)),
+    completionConnectorFailure,
+  );
+  if (persistedStatus.kind === "blocked") {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, `Handoff completion blocked: ${persistedStatus.message}`);
+  }
+  if (persistedStatus.value.owner !== request.sourceEnvironment) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, `Handoff ${command.handoffId} is not actively owned by ${request.sourceEnvironment}`);
+  }
+  registry.transfer(persistedStatus.value.taskId, request.sourceEnvironment);
   const taskId = registry.activeTaskId(request.sourceEnvironment);
   if (taskId === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "No active durable task is available for handoff completion");

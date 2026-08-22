@@ -24,6 +24,7 @@ const noOverrides = { model: null, role: null, environment: null } as const;
 interface LifecycleTrace {
   readonly responses: { taskId: string; stage: string; environment: Environment; status: string; message: string }[];
   readonly handoffSnapshots: HandoffStatus[];
+  readonly debugPhases: string[];
   readonly loadedSkills: LoadedSkill[];
   readonly requestedResources: { name: string; resources: readonly string[] }[];
   failedResult: CommandResult;
@@ -60,7 +61,7 @@ function localGitHubAdapter(fixture: KnownGoodRepositoryFixture): GitHubAdapter 
 async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<RuntimeFixture> {
   const store = new FileDurableContextStore(fixture.durableContextRoot);
   const handoffs = new PersistentHandoffService(new FileHandoffPersistence(fixture.handoffPersistencePath));
-  const trace: LifecycleTrace = { responses: [], handoffSnapshots: [], loadedSkills: [], requestedResources: [], failedResult: null as never, passingResult: null as never, regressionResult: null as never };
+  const trace: LifecycleTrace = { responses: [], handoffSnapshots: [], debugPhases: [], loadedSkills: [], requestedResources: [], failedResult: null as never, passingResult: null as never, regressionResult: null as never };
   let failedResult: CommandResult | null = null;
   let passingResult: CommandResult | null = null;
   let regressionResult: CommandResult | null = null;
@@ -118,7 +119,7 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
     resolveModelRoute: (await import("../../src/routing/model-router.js")).resolveModelRoute,
     discoverSkillMetadata, selectCapabilities,
     loadSelectedSkill: async (descriptor, resources) => { trace.requestedResources.push({ name: descriptor.name, resources: [...resources] }); const skill = await loadSelectedSkill(descriptor, resources); trace.loadedSkills.push(skill); return skill; },
-    evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture" }), recover: async (state) => { await rm(fixture.recoveryMarkerPath); return { ...state, stage: "recover", role: "recovery-operator" }; },
+    evaluateHardGates, captureRecoveryPoint, createDebugSession: () => ({ phase: "reproduce", hypothesis: null, originalFailure: "fixture", preservedRecoveryPointId: "fixture" }), recover: async (state) => { trace.debugPhases.push(state.debugSession?.phase ?? "missing"); await rm(fixture.recoveryMarkerPath); return { ...state, stage: "recover", role: "recovery-operator" }; },
     closeTask: async (state, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard): Promise<CloseVerdict> => closeTask(state, { store, gitHub: localGitHubAdapter(fixture) }, lease, assertOwnership), maximumEvidenceAgeMs: 300_000, now: () => new Date(),
   };
   Object.defineProperty(trace, "failedResult", { get: () => failedResult });
@@ -157,6 +158,7 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
       const result = await runLifecycle(fixture);
       expect(new Set(result.trace.responses.map((response) => response.taskId)).size).toBe(1);
       expect(result.trace.responses.map((response) => response.stage)).toEqual(["recover", "verify", "verify", "handoff", "verify", "close"]);
+      expect(result.trace.debugPhases).toEqual(["change"]);
       expect(result.trace.responses[0]).toMatchObject({ status: "blocked", environment: "codex" });
       expect(result.trace.responses.at(-2), result.trace.responses.at(-2)?.message).toMatchObject({ taskId: result.trace.responses[0]?.taskId, stage: "verify", environment: "work", status: "completed" });
       expect(result.trace.responses.at(-1), result.trace.responses.at(-1)?.message).toMatchObject({ taskId: result.trace.responses[0]?.taskId, stage: "close", environment: "work", status: "completed" });
@@ -248,5 +250,26 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
 
   it.skipIf(process.env.D_AI_GITHUB_EXTERNAL_INTEGRATION === "1")("keeps the configured external GitHub lane explicitly skipped when credentials are not configured", () => {
     expect(process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED).not.toBe("1");
+  });
+
+  it("completes an active handoff through a fresh runtime after restart", async () => {
+    const fixture = await createKnownGoodRepository();
+    try {
+      const first = await makeRuntimeFixture(fixture);
+      const intent = await first.runtime({ command: { kind: "intent", text: "implement verify repository" }, sourceEnvironment: "chat", overrides: noOverrides });
+      expect(intent.status).toBe("blocked");
+      const continued = await first.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(continued.status).toBe("completed");
+      const handoff = await first.runtime({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(handoff.status).toBe("accepted");
+
+      const restarted = await makeRuntimeFixture(fixture);
+      const completed = await restarted.runtime({ command: { kind: "complete", handoffId: `handoff-${intent.taskId}-1` }, sourceEnvironment: "work", overrides: noOverrides });
+
+      expect(completed).toMatchObject({ taskId: intent.taskId, stage: "verify", environment: "work", status: "completed" });
+      expect(restarted.handoffs.status(`handoff-${intent.taskId}-1`)).toMatchObject({ state: "completed", owner: "work" });
+    } finally {
+      await rm(fixture.rootPath, { recursive: true, force: true });
+    }
   });
 });

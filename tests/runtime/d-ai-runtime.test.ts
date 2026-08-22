@@ -1351,8 +1351,9 @@ describe("D-AI runtime", () => {
       expect(persisted).toMatchObject({
         environment: "codex",
         debugSession: {
-          phase: "reproduce",
+          phase: "reverify",
           originalFailure: "execution did not complete",
+          hypothesis: expect.stringMatching(/recovery hypothesis/i),
           preservedRecoveryPointId: expect.any(String),
         },
       });
