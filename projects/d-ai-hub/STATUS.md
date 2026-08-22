@@ -3,7 +3,7 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-21
+- Last updated: 2026-08-22
 
 ## Last verified progress
 
@@ -13,16 +13,17 @@
 - Project documentation was cleaned up so machine-specific paths and transient commit/tree snapshot identifiers are not treated as durable canonical state.
 - V1.1 hardening documents the safe ChatGPT Web ↔ GitHub ↔ Codex workflow and makes `skills/custom/` the only canonical custom Skill source.
 - V1.1 rollback hardening is implemented on the feature branch: explicit `@D-AI rollback`, ownership-gated runtime dispatch, durable DebugSession, RecoverySnapshot integrity, real Git revert/apply adapter, and durable RollbackAudit.
-- Verified evidence for the checkpoint: 399 tests passed, TypeScript build passed, and diff integrity passed. The checkpoint is committed locally but has not been pushed or merged.
+- Verified evidence for the checkpoint: 400 tests passed, TypeScript build passed, and diff integrity passed. The checkpoint is committed and pushed to `feat/d-ai-ownership-repair`; it has not been merged.
 - The current Codex environment has verified GitHub authentication, `git fetch --prune origin`, `git pull --ff-only origin main`, and clean synchronization with `origin/main`.
+- The 2026-08-22 `@D-AI sync` read-only check verified local `main` and the feature branch against their remote heads; the feature worktree still contains uncommitted Task 1B code/test changes and untracked Task 1B/repository-health-check documents. No tests or builds were run during that sync check.
 
 ## Current blockers
 
-The V1.1 checkpoint is local to its feature branch and is not yet present on canonical `main`; push/merge requires an explicit integration decision. New checkouts and environments must still authenticate and verify fetch/pull before treating local state as current.
+The V1.1 checkpoint is present on the pushed feature branch but is not yet present on canonical `main`; Draft PR #2 remains open for review and merge still requires an explicit integration decision. Task 1B durable transfer and opaque transition authorization remain incomplete and unverified in the dirty feature worktree. New checkouts and environments must still authenticate and verify fetch/pull before treating local state as current.
 
 ## Next concrete action
 
-Review the local V1.1 checkpoint, then explicitly decide whether to push/merge it into canonical `main` before starting the next 1.2 milestone.
+Preserve and review the existing Task 1B worktree changes, then run the focused transfer/authorization tests, build, and diff check before deciding whether to update Draft PR #2 or merge it into canonical `main`.
 
 ## Verification notes
 
