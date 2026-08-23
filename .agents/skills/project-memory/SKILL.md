@@ -1,6 +1,11 @@
 ---
 name: project-memory
 description: Use when starting, resuming, updating, or closing a project in D-AI-Hub so project state is explicit and does not depend on old chat history.
+metadata:
+  triggers: '["project","memory","resume"]'
+  compatibleEnvironments: '["chat","work","codex"]'
+  compatibleStages: '["bootstrap","plan","execute","inspect","verify","handoff","close"]'
+  requiredResources: '[]'
 ---
 
 # Project Memory — Agent Entry Point

@@ -3,36 +3,36 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-22
+- Last updated: 2026-08-23
 
 ## Current checkpoint
 
-- Current task: Preserve the resolved BUG-002 boundary, review the progressive project-memory baseline, and keep the ordinary-continuation versus explicit-sync boundary documented.
-- Working state: The canonical `main` fast-forwarded from `526e32f` to `740385b` after a clean remote-ahead check, then recorded the resolved BUG-002 state and the independent recovery sample; the latest verified `HEAD = origin/main`, ahead/behind `0/0`, and the worktree is clean. Old worktrees remain untouched.
-- Active plan: Do not invalidate credentials or alter the canonical remote merely to manufacture an authentication failure. Keep the five-scenario baseline under review and do not introduce a second memory source or context pack.
-- Latest verified evidence: Five progressive-loading scenarios completed: narrow status/roadmap 2 files, narrow decision 2 files, BUG investigation 4 files, and close/audit full order 6 files. Measured local reads were 70.223 ms/5,993 chars; 25.81 ms/17,576 chars; 4.92 ms/8,994 chars; 4.47 ms/5,504 chars; and 14.91 ms/19,165 chars respectively. A fresh Fast Read then loaded `STATUS.md` and `ROADMAP.md`: 2 files, 6,004 characters, 77.404 ms. A later independent Chat recovery read `STATUS.md` only: 1 file, 48.67 ms. These are local read baselines, not five independently measured cross-session recovery timings. Clean main no-op, clean and dirty feature branches, unavailable remote, Web/GitHub handoff, and the real remote-ahead path are verified; the latter used fetch `0/1`, successful `pull --ff-only`, final `HEAD = origin/main = 740385b`, and a clean worktree. A read-only review of the documented ordinary-continuation versus explicit-sync matrix found no contradiction and added no new end-to-end test evidence. Review conclusion: the existing five scenarios plus the later independent sample do not yet justify context-pack work, so it remains deferred.
+- Current task: restore the approved D-AI orchestrator v2 product intent and deliver a usable Codex activation entry without expanding Router, third-party Skill, or repository-health scope.
+- Working state: feature branch `feat/d-ai-ownership-repair` is at local merge commit `e763b717` before the review-fix commit; it merges feature `6bf9d51` with `origin/main` `3677579`. The canonical `main` worktree is untouched. Three pre-existing repository-health/PR2 files remain untracked and excluded.
+- Review-fix scope: parser/activation override forwarding, continue workspace fencing, override conflict fail-closed, recovery override preservation, rollback original-check rerun, close-without-handoff semantics, and their observable regression tests.
+- Independent review: final Standards and Spec reviews by separate GPT-5.6 Luna High reviewers found no blocking findings after the final recovery-stage fix.
+- Release gate: complete single-worker test, build, diff-check, and secret scan passed. The review fixes are still uncommitted and require the explicitly authorized feature-branch commit/push before PR update and merge evaluation.
 
-## Last verified progress
+## Four-layer delivery state
 
-- D-AI-Hub V1 foundation was merged into canonical `main`.
-- Codex operating context was subsequently committed and successfully pushed to GitHub `main`.
-- The root `AGENTS.md` bootstrap defines session-start, canonical ownership, security, branch, and session-close rules for Codex and compatible agents.
-- V1.1 hardening documents the safe ChatGPT Web ↔ GitHub ↔ Codex workflow and makes `skills/custom/` the only canonical custom Skill source.
-- The current Codex environment has verified GitHub authentication, authenticated fetch/pull, and clean synchronization with `origin/main`.
-- A full Codex Hub audit was completed after establishment; the confirmed V1.1 consistency and workflow issues were fixed and post-reviewed with no remaining Critical or blocking Important findings.
-- The Web operating pattern is now intentionally short-session based: use D-AI-Hub as durable memory rather than relying on very long ChatGPT conversation history. New durable sessions should restore only the narrowest relevant project, Skill, and knowledge context instead of loading the entire Hub.
-- The P0 consistency audit verified the scoped document links, canonical Skill frontmatter and compatibility targets, secret-like filenames/content, and `git diff --check`.
-- The P0 audit was a static documentation and consistency audit; it did not verify command behavior end to end.
-- The current change set introduced Fast Read, Write Gate, Release Gate, and a replace-in-place progress checkpoint; it repositions `@D-AI sync` as an optional explicit canonical-freshness check. Progressive project-memory loading is now present on canonical `main` at `483e06d`.
+1. **Markdown Hub — canonical source and v2 spec tracked on the feature branch.** The approved product specification is `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md`. Canonical `main` remains locally dirty with unrelated user Skill-routing documentation and was not modified.
+2. **Orchestrator runtime — implemented and verified on the feature branch.** Parser, routing, handoff, durable state, ownership/workspace fencing, verification, recovery, rollback, and close logic are covered by the current full gate.
+3. **Codex activation — release candidate ready for authorized publication.** The logical `@D-AI` Skill entry reaches the parser and configured runtime. Fresh status/close use workspace-scoped durable discovery; zero, multiple, mismatch, malformed identity, closed-task, ownership, dirty-close, missing-credentials, and remote-SHA mismatch cases fail closed or return NO/BLOCKED.
+4. **Chat/Work adapters — contract only, not product-activated.** No supported Chat or Work activation surface or configured execution/durable connector has been delivered; unavailable capabilities remain BLOCKED.
+
+## Verified evidence
+
+- Current structural baseline: `HEAD=e763b717`, parents `6bf9d51` and `3677579`; exact intended diff excludes all three repository-health/PR2 files.
+- Targeted review-fix evidence: runtime 82/82; the affected entry/close/gates set 193/193; both independent reviewers confirmed no blocking finding after the final fix.
+- Final complete gate after the final fix: 25/25 test files and 488/488 tests with one worker; `npm run build` passed; `git diff --check` passed; secret-shaped scan passed with no non-test credential-shaped additions.
+- Workspace identity evidence in the existing Codex activation boundary covers canonical path, junction, Windows case variant, zero/multiple discovery, cross-workspace isolation, ownership mismatch, explicit task selection, dirty close, missing GitHub configuration, and remote SHA mismatch.
+- Preserved untracked exclusions: `docs/superpowers/plans/2026-08-21-repository-health-check.md`, `docs/superpowers/plans/2026-08-22-pr2-review-repair.md`, and `docs/superpowers/specs/2026-08-21-repository-health-check.md`.
 
 ## Current blockers
 
-BUG-002 is resolved. BUG-001 remains open for authentication behavior in affected environments; the current Codex checkout has valid authenticated GitHub access. New checkouts and environments must authenticate before treating GitHub state as current.
+- Chat and Work product activation/connectors remain unavailable and correctly remain BLOCKED.
+- Publication is not yet complete: the review-fix commit must be created and pushed to `origin/feat/d-ai-ownership-repair`, then PR #2 rules/checks/reviews must be re-read before any ordinary merge decision.
 
 ## Next concrete action
 
-- Keep context-pack and additional fabricated samples deferred; revisit only when a genuinely separate real resumption or concrete synchronization need supplies new evidence.
-
-## Verification notes
-
-Remote GitHub updates have been successfully performed after the original setup session. The remote-ahead validation fast-forwarded clean `main` from `526e32f` to `740385b`, the resolved BUG-002 record was pushed as `aacc3e8`, and the independent recovery sample was pushed as `b8c7da9`; final `HEAD = origin/main = b8c7da9`, ahead/behind `0/0`, and the worktree was clean. Automated validation on the canonical checkout passed `git diff --check`; no package, test-runner, or build entry point is present, so no code test suite was run.
+Run the staged release gate on only the intended review-fix files, create the authorized non-squash fix commit, push the feature branch non-force, verify remote SHA, then update PR #2 and inspect actual required rules/checks before considering the authorized ordinary merge.

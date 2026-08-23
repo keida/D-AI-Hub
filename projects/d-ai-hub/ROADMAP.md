@@ -1,34 +1,38 @@
 # Roadmap
 
-## Now
+## Now — restore the approved v2 product slice
 
-- Apply the safe cross-client sync and write rules in `docs/workflow.md`; new environments must verify GitHub authentication before treating local state as current.
-- Keep BUG-001 open for authentication behavior in affected environments; BUG-002 sync behavior is resolved for the verified current workflow.
-- Keep `STATUS.md`, `DECISIONS.md`, `BUGS.md`, and `REFERENCES.md` current after meaningful work.
-- Add durable knowledge only when it has a clear canonical home and a useful retrieval path.
+1. Keep the approved product baseline tracked at `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md` and use it as the acceptance source of truth.
+2. Preserve the implemented orchestrator runtime and close hard gates; fix only defects that directly block Codex activation or its acceptance.
+3. Deliver the Codex activation layer through the canonical `d-ai` Skill, raw-command CLI, explicit durable task selection, and fail-closed default connectors.
+4. Prove discover → parse → configured runtime → durable state → close verdict from an unrelated workspace, including no active task, dirty worktree, missing connector/credentials, and remote SHA mismatch.
+5. Run full single-worker tests, build, diff integrity, secret-shaped additions scan, and one independent review against the approved v2 specification.
 
-## Completed in current V1.2 scope
+## Four-layer product sequence
 
-- P0 consistency audit and documentation alignment: command documentation is explicit about ChatGPT Web, Codex, and compatible agents, while `@D-AI update` remains an internal workflow.
-- Integrated the progressive project-memory loading revision in `ffe6c59` and documented the Release Gate result.
-- Reviewed Fast Read, Write Gate, and Release Gate behavior, including the replace-in-place `STATUS.md` checkpoint.
-- Reviewed the manual matrix distinguishing ordinary local continuation from explicit `@D-AI sync`; no documentation contradiction was found.
+- **Markdown Hub:** canonical source, product specification, decisions, roadmap, status, and references.
+- **Orchestrator runtime:** one D-AI control plane for lifecycle, routing, handoff, durable context, verification, recovery, rollback, and close.
+- **Codex activation:** first supported product entry; platform syntax invokes the same logical `@D-AI` command family.
+- **Chat/Work adapters:** later product entries after their actual supported capability seams and durable connectors are available; until then they remain explicitly `BLOCKED`.
 
-## Next
+## Completed on the active feature branch
 
-- Measure context-loading time, files read, and repeated checks across at least five real project resumptions before considering a context pack.
-- Register additional project records only when there is active project state to preserve.
+- Ownership fencing, atomic initial persistence, handoff restart reconciliation, partial rollback audit persistence, credential/quoted-secret rejection, and URL credential redaction.
+- Raw Codex command parsing into the existing runtime.
+- Fresh-runtime explicit durable task selection for active-state commands.
+- Canonical repository Skill source, compatibility entry, CLI, and external-workspace activation tests.
+- Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.
 
-## Deferred to V1.2+
+## Deferred until directly required by product acceptance
 
-- Optional automated repository health check for broken links, Skill frontmatter, secret-like files, and stale indexes; the current P0 audit is manual and does not introduce an automation system.
-- Optional GitHub Actions validation after real repository usage justifies it.
-- Optional source-ingestion workflow.
-- Optional semantic search or RAG after file-based retrieval is demonstrably insufficient.
-- Optional cross-agent bootstrap guidance for additional compatible clients.
+- External Router installation or evaluation.
+- Additional third-party Skill evaluation.
+- Repository health-check automation and the three existing untracked health-check/PR2 planning documents.
+- New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 
-## Not planned
+## Not yet delivered
 
-- Storing credentials or confidential employer material.
-- Vendoring large third-party Skill repositories without a deliberate local fork.
-- Automatic sync daemons, background ingestion, or vector infrastructure in V1.
+- Supported Chat activation entry and configured Chat execution/approval connector.
+- Supported Work activation entry and configured Work durable-context connector.
+- A successful real-environment `Safe-to-delete: YES` demonstration with exact GitHub remote SHA evidence for this activation release.
+- Canonical merge and release of the feature branch.

@@ -43,7 +43,18 @@
 - Why it matters: records the intended V1 foundation tasks and verification expectations.
 - Accessed / reviewed: 2026-08-20
 
+- Title: Approved D-AI Orchestrator v2 design specification
+- URL / repository path: `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md`
+- Why it matters: approved product baseline for the single D-AI control plane, logical global entry, Chat/Work/Codex routing and handoff, durable recovery, hard verification, and close verdict.
+- Provenance: copied byte-for-byte from the approved untracked design artifact in the legacy orchestrator worktree; both artifacts verified at SHA-256 `5224053CC37E695EC6A0C8047E2AEFBBC836FEFF8D826847FF0518AAF10BCB4F` on 2026-08-23.
+
+- Title: D-AI Codex activation Skill
+- URL / repository path: `skills/custom/d-ai/SKILL.md`
+- Why it matters: canonical user-discoverable Codex activation instructions and real platform syntax for logical `@D-AI` requests.
+- Compatibility entry: `.agents/skills/d-ai/SKILL.md`.
+
 ## Skill sources
 
 - `skills/custom/knowledge-manager/SKILL.md` — canonical durable-knowledge capture and retrieval workflow.
 - `skills/custom/project-memory/SKILL.md` — canonical project continuation and update workflow.
+- `skills/custom/d-ai/SKILL.md` — canonical Codex activation entry for logical D-AI commands.
