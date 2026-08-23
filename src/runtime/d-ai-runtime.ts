@@ -738,7 +738,8 @@ function validateCapturedRecoveryPoint(
     if (snapshot.stateManifest.manifestId !== manifest.manifestId
       || snapshot.stateManifest.taskId !== state.taskId
       || snapshot.verificationResults.length === 0
-      || snapshot.durableArtifacts[validated.durablePaths[0] ?? ""] === undefined) {
+      || !hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, snapshot.stateManifest.durablePaths, snapshot.stateManifest.hashes)
+      || !hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, Object.keys(snapshot.durableArtifacts), snapshot.durableArtifacts)) {
       return { kind: "blocked", message: "Captured recovery snapshot does not match the persisted verify manifest" };
     }
     if (snapshot.head.trim().length === 0 || snapshot.branch.trim().length === 0 || snapshot.workspacePath.trim().length === 0) {

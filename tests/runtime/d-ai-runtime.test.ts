@@ -1448,6 +1448,45 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.savedStates.some((state) => state.recoveryPoint?.createdAt === createdAt)).toBe(false);
   });
 
+  it("blocks a captured recovery snapshot with an unverified durable artifact before persisting it", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
+    const extraPath = "unverified.json";
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint | CapturedRecoveryPoint> => {
+        const captured = await captureRecoveryPoint(state);
+        const recoveryPoint = "recoveryPoint" in captured ? captured.recoveryPoint : captured;
+        const manifest = state.durableContext;
+        if (manifest === null) throw new InvalidTaskStateError("Recovery capture requires durable context");
+        return {
+          trigger: "recovery",
+          recoveryPoint,
+          snapshot: {
+            head: "0123456789abcdef0123456789abcdef01234567",
+            branch: "main",
+            workspacePath: "C:/workspace",
+            status: "clean",
+            binaryPatch: "no patch required",
+            stateManifest: {
+              ...manifest,
+              durablePaths: [...manifest.durablePaths, extraPath],
+              hashes: { ...manifest.hashes, [extraPath]: "b".repeat(64) },
+            },
+            verificationResults: state.verificationEvidence,
+            durableArtifacts: { ...manifest.hashes },
+          },
+        };
+      },
+    });
+
+    const result = await handle(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/recovery capture blocked|snapshot.*match/i);
+    expect(runtimeHarness.savedStates.some((state) => state.recoverySnapshot?.stateManifest.durablePaths.includes(extraPath))).toBe(false);
+  });
+
   it("propagates execution failure through debug/recovery", async () => {
     const runtimeHarness = harness(failedExecution, evaluateHardGates, "YES");
     const response = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("work", noOverrides));
