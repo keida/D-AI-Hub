@@ -21,7 +21,7 @@ export interface RemoteState {
 }
 
 export interface GitHubAdapter {
-  pushExpectedCommit(repositoryPath: string, remote: string, ref: string): Promise<GitPushEvidence>;
+  pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string): Promise<GitPushEvidence>;
   verifyRemoteState(repository: string, ref: string, expectedSha: string): Promise<RemoteState>;
 }
 
@@ -179,8 +179,9 @@ export class GitHubCliAdapter implements GitHubAdapter {
     return new GitHubCliAdapter(policy, transport);
   }
 
-  public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string): Promise<GitPushEvidence> {
+  public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string): Promise<GitPushEvidence> {
     this.assertConfigured();
+    const expected = assertExpectedSha(expectedSha);
     const localState = await inspectLocalGitState(repositoryPath, remote, ref);
     const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
     const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
@@ -198,6 +199,18 @@ export class GitHubCliAdapter implements GitHubAdapter {
         observedOutput: `${localEvidence}\nPush was not attempted because the required clean worktree policy failed.`,
         exitCode: 1,
         failureCategory: "dirty-worktree",
+      };
+    }
+    if (localState.head !== expected) {
+      return {
+        remote: localState.remote,
+        repository: configuredRepository.repository,
+        ref: localState.ref,
+        localSha: localState.head,
+        pushed: false,
+        observedOutput: `${localEvidence}\nPush was not attempted because local HEAD does not match the durable expected commit artifact.`,
+        exitCode: 1,
+        failureCategory: "verification-mismatch",
       };
     }
     const pushResult = await this.transport.pushRef(localState.repositoryPath, localState.pushUrl, localState.ref, localState.head);

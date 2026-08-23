@@ -27,6 +27,7 @@ export class CommandExecutionError extends Error {
 }
 
 const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|auth|authorization|credential|access[_-]?token|private[_-]?key|cookie|session[_-]?token)\s*[:=]\s*)(?!bearer\b)(?:"[^"]*"|'[^']*'|[^\s"']+)/gi;
+const separateSecretArgumentPattern = /^--(?:api[_-]?key|token|secret|password|passwd|auth|authorization|credential|access[_-]?token|private[_-]?key|cookie|session[_-]?token)$/i;
 const bearerValuePattern = '(?:"[^"]*"|\'[^\']*\'|[^\\s"\']+)';
 const authorizationBearerPattern = new RegExp(`(authorization\\s*:\\s*bearer\\s+)${bearerValuePattern}`, "gi");
 const bearerTokenPattern = new RegExp(`(bearer\\s+)${bearerValuePattern}`, "gi");
@@ -37,6 +38,21 @@ export function redactSensitiveText(value: string): string {
     .replace(secretAssignmentPattern, "$1[REDACTED]")
     .replace(bearerTokenPattern, "$1[REDACTED]");
   return redactSecretShapedValues(redacted);
+}
+
+function redactSensitiveArguments(argumentsList: readonly string[]): readonly string[] {
+  const redacted: string[] = [];
+  let redactNext = false;
+  for (const argument of argumentsList) {
+    if (redactNext) {
+      redacted.push("[REDACTED]");
+      redactNext = false;
+      continue;
+    }
+    redacted.push(redactSensitiveText(argument));
+    redactNext = separateSecretArgumentPattern.test(argument);
+  }
+  return redacted;
 }
 
 function assertCommandRequest(request: CommandRequest): void {
@@ -51,7 +67,7 @@ function assertCommandRequest(request: CommandRequest): void {
 function createResult(request: CommandRequest, stdout: string, stderr: string, exitCode: number | null): CommandResult {
   return {
     command: redactSensitiveText(request.command),
-    arguments: request.arguments.map(redactSensitiveText),
+    arguments: redactSensitiveArguments(request.arguments),
     stdout: redactSensitiveText(stdout),
     stderr: redactSensitiveText(stderr),
     exitCode,

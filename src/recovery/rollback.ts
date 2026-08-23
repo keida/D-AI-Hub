@@ -90,6 +90,22 @@ function incompletePreservedUserWork(): PreservedUserWork {
   return { archiveId: "preserve-failed", patchDigest: "0".repeat(64) };
 }
 
+function ownershipPartialFailure(
+  preservedUserWork: PreservedUserWork,
+  actions: readonly AuditableGitAction[],
+  error: TaskOwnershipError,
+): RollbackPartialFailureError {
+  const message = redactSensitiveText(error.message);
+  return new RollbackPartialFailureError(
+    {
+      preservedUserWork,
+      actions,
+      verification: { passed: false, observedOutput: "", reason: `Rollback ownership was lost after Git mutation: ${message}` },
+    },
+    message,
+  );
+}
+
 export async function safeRollback(input: RollbackInput): Promise<RollbackResult> {
   let preservedUserWork: PreservedUserWork;
   try {
@@ -114,7 +130,10 @@ export async function safeRollback(input: RollbackInput): Promise<RollbackResult
       assertCommit(commit);
       actions.push(assertAuditableAction(await input.adapter.revertCommit(commit), "revert"));
     } catch (error: unknown) {
-      if (error instanceof TaskOwnershipError) throw error;
+      if (error instanceof TaskOwnershipError) {
+        if (actions.length === 0) throw error;
+        throw ownershipPartialFailure(preservedUserWork, actions, error);
+      }
       const failedAction = failedCommandAction(error);
       throw new RollbackPartialFailureError(
         {
@@ -129,7 +148,10 @@ export async function safeRollback(input: RollbackInput): Promise<RollbackResult
   try {
     actions.push(assertAuditableAction(await input.adapter.restoreRecoveryPatch(input.recoveryPoint.snapshot.binaryPatch), "apply"));
   } catch (error: unknown) {
-    if (error instanceof TaskOwnershipError) throw error;
+    if (error instanceof TaskOwnershipError) {
+      if (actions.length === 0) throw error;
+      throw ownershipPartialFailure(preservedUserWork, actions, error);
+    }
     const failedAction = failedCommandAction(error);
     throw new RollbackPartialFailureError(
       {
@@ -144,7 +166,10 @@ export async function safeRollback(input: RollbackInput): Promise<RollbackResult
   try {
     verification = await input.adapter.verifyRecoveryPoint(input.recoveryPoint);
   } catch (error: unknown) {
-    if (error instanceof TaskOwnershipError) throw error;
+    if (error instanceof TaskOwnershipError) {
+      if (actions.length === 0) throw error;
+      throw ownershipPartialFailure(preservedUserWork, actions, error);
+    }
     throw new RollbackPartialFailureError(
       {
         preservedUserWork,

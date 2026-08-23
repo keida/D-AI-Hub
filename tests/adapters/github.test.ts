@@ -1,6 +1,10 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GitHubCliAdapter, GitRemoteBlockedError, resolveGitHubRepository } from "../../src/adapters/github.js";
 import { classifyGitFailure } from "../../src/adapters/git.js";
+import { runCommand } from "../../src/adapters/command-runner.js";
 
 describe("resolveGitHubRepository", () => {
   it("normalizes SSH and HTTPS GitHub remotes without retaining credentials", () => {
@@ -52,6 +56,41 @@ describe("GitHubCliAdapter external boundary", () => {
   it("blocks before transport when external credentials are not configured", async () => {
     const external = GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: false });
 
-    await expect(external.pushExpectedCommit("not-a-repository", "origin", "refs/heads/main")).rejects.toThrow(/credentials|configuration/i);
+    await expect(external.pushExpectedCommit("not-a-repository", "origin", "refs/heads/main", "0".repeat(40))).rejects.toThrow(/credentials|configuration/i);
+  });
+
+  it("does not push a local HEAD that differs from the durable commit artifact", async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), "d-ai-github-expected-commit-"));
+    const git = async (argumentsList: readonly string[]): Promise<string> => (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
+    let pushCalls = 0;
+    const adapter = GitHubCliAdapter.forTestTransport(
+      { mode: "test", enterpriseHost: null },
+      {
+        pushRef: async () => {
+          pushCalls += 1;
+          return { pushed: true, observedOutput: "pushed", exitCode: 0, failureCategory: null };
+        },
+        readRef: async () => ({ command: "git", arguments: ["ls-remote"], stdout: "", stderr: "", exitCode: 0 }),
+      },
+    );
+
+    try {
+      await git(["init", "--initial-branch=main"]);
+      await git(["config", "user.email", "d-ai@example.test"]);
+      await git(["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "known good\n", "utf8");
+      await git(["add", "artifact.txt"]);
+      await git(["commit", "-m", "known good"]);
+      await git(["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      const localHead = await git(["rev-parse", "HEAD"]);
+
+      const evidence = await adapter.pushExpectedCommit(repositoryPath, "origin", "refs/heads/main", "0".repeat(40));
+
+      expect(pushCalls).toBe(0);
+      expect(evidence).toMatchObject({ localSha: localHead, pushed: false, exitCode: 1, failureCategory: "verification-mismatch" });
+      expect(evidence.observedOutput).toMatch(/durable|expected|commit/i);
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true });
+    }
   });
 });

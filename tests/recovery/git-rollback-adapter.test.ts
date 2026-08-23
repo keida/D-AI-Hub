@@ -153,7 +153,7 @@ describe("Git rollback adapter", () => {
     }
   });
 
-  it("stops Git verification when ownership is lost between verification reads", async () => {
+  it("retains a partial audit when ownership is lost between verification reads", async () => {
     const fixture = await createRepository();
     const lease: TaskOwnershipLease = { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
     let checks = 0;
@@ -163,7 +163,16 @@ describe("Git rollback adapter", () => {
     };
 
     try {
-      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), lease, assertOwnership)).rejects.toThrow(TaskOwnershipError);
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), lease, assertOwnership)).rejects.toMatchObject({
+        name: "RollbackPartialFailureError",
+        result: {
+          actions: expect.arrayContaining([
+            expect.objectContaining({ arguments: ["revert", "--no-edit", expect.any(String)] }),
+            expect.objectContaining({ arguments: ["apply", "--binary", "--allow-empty", expect.any(String)] }),
+          ]),
+          verification: { passed: false, reason: expect.stringMatching(/ownership/i) },
+        },
+      });
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

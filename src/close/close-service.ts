@@ -420,7 +420,7 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before push: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], state.verificationEvidence);
   }
-  const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref).then(
+  const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref, configuration.commitSha).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as GitPushEvidence | null, error }),
   );

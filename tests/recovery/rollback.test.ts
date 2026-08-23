@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CommandExecutionError } from "../../src/adapters/command-runner.js";
+import { TaskOwnershipError } from "../../src/domain/errors.js";
 
 describe("safeRollback", () => {
   it("preserves user work, uses auditable revert, and verifies restoration", async () => {
@@ -132,6 +133,47 @@ describe("safeRollback", () => {
           { arguments: ["revert", "--no-edit", "abcdefabcdefabcdefabcdefabcdefabcdefabcd"], stderr: "second revert failed token=[REDACTED]", exitCode: 1 },
         ],
         verification: { passed: false },
+      },
+    });
+  });
+
+  it("retains completed actions when ownership is lost before the next rollback operation", async () => {
+    const { createRecoveryPoint } = await import("../../src/recovery/recovery-point-service.js");
+    const { safeRollback } = await import("../../src/recovery/rollback.js");
+    const point = createRecoveryPoint({
+      recoveryPointId: "recovery-ownership-loss",
+      taskId: "task-ownership-loss",
+      trigger: "recovery",
+      stage: "recover",
+      environment: "codex",
+      role: "recovery-operator",
+      head: "0123456789abcdef0123456789abcdef01234567",
+      branch: "feat/task-7",
+      workspacePath: "C:/workspace",
+      status: "clean",
+      binaryPatch: "",
+      stateManifest: { manifestId: "00000000-0000-4000-8000-000000000007", taskId: "task-ownership-loss", stage: "recover", environment: "codex", role: "recovery-operator", durablePaths: ["state.json"], hashes: { "state.json": "b".repeat(64) }, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" },
+      verificationResults: [{ evidenceId: "evidence-ownership-loss", stage: "verify", environment: "codex", role: "evidence-collector", selectedModel: "model", command: "npm test", observedOutput: "passed", exitCode: 0, interpretation: "Quality passed", passed: true, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" }],
+      createdAt: "2026-08-21T00:00:00.000Z",
+    });
+
+    await expect(safeRollback({
+      recoveryPoint: point,
+      commitsToRevert: ["1234567890abcdef1234567890abcdef12345678", "abcdefabcdefabcdefabcdefabcdefabcdefabcd"],
+      adapter: {
+        async preserveUncommittedWork() { return { archiveId: "user-work-ownership", patchDigest: "c".repeat(64) }; },
+        async revertCommit(commit: string) {
+          if (commit.startsWith("abc")) throw new TaskOwnershipError("Rollback ownership was lost after the first revert");
+          return { command: "git", arguments: ["revert", "--no-edit", commit], stdout: "reverted", stderr: "", exitCode: 0 };
+        },
+        async restoreRecoveryPatch() { throw new Error("not expected"); },
+        async verifyRecoveryPoint() { throw new Error("not expected"); },
+      },
+    })).rejects.toMatchObject({
+      name: "RollbackPartialFailureError",
+      result: {
+        actions: [{ arguments: ["revert", "--no-edit", "1234567890abcdef1234567890abcdef12345678"], exitCode: 0 }],
+        verification: { passed: false, reason: expect.stringMatching(/ownership/i) },
       },
     });
   });

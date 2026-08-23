@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redactSensitiveText } from "../../src/adapters/command-runner.js";
+import { redactSensitiveText, runCommand } from "../../src/adapters/command-runner.js";
 
 describe("redactSensitiveText", () => {
   it.each([
@@ -17,5 +17,15 @@ describe("redactSensitiveText", () => {
     ["authorization: bearer 'quoted-token'", "authorization: bearer [REDACTED]"],
   ])("redacts quoted credentials: %s", (value, expected) => {
     expect(redactSensitiveText(value)).toBe(expected);
+  });
+
+  it("redacts values that follow separate sensitive arguments", async () => {
+    const result = await runCommand({
+      command: process.execPath,
+      arguments: ["-e", "process.exit(0)", "--", "--password", "hunter2", "--token", "token-value"],
+      cwd: null,
+    });
+
+    expect(result.arguments).toEqual(["-e", "process.exit(0)", "--", "--password", "[REDACTED]", "--token", "[REDACTED]"]);
   });
 });
