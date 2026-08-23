@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { lstat, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
@@ -15,6 +15,7 @@ import type {
   TaskOwnershipTransitionAuthorizer,
   TaskStateWriteAuthorization,
 } from "./durable-context-store.js";
+import { canonicalWorkspaceIdentityPath } from "./workspace-identity.js";
 
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const credentialFieldPattern = /(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credential|cookie|password|private[_-]?key|secret|session[_-]?token)/i;
@@ -573,6 +574,28 @@ export class FileDurableContextStore implements DurableContextStore {
 
   public constructor(rootPath: string) {
     this.rootPath = resolve(rootPath);
+  }
+
+  public async discoverActiveTasks(workspacePath: string): Promise<readonly TaskState[]> {
+    const canonicalWorkspacePath = await realpath(resolve(workspacePath));
+    let entries: Dirent<string>[];
+    try {
+      entries = await readdir(this.rootPath, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) return [];
+      throw new InvalidTaskStateError(`Unable to inspect durable task root at ${this.rootPath}: ${describeError(error)}`);
+    }
+
+    const candidates: TaskState[] = [];
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      if (!entry.isDirectory() || !taskIdPattern.test(entry.name)) continue;
+      const state = await this.load(entry.name);
+      if (state === null || state.stage === "close") continue;
+      if (canonicalWorkspaceIdentityPath(state.contextManifest) === canonicalWorkspacePath) {
+        candidates.push(state);
+      }
+    }
+    return candidates;
   }
 
   public async load(taskId: string): Promise<TaskState | null> {

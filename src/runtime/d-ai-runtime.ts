@@ -1,10 +1,10 @@
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import { CommandExecutionError, redactSensitiveText } from "../adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js";
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
-import { GitHubCliAdapter } from "../adapters/github.js";
+import { GitHubCliAdapter, type GitHubAdapter } from "../adapters/github.js";
 import { bootstrapTask, prepareBootstrapTask } from "../bootstrap/bootstrap-task.js";
 import { closeTask } from "../close/close-service.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
@@ -42,12 +42,14 @@ import type {
   TaskStateWriteAuthorization,
 } from "../state/durable-context-store.js";
 import { FileDurableContextStore } from "../state/file-durable-context-store.js";
+import { matchesWorkspaceIdentity } from "../state/workspace-identity.js";
 import { evaluateHardGates, type GateEvidence, type GateResult, type HardGateInput } from "../verification/gates.js";
 
 export interface DAIRequest {
   readonly command: DAICommand;
   readonly sourceEnvironment: Environment;
   readonly overrides: RoutingOverrides;
+  readonly activeTaskId?: string | null;
 }
 
 export interface DAIResponse {
@@ -70,6 +72,7 @@ export interface ExternalDAIRequest {
   readonly command: DAICommand;
   readonly sourceEnvironment: string;
   readonly overrides: ExternalRoutingOverrides;
+  readonly activeTaskId?: string | null;
 }
 
 export interface EnvironmentExecutionRequest {
@@ -105,8 +108,10 @@ type CreateDebugSession = (originalFailure: string, preservedRecoveryPointId: st
 type CaptureRecoveryPoint = (state: TaskState) => Promise<RecoveryPoint | CapturedRecoveryPoint>;
 type Recover = (state: TaskState, reason: string) => Promise<TaskState>;
 type RollbackTask = (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<RollbackResult>;
+type DiscoverActiveTasks = (workspacePath: string) => Promise<readonly TaskState[]>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
+  readonly discoverActiveTasks?: DiscoverActiveTasks | undefined;
   readonly workspacePath: string | null;
   readonly repositoryPath: string | null;
   readonly skillRoots: readonly string[];
@@ -148,7 +153,12 @@ const overridesSchema = z.object({
   environment: environmentSchema.nullable(),
   stage: stageSchema.nullable().optional(),
 }).strict();
-const requestSchema = z.object({ command: commandSchema, sourceEnvironment: environmentSchema, overrides: overridesSchema }).strict();
+const requestSchema = z.object({
+  command: commandSchema,
+  sourceEnvironment: environmentSchema,
+  overrides: overridesSchema,
+  activeTaskId: z.string().trim().min(1).nullable().optional(),
+}).strict();
 const evidenceSchema = z.object({
   evidenceId: z.string().trim().min(1),
   stage: stageSchema,
@@ -295,12 +305,14 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
+  const { activeTaskId, ...validated } = result.data;
   return {
-    ...result.data,
+    ...validated,
     overrides: {
       ...result.data.overrides,
       stage: result.data.overrides.stage ?? null,
     },
+    ...(activeTaskId === undefined ? {} : { activeTaskId }),
   };
 }
 
@@ -1646,11 +1658,102 @@ async function closeActiveTask(
   );
 }
 
+async function selectExplicitDurableTask(
+  taskId: string,
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse | null> {
+  const loaded = await connectorOutcome(
+    () => dependencies.store.load(taskId),
+    closeConnectorFailure,
+  );
+  if (loaded.kind === "blocked") {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Durable task selection blocked: ${loaded.message}`);
+  }
+  const state = loaded.value;
+  if (state === null) {
+    return blockedWithoutState(taskId, request.sourceEnvironment, `Task or project was not found: ${taskId}`);
+  }
+  if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
+    return response(state, "blocked", `Task ${state.taskId} belongs to a different workspace; run D-AI from its workspace or select a matching task`);
+  }
+  if (state.stage === "close") {
+    return response(state, "blocked", `Task ${state.taskId} is not active; current stage is close`);
+  }
+  if (state.environment !== request.sourceEnvironment) {
+    return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
+  }
+  const owner = registry.owner(state.taskId);
+  if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
+    return response(state, "blocked", `Task ${state.taskId} ownership changed while durable task selection was loading state`);
+  }
+  registry.transfer(state.taskId, state.environment);
+  return null;
+}
+
+async function selectDiscoveredDurableTask(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+  registry: RuntimeTaskRegistry,
+): Promise<DAIResponse | null> {
+  if (dependencies.workspacePath === null) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "Workspace identity is unavailable; select a task explicitly");
+  }
+  const discover = dependencies.discoverActiveTasks
+    ?? (dependencies.store.discoverActiveTasks === undefined
+      ? undefined
+      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
+  if (discover === undefined) return null;
+  const discovered = await connectorOutcome(
+    () => discover(dependencies.workspacePath!),
+    closeConnectorFailure,
+  );
+  if (discovered.kind === "blocked") {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, `Workspace task discovery blocked: ${discovered.message}`);
+  }
+  const candidates = [...discovered.value].sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (candidates.length === 0) {
+    return blockedWithoutState(
+      "unassigned",
+      request.sourceEnvironment,
+      "No active D-AI task matches this workspace. Use @D-AI continue <task-id> or add --task <task-id> for an explicit selection",
+    );
+  }
+  if (candidates.length > 1) {
+    return blockedWithoutState(
+      "ambiguous",
+      request.sourceEnvironment,
+      `Multiple active D-AI tasks match this workspace: ${candidates.map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> to disambiguate`,
+    );
+  }
+  const state = candidates[0]!;
+  if (state.environment !== request.sourceEnvironment) {
+    return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
+  }
+  const owner = registry.owner(state.taskId);
+  if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
+    return response(state, "blocked", `Task ${state.taskId} ownership changed while workspace task discovery was loading state`);
+  }
+  registry.transfer(state.taskId, state.environment);
+  return null;
+}
+
 export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request: ExternalDAIRequest) => Promise<DAIResponse> {
   validateDependencies(dependencies);
   const registry = createRuntimeTaskRegistry();
   return async (externalRequest: ExternalDAIRequest): Promise<DAIResponse> => {
     const request = validateRequest(externalRequest);
+    if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
+      const selection = await selectExplicitDurableTask(request.activeTaskId, request, dependencies, registry);
+      if (selection !== null) return selection;
+    }
+    if (request.activeTaskId === undefined || request.activeTaskId === null) {
+      if (request.command.kind === "status" || request.command.kind === "close") {
+        const selection = await selectDiscoveredDurableTask(request, dependencies, registry);
+        if (selection !== null) return selection;
+      }
+    }
     if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, registry);
     if (request.command.kind === "continue") return continueTask(request, request.command, dependencies, registry);
     if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, registry);
@@ -1693,12 +1796,24 @@ function defaultCaptureRecoveryPoint(state: TaskState): Promise<RecoveryPoint> {
   return Promise.reject(new InvalidTaskStateError(`No recovery point connector is configured for ${state.taskId}`));
 }
 
-function createDefaultDependencies(): DAIRuntimeDependencies {
-  const root = process.cwd();
-  const durableRoot = join(root, ".d-ai");
+export interface ConfiguredDAIRuntimeOptions {
+  readonly workspacePath: string;
+  readonly durableRoot?: string;
+  readonly gitHub?: GitHubAdapter;
+  readonly githubCredentialsConfigured?: boolean;
+  readonly githubEnterpriseHost?: string | null;
+}
+
+function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRuntimeDependencies {
+  const root = resolve(options.workspacePath);
+  const durableRoot = resolve(options.durableRoot ?? join(root, ".d-ai"));
   const store = new FileDurableContextStore(durableRoot);
   const handoffService = new PersistentHandoffService(new FileHandoffPersistence(join(durableRoot, "handoffs.json")));
-  const gitHub = GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED === "1" });
+  const gitHub = options.gitHub ?? GitHubCliAdapter.create({
+    mode: "external",
+    enterpriseHost: options.githubEnterpriseHost ?? process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null,
+    credentialsConfigured: options.githubCredentialsConfigured ?? process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED === "1",
+  });
   return {
     store,
     workspacePath: root,
@@ -1726,10 +1841,15 @@ function createDefaultDependencies(): DAIRuntimeDependencies {
     closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard): Promise<CloseVerdict> => closeTask(state, { store, gitHub }, lease, assertOwnership),
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),
+    discoverActiveTasks: (workspacePath: string): Promise<readonly TaskState[]> => store.discoverActiveTasks(workspacePath),
   };
 }
 
-const defaultRuntime = createDAIRuntime(createDefaultDependencies());
+export function createConfiguredDAIRuntime(options: ConfiguredDAIRuntimeOptions): ReturnType<typeof createDAIRuntime> {
+  return createDAIRuntime(createDefaultDependencies(options));
+}
+
+const defaultRuntime = createConfiguredDAIRuntime({ workspacePath: process.cwd() });
 
 export async function handleDAIRequest(request: DAIRequest): Promise<DAIResponse> {
   return defaultRuntime(request);
