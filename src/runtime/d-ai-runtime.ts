@@ -22,7 +22,7 @@ import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
-import { FileHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
+import { FileHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../handoff/envelope.js";
 import type { CapturedRecoveryPoint } from "../recovery/recovery-point-service.js";
 import { createGitRollbackTask } from "../recovery/git-rollback-adapter.js";
@@ -998,6 +998,7 @@ async function continueTaskExclusive(
   dependencies: DAIRuntimeDependencies,
   registry: RuntimeTaskRegistry,
   lease: TaskOwnershipLease,
+  transferOwnership: TaskOwnershipTransfer,
 ): Promise<DAIResponse> {
   if (registry.isBlocked(command.taskIdOrProject)) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task ${command.taskIdOrProject} is blocked by a failed handoff`);
@@ -1013,7 +1014,16 @@ async function continueTaskExclusive(
   if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
     return response(state, "blocked", `Task ${state.taskId} ownership changed while continue was loading durable state`);
   }
-  if (state.handoffState === "pending" || state.handoffState === "acknowledged" || state.handoffState === "rejected") {
+  if (state.handoffState === "pending") {
+    const reconciliation = await reconcilePendingHandoff(state, dependencies, lease, transferOwnership);
+    if (reconciliation.kind === "blocked") {
+      registry.block(state.taskId);
+      return response(reconciliation.state, "blocked", reconciliation.message);
+    }
+    registry.transfer(state.taskId, reconciliation.state.environment);
+    return response(reconciliation.state, "accepted", reconciliation.message);
+  }
+  if (state.handoffState === "acknowledged" || state.handoffState === "rejected") {
     return response(state, "blocked", `Task ${state.taskId} cannot continue from handoff state ${state.handoffState}`);
   }
   if (state.stage === "recover") {
@@ -1040,6 +1050,78 @@ async function continueTaskExclusive(
   return response(state, "accepted", `Continuing task ${state.taskId}`);
 }
 
+type PendingHandoffReconciliation =
+  | { readonly kind: "resumed"; readonly state: TaskState; readonly message: string }
+  | { readonly kind: "reset"; readonly state: TaskState; readonly message: string }
+  | { readonly kind: "blocked"; readonly state: TaskState; readonly message: string };
+
+function handoffRecordSequence(record: HandoffPersistenceRecord): number {
+  const suffix = record.envelope.handoffId.slice(record.envelope.handoffId.lastIndexOf("-") + 1);
+  return Number(suffix);
+}
+
+async function reconcilePendingHandoff(
+  state: TaskState,
+  dependencies: DAIRuntimeDependencies,
+  lease: TaskOwnershipLease,
+  transferOwnership: TaskOwnershipTransfer,
+): Promise<PendingHandoffReconciliation> {
+  const records = [...await dependencies.handoffService.recordsForTask(state.taskId)]
+    .sort((left, right) => handoffRecordSequence(right) - handoffRecordSequence(left));
+  const candidate = records.find((record) => record.state === "pending" || record.state === "active" || record.state === "rejected");
+  if (candidate === undefined) {
+    const blockedState = await persistState(dependencies.store, {
+      ...state,
+      handoffState: "rejected",
+      routingDecision: state.routingDecision === null ? null : {
+        ...state.routingDecision,
+        reason: "Interrupted handoff was safely rejected after restart because no durable handoff transaction was found",
+      },
+      durableContext: null,
+    }, lease);
+    return { kind: "blocked", state: blockedState, message: "Interrupted handoff was safely rejected after restart because no durable handoff transaction was found" };
+  }
+  if (candidate.envelope.taskState.environment !== state.environment) {
+    const blockedState = await persistState(dependencies.store, {
+      ...state,
+      handoffState: "rejected",
+      routingDecision: state.routingDecision === null ? null : {
+        ...state.routingDecision,
+        reason: `Interrupted handoff ${candidate.envelope.handoffId} was safely rejected after restart because its source environment did not match durable task state`,
+      },
+      durableContext: null,
+    }, lease);
+    return { kind: "blocked", state: blockedState, message: `Interrupted handoff ${candidate.envelope.handoffId} was safely rejected after restart because its source environment did not match durable task state` };
+  }
+  if (candidate.state === "active" && candidate.owner !== null) {
+    const targetLease = candidate.owner === state.environment ? lease : await transferOwnership(candidate.owner);
+    const resumedState = await persistState(dependencies.store, {
+      ...state,
+      environment: candidate.owner,
+      handoffState: "active",
+      contextManifest: state.contextManifest.includes(`handoff-source:${state.environment}`)
+        ? [...state.contextManifest]
+        : [...state.contextManifest, `handoff-source:${state.environment}`],
+      routingDecision: state.routingDecision === null ? null : {
+        ...state.routingDecision,
+        environment: candidate.owner,
+        reason: `Handoff ownership resumed by ${candidate.owner} after runtime restart`,
+      },
+      durableContext: null,
+    }, targetLease);
+    return { kind: "resumed", state: resumedState, message: `Handoff ${candidate.envelope.handoffId} ownership resumed by ${candidate.owner} after runtime restart` };
+  }
+  if (candidate.state === "pending") {
+    await dependencies.handoffService.reject(candidate.envelope.handoffId, "Handoff was interrupted before target ownership became active and was safely rejected after restart");
+  }
+  const restoredState = await persistState(dependencies.store, {
+    ...candidate.envelope.taskState,
+    contextManifest: [...candidate.envelope.taskState.contextManifest, `handoff-recovery-rejected:${candidate.envelope.handoffId}`],
+    durableContext: null,
+  }, lease);
+  return { kind: "reset", state: restoredState, message: `Interrupted handoff ${candidate.envelope.handoffId} was safely rejected after restart; the task was restored to its source state` };
+}
+
 async function continueTask(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "continue" }>,
@@ -1056,7 +1138,7 @@ async function continueTask(
       state.taskId,
       request.sourceEnvironment,
       dependencies.store,
-      async (lease) => continueTaskExclusive(request, command, dependencies, registry, lease),
+      async (lease, transfer) => continueTaskExclusive(request, command, dependencies, registry, lease, transfer),
     ),
   );
 }

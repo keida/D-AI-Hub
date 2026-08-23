@@ -272,4 +272,42 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
       await rm(fixture.rootPath, { recursive: true, force: true });
     }
   });
+
+  it("reconciles a persisted pending handoff after the runtime restarts", async () => {
+    const fixture = await createKnownGoodRepository();
+    try {
+      const first = await makeRuntimeFixture(fixture);
+      const intent = await first.runtime({ command: { kind: "intent", text: "implement verify repository" }, sourceEnvironment: "chat", overrides: noOverrides });
+      const continued = await first.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(continued.status).toBe("completed");
+      const state = await first.store.load(intent.taskId);
+      if (state === null) throw new Error("Expected a durable state before simulating the interrupted handoff");
+
+      const envelope = await first.handoffs.create({ state, targetEnvironment: "work" });
+      await new WorkEnvironmentAdapter(first.handoffs).receive(envelope);
+      const pendingState: TaskState = {
+        ...state,
+        stage: "handoff",
+        handoffState: "pending",
+        routingDecision: state.routingDecision === null ? null : {
+          ...state.routingDecision,
+          stage: "handoff",
+          reason: "Handoff pending acknowledgement from work",
+        },
+        durableContext: null,
+      };
+      await first.store.withTaskOwnership!(intent.taskId, state.environment, async (lease) => {
+        await first.store.save(pendingState, lease);
+      });
+
+      const restarted = await makeRuntimeFixture(fixture);
+      const resumed = await restarted.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: state.environment, overrides: noOverrides });
+      expect(resumed).toMatchObject({ taskId: intent.taskId, stage: "handoff", environment: "work", status: "accepted" });
+      await expect(restarted.store.load(intent.taskId)).resolves.toMatchObject({ stage: "handoff", environment: "work", handoffState: "active" });
+      expect(restarted.handoffs.status(envelope.handoffId)).toMatchObject({ state: "active", owner: "work" });
+
+      const completed = await restarted.runtime({ command: { kind: "complete", handoffId: envelope.handoffId }, sourceEnvironment: "work", overrides: noOverrides });
+      expect(completed).toMatchObject({ taskId: intent.taskId, stage: "verify", environment: "work", status: "completed" });
+    } finally { await fixture.cleanup(); }
+  });
 });

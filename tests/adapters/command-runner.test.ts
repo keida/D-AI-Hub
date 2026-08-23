@@ -28,4 +28,17 @@ describe("redactSensitiveText", () => {
 
     expect(result.arguments).toEqual(["-e", "process.exit(0)", "--", "--password", "[REDACTED]", "--token", "[REDACTED]"]);
   });
+
+  it("redacts credentials embedded in URL userinfo from arguments and output", async () => {
+    const credentialUrl = "https://user:fixture-secret@example.com/repo";
+    const result = await runCommand({
+      command: process.execPath,
+      arguments: ["-e", `process.stdout.write(${JSON.stringify(credentialUrl)})`, "--", credentialUrl],
+      cwd: null,
+    });
+
+    expect(result.arguments.at(-1)).toBe("https://[REDACTED]@example.com/repo");
+    expect(result.stdout).toBe("https://[REDACTED]@example.com/repo");
+    expect(JSON.stringify(result)).not.toContain("fixture-secret");
+  });
 });

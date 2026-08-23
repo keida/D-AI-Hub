@@ -11,7 +11,7 @@ import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError, TaskOwnershipError } from "../../src/domain/errors.js";
 import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
-import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
+import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../../src/handoff/envelope.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
 import type { EnvironmentCapabilities } from "../../src/routing/environment-capabilities.js";
@@ -974,6 +974,7 @@ describe("D-AI runtime", () => {
     const handoffService: HandoffService = {
       ready: () => runtimeHarness.handoffService.ready(),
       create: (input) => runtimeHarness.handoffService.create(input),
+      recordsForTask: (taskId) => runtimeHarness.handoffService.recordsForTask(taskId),
       acknowledge: (envelope, target) => runtimeHarness.handoffService.acknowledge(envelope, target),
       complete: async () => {
         if (failCompletion) {
@@ -1195,6 +1196,7 @@ describe("D-AI runtime", () => {
         }));
         return runtimeHarness.handoffService.create(input);
       },
+      recordsForTask: (taskId): Promise<readonly HandoffPersistenceRecord[]> => runtimeHarness.handoffService.recordsForTask(taskId),
       acknowledge: (envelope, target): Promise<void> => runtimeHarness.handoffService.acknowledge(envelope, target),
       complete: (handoffId, recipient): Promise<void> => runtimeHarness.handoffService.complete(handoffId, recipient),
       reject: (handoffId, reason): Promise<void> => runtimeHarness.handoffService.reject(handoffId, reason),

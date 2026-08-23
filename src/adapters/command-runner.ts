@@ -28,12 +28,14 @@ export class CommandExecutionError extends Error {
 
 const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|auth|authorization|credential|access[_-]?token|private[_-]?key|cookie|session[_-]?token)\s*[:=]\s*)(?!bearer\b)(?:"[^"]*"|'[^']*'|[^\s"']+)/gi;
 const separateSecretArgumentPattern = /^--(?:api[_-]?key|token|secret|password|passwd|auth|authorization|credential|access[_-]?token|private[_-]?key|cookie|session[_-]?token)$/i;
+const urlUserinfoPattern = /\b([a-z][a-z\d+.-]*:\/\/)[^\s/@]+@/gi;
 const bearerValuePattern = '(?:"[^"]*"|\'[^\']*\'|[^\\s"\']+)';
 const authorizationBearerPattern = new RegExp(`(authorization\\s*:\\s*bearer\\s+)${bearerValuePattern}`, "gi");
 const bearerTokenPattern = new RegExp(`(bearer\\s+)${bearerValuePattern}`, "gi");
 
 export function redactSensitiveText(value: string): string {
   const redacted = value
+    .replace(urlUserinfoPattern, "$1[REDACTED]@")
     .replace(authorizationBearerPattern, "$1[REDACTED]")
     .replace(secretAssignmentPattern, "$1[REDACTED]")
     .replace(bearerTokenPattern, "$1[REDACTED]");

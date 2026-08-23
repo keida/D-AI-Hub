@@ -12,6 +12,7 @@ import { createHandoffEnvelope, handoffEnvelopeSchema, parseHandoffEnvelope, val
 export interface HandoffService {
   ready(): Promise<void>;
   create(input: { readonly state: TaskState; readonly targetEnvironment: Environment }): Promise<HandoffEnvelope>;
+  recordsForTask(taskId: string): Promise<readonly HandoffPersistenceRecord[]>;
   acknowledge(envelope: HandoffEnvelope, target: EnvironmentCapabilities): Promise<void>;
   complete(handoffId: string, recipient: Environment): Promise<void>;
   reject(handoffId: string, reason: string): Promise<void>;
@@ -336,6 +337,12 @@ export class PersistentHandoffService implements HandoffService {
       await this.replace({ envelope, owner: null, state: "pending", reason: null });
       return parseHandoffEnvelope(envelope);
     });
+  }
+
+  public async recordsForTask(taskId: string): Promise<readonly HandoffPersistenceRecord[]> {
+    return this.runExclusive(async () => [...this.records.values()]
+      .filter((record) => record.envelope.taskId === taskId)
+      .map(cloneRecord));
   }
 
   public async acknowledge(envelope: HandoffEnvelope, target: EnvironmentCapabilities): Promise<void> {
