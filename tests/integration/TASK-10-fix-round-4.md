@@ -20,7 +20,7 @@ The V1 public command contract exposes one resume/re-execute operation; the fixt
 
 ## Verification evidence
 
-Results below were refreshed from the actual checkout at `C:\Users\User\Documents\ChatGPT\D-AI-Hub\.worktrees\d-ai-orchestrator-v1` after implementation.
+Results below were refreshed from the actual checkout after implementation.
 
 - Targeted runtime/recovery/close/Skill/Task 10 tests: 6 files, 100 tests passed.
 - `npm test`: 19 files, 290 tests passed.
