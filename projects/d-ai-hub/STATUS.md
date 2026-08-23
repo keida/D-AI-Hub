@@ -8,9 +8,9 @@
 ## Current checkpoint
 
 - Current task: Complete the independent-review P1/P2 repair set and keep PR #2 ready for final re-review.
-- Working state: The ownership-repair branch contains local commit `269672c`; three pre-existing untracked planning/spec documents remain untouched. No push, merge, reset, stash, or cleanup was performed.
-- Active plan: Await explicit authorization before push. Do not merge PR #2 without separate explicit approval.
-- Latest verified evidence: Handoff transfer-back failure now persists a target-owned rejected coordination state; preserve-stage Git failures now produce complete partial rollback audits; Git rollback retries fail closed when a partial audit is persisted; durable and command redaction reject `auth=`; stale initial-creation reservations recover after lease expiry. Single-worker full validation passed: 21 test files and 446 tests, TypeScript build, and `git diff --check`. Release Gate read-only checks found no staged files before commit, preserved the three untracked planning/spec files, and found no real secret-like additions; intentional matches were confined to test fixtures.
+- Working state: The ownership-repair branch contains pushed commit `025ef7b`; three pre-existing untracked planning/spec documents remain untouched. No merge, reset, stash, or cleanup was performed.
+- Active plan: Await explicit merge approval. Do not merge PR #2 without separate explicit approval.
+- Latest verified evidence: Handoff transfer-back failure now persists a target-owned rejected coordination state; preserve-stage Git failures now produce complete partial rollback audits; Git rollback retries fail closed when a partial audit is persisted; durable and command redaction reject `auth=`; stale initial-creation reservations recover after lease expiry. Single-worker full validation passed: 21 test files and 446 tests, TypeScript build, and `git diff --check`. Release Gate read-only checks found no staged files before commit, preserved the three untracked planning/spec files, found no real secret-like additions, and remote verification confirms `origin/feat/d-ai-ownership-repair` at `025ef7b`; intentional secret-shaped matches were confined to test fixtures.
 
 ## Last verified progress
 
@@ -35,7 +35,7 @@ The previous independent review's two P1 findings and P2 durable handoff coverag
 
 ## Next concrete action
 
-Decide whether to push local commit `269672c`; keep context-pack and additional fabricated samples deferred.
+Review the pushed PR #2 and decide whether to merge; keep context-pack and additional fabricated samples deferred.
 
 ## Verification notes
 
