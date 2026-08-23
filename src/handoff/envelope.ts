@@ -102,8 +102,8 @@ function assertNestedIdentity(envelope: HandoffEnvelope): void {
   const matches = (taskId: string, stage: TaskState["stage"], environment: Environment, role: TaskState["role"]): boolean => taskId === envelope.taskId && stage === envelope.stage && environment === envelope.sourceEnvironment && role === envelope.role;
   if (state.routingDecision !== null && !matches(envelope.taskId, state.routingDecision.stage, state.routingDecision.environment, state.routingDecision.role)) throw new InvalidHandoffError(`Invalid handoff envelope: routing decision identity mismatch for ${envelope.handoffId}`);
   if (state.durableContext !== null && !matches(state.durableContext.taskId, state.durableContext.stage, state.durableContext.environment, state.durableContext.role)) throw new InvalidHandoffError(`Invalid handoff envelope: durable context identity mismatch for ${envelope.handoffId}`);
-  if (state.recoveryPoint !== null && !matches(state.recoveryPoint.taskId, state.recoveryPoint.stage, state.recoveryPoint.environment, state.recoveryPoint.role)) throw new InvalidHandoffError(`Invalid handoff envelope: recovery point identity mismatch for ${envelope.handoffId}`);
-  if (state.verificationEvidence.some((evidence) => evidence.stage !== envelope.stage || evidence.environment !== envelope.sourceEnvironment || evidence.role !== envelope.role)) throw new InvalidHandoffError(`Invalid handoff envelope: verification evidence identity mismatch for ${envelope.handoffId}`);
+  if (state.recoveryPoint !== null && state.recoveryPoint.taskId !== envelope.taskId) throw new InvalidHandoffError(`Invalid handoff envelope: recovery point task identity mismatch for ${envelope.handoffId}`);
+  if (state.recoveryPoint !== null && state.verificationEvidence.some((evidence) => evidence.recoveryPointId !== null && evidence.recoveryPointId !== state.recoveryPoint?.recoveryPointId)) throw new InvalidHandoffError(`Invalid handoff envelope: verification evidence recovery linkage mismatch for ${envelope.handoffId}`);
 }
 
 function cloneEnvelope(envelope: HandoffEnvelope): HandoffEnvelope {

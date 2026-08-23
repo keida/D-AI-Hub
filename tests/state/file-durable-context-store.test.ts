@@ -752,6 +752,22 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("verifies the submitted immutable generation when top-level mirrors are stale", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-verify-generation", "Verify the immutable generation");
+
+    try {
+      const manifest = await store.save(state);
+      await writeFile(join(rootPath, state.taskId, "manifest.json"), "not the active manifest\n", "utf8");
+      await writeFile(join(rootPath, state.taskId, "context.json"), "not the active context\n", "utf8");
+
+      await expect(store.verifyDurableSnapshot(manifest)).resolves.toBeUndefined();
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("fences a late lower-generation pointer behind the successor pointer", async () => {
     const rootPath = await createStoreRoot();
     const firstStore = new FileDurableContextStore(rootPath);

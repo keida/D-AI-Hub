@@ -791,24 +791,26 @@ export class FileDurableContextStore implements DurableContextStore {
     const paths = createSnapshotPaths(this.rootPath, manifest.taskId);
     const expectedManifestHash = manifest.hashes[paths.manifest];
     if (expectedManifestHash === undefined) throw new InvalidTaskStateError(`Durable snapshot is missing its manifest hash for task ${manifest.taskId}`);
-    const manifestContent = await readRequiredContent(manifest.taskId, paths.manifest, expectedManifestHash);
-    const persistedManifest = parseManifest(parseJson(manifestContent, manifest.taskId, paths.manifest), manifest.taskId, paths.manifest);
+    const manifestPath = generationPath(paths, manifest.manifestId, paths.manifest);
+    const manifestContent = await readRequiredContent(manifest.taskId, manifestPath, expectedManifestHash);
+    const persistedManifest = parseManifest(parseJson(manifestContent, manifest.taskId, manifestPath), manifest.taskId, manifestPath);
     const observedManifestHash = createHashForContent(createCanonicalManifestContent(persistedManifest));
     if (observedManifestHash !== expectedManifestHash || JSON.stringify(persistedManifest) !== JSON.stringify(manifest)) {
-      throwIntegrityError(manifest.taskId, paths.manifest, expectedManifestHash, observedManifestHash, "durable manifest does not match submitted snapshot");
+      throwIntegrityError(manifest.taskId, manifestPath, expectedManifestHash, observedManifestHash, "durable manifest does not match submitted snapshot");
     }
     for (const targetPath of manifest.durablePaths) {
       const expectedHash = manifest.hashes[targetPath];
       if (expectedHash === undefined) throw new InvalidTaskStateError(`Durable snapshot is missing a hash for ${targetPath}`);
-      const content = await readRequiredContent(manifest.taskId, targetPath, expectedHash);
+      const selectedPath = generationPath(paths, manifest.manifestId, targetPath);
+      const content = await readRequiredContent(manifest.taskId, selectedPath, expectedHash);
       if (targetPath === paths.manifest) continue;
       if (targetPath === paths.state) {
-        const persistedState = parseTaskState(parseJson(content, manifest.taskId, targetPath), targetPath);
+        const persistedState = parseTaskState(parseJson(content, manifest.taskId, selectedPath), selectedPath);
         const observedStateHash = createHashForContent(createCanonicalStateContent(persistedState));
-        if (observedStateHash !== expectedHash) throwIntegrityError(manifest.taskId, targetPath, expectedHash, observedStateHash, "canonical state hash mismatch");
+        if (observedStateHash !== expectedHash) throwIntegrityError(manifest.taskId, selectedPath, expectedHash, observedStateHash, "canonical state hash mismatch");
         continue;
       }
-      assertRawHash(manifest.taskId, targetPath, content, expectedHash);
+      assertRawHash(manifest.taskId, selectedPath, content, expectedHash);
     }
   }
 

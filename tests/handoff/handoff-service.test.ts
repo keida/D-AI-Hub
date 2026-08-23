@@ -172,7 +172,48 @@ describe("PersistentHandoffService", () => {
     expect(() => validateHandoffCreateInput({ state: state("chat"), targetEnvironment: null })).toThrow(InvalidTaskStateError);
   });
 
-  it("rejects malformed envelopes and nested identity mismatches", async () => {
+  it("allows recovery handoff with historical recovery records", async () => {
+    const recoveryPointId = "recovery-historical";
+    const source: TaskState = {
+      ...state("work"),
+      stage: "recover",
+      role: "recovery-operator",
+      recoveryPoint: {
+        recoveryPointId,
+        taskId: "task-handoff",
+        stage: "verify",
+        environment: "work",
+        role: "reviewer",
+        durablePaths: [],
+        hashes: {},
+        restorationInstructions: "restore the captured state",
+        createdAt: "2026-08-21T00:00:00.000Z",
+      },
+      verificationEvidence: [{
+        evidenceId: "evidence-historical",
+        stage: "verify",
+        environment: "work",
+        role: "evidence-collector",
+        selectedModel: "review-model",
+        command: "npm test",
+        observedOutput: "tests passed",
+        exitCode: 0,
+        interpretation: "Verification passed",
+        passed: true,
+        recoveryPointId,
+        recordedAt: "2026-08-21T00:00:00.000Z",
+      }],
+    };
+
+    await expect(service().create({ state: source, targetEnvironment: "codex" })).resolves.toMatchObject({
+      taskId: source.taskId,
+      stage: source.stage,
+      role: source.role,
+      targetEnvironment: "codex",
+    });
+  });
+
+  it("rejects malformed envelopes, nested identity mismatches, and recovery linkage mismatches", async () => {
     const handoffService = service();
     const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
     const malformed = { ...envelope, integrityHash: "0".repeat(64) };
@@ -182,7 +223,11 @@ describe("PersistentHandoffService", () => {
     await expect(handoffService.create({ state: { ...state("chat"), routingDecision: { stage: "execute", environment: "codex", role: "implementer", selectedModel: "model", selectedCapabilities: [], reason: "reason", overrideSource: "default" } }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
     await expect(handoffService.create({ state: { ...state("chat"), durableContext: { manifestId: "00000000-0000-4000-8000-000000000007", taskId: "other-task", stage: "execute", environment: "chat", role: "implementer", durablePaths: [], hashes: {}, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" } }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
     await expect(handoffService.create({ state: { ...state("chat"), recoveryPoint: { recoveryPointId: "recovery", taskId: "other-task", stage: "execute", environment: "chat", role: "implementer", durablePaths: [], hashes: {}, restorationInstructions: "restore", createdAt: "2026-08-21T00:00:00.000Z" } }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
-    await expect(handoffService.create({ state: { ...state("chat"), verificationEvidence: [{ evidenceId: "evidence", stage: "execute", environment: "codex", role: "implementer", selectedModel: "model", command: "command", observedOutput: "output", exitCode: 0, interpretation: "interpretation", passed: true, recoveryPointId: null, recordedAt: "2026-08-21T00:00:00.000Z" }] }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
+    await expect(handoffService.create({ state: {
+      ...state("chat"),
+      recoveryPoint: { recoveryPointId: "recovery-expected", taskId: "task-handoff", stage: "verify", environment: "chat", role: "reviewer", durablePaths: [], hashes: {}, restorationInstructions: "restore", createdAt: "2026-08-21T00:00:00.000Z" },
+      verificationEvidence: [{ evidenceId: "evidence", stage: "execute", environment: "codex", role: "implementer", selectedModel: "model", command: "command", observedOutput: "output", exitCode: 0, interpretation: "interpretation", passed: true, recoveryPointId: "recovery-other", recordedAt: "2026-08-21T00:00:00.000Z" }],
+    }, targetEnvironment: "work" })).rejects.toThrow(InvalidHandoffError);
   });
 
   it("requires the verified recipient to complete", async () => {
