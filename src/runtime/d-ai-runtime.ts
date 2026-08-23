@@ -108,6 +108,7 @@ type CreateDebugSession = (originalFailure: string, preservedRecoveryPointId: st
 type CaptureRecoveryPoint = (state: TaskState) => Promise<RecoveryPoint | CapturedRecoveryPoint>;
 type Recover = (state: TaskState, reason: string) => Promise<TaskState>;
 type RollbackTask = (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<RollbackResult>;
+type RerunOriginalCheck = (state: TaskState) => Promise<readonly VerificationEvidence[]>;
 type DiscoverActiveTasks = (workspacePath: string) => Promise<readonly TaskState[]>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
@@ -130,6 +131,7 @@ export interface DAIRuntimeDependencies {
   readonly captureRecoveryPoint: CaptureRecoveryPoint;
   readonly recover: Recover;
   readonly rollbackTask?: RollbackTask | undefined;
+  readonly rerunOriginalCheck?: RerunOriginalCheck | undefined;
   readonly closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<CloseVerdict>;
   readonly maximumEvidenceAgeMs: number;
   readonly now: () => Date;
@@ -546,6 +548,54 @@ function requestedRole(stage: Stage, overrides: RoutingOverrides): Role {
   const role = defaultRolesByStage.get(stage);
   if (role === undefined) throw new InvalidTaskStateError(`No default role is declared for stage=${stage}`);
   return role;
+}
+
+async function applyContinueRoutingOverrides(
+  state: TaskState,
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+  lease: TaskOwnershipLease,
+  transfer: TaskOwnershipTransfer,
+): Promise<{ readonly state: TaskState; readonly lease: TaskOwnershipLease; readonly applied: boolean }> {
+  const overrides = request.overrides;
+  if (overrides.model === null && overrides.role === null && overrides.environment === null && (overrides.stage === null || overrides.stage === undefined)) {
+    return { state, lease, applied: false };
+  }
+  const routeStage = overrides.stage ?? (state.stage === "recover" ? "execute" : state.stage);
+  const role = requestedRole(routeStage, overrides);
+  const candidateEnvironment = preferredEnvironment(request.sourceEnvironment, routeStage, role, overrides, dependencies.modelPolicies);
+  const modelDecision = dependencies.resolveModelRoute(
+    routeStage,
+    role,
+    candidateEnvironment,
+    dependencies.modelPolicies,
+    overrides,
+  );
+  const route = dependencies.selectEnvironment({
+    stage: routeStage,
+    requiredCapabilities: modelDecision.selectedCapabilities,
+    available: environmentSchema.options.map((environment) => dependencies.adapters[environment].capabilities()),
+    userEnvironmentOverride: overrides.environment,
+  });
+  const routingDecision = route.environment === modelDecision.environment
+    ? modelDecision
+    : dependencies.resolveModelRoute(routeStage, role, route.environment, dependencies.modelPolicies, overrides);
+  const executionLease = route.environment === lease.environment ? lease : await transfer(route.environment);
+  const updatedState = await persistState(dependencies.store, {
+    ...state,
+    environment: route.environment,
+    role,
+    routingDecision: {
+      ...routingDecision,
+      stage: state.stage,
+      ...(routeStage === state.stage ? {} : { requestedStage: routeStage }),
+      environment: route.environment,
+      role,
+    },
+    selectedCapabilities: [...routingDecision.selectedCapabilities],
+    durableContext: null,
+  }, executionLease);
+  return { state: updatedState, lease: executionLease, applied: true };
 }
 
 async function routeIntent(
@@ -1015,9 +1065,12 @@ async function continueTaskExclusive(
   if (registry.isBlocked(command.taskIdOrProject)) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task ${command.taskIdOrProject} is blocked by a failed handoff`);
   }
-  const state = await dependencies.store.load(command.taskIdOrProject);
+  let state = await dependencies.store.load(command.taskIdOrProject);
   if (state === null) {
     return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
+  }
+  if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
+    return response(state, "blocked", `Task ${state.taskId} belongs to a different workspace; run D-AI from its workspace or select a matching task`);
   }
   if (request.sourceEnvironment !== state.environment) {
     return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
@@ -1026,6 +1079,15 @@ async function continueTaskExclusive(
   if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
     return response(state, "blocked", `Task ${state.taskId} ownership changed while continue was loading durable state`);
   }
+  let routed: { readonly state: TaskState; readonly lease: TaskOwnershipLease; readonly applied: boolean };
+  try {
+    routed = await applyContinueRoutingOverrides(state, request, dependencies, lease, transferOwnership);
+  } catch (error: unknown) {
+    const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+    return response(state, "blocked", `Routing override blocked: ${message}`);
+  }
+  state = routed.state;
+  lease = routed.lease;
   if (state.handoffState === "pending") {
     const reconciliation = await reconcilePendingHandoff(state, dependencies, lease, transferOwnership);
     if (reconciliation.kind === "blocked") {
@@ -1040,21 +1102,29 @@ async function continueTaskExclusive(
   }
   if (state.stage === "recover") {
     const descriptors = await dependencies.discoverSkillMetadata(dependencies.skillRoots);
-    const selected = dependencies.selectCapabilities(state.goal, "execute", state.environment, descriptors);
+    const executionStage = routed.applied ? (state.routingDecision?.requestedStage ?? "execute") : "execute";
+    const executionRole = state.routingDecision?.overrideSource === "user" ? state.role : "implementer";
+    const selected = dependencies.selectCapabilities(state.goal, executionStage, state.environment, descriptors);
     const skills = await Promise.all(selected.map((descriptor) => dependencies.loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
     const failedEvidence = state.verificationEvidence.filter((evidence) => !evidence.passed);
-    const executionState = await persistState(
-      dependencies.store,
-      {
-        ...transitionState(state, "execute", "implementer", state.environment),
-        verificationEvidence: [],
-        verificationHistory: [...(state.verificationHistory ?? []), ...state.verificationEvidence],
-        contextManifest: failedEvidence.length === 0
-          ? [...state.contextManifest]
-          : [...state.contextManifest, `recovered-from-failure:${failedEvidence.map((evidence) => evidence.evidenceId).join(",")}`],
-      },
-      lease,
-    );
+    let executionState: TaskState;
+    try {
+      executionState = await persistState(
+        dependencies.store,
+        {
+          ...transitionState(state, executionStage, executionRole, state.environment),
+          verificationEvidence: [],
+          verificationHistory: [...(state.verificationHistory ?? []), ...state.verificationEvidence],
+          contextManifest: failedEvidence.length === 0
+            ? [...state.contextManifest]
+            : [...state.contextManifest, `recovered-from-failure:${failedEvidence.map((evidence) => evidence.evidenceId).join(",")}`],
+        },
+        lease,
+      );
+    } catch (error: unknown) {
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+      return response(state, "blocked", `Recovery continuation blocked: ${message}`);
+    }
     registry.transfer(state.taskId, state.environment);
     return executeRoutedState(executionState, skills, dependencies, registry, lease);
   }
@@ -1209,17 +1279,44 @@ async function rollbackActiveTaskExclusive(
   if (!rollbackResult.verification.passed) {
     return persistRollbackFailure(rollbackResult, `Rollback verification failed: ${rollbackResult.verification.reason}`);
   }
+  const rollbackState = {
+    ...transitionToRecovery(state),
+    recoveryPoint: state.recoveryPoint,
+    debugSession: state.debugSession ?? null,
+    rollbackAudit: rollbackAudit(rollbackResult, dependencies.now().toISOString()),
+  };
+  if (dependencies.rerunOriginalCheck === undefined) {
+    const recoveredState = await persistState(dependencies.store, rollbackState, lease);
+    return response(recoveredState, "blocked", "Rollback restored the recovery point, but the original failing check cannot be re-run because no verifier is configured");
+  }
+  let rerunEvidence: readonly VerificationEvidence[];
+  try {
+    rerunEvidence = await dependencies.rerunOriginalCheck(state);
+  } catch (error: unknown) {
+    const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+    const recoveredState = await persistState(dependencies.store, rollbackState, lease);
+    return response(recoveredState, "blocked", `Rollback restored the recovery point, but the original failing check could not be re-run: ${message}`);
+  }
+  const rerunFailure = rerunEvidence.length === 0
+    ? "Original failing check produced no verification evidence"
+    : evidenceIdentityFailure(state, rerunEvidence) ?? (rerunEvidence.some((evidence) => !evidence.passed) ? "Original failing check still fails after rollback" : null);
   const recoveredState = await persistState(
     dependencies.store,
     {
-      ...transitionToRecovery(state),
-      recoveryPoint: state.recoveryPoint,
-      debugSession: state.debugSession ?? null,
-      rollbackAudit: rollbackAudit(rollbackResult, dependencies.now().toISOString()),
+      ...rollbackState,
+      verificationHistory: [...(state.verificationHistory ?? []), ...state.verificationEvidence],
+      verificationEvidence: [...rerunEvidence],
+      contextManifest: [...rollbackState.contextManifest, `rollback-original-check:${rerunFailure === null ? "passed" : "failed"}`],
     },
     lease,
   );
-  return response(recoveredState, "completed", "Rollback completed and recovery point verified");
+  return response(
+    recoveredState,
+    rerunFailure === null ? "accepted" : "blocked",
+    rerunFailure === null
+      ? "Rollback restored the recovery point and re-ran the original failing check successfully; the task remains in recovery and requires a new plan or user decision"
+      : `Rollback restored the recovery point, but the original failing check was not verified: ${rerunFailure}`,
+  );
 }
 
 async function rollbackActiveTask(
@@ -1815,17 +1912,18 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     enterpriseHost: options.githubEnterpriseHost ?? process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null,
     credentialsConfigured: options.githubCredentialsConfigured ?? process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED === "1",
   });
+  const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
+    chat: new ChatEnvironmentAdapter(handoffService, defaultExecutionAdapter),
+    work: new WorkEnvironmentAdapter(handoffService, defaultExecutionAdapter),
+    codex: new CodexEnvironmentAdapter(handoffService, defaultExecutionAdapter),
+  };
   return {
     store,
     workspacePath: root,
     repositoryPath: root,
     skillRoots: [join(root, ".agents", "skills")],
     modelPolicies: defaultModelPolicies,
-    adapters: {
-      chat: new ChatEnvironmentAdapter(handoffService, defaultExecutionAdapter),
-      work: new WorkEnvironmentAdapter(handoffService, defaultExecutionAdapter),
-      codex: new CodexEnvironmentAdapter(handoffService, defaultExecutionAdapter),
-    },
+    adapters,
     handoffService,
     bootstrapTask,
     prepareBootstrapTask,
@@ -1839,6 +1937,14 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     captureRecoveryPoint: defaultCaptureRecoveryPoint,
     recover: defaultRecovery,
     rollbackTask: createGitRollbackTask(root),
+    rerunOriginalCheck: async (state): Promise<readonly VerificationEvidence[]> => {
+      const descriptors = await discoverSkillMetadata([join(root, ".agents", "skills")]);
+      const selected = selectCapabilities(state.goal, "execute", state.environment, descriptors);
+      const skills = await Promise.all(selected.map((descriptor) => loadSelectedSkill(descriptor, descriptor.requiredResources ?? [])));
+      const execution = await adapters[state.environment].execute({ state, skills });
+      if (execution.status !== "completed") throw new InvalidTaskStateError(execution.message);
+      return execution.evidence;
+    },
     closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard): Promise<CloseVerdict> => closeTask(state, { store, gitHub }, lease, assertOwnership),
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),

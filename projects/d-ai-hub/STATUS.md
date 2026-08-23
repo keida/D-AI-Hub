@@ -7,38 +7,32 @@
 
 ## Current checkpoint
 
-- Current task: Restore the approved D-AI orchestrator v2 product intent and deliver a usable Codex activation entry without expanding Router, third-party Skill, or repository-health scope.
-- Authorized scope: Track the approved v2 specification; align project state; implement the minimum Codex raw-command activation, explicit durable task selection, and product-boundary acceptance. Commit and push only the intended feature-branch files; do not merge, reset, stash, clean, or delete. Preserve all existing modified and untracked files outside the intended set.
-- Working state: `main = origin/main = c958fbc` and its user-owned Skill-routing documentation edits remain untouched. The release commits `8557242`, `6c61c97`, `76f02f2`, and `5308dac` are pushed to `origin/feat/d-ai-ownership-repair`; the three pre-existing untracked repository-health/PR2 planning files remain untouched.
-- Active plan: Release candidate pushed; open or update the PR for review, and do not merge without separate authorization.
+- Current task: restore the approved D-AI orchestrator v2 product intent and deliver a usable Codex activation entry without expanding Router, third-party Skill, or repository-health scope.
+- Working state: feature branch `feat/d-ai-ownership-repair` is at local merge commit `e763b717` before the review-fix commit; it merges feature `6bf9d51` with `origin/main` `3677579`. The canonical `main` worktree is untouched. Three pre-existing repository-health/PR2 files remain untracked and excluded.
+- Review-fix scope: parser/activation override forwarding, continue workspace fencing, override conflict fail-closed, recovery override preservation, rollback original-check rerun, close-without-handoff semantics, and their observable regression tests.
+- Independent review: final Standards and Spec reviews by separate GPT-5.6 Luna High reviewers found no blocking findings after the final recovery-stage fix.
+- Release gate: complete single-worker test, build, diff-check, and secret scan passed. The review fixes are still uncommitted and require the explicitly authorized feature-branch commit/push before PR update and merge evaluation.
 
 ## Four-layer delivery state
 
-1. **Markdown Hub — established, canonical integration pending.** `main` remains the canonical GitHub branch. The approved v2 product specification is present at `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md` on the active branch. Release commits are pushed on the feature branch and not merged.
-2. **Orchestrator runtime — implemented on the feature branch, not merged.** Parser, routing, handoff, durable state, verification, recovery, rollback, and close logic exist. The branch contains 75 commits and 85 files / 17,665 insertions beyond `origin/main`; the pushed release checkpoint is `5308dac`.
-3. **Codex activation — release candidate commits prepared.** The canonical `d-ai` Skill, compatibility entry, raw-command adapter, CLI, and explicit `activeTaskId` recovery seam are committed locally. A reversible user-level junction at `~/.agents/skills/d-ai` points to the canonical Skill source. Fresh `@D-AI status`/`@D-AI close` auto-select one active durable task by persisted workspace identity; zero, multiple, mismatch, malformed/duplicate identity, closed-task, and ownership cases remain `BLOCKED`. Targeted tests prove canonical paths, junctions, Windows case variants, cross-workspace isolation, dirty-worktree `NO`, missing-credentials `BLOCKED`, remote-SHA-mismatch `NO`, and unconfigured execution connector `BLOCKED`.
-4. **Chat/Work adapters — contract only, not product-activated.** Runtime adapter classes and logical command semantics exist, but no supported Chat or Work activation surface or configured execution/durable connector has been delivered. Their unavailable capabilities remain `BLOCKED` and must not be reported as complete.
+1. **Markdown Hub — canonical source and v2 spec tracked on the feature branch.** The approved product specification is `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md`. Canonical `main` remains locally dirty with unrelated user Skill-routing documentation and was not modified.
+2. **Orchestrator runtime — implemented and verified on the feature branch.** Parser, routing, handoff, durable state, ownership/workspace fencing, verification, recovery, rollback, and close logic are covered by the current full gate.
+3. **Codex activation — release candidate ready for authorized publication.** The logical `@D-AI` Skill entry reaches the parser and configured runtime. Fresh status/close use workspace-scoped durable discovery; zero, multiple, mismatch, malformed identity, closed-task, ownership, dirty-close, missing-credentials, and remote-SHA mismatch cases fail closed or return NO/BLOCKED.
+4. **Chat/Work adapters — contract only, not product-activated.** No supported Chat or Work activation surface or configured execution/durable connector has been delivered; unavailable capabilities remain BLOCKED.
 
 ## Verified evidence
 
-- Live remote read after push: `refs/heads/main = c958fbc88c7e1c76fcfa5cd58b1049c3c0c93c95`; `refs/heads/feat/d-ai-ownership-repair = 5308dac69e418a0c91e4e15f412248c25f2f595f`, matching local `HEAD` at verification time.
-- Approved-spec source and tracked copy share SHA-256 `5224053CC37E695EC6A0C8047E2AEFBBC836FEFF8D826847FF0518AAF10BCB4F`.
-- Targeted activation verification passed: runtime 77/77; entry 3/3; external Skill boundary 2/2; configured close boundary 14/14.
-- Real user-level smoke from an unrelated temporary workspace resolved `~/.agents/skills/d-ai`, entered the configured Codex runtime, and returned exit code 2 with `taskId=unassigned`, `status=blocked`, and workspace-scoped retry guidance.
-- Final complete verification passed 25/25 test files and 477/477 tests with one worker, `npm run build`, and `git diff --check`. Secret-shaped scan found no non-test credentials; three matches are intentional sentinel values in existing rejection tests.
-- Earlier pushed runtime checkpoint verification passed 21 test files and 457/457 tests; the current 25/477 result supersedes that local validation baseline.
-
-## Release-candidate commit scope
-
-- Committed intended set: docs/Skill/project-state commit `8557242`; runtime/store/entry/package commit `6c61c97`; tests commit `76f02f2`.
-- Untracked preserved and excluded: `docs/superpowers/plans/2026-08-21-repository-health-check.md`, `docs/superpowers/plans/2026-08-22-pr2-review-repair.md`, and `docs/superpowers/specs/2026-08-21-repository-health-check.md`.
+- Current structural baseline: `HEAD=e763b717`, parents `6bf9d51` and `3677579`; exact intended diff excludes all three repository-health/PR2 files.
+- Targeted review-fix evidence: runtime 82/82; the affected entry/close/gates set 193/193; both independent reviewers confirmed no blocking finding after the final fix.
+- Final complete gate after the final fix: 25/25 test files and 488/488 tests with one worker; `npm run build` passed; `git diff --check` passed; secret-shaped scan passed with no non-test credential-shaped additions.
+- Workspace identity evidence in the existing Codex activation boundary covers canonical path, junction, Windows case variant, zero/multiple discovery, cross-workspace isolation, ownership mismatch, explicit task selection, dirty close, missing GitHub configuration, and remote SHA mismatch.
+- Preserved untracked exclusions: `docs/superpowers/plans/2026-08-21-repository-health-check.md`, `docs/superpowers/plans/2026-08-22-pr2-review-repair.md`, and `docs/superpowers/specs/2026-08-21-repository-health-check.md`.
 
 ## Current blockers
 
-- Independent two-axis review completed with separate GPT-5.6 Luna High reviewers. Standards: no new hard violation; PR2 plan source traceability remains partial because the original review artifact/issue ID is not present in the repository. Spec: the requested Codex slice is resolved; the workspace hash is intentionally a snapshot fingerprint and path is the stable discovery key.
-- Chat and Work product activation/connectors remain unavailable and correctly remain `BLOCKED`.
-- Canonical `main` cannot be updated from this task because merge is not authorized and its working tree contains preserved user edits.
+- Chat and Work product activation/connectors remain unavailable and correctly remain BLOCKED.
+- Publication is not yet complete: the review-fix commit must be created and pushed to `origin/feat/d-ai-ownership-repair`, then PR #2 rules/checks/reviews must be re-read before any ordinary merge decision.
 
 ## Next concrete action
 
-Open or update the PR for review from `feat/d-ai-ownership-repair`; merge remains out of scope and requires separate authorization.
+Run the staged release gate on only the intended review-fix files, create the authorized non-squash fix commit, push the feature branch non-force, verify remote SHA, then update PR #2 and inspect actual required rules/checks before considering the authorized ordinary merge.

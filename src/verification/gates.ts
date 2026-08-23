@@ -136,6 +136,7 @@ function stateFailure(state: TaskState, gate: GateName, now: Date, maximumEviden
   }
   if (gate === "recovery") return recoveryStateFailure(state, now);
   if (gate === "handoff") {
+    if (state.handoffState === "none") return null;
     if (state.handoffState !== "acknowledged" && state.handoffState !== "active" && state.handoffState !== "completed") {
       return `Handoff is not acknowledged by a target environment; current state is ${state.handoffState}`;
     }

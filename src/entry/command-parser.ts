@@ -1,5 +1,6 @@
 import { InvalidTaskStateError } from "../domain/errors.js";
 import type { Environment } from "../domain/types.js";
+import { parseRoutingOverrides, type RoutingOverrides } from "../routing/override-parser.js";
 
 export type DAICommand =
   | { readonly kind: "intent"; readonly text: string }
@@ -10,9 +11,15 @@ export type DAICommand =
   | { readonly kind: "close" }
   | { readonly kind: "rollback" };
 
+export interface ParsedDAIInvocation {
+  readonly command: DAICommand;
+  readonly overrides: RoutingOverrides;
+}
+
 const commandPrefix = "@D-AI";
 const environments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
 const reservedCommands: ReadonlySet<string> = new Set(["continue", "status", "handoff", "complete", "close", "rollback"]);
+const routingOverrideKeys: ReadonlySet<string> = new Set(["model", "role", "environment", "stage"]);
 
 function normalizedTokens(input: string): readonly string[] {
   if (typeof input !== "string") {
@@ -38,8 +45,7 @@ function assertArgumentCount(command: string, arguments_: readonly string[], cou
   }
 }
 
-export function parseDAICommand(input: string): DAICommand {
-  const tokens = normalizedTokens(input);
+function parseCommandTokens(tokens: readonly string[]): DAICommand {
   const command = tokens[1];
   if (command === undefined) {
     throw new InvalidTaskStateError("D-AI command or intent is missing");
@@ -76,4 +82,21 @@ export function parseDAICommand(input: string): DAICommand {
     throw new InvalidTaskStateError(`Malformed D-AI command: ${command}`);
   }
   return { kind: "intent", text: tokens.slice(1).join(" ") };
+}
+
+export function parseDAIInvocation(input: string): ParsedDAIInvocation {
+  const tokens = normalizedTokens(input);
+  const commandTokens = tokens.slice(0, 2);
+  const overrideTokens: string[] = [];
+  for (const token of tokens.slice(2)) {
+    const separator = token.indexOf("=");
+    const key = separator > 0 ? token.slice(0, separator) : "";
+    if (routingOverrideKeys.has(key)) overrideTokens.push(token);
+    else commandTokens.push(token);
+  }
+  return { command: parseCommandTokens(commandTokens), overrides: parseRoutingOverrides(overrideTokens) };
+}
+
+export function parseDAICommand(input: string): DAICommand {
+  return parseDAIInvocation(input).command;
 }

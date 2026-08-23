@@ -1735,11 +1735,16 @@ describe("D-AI runtime", () => {
       return executionAttempts === 1 ? failedExecution(request) : completedExecution(request);
     }, evaluateHardGates, "YES");
     const rollbackCalls: Array<{ readonly state: TaskState; readonly lease: TaskOwnershipLease }> = [];
+    const rerunStates: TaskState[] = [];
     const handle = createDAIRuntime({
       ...runtimeHarness.dependencies,
       rollbackTask: async (state, lease): Promise<RollbackResult> => {
         rollbackCalls.push({ state, lease });
         return successfulRollbackResult();
+      },
+      rerunOriginalCheck: async (state): Promise<readonly VerificationEvidence[]> => {
+        rerunStates.push(state);
+        return completedExecution({ state, skills: [] }).evidence;
       },
     });
     const failed = await handle(intentRequest("codex", noOverrides));
@@ -1765,7 +1770,9 @@ describe("D-AI runtime", () => {
 
     expect(recovered.status).toBe("completed");
     expect(beforeRollback?.debugSession).not.toBeNull();
-    expect(result).toMatchObject({ taskId: failed.taskId, stage: "recover", status: "completed" });
+    expect(result).toMatchObject({ taskId: failed.taskId, stage: "recover", status: "accepted" });
+    expect(result.message).toMatch(/rollback restored.*re-ran.*original failing check/i);
+    expect(rerunStates).toHaveLength(1);
     expect(rollbackCalls).toHaveLength(1);
     expect(rollbackCalls[0]?.state.taskId).toBe(failed.taskId);
     expect(rollbackCalls[0]?.lease).toMatchObject({ taskId: failed.taskId, environment: "codex" });
@@ -1789,6 +1796,7 @@ describe("D-AI runtime", () => {
         workspacePath: repositoryPath,
         repositoryPath,
         rollbackTask: createGitRollbackTask(repositoryPath),
+        rerunOriginalCheck: async (state): Promise<readonly VerificationEvidence[]> => completedExecution({ state, skills: [] }).evidence,
         captureRecoveryPoint: async (state): Promise<CapturedRecoveryPoint> => {
           if (state.durableContext === null) throw new InvalidTaskStateError("Recovery capture requires durable context");
           const snapshot: RecoverySnapshot = {
@@ -1828,7 +1836,7 @@ describe("D-AI runtime", () => {
       await writeFile(join(repositoryPath, "user-work.txt"), "preserve me\n", "utf8");
 
       const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
-      expect(result).toMatchObject({ status: "completed", stage: "recover" });
+      expect(result).toMatchObject({ status: "accepted", stage: "recover" });
       expect(await git(["show", "HEAD:artifact.txt"])).toBe("known good");
       expect(await git(["status", "--porcelain=v1"])).toBe("");
       expect(await git(["stash", "list"])).toMatch(/d-ai-rollback-/);
@@ -1906,6 +1914,103 @@ describe("D-AI runtime", () => {
     await expect(readFile(sentinelPath, "utf8")).resolves.toBe(sentinelBefore);
     expect(response.message).toMatch(verdict === "YES" ? /yes/i : new RegExp(verdict, "i"));
     expect(runtimeHarness.closedStates.at(-1)?.stage).toBe("verify");
+  });
+
+  it("blocks explicit continue when the durable task belongs to another workspace", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const initial = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await initial(intentRequest("codex", noOverrides));
+    const otherWorkspace = join(process.cwd(), "tests", "fixtures", "unrelated-workspace");
+    const fresh = createDAIRuntime({ ...runtimeHarness.dependencies, workspacePath: otherWorkspace });
+
+    const result = await fresh({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(result).toMatchObject({ taskId: accepted.taskId, status: "blocked" });
+    expect(result.message).toMatch(/different workspace/i);
+  });
+
+  it("applies continue routing overrides to the durable routing decision", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await handle(intentRequest("codex", noOverrides));
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: accepted.taskId },
+      sourceEnvironment: "codex",
+      overrides: { model: "codex-model", role: "implementer", environment: null, stage: "execute" },
+    });
+    const persisted = await runtimeHarness.store.load(accepted.taskId);
+
+    expect(result.status).toBe("accepted");
+    expect(persisted?.routingDecision).toMatchObject({
+      stage: "verify",
+      requestedStage: "execute",
+      role: "implementer",
+      selectedModel: "codex-model",
+      overrideSource: "user",
+    });
+  });
+
+  it("fails closed when continue routing overrides have no compatible policy", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await handle(intentRequest("codex", noOverrides));
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: accepted.taskId },
+      sourceEnvironment: "codex",
+      overrides: { model: "missing-model", role: "reviewer", environment: null, stage: "execute" },
+    });
+
+    expect(result).toMatchObject({ taskId: accepted.taskId, status: "blocked" });
+    expect(result.message).toMatch(/routing override blocked|no model policy/i);
+  });
+
+  it("preserves valid continue routing overrides when resuming recovery", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      modelPolicies: [
+        ...policies,
+        { stage: "execute", role: "reviewer", model: "recovery-review-model", requiredCapabilities: ["local-execution"], compatibleEnvironments: ["codex"] },
+      ],
+    });
+    const accepted = await handle(intentRequest("codex", noOverrides));
+    const state = await runtimeHarness.store.load(accepted.taskId);
+    if (state === null) throw new InvalidTaskStateError("Expected durable task state");
+    await runtimeHarness.store.save({ ...state, stage: "recover", role: "recovery-operator", durableContext: null });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: accepted.taskId },
+      sourceEnvironment: "codex",
+      overrides: { model: "recovery-review-model", role: "reviewer", environment: null, stage: "execute" },
+    });
+    const executed = runtimeHarness.executed.at(-1);
+
+    expect(["accepted", "completed"], result.message).toContain(result.status);
+    expect(executed?.state).toMatchObject({ stage: "execute", role: "reviewer" });
+    expect(executed?.state.routingDecision).toMatchObject({ selectedModel: "recovery-review-model", role: "reviewer" });
+  });
+
+  it("does not reuse a historical requested stage when resuming recovery", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const handle = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await handle(intentRequest("codex", noOverrides));
+    const state = await runtimeHarness.store.load(accepted.taskId);
+    if (state === null || state.routingDecision === null) throw new InvalidTaskStateError("Expected durable routed task state");
+    await runtimeHarness.store.save({
+      ...state,
+      stage: "recover",
+      role: "recovery-operator",
+      routingDecision: { ...state.routingDecision, stage: "recover", role: "recovery-operator", requestedStage: "plan" },
+      durableContext: null,
+    });
+
+    const result = await handle({ command: { kind: "continue", taskIdOrProject: accepted.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+    const executed = runtimeHarness.executed.at(-1);
+
+    expect(["accepted", "completed"], result.message).toContain(result.status);
+    expect(executed?.state).toMatchObject({ stage: "execute", role: "implementer" });
   });
 
   it("selects an explicit durable task for close in a fresh runtime", async () => {

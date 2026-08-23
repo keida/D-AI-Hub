@@ -663,6 +663,13 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/handoff/i);
   });
 
+  it("allows close when the task has no handoff", async () => {
+    const state = { ...closeReadyState(new Date().toISOString()), handoffState: "none" as const };
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))) }, ...validCloseOwnership());
+
+    expect(verdict).toMatchObject({ status: "YES", taskId: state.taskId });
+  });
+
   it("returns NO while close approval is pending", async () => {
     const state = { ...closeReadyState(new Date().toISOString()), approvalState: "pending" as const };
     const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))) });

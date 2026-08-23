@@ -1,4 +1,4 @@
-import { parseDAICommand } from "./command-parser.js";
+import { parseDAIInvocation } from "./command-parser.js";
 import type { DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
 
 export interface CodexActivationInput {
@@ -10,11 +10,11 @@ export type DAIRuntimeHandler = (request: ExternalDAIRequest) => Promise<DAIResp
 
 export function createCodexActivation(runtime: DAIRuntimeHandler): (input: CodexActivationInput) => Promise<DAIResponse> {
   return async (input: CodexActivationInput): Promise<DAIResponse> => {
-    const command = parseDAICommand(input.rawCommand);
+    const parsed = parseDAIInvocation(input.rawCommand);
     const result = await runtime({
-      command,
+      command: parsed.command,
       sourceEnvironment: "codex",
-      overrides: { model: null, role: null, environment: null, stage: null },
+      overrides: parsed.overrides,
       activeTaskId: input.taskId,
     });
     return result;

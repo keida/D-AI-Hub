@@ -141,7 +141,7 @@ function gateEvidence(state: TaskState): readonly GateEvidence[] {
 
 function preflight(state: TaskState, now: Date, snapshotManifest: DurableContextManifest | null): PreflightResult {
   const reasons: string[] = [];
-  if (state.handoffState !== "completed") {
+  if (state.handoffState !== "none" && state.handoffState !== "completed") {
     reasons.push(failure(`Close has unresolved handoff state ${state.handoffState}`, "complete or explicitly resolve the handoff"));
   }
   if (state.approvalState === "pending" || state.approvalState === "rejected") {

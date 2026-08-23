@@ -45,4 +45,18 @@ describe("Codex D-AI activation", () => {
     expect(result.status).toBe("blocked");
     expect(result.message).toContain("No active task is available for close");
   });
+
+  it("passes routing overrides from the logical command into the runtime", async () => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-override", stage: "verify", environment: "codex", status: "accepted", evidence: [], message: "accepted" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    await activate({ rawCommand: "@D-AI continue task-override model=gpt-5 role=reviewer stage=verify", taskId: null });
+
+    expect(requests[0]?.overrides).toEqual({ model: "gpt-5", role: "reviewer", environment: null, stage: "verify" });
+    expect(requests[0]?.command).toEqual({ kind: "continue", taskIdOrProject: "task-override" });
+  });
 });

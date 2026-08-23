@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InvalidTaskStateError } from "../../src/domain/errors.js";
-import { parseDAICommand } from "../../src/entry/command-parser.js";
+import { parseDAICommand, parseDAIInvocation } from "../../src/entry/command-parser.js";
 
 describe("parseDAICommand", () => {
   it.each([
@@ -41,5 +41,12 @@ describe("parseDAICommand", () => {
     expect(() => parseDAICommand("@D-AI rollback extra")).toThrow(
       "rollback requires exactly 0 arguments",
     );
+  });
+
+  it("extracts routing overrides from a logical invocation without changing the command", () => {
+    expect(parseDAIInvocation("@D-AI continue task-123 model=gpt-5 role=reviewer stage=verify")).toEqual({
+      command: { kind: "continue", taskIdOrProject: "task-123" },
+      overrides: { model: "gpt-5", role: "reviewer", environment: null, stage: "verify" },
+    });
   });
 });

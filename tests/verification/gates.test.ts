@@ -210,7 +210,7 @@ describe("evaluateHardGates", () => {
     };
     const cases: readonly { readonly gate: GateName; readonly state: TaskState; readonly reason: RegExp }[] = [
       { gate: "failure-handling", state: { ...baseState, stage: "debug", role: "debugger" }, reason: /failure handling.*active/i },
-      { gate: "handoff", state: { ...baseState, handoffState: "none" }, reason: /handoff.*not.*acknowledged/i },
+      { gate: "handoff", state: { ...baseState, handoffState: "pending" }, reason: /handoff.*not.*acknowledged/i },
       { gate: "remote-durability", state: baseState, reason: /remote.*not represented/i },
       { gate: "close", state: baseState, reason: /close stage/i },
       { gate: "close", state: rejectedCloseState, reason: /rejected handoff/i },
