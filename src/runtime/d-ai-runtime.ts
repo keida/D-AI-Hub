@@ -1128,6 +1128,7 @@ async function reconcilePendingHandoff(
   }
   const restoredState = await persistState(dependencies.store, {
     ...candidate.envelope.taskState,
+    handoffState: "none",
     contextManifest: [...candidate.envelope.taskState.contextManifest, `handoff-recovery-rejected:${candidate.envelope.handoffId}`],
     durableContext: null,
   }, lease);

@@ -310,4 +310,43 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
       expect(completed).toMatchObject({ taskId: intent.taskId, stage: "verify", environment: "work", status: "completed" });
     } finally { await fixture.cleanup(); }
   });
+
+  it("restores the source lifecycle after rejecting an interrupted pending handoff", async () => {
+    const fixture = await createKnownGoodRepository();
+    try {
+      const first = await makeRuntimeFixture(fixture);
+      const intent = await first.runtime({ command: { kind: "intent", text: "implement verify repository" }, sourceEnvironment: "chat", overrides: noOverrides });
+      const continued = await first.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(continued.status).toBe("completed");
+      const state = await first.store.load(intent.taskId);
+      if (state === null) throw new Error("Expected a durable state before simulating the interrupted handoff");
+
+      const envelope = await first.handoffs.create({ state, targetEnvironment: "work" });
+      const pendingState: TaskState = {
+        ...state,
+        stage: "handoff",
+        handoffState: "pending",
+        routingDecision: state.routingDecision === null ? null : {
+          ...state.routingDecision,
+          stage: "handoff",
+          reason: "Handoff pending acknowledgement from work",
+        },
+        durableContext: null,
+      };
+      await first.store.withTaskOwnership!(intent.taskId, state.environment, async (lease) => {
+        await first.store.save(pendingState, lease);
+      });
+
+      const restarted = await makeRuntimeFixture(fixture);
+      const resumed = await restarted.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: state.environment, overrides: noOverrides });
+
+      expect(resumed).toMatchObject({ taskId: intent.taskId, status: "accepted" });
+      await expect(restarted.store.load(intent.taskId)).resolves.toMatchObject({
+        stage: state.stage,
+        environment: state.environment,
+        handoffState: "none",
+      });
+      expect(restarted.handoffs.status(envelope.handoffId)).toMatchObject({ state: "rejected" });
+    } finally { await fixture.cleanup(); }
+  });
 });

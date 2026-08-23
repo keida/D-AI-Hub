@@ -68,7 +68,17 @@ function createAdapter(repositoryPath: string, assertOwnership: TaskOwnershipGua
         const archive = await git(repositoryPath, ["show", "--format=", "--binary", archiveId]);
         return { archiveId, patchDigest: patchDigest(archive.stdout) };
       } catch (error: unknown) {
-        if (error instanceof TaskOwnershipError) throw error;
+        if (error instanceof TaskOwnershipError) {
+          const message = redactSensitiveText(error.message);
+          throw new RollbackPartialFailureError(
+            {
+              preservedUserWork: { archiveId: `preserve-pending:${marker}`, patchDigest: "0".repeat(64) },
+              actions: [stashAction],
+              verification: { passed: false, observedOutput: "", reason: `Preserve stage ownership was lost after Git mutation: ${message}` },
+            },
+            message,
+          );
+        }
         const failedAction = failedPreserveAction(error);
         const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
         throw new RollbackPartialFailureError(
@@ -134,6 +144,9 @@ export function createGitRollbackTask(repositoryPath: string): (
     }
     if (state.rollbackAudit?.verification.passed === false) {
       throw new InvalidTaskStateError(`Task ${state.taskId} has a persisted partial rollback audit; manual reconciliation is required before retry`);
+    }
+    if (state.rollbackAudit?.verification.passed === true) {
+      throw new InvalidTaskStateError(`Task ${state.taskId} has a completed rollback audit; the rollback is terminal and must not be retried`);
     }
     const point = capturedPoint(state);
     if (point.snapshot.workspacePath !== repositoryPath) throw new Error("Recovery workspace does not match the configured repository");

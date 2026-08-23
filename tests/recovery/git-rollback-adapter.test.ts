@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { TaskOwnershipError } from "../../src/domain/errors.js";
 import { createGitRollbackTask } from "../../src/recovery/git-rollback-adapter.js";
+import { RollbackPartialFailureError } from "../../src/recovery/rollback.js";
 import type { RecoverySnapshot, TaskState } from "../../src/domain/types.js";
 import type { TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 
@@ -136,6 +137,31 @@ describe("Git rollback adapter", () => {
     }
   });
 
+  it("does not repeat Git mutations after a persisted successful rollback audit", async () => {
+    const fixture = await createRepository();
+    const successfulAudit: NonNullable<TaskState["rollbackAudit"]> = {
+      archiveId: "archive-1",
+      patchDigest: "a".repeat(64),
+      actions: [{
+        command: "git",
+        arguments: ["revert", "--no-edit", fixture.currentHead],
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+      }],
+      verification: { passed: true, observedOutput: "tree verified", reason: "Recovery tree, branch, and workspace verified" },
+      recordedAt: "2026-08-21T00:00:00.000Z",
+    };
+
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot, successfulAudit), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/already completed|terminal|retry/i);
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
+      await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("does not mutate Git after ownership is lost between rollback operations", async () => {
     const fixture = await createRepository();
     const lease: TaskOwnershipLease = { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
@@ -148,6 +174,30 @@ describe("Git rollback adapter", () => {
       await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), lease, assertOwnership)).rejects.toThrow(TaskOwnershipError);
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["status", "--porcelain=v1"])).resolves.toContain("?? user-work.txt");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("retains the stash action when ownership is lost after preserving user work", async () => {
+    const fixture = await createRepository();
+    const lease: TaskOwnershipLease = { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" };
+    let checks = 0;
+    const assertOwnership = async (): Promise<void> => {
+      checks += 1;
+      if (checks >= 5) throw new TaskOwnershipError("Rollback ownership was lost after preserving user work");
+    };
+
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot), lease, assertOwnership)).rejects.toMatchObject({
+        name: "RollbackPartialFailureError",
+        result: {
+          actions: [expect.objectContaining({ arguments: expect.arrayContaining(["stash", "push"]) })],
+          verification: { passed: false, reason: expect.stringMatching(/ownership/i) },
+        },
+      });
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
+      await expect(git(fixture.root, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
