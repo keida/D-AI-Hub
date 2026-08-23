@@ -735,7 +735,8 @@ function validateCapturedRecoveryPoint(
   if (snapshot !== null) {
     const snapshotSecretFailure = secretLikeRecoverySnapshotField(snapshot);
     if (snapshotSecretFailure !== null) return { kind: "blocked", message: snapshotSecretFailure };
-    if (snapshot.stateManifest.manifestId !== manifest.manifestId
+    if (validated.snapshotManifestId !== snapshot.stateManifest.manifestId
+      || snapshot.stateManifest.manifestId !== manifest.manifestId
       || snapshot.stateManifest.taskId !== state.taskId
       || snapshot.verificationResults.length === 0
       || !hasExactPathHashEquality(manifest.durablePaths, manifest.hashes, snapshot.stateManifest.durablePaths, snapshot.stateManifest.hashes)

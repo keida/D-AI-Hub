@@ -1461,7 +1461,7 @@ describe("D-AI runtime", () => {
         if (manifest === null) throw new InvalidTaskStateError("Recovery capture requires durable context");
         return {
           trigger: "recovery",
-          recoveryPoint,
+          recoveryPoint: { ...recoveryPoint, snapshotManifestId: manifest.manifestId },
           snapshot: {
             head: "0123456789abcdef0123456789abcdef01234567",
             branch: "main",
@@ -1485,6 +1485,40 @@ describe("D-AI runtime", () => {
     expect(result.status).toBe("blocked");
     expect(result.message).toMatch(/recovery capture blocked|snapshot.*match/i);
     expect(runtimeHarness.savedStates.some((state) => state.recoverySnapshot?.stateManifest.durablePaths.includes(extraPath))).toBe(false);
+  });
+
+  it("blocks a captured recovery point bound to a different snapshot generation", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const captureRecoveryPoint = runtimeHarness.dependencies.captureRecoveryPoint;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      captureRecoveryPoint: async (state: TaskState): Promise<RecoveryPoint | CapturedRecoveryPoint> => {
+        const captured = await captureRecoveryPoint(state);
+        const recoveryPoint = "recoveryPoint" in captured ? captured.recoveryPoint : captured;
+        const manifest = state.durableContext;
+        if (manifest === null) throw new InvalidTaskStateError("Recovery capture requires durable context");
+        return {
+          trigger: "recovery",
+          recoveryPoint: { ...recoveryPoint, snapshotManifestId: "00000000-0000-4000-8000-000000000009" },
+          snapshot: {
+            head: "0123456789abcdef0123456789abcdef01234567",
+            branch: "main",
+            workspacePath: "C:/workspace",
+            status: "clean",
+            binaryPatch: "no patch required",
+            stateManifest: manifest,
+            verificationResults: state.verificationEvidence,
+            durableArtifacts: manifest.hashes,
+          },
+        };
+      },
+    });
+
+    const result = await handle(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/snapshot.*manifest|generation/i);
+    expect(runtimeHarness.savedStates.some((state) => state.recoveryPoint?.snapshotManifestId === "00000000-0000-4000-8000-000000000009")).toBe(false);
   });
 
   it("propagates execution failure through debug/recovery", async () => {

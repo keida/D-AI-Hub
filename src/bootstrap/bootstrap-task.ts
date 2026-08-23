@@ -33,7 +33,10 @@ async function hashPath(path: string, rootPath: string): Promise<string> {
     return sha256(`link:${relativePath}:${target}`);
   }
   if (entry.isFile()) {
-    return sha256(`file:${relativePath}:${await readFile(path)}`);
+    return createHash("sha256")
+      .update(`file:${relativePath}:`, "utf8")
+      .update(await readFile(path))
+      .digest("hex");
   }
   if (!entry.isDirectory()) {
     return sha256(`other:${relativePath}`);

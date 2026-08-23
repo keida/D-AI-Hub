@@ -117,4 +117,30 @@ describe("bootstrapTask", () => {
       await rm(workspacePath, { recursive: true, force: true });
     }
   });
+
+  it("changes the derived task identity when binary bytes change in place", async () => {
+    const storeRoot = await createDirectory("d-ai-bootstrap-store-");
+    const workspacePath = await createDirectory("d-ai-bootstrap-workspace-");
+    const binaryPath = join(workspacePath, "payload.bin");
+    const store = new FileDurableContextStore(storeRoot);
+
+    try {
+      await writeFile(binaryPath, Buffer.from([0x80]));
+      const first = await prepareBootstrapTask(
+        { taskId: null, goal: "Hash binary content", environment: "work", workspacePath, repositoryPath: null },
+        store,
+      );
+
+      await writeFile(binaryPath, Buffer.from([0x81]));
+      const second = await prepareBootstrapTask(
+        { taskId: null, goal: "Hash binary content", environment: "work", workspacePath, repositoryPath: null },
+        store,
+      );
+
+      expect(second.taskId).not.toBe(first.taskId);
+    } finally {
+      await rm(storeRoot, { recursive: true, force: true });
+      await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
 });

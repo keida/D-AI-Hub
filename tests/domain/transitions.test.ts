@@ -21,6 +21,7 @@ describe("assertStageTransition", () => {
     ["verify", "debug"],
     ["debug", "recover"],
     ["recover", "execute"],
+    ["recover", "handoff"],
     ["execute", "handoff"],
     ["handoff", "execute"],
   ])("accepts %s to %s", (from, to) => {

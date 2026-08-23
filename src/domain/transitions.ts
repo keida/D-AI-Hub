@@ -22,7 +22,7 @@ const allowedTransitions: ReadonlyMap<Stage, ReadonlySet<Stage>> = new Map([
   ["inspect", new Set(["verify", "debug", "handoff"])],
   ["verify", new Set(["close", "debug", "recover", "handoff"])],
   ["debug", new Set(["recover", "execute", "handoff"])],
-  ["recover", new Set(["execute", "inspect", "verify"])],
+  ["recover", new Set(["execute", "inspect", "verify", "handoff"])],
   ["handoff", new Set(["plan", "execute", "inspect", "verify", "debug", "recover"])],
   ["close", new Set()],
 ]);
