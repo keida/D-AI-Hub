@@ -67,7 +67,7 @@ describe("discoverSkillMetadata", () => {
     const productionRoot = join(process.cwd(), ".agents", "skills");
     const descriptors = await discoverSkillMetadata([productionRoot]);
 
-    expect(descriptors.map((descriptor) => descriptor.name)).toEqual(["knowledge-manager", "project-memory"]);
+    expect(descriptors.map((descriptor) => descriptor.name)).toEqual(["d-ai", "knowledge-manager", "project-memory"]);
     expect(selectCapabilities("resume project memory", "bootstrap", "codex", descriptors).map((descriptor) => descriptor.name)).toEqual(["project-memory"]);
   });
 

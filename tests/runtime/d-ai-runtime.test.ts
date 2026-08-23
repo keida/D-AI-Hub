@@ -1908,6 +1908,28 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.closedStates.at(-1)?.stage).toBe("verify");
   });
 
+  it("selects an explicit durable task for close in a fresh runtime", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const seedingRuntime = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await seedingRuntime(intentRequest("codex", noOverrides));
+    const freshRuntime = createDAIRuntime(runtimeHarness.dependencies);
+
+    const result = await freshRuntime({
+      command: { kind: "close" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      activeTaskId: accepted.taskId,
+    });
+
+    expect(result).toMatchObject({
+      taskId: accepted.taskId,
+      stage: "close",
+      environment: "codex",
+      status: "completed",
+      message: "Safe-to-delete: YES",
+    });
+  });
+
   it("keeps a NO close retryable in verify before the real close evaluator runs", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const gitHub: GitHubAdapter = {
