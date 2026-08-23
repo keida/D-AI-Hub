@@ -1,5 +1,7 @@
 # D-AI Orchestrator v2 Design Specification
 
+> **Scope status — superseded for current V1 delivery (2026-08-23):** This document remains the approved cross-environment architecture and contract reference. Its cross-environment delivery scope is superseded by `projects/d-ai-hub/DECISIONS.md` decision **“Supersede cross-environment delivery scope with Codex-first V1”**. Current V1 requires Codex local control, GitHub durable evidence, and D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only. Native Chat/Work activation, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred. Existing Chat/Work contracts remain reference seams and must fail closed without connectors.
+
 **Status:** Approved v2 baseline — status corrected after final review
 **Date:** 2026-08-21
 **Scope:** D-AI-Hub control-plane architecture
@@ -21,15 +23,15 @@ The design deliberately separates the control plane from the execution tools. D-
 
 ### Goals
 
-1. Provide one global `@D-AI` entry and bootstrap contract for Chat, Work, and Codex.
-2. Route work by stage across environments and by role across models, while preserving explicit user overrides.
+1. Provide one Codex-discoverable `@D-AI` entry and bootstrap path for local control.
+2. Route Codex work by stage and role while preserving explicit user overrides and capability gates.
 3. Route skills by capability, with progressive disclosure and minimum useful context.
-4. Move a task between Chat, Work, and Codex without copying an uncontrolled transcript.
+4. Preserve a versioned cross-environment handoff contract as reference material without making Chat/Work activation a V1 dependency.
 5. Make verification a hard gate for progress and completion claims.
 6. Make failure enter a systematic debugging and recovery path.
 7. Create known-good recovery points and safe, auditable rollback paths.
 8. Make `@D-AI close` produce an evidence-backed verdict, including GitHub commit verification.
-9. Keep the first implementation small enough to test as one coherent control-plane slice.
+9. Keep the Codex-first implementation small enough to test as one coherent control-plane slice.
 
 ### Non-goals
 
@@ -38,8 +40,11 @@ The design deliberately separates the control plane from the execution tools. D-
 - `@D-AI close` will not delete files, uninstall software, terminate processes, or remove a repository.
 - A model's assertion, a successful HTTP response, or the existence of a process is not completion evidence by itself.
 - Memory will not be treated as authoritative when current local or remote evidence is available.
+- Native Chat/Work activation, the Work file-backed connector, automatic Chat↔Work↔Codex handoff, and automatic cross-environment routing are not V1 requirements.
 
 ## 3. Control-plane model
+
+The control-plane diagram and routing model below are retained v2 architecture/reference material. Current V1 activates the Codex path only; cross-environment routing is Future/Deferred.
 
 ```text
                          @D-AI
@@ -124,26 +129,26 @@ Environment routing answers **where** the current stage runs; model routing answ
 
 The router may choose a different environment when task evidence requires it, but it must record the reason and re-check the target's capabilities. An environment override may constrain routing, but cannot bypass a gate or make an unavailable adapter appear compatible.
 
-## 4. Global `@D-AI` entry and bootstrap
+## 4. Global logical `@D-AI` entry and Codex bootstrap
 
 ### 4.1 Entry contract
 
-Chat, Work, and Codex must recognize the same logical command family:
+Codex must recognize the logical command family through its supported Skill/CLI activation surface:
 
 ```text
 @D-AI <intent>
 @D-AI continue <task-or-project>
 @D-AI status
-@D-AI handoff <environment>
 @D-AI close
+@D-AI rollback
 ```
 
-Environment-specific syntax may differ at the adapter boundary, but the normalized intent and resulting state transitions must be equivalent.
+The logical prefix is not a Codex built-in command. Environment-specific syntax and future adapters may be added only at a documented boundary; current V1 acceptance covers the real Codex Skill → CLI → runtime path.
 
 ### 4.2 Bootstrap sequence
 
 1. Normalize the request and assign or recover `task_id`.
-2. Identify the active environment, workspace, repository, branch, and relevant project instructions.
+2. Identify the Codex environment, workspace, repository, branch, and relevant project instructions.
 3. Read current task state and the latest recovery point.
 4. Inspect only the bounded files and evidence needed to classify the request.
 5. Select the minimum capability candidates; do not load the entire skill library.
@@ -152,15 +157,15 @@ Environment-specific syntax may differ at the adapter boundary, but the normaliz
 
 Bootstrap is read-only unless the user explicitly requests an operation. If the workspace or repository cannot be identified, D-AI must stop with an actionable error instead of guessing.
 
-### 4.3 Environment adapter contract and compatibility assumptions
+### 4.3 Environment adapter contract and deferred compatibility assumptions
 
-The names Chat, Work, and Codex define the target adapter contract for this design; they do not claim that every current product surface already exposes all required APIs. The implementation must validate capabilities at runtime rather than infer them from a label:
+The names Chat, Work, and Codex define the retained adapter contracts for this design; they do not claim that current product surfaces expose the required APIs. Only Codex activation is in the current V1 product boundary. All adapters must validate capabilities at runtime rather than infer them from a label:
 
 - **Chat** is the conversational intent, approval, routing, and status surface. It must not be treated as a local filesystem or process executor unless an explicit adapter provides that capability.
 - **Work** is the workspace-aware and durable-context surface. It must be able to persist task state, context manifests, approvals, evidence manifests, and handoff records before close can succeed.
-- **Codex** is the local execution surface for repository, tool, process, and test operations. It supplies local state evidence and may push to GitHub through the configured Git adapter.
+- **Codex** is the V1 local execution surface for repository, tool, process, and test operations. It supplies local state evidence and may push to GitHub through the configured Git adapter.
 
-If a surface cannot provide the capability required by its assigned stage, D-AI stops or routes to a compatible environment with an explicit transition record. Compatibility is capability-based, not name-based.
+Chat and Work remain unsupported/deferred product surfaces in V1. If an adapter or connector cannot provide the capability required by its assigned stage, D-AI stops with an explicit `BLOCKED` result; it must not route around an unavailable capability or imply activation. Compatibility is capability-based, not name-based.
 
 ## 5. Stage/role-based model routing
 
@@ -252,7 +257,9 @@ Taste / UI quality review
 
 Additional skills are selected only when the task evidence requires them, such as Windows lifecycle control, testing, or security review.
 
-## 7. Chat ↔ Work ↔ Codex handoff
+## 7. Chat ↔ Work ↔ Codex handoff contract (Future/Deferred delivery)
+
+The following handoff envelope and ownership protocol remain the reference contract for a future connector-backed expansion. They are not a current V1 activation requirement, and no V1 completion claim may depend on native Chat/Work availability.
 
 ### 7.1 Handoff envelope
 
@@ -292,7 +299,7 @@ Secrets, API keys, raw credentials, and unnecessary conversation history are exc
 6. Target continues from the recorded stage and rechecks stale evidence before irreversible work.
 7. Completion or rejection is written back to task state.
 
-Chat may hand off an approved plan to Work, Work may hand off executable work to Codex, and Codex may return evidence or a recovery state to Work or Chat. Any other direction is valid when the target capability check passes. If the target cannot validate the envelope, the handoff is rejected with a specific reason. It must not fall back to starting a new, untracked task.
+Future Chat/Work connectors may hand off an approved plan or evidence when the target capability check passes. If the target cannot validate the envelope, the handoff is rejected with a specific reason. It must not fall back to starting a new, untracked task. This future behavior is not part of current V1 acceptance.
 
 ## 8. Verification hard gates
 
@@ -407,41 +414,44 @@ The matrices describe the V1 contract, not an assertion that every adapter alrea
 
 ### 12.1 Environment capability matrix
 
+The matrix is a retained contract/reference map. In the current V1 product boundary, only the Codex column is an activation requirement; Chat and Work rows describe deferred capabilities and must remain `BLOCKED` when no connector is configured.
+
 | Environment | Primary responsibility | Must support in V1 | Must not be assumed |
 |---|---|---|---|
-| Chat | Intent capture, approval, routing, status, and human-readable handoff initiation. | Global entry, bootstrap, route decisions, approval records, status, handoff envelope creation. | Local filesystem, process control, repository mutation, or durable storage without an explicit adapter. |
-| Work | Workspace-aware planning, durable context, artifact manifests, and cross-environment continuity. | Durable task state, context manifests, approvals, evidence manifests, recovery points, handoff records, close coordination. | Local execution or Git push unless its adapters expose and verify those capabilities. |
-| Codex | Local repository, tool, process, test, and runtime execution. | Workspace inspection, scoped changes, local verification, recovery, worktree state, Git push evidence. | Durable context persistence or remote verification without an explicit Work/GitHub adapter. |
+| Chat | Deferred conversational discussion, viewing, approval, and future handoff initiation. | Future connector only; not required for V1 runtime. | Local filesystem, process control, repository mutation, runtime execution, or implied product activation. |
+| Work | Deferred workspace-aware planning and durable-context product surface. | Future connector only; not required for V1 runtime. | Local execution, Git push, or durable product activation without a supported connector. |
+| Codex | V1 local repository, tool, process, test, and runtime execution. | Workspace inspection, scoped changes, local verification, recovery, rollback, worktree state, GitHub push evidence. | GitHub remote verification or other external capability without an explicit configured adapter. |
 
 ### 12.2 Capability-by-environment contract
 
 | Capability | Chat | Work | Codex | V1 boundary |
 |---|---:|---:|---:|---|
-| Normalized `@D-AI` entry | Required | Required | Required | All three adapters normalize to the same intent. |
-| Bootstrap and task identity | Required | Required | Required | Any environment may resume a task. |
-| Stage-based environment routing | Required | Required | Required | Router records selected environment and reason. |
-| Role-based model routing | Required | Required | Required | Model selection is separate from environment selection. |
-| User model/role/environment override | Required | Required | Required | Overrides never bypass gates. |
-| Agent Skills metadata routing | Required | Required | Required | Metadata first; bodies and resources on demand. |
-| Durable context save | Via Work adapter | Native responsibility | Via Work adapter | Required before close. |
-| Local execution and live state | No default | Adapter-dependent | Native responsibility | Evidence must identify its source. |
-| Chat ↔ Work ↔ Codex handoff | Source/target | Source/target | Source/target | Versioned envelope, ack, single owner. |
-| Verification hard gates | Required | Required | Required | Gate execution may be delegated; gate state is centralized. |
-| Systematic debugging | Coordination | Workflow/project failures | Runtime/repository failures | Original symptom must be re-run. |
-| Known-good recovery point | Record/approve | Persist/restore context | Persist/restore local state | Rollback preserves user work. |
-| GitHub push evidence | Adapter result | Consume/verify | Produce | Push success is recorded, not inferred. |
-| GitHub remote-state verification | Adapter result | Required for close | Adapter result | Exact repository/ref/SHA required. |
-| Safe-to-delete verdict | Display/approve | Authoritative computation | Supply local evidence | YES requires all close preconditions. |
+| Normalized `@D-AI` entry | Deferred | Deferred | Required | Current V1 acceptance covers Codex Skill/CLI normalization. |
+| Bootstrap and task identity | Deferred | Deferred | Required | Codex discovers or explicitly selects durable task identity. |
+| Stage-based environment routing | Future contract | Future contract | Required within Codex | No automatic cross-environment routing in V1. |
+| Role-based model routing | Future contract | Future contract | Required | Model selection remains separate from capability gates. |
+| User model/role/environment override | Deferred | Deferred | Required | Overrides never bypass gates. |
+| Agent Skills metadata routing | Deferred | Deferred | Required | Metadata first; bodies and resources on demand. |
+| Durable context save | Future adapter | Future adapter | Local durable store | Local state is required before close. |
+| Local execution and live state | No default | Deferred | Native responsibility | Evidence must identify its source. |
+| Chat ↔ Work ↔ Codex handoff | Deferred | Deferred | Reference target/source contract | No automatic handoff in V1. |
+| Verification hard gates | Deferred | Deferred | Required | Gate state is centralized in the Codex runtime. |
+| Systematic debugging | Deferred | Deferred | Required | Original symptom must be re-run. |
+| Known-good recovery point | Deferred | Deferred | Required | Rollback preserves user work. |
+| GitHub push evidence | Future adapter | Future adapter | Produce | Push success is recorded, not inferred. |
+| GitHub remote-state verification | Future adapter | Future adapter | Required for close | Exact repository/ref/SHA required. |
+| Safe-to-delete verdict | Future display | Future computation | Compute/supply evidence | YES requires all close preconditions. |
 
 ### 12.3 Delivery compatibility
 
 | Capability | V1 | V1.1 | Future |
 |---|---:|---:|---:|
-| Chat/Work/Codex global entry and bootstrap | Yes | Expand syntax | More surfaces |
-| Stage-based environment routing | Explicit policy | Compatibility registry and metrics | Autonomous cross-provider optimization |
+| Codex entry and bootstrap | Yes | Expand syntax | More surfaces |
+| Chat/Work activation and connectors | No | No required dependency | Evaluate after connector evidence |
+| Stage-based Codex routing | Explicit policy | Compatibility registry and metrics | Autonomous cross-provider optimization |
 | Role/model routing and overrides | Yes | Saved preferences and richer policy | Policy simulation |
 | Skill progressive disclosure | Yes | Resource caching | Distributed capability graph |
-| Three-way handoff | Yes | Resume and conflict UI | Multi-device live collaboration |
+| Three-way handoff contract | Reference only | Connector-backed resume | Multi-device live collaboration |
 | Verification hard gates | Yes | Promptfoo regression suite | Continuous production evaluation |
 | Systematic debugging | Yes | Failure analytics | Automated hypothesis search with approval |
 | Recovery points and safe rollback | Yes | Rich checkpoints and dry-run rollback | Durable graph replay |
@@ -451,24 +461,26 @@ The matrices describe the V1 contract, not an assertion that every adapter alrea
 
 ## 13. Delivery boundaries
 
-### V1 — reliable control-plane slice
+### V1 — Codex-first reliable control-plane slice
 
 V1 is complete only when the following are implemented as one coherent, testable path:
 
-- Global normalized `@D-AI` entry and bootstrap for Chat, Work, and Codex adapters.
-- Stage-based environment routing across Chat, Work, and Codex with capability checks.
+- Real Codex Skill → CLI → runtime `@D-AI` entry and bootstrap.
+- Stage/role routing within the configured Codex control path with capability checks.
 - Task identity and the core state fields in Section 3.1.
 - Explicit lifecycle stages and role-aware model routing.
 - User model, role, and stage overrides with clear conflict errors.
 - Capability registry lookup with metadata-first, skill-second, resource-on-demand loading.
 - Minimum-context manifests and secret redaction for handoffs.
-- Chat ↔ Work ↔ Codex handoff envelope, validation, acknowledgement, and single-owner execution.
-- Durable context save and critical-unsaved-context detection before close.
+- Retained Chat/Work handoff envelope and ownership contracts, covered as reference compatibility only.
+- Local durable context save and critical-unsaved-context detection before close.
 - Verification hard gates with evidence, exit status, and stale-evidence handling.
 - Systematic debugging loop and failure stop behavior.
 - Known-good recovery points and safe rollback that preserves user work.
 - `@D-AI close` with durable-context verification, recorded push success, exact GitHub repository/ref/SHA verification, and the three-way deletion verdict.
-- Initial environment capability matrix and contract-level tests for all of the above.
+- Codex activation, workspace identity, ownership, close safety, and contract-level tests for the V1 path.
+
+Native Chat/Work activation, a Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are explicitly outside this V1 boundary. Their absence must be reported as deferred/unsupported, never as successful completion.
 
 V1 intentionally uses a small number of explicit transitions and adapters. It does not require a general graph runtime, a marketplace import, or automatic multi-agent delegation.
 
@@ -514,28 +526,31 @@ The local Taste and Darwin references are profile-local inputs and are not treat
 
 ## 15. Testing and acceptance strategy
 
-V1 testing should prefer real adapter and repository behavior over mocks. The minimum contract suite must cover:
+V1 testing should prefer real Codex adapter and repository behavior over mocks. The minimum V1 suite must cover:
 
-1. Chat, Work, and Codex bootstrap create equivalent normalized state.
-2. A normal intent selects a stage, compatible environment, minimal capability set, and no unrelated resources.
+1. The real Codex Skill/CLI entry parses normal `@D-AI continue/status/close/rollback` commands and reaches the configured runtime.
+2. A normal Codex intent selects a stage, compatible capability set, and no unrelated resources.
 3. A user model, role, or environment override is honored; an impossible override fails clearly.
-4. Each Chat ↔ Work ↔ Codex handoff is rejected when stale, malformed, mismatched, or already owned, and is resumed when valid.
-5. A failed verification gate prevents a completion claim and enters the debugging path.
-6. A debugging change preserves the failed state and re-runs the original check.
-7. A recovery restores the known-good point without discarding uncommitted user work.
-8. `@D-AI close` returns `NO` when durable context is not saved.
-9. `@D-AI close` returns `NO` when critical unsaved context remains.
-10. `@D-AI close` returns `NO` when GitHub push does not succeed.
-11. `@D-AI close` returns `NO` when GitHub has a different SHA than the expected artifact.
-12. `@D-AI close` returns `BLOCKED` when GitHub or required evidence cannot be checked.
-13. `@D-AI close` returns `YES` only when every applicable precondition is freshly verified.
-14. No close path deletes files or performs unrelated cleanup.
+4. A failed verification gate prevents a completion claim and enters the debugging path.
+5. A debugging change preserves the failed state and re-runs the original check.
+6. A recovery restores the known-good point without discarding uncommitted user work.
+7. `@D-AI close` returns `NO` when durable context is not saved.
+8. `@D-AI close` returns `NO` when critical unsaved context remains.
+9. `@D-AI close` returns `NO` when GitHub push does not succeed.
+10. `@D-AI close` returns `NO` when GitHub has a different SHA than the expected artifact.
+11. `@D-AI close` returns `BLOCKED` when GitHub or required evidence cannot be checked.
+12. `@D-AI close` returns `YES` only when every applicable precondition is freshly verified.
+13. No close path deletes files or performs unrelated cleanup.
+
+The retained Chat/Work adapter and handoff contract tests are compatibility/reference coverage. They do not constitute native product activation or V1 acceptance.
 
 The implementation plan must map each case to a stable state identifier or accessibility/test identifier rather than relying on brittle visible-text clicks for UI automation.
 
 ## 16. Definition of Done
 
 ### Spec DoD for this document
+
+These checklist items describe the retained v2 architecture and contract reference. The current product acceptance boundary is the Codex-first V1 implementation DoD below.
 
 - [x] V1, V1.1, and Future boundaries are explicit.
 - [x] Chat, Work, and Codex bootstrap and global `@D-AI` entry are defined.
@@ -551,7 +566,7 @@ The implementation plan must map each case to a stable state identifier or acces
 
 ### V1 implementation DoD
 
-V1 is done only when all V1 capabilities in Section 13 are implemented, the contract suite in Section 15 passes with fresh evidence, the repository diff is reviewable, failure and recovery paths have been exercised, and an independent review confirms that no gate is bypassed.
+Codex-first V1 is done only when the Codex capabilities in Section 13 are implemented, the Codex contract suite in Section 15 passes with fresh evidence, local durable state and GitHub close evidence are verified, the repository diff is reviewable, failure and recovery paths have been exercised, and an independent review confirms that no gate is bypassed. Chat/Work activation is not a prerequisite.
 
 ### Close-verdict DoD
 
@@ -559,4 +574,4 @@ The close feature is done only when a successful `YES` case and each negative/bl
 
 ## 17. Approval boundary
 
-This document is the design output for the approved v2 baseline. The next action is to invoke the writing-plans workflow and decompose V1 into implementation tasks. No orchestrator implementation, dependency installation, commit, push, or deletion operation is authorized by this spec-writing task.
+This document remains the design output for the approved v2 baseline, with its current delivery scope superseded by the 2026-08-23 Codex-first decision recorded in `projects/d-ai-hub/DECISIONS.md`. The next action for current V1 is to verify and release the Codex-first path; native Chat/Work expansion requires a separate future decision. No orchestrator implementation, dependency installation, commit, push, or deletion operation is authorized by this documentation scope task.

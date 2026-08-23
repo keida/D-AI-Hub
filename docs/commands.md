@@ -1,10 +1,10 @@
 # D-AI-Hub Short Commands
 
-D-AI-Hub exposes two primary lifecycle command prefixes and one optional synchronization check for ChatGPT Web, Codex, and compatible agents. They are repository conventions, not built-in commands. Their authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains available internally when durable outcomes should be captured during a session. The actions each client can perform still depend on its available GitHub access and permissions.
+D-AI V1 exposes a Codex-first logical command protocol. Commands are repository conventions, not built-in commands. Codex is the supported runtime activation surface; ChatGPT Web is for ordinary discussion and viewing only. The authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains internal when durable outcomes should be captured during a session.
 
 ## Three layers
 
-1. **Logical command** — the user-facing protocol, such as `@D-AI status` or `@D-AI close`.
+1. **Logical command** — the user-facing protocol, primarily `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`.
 2. **Codex Skill activation** — when a message begins with `@D-AI`, the `d-ai` Skill invokes the real runtime through `skills/custom/d-ai/scripts/invoke.ps1`.
 3. **CLI implementation** — the internal `npm run d-ai -- --workspace <path> --command "@D-AI status"` entry used by the Skill. Codex-only `--task <task-id>` is an explicit override.
 
@@ -14,10 +14,12 @@ The logical prefix is a D-AI-Hub protocol, not a Codex built-in command. The Ski
 
 | Command | Purpose |
 | --- | --- |
-| `@D-AI establish` | Establish D-AI-Hub in a new or uncertain environment. |
-| `@D-AI sync` | Optionally verify canonical GitHub freshness when remote state matters. |
+| `@D-AI continue <task-or-project>` | Resume the active Codex task after workspace and ownership checks. |
 | `@D-AI status` | Show the uniquely discovered active task for the current workspace, or fail closed. |
-| `@D-AI close` | Finish the session by updating project memory/knowledge and syncing durable changes. |
+| `@D-AI close` | Verify durable state, GitHub evidence, and project-memory outcomes; return `YES`, `NO`, or `BLOCKED`. |
+| `@D-AI rollback` | Perform an explicitly authorized, durable, auditable rollback or fail closed. |
+
+`@D-AI establish`, `@D-AI sync`, and internal `@D-AI update` remain setup/maintenance workflows rather than the daily V1 command set. Cross-environment `handoff` remains a contract/reference command and is Future/Deferred for product delivery.
 
 For `status` and `close`, the runtime automatically selects the unique active durable task whose persisted workspace identity matches the current workspace. Zero matches, multiple matches, and ownership conflicts fail closed. Add `--task <task-id>` only when the result asks for explicit disambiguation or recovery.
 
@@ -98,12 +100,10 @@ Or with scope:
 Use when meaningful work is finished for the session.
 
 Expected outcome:
-- durable session outcomes are captured;
-- touched project `STATUS.md` reflects verified reality and the next action;
-- decisions, bugs, roadmap, references, reusable knowledge, and indexes are updated as needed;
-- stale machine-specific/transient details are removed or generalized;
-- security check is performed;
-- changes are committed/pushed when possible, with final sync status reported.
+- local durable task state and the touched project's Markdown memory reflect verified reality and the next action;
+- GitHub push success and exact remote repository/ref/SHA evidence are checked when the close gate applies;
+- missing credentials, remote evidence, ownership, or durable context return `NO`/`BLOCKED`;
+- no files, processes, repositories, or unrelated user changes are deleted or hidden.
 
 Example:
 

@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-08-23 — Supersede cross-environment delivery scope with Codex-first V1
+
+**Context**
+
+The approved 2026-08-21 v2 design remains the historical cross-environment architecture reference, but the current supported product boundary is narrower. The repository has a usable Codex local control layer, GitHub evidence/persistence seams, and Markdown project memory; no supported native Chat or Work activation connector is available.
+
+**Decision**
+
+D-AI V1 is Codex-first: Codex local control and execution, GitHub-backed durable evidence, and D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only; it is not required for runtime execution. Native Chat activation, native Work activation, the Work file-backed connector, Chat↔Work↔Codex automatic handoff, and cross-environment automatic routing are Future/Deferred rather than V1 requirements.
+
+Keep the existing Chat and Work adapters, handoff envelope, and environment-routing contracts as reference seams. They must remain explicitly unsupported/deferred and fail closed whenever their connectors are unavailable; they must not imply product activation or allow a virtual capability to produce completion.
+
+The V1 user-facing command set is `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`. Local durable state is authoritative for task identity and ownership; GitHub is authoritative for pushed evidence and exact remote repository/ref/SHA verification; Markdown project memory records durable project decisions and checkpoints.
+
+This decision supersedes the delivery scope of the cross-environment V1 sections in `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md`, not the historical design or its contract definitions. The spec now carries a traceable scope note and keeps the deferred architecture visible.
+
+**Rationale**
+
+It makes the shipped product boundary honest and independently releasable while preserving the original architecture for a later, connector-backed expansion. It also prevents Chat/Work availability gaps from blocking Codex V1 or being mistaken for successful execution.
+
+**Consequences**
+
+Codex runtime, local durable state, GitHub evidence, and Markdown project memory are the only V1 delivery path. A positive close still requires the configured GitHub and repository evidence gates. Chat/Work contract tests may remain as compatibility coverage, but native activation and automatic cross-environment routing are not V1 acceptance criteria.
+
+**Revisit trigger**
+
+Revisit only after a supported external Chat or Work connector is available, its capability and ownership boundary is documented, and an independent acceptance review proves real activation without weakening fail-closed behavior.
+
 ## 2026-08-20 — GitHub main is canonical
 
 **Context**
