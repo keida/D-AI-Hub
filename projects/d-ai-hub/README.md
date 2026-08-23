@@ -10,6 +10,10 @@ Included: Markdown documentation, Agent Skills entry points, custom and external
 
 Excluded from V1: vector databases, embeddings, RAG infrastructure, web applications, background ingestion daemons, automatic sync services, and large third-party Skill copies.
 
+## D-AI V1 product boundary
+
+D-AI V1 is Codex local control, GitHub-backed durable evidence, and D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only; it is not a runtime dependency. Native Chat/Work activation, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred; existing contracts remain reference-only and fail closed without connectors.
+
 ## Architecture
 
 - `.agents/skills/` provides Agent Skills-compatible entry points.

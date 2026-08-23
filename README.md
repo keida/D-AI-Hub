@@ -31,11 +31,17 @@ GitHub is the canonical source of truth. ChatGPT Web and Codex should both read 
 
 ### ChatGPT Web
 
-Use for discussion, planning, lightweight skill use, knowledge capture, and reviewing repository-hosted context.
+Use for ordinary discussion and viewing/reviewing repository-hosted content. It is not a D-AI runtime.
 
 ### Codex
 
 Use for repository maintenance, software development, testing, Git operations, local Agent Skills, structured project-memory updates, and skill optimization.
+
+## D-AI V1 boundary
+
+D-AI V1 is a Codex-first local control layer with GitHub-backed durable evidence and D-AI-Hub Markdown knowledge/project memory. ChatGPT Web remains available for ordinary discussion and viewing, but it is not required for the D-AI runtime.
+
+Native Chat activation, native Work activation, the Work file-backed connector, automatic Chat↔Work↔Codex handoff, and automatic cross-environment routing are Future/Deferred. Existing contracts may remain for reference, but unavailable Chat/Work capabilities must fail closed and must not be presented as product activation.
 
 ## Core rules
 
