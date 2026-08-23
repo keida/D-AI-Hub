@@ -25,6 +25,7 @@ export interface DurableContextStore {
   load(taskId: string): Promise<TaskState | null>;
   loadGenerationManifest?(taskId: string, manifestId: string): Promise<DurableContextManifest>;
   verifyDurableSnapshot?(manifest: DurableContextManifest): Promise<void>;
+  createIfAbsent?(state: TaskState): Promise<DurableContextManifest>;
   save(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest>;
   saveCloseCandidate?(candidate: CloseCandidate, lease?: TaskOwnershipLease): Promise<void>;
   loadCloseCandidate?(taskId: string): Promise<CloseCandidate | null>;

@@ -124,6 +124,9 @@ export async function prepareBootstrapTask(input: BootstrapInput, store: Durable
 export async function bootstrapTask(input: BootstrapInput, store: DurableContextStore): Promise<TaskState> {
   const state = await prepareBootstrapTask(input, store);
   if (state.durableContext !== null) return state;
-  const manifest = await store.save(state);
+  if (store.createIfAbsent === undefined) {
+    throw new InvalidTaskStateError("Bootstrap persistence requires an atomic create-if-absent durable store operation");
+  }
+  const manifest = await store.createIfAbsent(state);
   return { ...state, durableContext: manifest };
 }

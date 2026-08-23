@@ -1,5 +1,5 @@
-import { redactSensitiveText } from "../adapters/command-runner.js";
-import { InvalidTaskStateError, UnsavedContextError, VerificationGateError } from "../domain/errors.js";
+import { CommandExecutionError, redactSensitiveText } from "../adapters/command-runner.js";
+import { InvalidTaskStateError, TaskOwnershipError, UnsavedContextError, VerificationGateError } from "../domain/errors.js";
 import type { CapturedRecoveryPoint } from "./recovery-point-service.js";
 
 export interface PreservedUserWork {
@@ -40,6 +40,16 @@ export interface RollbackResult {
   readonly verification: RollbackVerification;
 }
 
+export class RollbackPartialFailureError extends Error {
+  public readonly result: RollbackResult;
+
+  public constructor(result: RollbackResult, message: string) {
+    super(message);
+    this.name = "RollbackPartialFailureError";
+    this.result = result;
+  }
+}
+
 function assertCommit(commit: string): void {
   if (!/^[a-f0-9]{40,64}$/i.test(commit)) throw new InvalidTaskStateError("Rollback commit must be a full Git object id");
 }
@@ -71,22 +81,84 @@ function assertAuditableAction(action: AuditableGitAction, operation: "revert" |
   return sanitized;
 }
 
+function failedCommandAction(error: unknown): AuditableGitAction | null {
+  if (!(error instanceof CommandExecutionError)) return null;
+  return sanitizedAction(error.result);
+}
+
+function incompletePreservedUserWork(): PreservedUserWork {
+  return { archiveId: "preserve-failed", patchDigest: "0".repeat(64) };
+}
+
 export async function safeRollback(input: RollbackInput): Promise<RollbackResult> {
-  const preservedUserWork = await input.adapter.preserveUncommittedWork();
+  let preservedUserWork: PreservedUserWork;
+  try {
+    preservedUserWork = await input.adapter.preserveUncommittedWork();
+  } catch (error: unknown) {
+    if (error instanceof TaskOwnershipError || error instanceof RollbackPartialFailureError) throw error;
+    const failedAction = failedCommandAction(error);
+    const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+    throw new RollbackPartialFailureError(
+      {
+        preservedUserWork: incompletePreservedUserWork(),
+        actions: failedAction === null ? [] : [failedAction],
+        verification: { passed: false, observedOutput: "", reason: `Preserve stage failed: ${message}` },
+      },
+      `Preserve stage failed: ${message}`,
+    );
+  }
   assertPreservedUserWork(preservedUserWork);
   const actions: AuditableGitAction[] = [];
   for (const commit of input.commitsToRevert) {
-    assertCommit(commit);
-    actions.push(assertAuditableAction(await input.adapter.revertCommit(commit), "revert"));
+    try {
+      assertCommit(commit);
+      actions.push(assertAuditableAction(await input.adapter.revertCommit(commit), "revert"));
+    } catch (error: unknown) {
+      if (error instanceof TaskOwnershipError) throw error;
+      const failedAction = failedCommandAction(error);
+      throw new RollbackPartialFailureError(
+        {
+          preservedUserWork,
+          actions: failedAction === null ? actions : [...actions, failedAction],
+          verification: { passed: false, observedOutput: "", reason: redactSensitiveText(error instanceof Error ? error.message : String(error)) },
+        },
+        redactSensitiveText(error instanceof Error ? error.message : String(error)),
+      );
+    }
   }
-  actions.push(assertAuditableAction(await input.adapter.restoreRecoveryPatch(input.recoveryPoint.snapshot.binaryPatch), "apply"));
-  const verification = await input.adapter.verifyRecoveryPoint(input.recoveryPoint);
-  if (!verification.passed) throw new VerificationGateError(`Recovery point verification failed: ${redactSensitiveText(verification.reason)}`);
+  try {
+    actions.push(assertAuditableAction(await input.adapter.restoreRecoveryPatch(input.recoveryPoint.snapshot.binaryPatch), "apply"));
+  } catch (error: unknown) {
+    if (error instanceof TaskOwnershipError) throw error;
+    const failedAction = failedCommandAction(error);
+    throw new RollbackPartialFailureError(
+      {
+        preservedUserWork,
+        actions: failedAction === null ? actions : [...actions, failedAction],
+        verification: { passed: false, observedOutput: "", reason: redactSensitiveText(error instanceof Error ? error.message : String(error)) },
+      },
+      redactSensitiveText(error instanceof Error ? error.message : String(error)),
+    );
+  }
+  let verification: RollbackVerification;
+  try {
+    verification = await input.adapter.verifyRecoveryPoint(input.recoveryPoint);
+  } catch (error: unknown) {
+    if (error instanceof TaskOwnershipError) throw error;
+    throw new RollbackPartialFailureError(
+      {
+        preservedUserWork,
+        actions,
+        verification: { passed: false, observedOutput: "", reason: redactSensitiveText(error instanceof Error ? error.message : String(error)) },
+      },
+      redactSensitiveText(error instanceof Error ? error.message : String(error)),
+    );
+  }
   return {
     preservedUserWork,
     actions,
     verification: {
-      passed: true,
+      passed: verification.passed,
       observedOutput: redactSensitiveText(verification.observedOutput),
       reason: redactSensitiveText(verification.reason),
     },

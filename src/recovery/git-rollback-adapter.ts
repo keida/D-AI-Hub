@@ -2,11 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CommandExecutionError, runCommand, type CommandResult } from "../adapters/command-runner.js";
+import { CommandExecutionError, redactSensitiveText, runCommand, type CommandResult } from "../adapters/command-runner.js";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import type { TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
 import type { CapturedRecoveryPoint } from "./recovery-point-service.js";
-import { safeRollback, type AuditableGitAction, type RollbackResult } from "./rollback.js";
+import { RollbackPartialFailureError, safeRollback, type AuditableGitAction, type RollbackResult } from "./rollback.js";
 import type { TaskState } from "../domain/types.js";
 
 function action(result: CommandResult): AuditableGitAction {
@@ -30,6 +30,10 @@ async function gitAllowFailure(repositoryPath: string, argumentsList: readonly s
     if (error instanceof CommandExecutionError) return error.result;
     throw error;
   }
+}
+
+function failedPreserveAction(error: unknown): AuditableGitAction | null {
+  return error instanceof CommandExecutionError ? action(error.result) : null;
 }
 
 function output(result: CommandResult): string {
@@ -56,11 +60,26 @@ function createAdapter(repositoryPath: string, assertOwnership: TaskOwnershipGua
       if (/no local changes to save/i.test(stash.stdout)) {
         return { archiveId: `clean-worktree:${marker}`, patchDigest: patchDigest("") };
       }
-      await assertOwnership();
-      const archiveId = output(await git(repositoryPath, ["rev-parse", "stash@{0}"]));
-      await assertOwnership();
-      const archive = await git(repositoryPath, ["show", "--format=", "--binary", archiveId]);
-      return { archiveId, patchDigest: patchDigest(archive.stdout) };
+      const stashAction = action(stash);
+      try {
+        await assertOwnership();
+        const archiveId = output(await git(repositoryPath, ["rev-parse", "stash@{0}"]));
+        await assertOwnership();
+        const archive = await git(repositoryPath, ["show", "--format=", "--binary", archiveId]);
+        return { archiveId, patchDigest: patchDigest(archive.stdout) };
+      } catch (error: unknown) {
+        if (error instanceof TaskOwnershipError) throw error;
+        const failedAction = failedPreserveAction(error);
+        const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+        throw new RollbackPartialFailureError(
+          {
+            preservedUserWork: { archiveId: `preserve-failed:${marker}`, patchDigest: "0".repeat(64) },
+            actions: failedAction === null ? [stashAction] : [stashAction, failedAction],
+            verification: { passed: false, observedOutput: "", reason: `Preserve stage failed: ${message}` },
+          },
+          `Preserve stage failed: ${message}`,
+        );
+      }
     },
     async revertCommit(commit: string) {
       await assertOwnership();
@@ -112,6 +131,9 @@ export function createGitRollbackTask(repositoryPath: string): (
     if (assertOwnership === undefined) throw new TaskOwnershipError(`Rollback ownership guard is unavailable for task ${state.taskId}`);
     if (lease.taskId !== state.taskId || lease.environment !== state.environment) {
       throw new TaskOwnershipError(`Rollback ownership does not match task ${state.taskId}`);
+    }
+    if (state.rollbackAudit?.verification.passed === false) {
+      throw new InvalidTaskStateError(`Task ${state.taskId} has a persisted partial rollback audit; manual reconciliation is required before retry`);
     }
     const point = capturedPoint(state);
     if (point.snapshot.workspacePath !== repositoryPath) throw new Error("Recovery workspace does not match the configured repository");

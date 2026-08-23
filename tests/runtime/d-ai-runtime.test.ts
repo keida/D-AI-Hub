@@ -1,14 +1,14 @@
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { describe, expect, it, vi } from "vitest";
 import { CommandExecutionError, runCommand } from "../../src/adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../../src/adapters/environments/chat-adapter.js";
 import { CodexEnvironmentAdapter } from "../../src/adapters/environments/codex-adapter.js";
 import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-adapter.js";
 import { bootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
 import { closeTask } from "../../src/close/close-service.js";
-import { CloseBlockedError, InvalidTaskStateError } from "../../src/domain/errors.js";
+import { CloseBlockedError, InvalidTaskStateError, TaskOwnershipError } from "../../src/domain/errors.js";
 import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
 import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
@@ -20,7 +20,7 @@ import { resolveModelRoute, type ModelPolicy } from "../../src/routing/model-rou
 import { createDebugSession } from "../../src/debugging/debug-session.js";
 import type { CapturedRecoveryPoint } from "../../src/recovery/recovery-point-service.js";
 import { createGitRollbackTask } from "../../src/recovery/git-rollback-adapter.js";
-import type { RollbackResult } from "../../src/recovery/rollback.js";
+import { RollbackPartialFailureError, type RollbackResult } from "../../src/recovery/rollback.js";
 import {
   createDAIRuntime,
   type DAIEnvironmentAdapter,
@@ -41,7 +41,7 @@ import type {
   TaskOwnershipTransition,
   TaskOwnershipTransitionAuthorizer,
 } from "../../src/state/durable-context-store.js";
-import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
+import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateResult, type HardGateInput } from "../../src/verification/gates.js";
 
 const skillRoot = join(process.cwd(), "tests", "fixtures", "skills");
@@ -744,11 +744,41 @@ describe("D-AI runtime", () => {
 
     expect(response.status, response.message).toBe("completed");
     expect(events).toEqual([
-      "transition:codex",
       "transfer:start:codex",
       "transfer:complete:codex",
     ]);
     expect(executionEvents).toEqual(["execute:codex"]);
+  });
+
+  it("does not persist routed state or execute when durable ownership transfer fails", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const baseStore = runtimeHarness.store;
+    const store: DurableContextStore = {
+      ...baseStore,
+      withTaskOwnership: <T>(
+        taskId: string,
+        environment: Environment,
+        operation: (
+          lease: TaskOwnershipLease,
+          transfer: TaskOwnershipTransfer,
+          assertOwnership: TaskOwnershipGuard,
+          authorizeTransition: TaskOwnershipTransitionAuthorizer,
+        ) => Promise<T>,
+      ) => baseStore.withTaskOwnership!(taskId, environment, (lease, _transfer, assertOwnership, authorizeTransition) => operation(
+        lease,
+        async () => { throw new TaskOwnershipError("transfer failed"); },
+        assertOwnership,
+        authorizeTransition,
+      )),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store });
+
+    const response = await handle(intentRequest("chat", noOverrides));
+    const persisted = await baseStore.load(response.taskId);
+
+    expect(response).toMatchObject({ status: "blocked", taskId: expect.any(String) });
+    expect(persisted).toMatchObject({ stage: "bootstrap", environment: "chat" });
+    expect(runtimeHarness.executed).toHaveLength(0);
   });
 
   it("preserves the task id and transfers single ownership through the existing handoff service", async () => {
@@ -1021,7 +1051,9 @@ describe("D-AI runtime", () => {
       const accepted = await seedRuntime(intentRequest("codex", noOverrides));
       const durableState = await firstStore.load(accepted.taskId);
       if (durableState === null) throw new InvalidTaskStateError("Expected a durable task state");
-      await firstStore.save({ ...durableState, stage: "recover", role: "recovery-operator", durableContext: null });
+      await firstStore.withTaskOwnership(accepted.taskId, durableState.environment, async (lease) => {
+        await firstStore.save({ ...durableState, stage: "recover", role: "recovery-operator", durableContext: null }, lease);
+      });
       delayNextExecution = true;
 
       const firstRuntime = createDAIRuntime({ ...runtimeHarness.dependencies, store: firstStore, adapters });
@@ -1094,7 +1126,7 @@ describe("D-AI runtime", () => {
         environment: "work",
         handoffState: "active",
       });
-      expect(observedStore.transitions()).toEqual(["work"]);
+      expect(observedStore.transitions()).toEqual([]);
       expect(observedStore.transfers()).toEqual(["work"]);
     } finally {
       await rm(durableRoot, { recursive: true, force: true });
@@ -1269,6 +1301,102 @@ describe("D-AI runtime", () => {
     ]);
   });
 
+  it("does not leave a durable active handoff when ownership transfer fails after target cleanup is unavailable", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const baseStore = runtimeHarness.store;
+    const store: DurableContextStore = {
+      ...baseStore,
+      save: async (state: TaskState, authorization?: TaskOwnershipLease | TaskOwnershipTransition): Promise<DurableContextManifest> => {
+        if (state.handoffState === "rejected") throw new InvalidTaskStateError("handoff rejection persistence unavailable");
+        return baseStore.save(state, authorization);
+      },
+      withTaskOwnership: <T>(
+        taskId: string,
+        environment: Environment,
+        operation: (
+          lease: TaskOwnershipLease,
+          transfer: TaskOwnershipTransfer,
+          assertOwnership: TaskOwnershipGuard,
+          authorizeTransition: TaskOwnershipTransitionAuthorizer,
+        ) => Promise<T>,
+      ) => baseStore.withTaskOwnership!(taskId, environment, (lease, _transfer, assertOwnership, authorizeTransition) => operation(
+        lease,
+        async (targetEnvironment: Environment): Promise<TaskOwnershipLease> => {
+          if (targetEnvironment === "work") throw new TaskOwnershipError("handoff ownership transfer failed");
+          return _transfer(targetEnvironment);
+        },
+        assertOwnership,
+        authorizeTransition,
+      )),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+
+    const response = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+    expect(response).toMatchObject({ taskId: accepted.taskId, status: "blocked" });
+    await expect(baseStore.load(accepted.taskId)).resolves.toMatchObject({ stage: "handoff", handoffState: "pending", environment: "codex" });
+    expect(runtimeHarness.savedStates.filter((state) => state.handoffState === "active")).toHaveLength(0);
+  });
+
+  it("persists a target-owned coordination state when durable handoff rollback also fails", async () => {
+    const durableRoot = await mkdtemp(join(tmpdir(), "d-ai-runtime-handoff-recovery-"));
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const fileStore = new FileDurableContextStore(durableRoot);
+    const observed = observeFileStoreOwnership(fileStore);
+    let failActiveSave = true;
+    const store: DurableContextStore = {
+      ...observed.store,
+      save: async (state: TaskState, authorization?: TaskOwnershipLease | TaskOwnershipTransition): Promise<DurableContextManifest> => {
+        if (state.handoffState === "active" && failActiveSave) {
+          failActiveSave = false;
+          throw new InvalidTaskStateError("target active persistence failed");
+        }
+        return observed.store.save(state, authorization);
+      },
+      withTaskOwnership: <T>(
+        taskId: string,
+        environment: Environment,
+        operation: (
+          lease: TaskOwnershipLease,
+          transfer: TaskOwnershipTransfer,
+          assertOwnership: TaskOwnershipGuard,
+          authorizeTransition: TaskOwnershipTransitionAuthorizer,
+        ) => Promise<T>,
+      ) => fileStore.withTaskOwnership!(taskId, environment, (lease, transfer, assertOwnership, authorizeTransition) => operation(
+        lease,
+        async (targetEnvironment: Environment): Promise<TaskOwnershipLease> => {
+          const targetLease = await transfer(targetEnvironment);
+          if (targetEnvironment === "work") {
+            const leasePath = join(durableRoot, taskId, "ownership", targetLease.generation.toString(), "lease");
+            const expiredAt = new Date(Date.now() - FILE_DURABLE_CONTEXT_LEASE_MS - 1_000);
+            await utimes(leasePath, expiredAt, expiredAt);
+          }
+          return targetLease;
+        },
+        assertOwnership,
+        authorizeTransition,
+      )),
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store });
+
+    try {
+      vi.useFakeTimers({ now: new Date("2026-08-21T00:01:00.000Z") });
+      const accepted = await handle(intentRequest("chat", noOverrides));
+      expect(accepted.status, accepted.message).toBe("completed");
+      const response = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+      expect(response).toMatchObject({ taskId: accepted.taskId, status: "blocked" });
+      await expect(fileStore.load(accepted.taskId)).resolves.toMatchObject({
+        environment: "work",
+        handoffState: "rejected",
+        contextManifest: expect.arrayContaining([expect.stringMatching(/handoff-recovery-required/i)]),
+      });
+    } finally {
+      vi.useRealTimers();
+      await rm(durableRoot, { recursive: true, force: true });
+    }
+  });
+
   it("propagates a blocked gate and enters debug/recovery without claiming completion", async () => {
     const runtimeHarness = harness(completedExecution, blockedGates, "YES");
     const response = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("chat", noOverrides));
@@ -1357,7 +1485,7 @@ describe("D-AI runtime", () => {
           preservedRecoveryPointId: expect.any(String),
         },
       });
-      expect(observedStore.transitions()).toEqual(["codex"]);
+      expect(observedStore.transitions()).toEqual([]);
       expect(observedStore.transfers()).toEqual(["codex"]);
 
       const freshStore = new FileDurableContextStore(durableRoot);
@@ -1470,6 +1598,59 @@ describe("D-AI runtime", () => {
     expect(result.message).toMatch(/rollback adapter failed/i);
     expect(result.message).toContain("[REDACTED]");
     expect(result.message).not.toContain("rollback-secret");
+  });
+
+  it("persists a blocked recovery audit when rollback verification fails after actions", async () => {
+    const durableRoot = await mkdtemp(join(tmpdir(), "d-ai-runtime-partial-rollback-"));
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const durableStore = new FileDurableContextStore(durableRoot);
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store: durableStore,
+      rollbackTask: async (): Promise<RollbackResult> => {
+        throw new RollbackPartialFailureError({
+          preservedUserWork: { archiveId: "archive-partial", patchDigest: "a".repeat(64) },
+          actions: [{ command: "git", arguments: ["apply"], stdout: "applied", stderr: "", exitCode: 0 }],
+          verification: { passed: false, observedOutput: "", reason: "second revert failed" },
+        }, "second revert failed");
+      },
+    });
+    try {
+      const accepted = await handle(intentRequest("codex", noOverrides));
+      const acceptedState = await durableStore.load(accepted.taskId);
+      if (acceptedState?.durableContext === null || acceptedState?.durableContext === undefined || acceptedState.recoveryPoint === null) throw new InvalidTaskStateError("Rollback fixture did not persist recovery context");
+      const acceptedRecoveryPoint = acceptedState.recoveryPoint;
+      const snapshotManifest = acceptedState.durableContext;
+      await durableStore.withTaskOwnership(accepted.taskId, acceptedState.environment, async (lease) => {
+        await durableStore.save({
+          ...acceptedState,
+          recoveryPoint: {
+            ...acceptedRecoveryPoint,
+            durablePaths: snapshotManifest.durablePaths,
+            hashes: snapshotManifest.hashes,
+            snapshotManifestId: snapshotManifest.manifestId,
+          },
+          recoverySnapshot: {
+            head: "0123456789abcdef0123456789abcdef01234567",
+            branch: "main",
+            workspacePath: "C:/workspace",
+            status: "clean",
+            binaryPatch: "no patch required",
+            stateManifest: snapshotManifest,
+            verificationResults: acceptedState.verificationEvidence,
+            durableArtifacts: snapshotManifest.hashes,
+          },
+        }, lease);
+      });
+
+      const result = await handle({ command: { kind: "rollback" }, sourceEnvironment: "codex", overrides: noOverrides });
+      const persisted = await new FileDurableContextStore(durableRoot).load(accepted.taskId);
+
+      expect(result).toMatchObject({ status: "blocked", stage: "recover", message: expect.stringMatching(/partially completed|second revert failed/i) });
+      expect(persisted).toMatchObject({ stage: "recover", role: "recovery-operator", rollbackAudit: { verification: { passed: false }, actions: [{ command: "git", arguments: ["apply"] }] } });
+    } finally {
+      await rm(durableRoot, { recursive: true, force: true });
+    }
   });
 
   it("persists a verified rollback as recover while preserving debugSession and ownership lease", async () => {

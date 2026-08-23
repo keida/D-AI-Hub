@@ -25,6 +25,7 @@ const ownershipLeaseFile = "lease";
 const ownershipReleasedFile = "released";
 const ownershipTransferFile = "transfer.json";
 const activeDirectoryName = "active";
+const initializationReservationFile = "initializing";
 
 const stageSchema = z.enum([
   "bootstrap",
@@ -478,6 +479,46 @@ async function writeGenerationAtomically(paths: SnapshotPaths, manifestId: strin
   }
 }
 
+async function reserveInitialCreation(paths: SnapshotPaths, taskId: string): Promise<void> {
+  const reservationPath = join(paths.taskRoot, initializationReservationFile);
+  try {
+    await writeFile(reservationPath, `${taskId}\n`, { encoding: "utf8", flag: "wx" });
+  } catch (error: unknown) {
+    if (isAlreadyExistsError(error)) {
+      try {
+        const reservation = await stat(reservationPath);
+        if (Date.now() - reservation.mtimeMs > FILE_DURABLE_CONTEXT_LEASE_MS) {
+          await rm(reservationPath, { force: true });
+          await writeFile(reservationPath, `${taskId}\n`, { encoding: "utf8", flag: "wx" });
+          return;
+        }
+      } catch (recoveryError: unknown) {
+        if (!isMissingFileError(recoveryError)) {
+          throw new InvalidTaskStateError(`Unable to inspect stale initial durable creation for task ${taskId}: ${describeError(recoveryError)}`);
+        }
+        try {
+          await writeFile(reservationPath, `${taskId}\n`, { encoding: "utf8", flag: "wx" });
+          return;
+        } catch (retryError: unknown) {
+          if (!isAlreadyExistsError(retryError)) {
+            throw new InvalidTaskStateError(`Unable to reserve initial durable creation for task ${taskId}: ${describeError(retryError)}`);
+          }
+        }
+      }
+      throw new TaskOwnershipError(`Durable task ${taskId} already exists or is being created`);
+    }
+    throw new InvalidTaskStateError(`Unable to reserve initial durable creation for task ${taskId}: ${describeError(error)}`);
+  }
+}
+
+async function releaseInitialCreation(paths: SnapshotPaths, taskId: string): Promise<void> {
+  try {
+    await rm(join(paths.taskRoot, initializationReservationFile), { force: true });
+  } catch (error: unknown) {
+    throw new InvalidTaskStateError(`Unable to release initial durable creation for task ${taskId}: ${describeError(error)}`);
+  }
+}
+
 async function loadActivePointer(paths: SnapshotPaths, taskId: string): Promise<ActivePointer | null> {
   let entries: Dirent<string>[];
   try {
@@ -503,6 +544,13 @@ async function loadActivePointer(paths: SnapshotPaths, taskId: string): Promise<
     const issue = result.error.issues[0];
     const reason = issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
     throw new InvalidTaskStateError(`Invalid active durable pointer for task ${taskId} at ${path}: ${reason}`);
+  }
+  const filenameGeneration = BigInt(entry.name.slice(0, 20));
+  const payloadGeneration = BigInt(result.data.ownershipGeneration);
+  if (filenameGeneration !== payloadGeneration) {
+    throw new InvalidTaskStateError(
+      `Invalid active durable pointer for task ${taskId} at ${path}: filename generation ${filenameGeneration} does not match payload generation ${payloadGeneration}`,
+    );
   }
   return {
     manifestId: result.data.manifestId,
@@ -619,6 +667,9 @@ export class FileDurableContextStore implements DurableContextStore {
   }
 
   public async save(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest> {
+    if (authorization === undefined) {
+      return this.createIfAbsent(state);
+    }
     const previous = this.saveLocks.get(state.taskId) ?? Promise.resolve();
     let release: () => void = () => {};
     const current = new Promise<void>((resolve) => { release = resolve; });
@@ -630,6 +681,27 @@ export class FileDurableContextStore implements DurableContextStore {
       release();
       if (this.saveLocks.get(state.taskId) === current) this.saveLocks.delete(state.taskId);
     }
+  }
+
+  public async createIfAbsent(state: TaskState): Promise<DurableContextManifest> {
+    assertTaskId(state.taskId);
+    return this.withTaskOwnership(state.taskId, state.environment, async (lease) => {
+      const existing = await this.load(state.taskId);
+      if (existing !== null) {
+        throw new TaskOwnershipError(`Durable task ${state.taskId} already exists`);
+      }
+      await reserveInitialCreation(createSnapshotPaths(this.rootPath, state.taskId), state.taskId);
+      const paths = createSnapshotPaths(this.rootPath, state.taskId);
+      try {
+        const raced = await this.load(state.taskId);
+        if (raced !== null) {
+          throw new TaskOwnershipError(`Durable task ${state.taskId} already exists`);
+        }
+        return await this.save(state, lease);
+      } finally {
+        await releaseInitialCreation(paths, state.taskId);
+      }
+    });
   }
 
   private async saveInternal(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest> {

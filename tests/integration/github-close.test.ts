@@ -157,7 +157,7 @@ async function createRealCloseFixture(
     recoveryPoint: null,
     durableContext: null,
   };
-  const snapshotManifest = await store.save(baseState);
+  const snapshotManifest = await store.createIfAbsent(baseState);
   const verifiedState: TaskState = {
     ...baseState,
     verificationEvidence: verificationEvidence(now),
@@ -174,7 +174,9 @@ async function createRealCloseFixture(
       snapshotManifestId: snapshotManifest.manifestId,
     },
   };
-  await store.save(verifiedState);
+  await store.withTaskOwnership(verifiedState.taskId, verifiedState.environment, async (lease) => {
+    await store.save(verifiedState, lease);
+  });
   const state = await store.load(verifiedState.taskId);
   if (state === null) throw new Error("Expected the real durable close fixture to load");
   return { store, state, commitSha };

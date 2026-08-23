@@ -3,14 +3,14 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-22
+- Last updated: 2026-08-23
 
 ## Current checkpoint
 
-- Current task: Publish the two P1 fixes identified during independent review and keep PR #2 ready for re-review.
-- Working state: P1 fixes are implemented locally but not yet committed. The rewritten feature branch remains pushed at `00992e4`; backup branch `backup/pr2-before-secret-history-rewrite` preserves the pre-rewrite tip. Three pre-existing untracked planning/spec documents remain untouched.
-- Active plan: Commit and push only the two P1 fixes and their regression tests, then re-run GitHub checks. Do not merge PR #2 without separate explicit approval.
-- Latest verified evidence: The generation-pointer recovery regression and quoted-secret redaction tests are both green. Full validation passed: 21 test files and 416 tests, TypeScript build, `git diff --check`, and secret-like scan. GitGuardian previously reported `No secrets detected` on the rewritten history.
+- Current task: Complete the independent-review P1/P2 repair set and keep PR #2 ready for final re-review.
+- Working state: The ownership-repair branch contains local commit `269672c`; three pre-existing untracked planning/spec documents remain untouched. No push, merge, reset, stash, or cleanup was performed.
+- Active plan: Await explicit authorization before push. Do not merge PR #2 without separate explicit approval.
+- Latest verified evidence: Handoff transfer-back failure now persists a target-owned rejected coordination state; preserve-stage Git failures now produce complete partial rollback audits; Git rollback retries fail closed when a partial audit is persisted; durable and command redaction reject `auth=`; stale initial-creation reservations recover after lease expiry. Single-worker full validation passed: 21 test files and 446 tests, TypeScript build, and `git diff --check`. Release Gate read-only checks found no staged files before commit, preserved the three untracked planning/spec files, and found no real secret-like additions; intentional matches were confined to test fixtures.
 
 ## Last verified progress
 
@@ -31,11 +31,11 @@
 
 ## Current blockers
 
-PR #2 still needs independent review and explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
+The previous independent review's two P1 findings and P2 durable handoff coverage gap are implemented and locally verified. Final independent re-review found no new P1/P2; PR #2 is no longer code-review blocked, but still requires explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
 
 ## Next concrete action
 
-Obtain independent review for PR #2, then decide whether to merge it into canonical `main`. Keep context-pack and additional fabricated samples deferred.
+Decide whether to push local commit `269672c`; keep context-pack and additional fabricated samples deferred.
 
 ## Verification notes
 

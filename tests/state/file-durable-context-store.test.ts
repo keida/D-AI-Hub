@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { TaskOwnershipError } from "../../src/domain/errors.js";
+import { InvalidTaskStateError, TaskOwnershipError } from "../../src/domain/errors.js";
 import type { RecoverySnapshot, TaskState } from "../../src/domain/types.js";
 import type { TaskOwnershipTransition } from "../../src/state/durable-context-store.js";
 import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
@@ -69,6 +69,16 @@ async function createStoreRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), "d-ai-context-store-"));
 }
 
+async function latestOwnershipGenerationPath(rootPath: string, taskId: string): Promise<string> {
+  const entries = (await readdir(join(rootPath, taskId, "ownership"), { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && /^[1-9][0-9]*$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort((left, right) => Number(BigInt(right) - BigInt(left)));
+  const generation = entries[0];
+  if (generation === undefined) throw new Error(`No ownership generation exists for ${taskId}`);
+  return join(rootPath, taskId, "ownership", generation);
+}
+
 describe("FileDurableContextStore", () => {
   it("round-trips a validated state with durable content hashes", async () => {
     const rootPath = await createStoreRoot();
@@ -132,8 +142,8 @@ describe("FileDurableContextStore", () => {
 
     try {
       const manifest = await store.save(state);
-      const contextPath = join(rootPath, state.taskId, "context.json");
-      const expectedHash = manifest.hashes[contextPath];
+      const contextPath = join(rootPath, state.taskId, "generations", manifest.manifestId, "context.json");
+      const expectedHash = manifest.hashes[join(rootPath, state.taskId, "context.json")];
       if (expectedHash === undefined) {
         throw new Error("Expected a context hash");
       }
@@ -154,8 +164,8 @@ describe("FileDurableContextStore", () => {
 
     try {
       const manifest = await store.save(state);
-      const statePath = join(rootPath, state.taskId, "state.json");
-      const expectedHash = manifest.hashes[statePath];
+      const statePath = join(rootPath, state.taskId, "generations", manifest.manifestId, "state.json");
+      const expectedHash = manifest.hashes[join(rootPath, state.taskId, "state.json")];
       if (expectedHash === undefined) {
         throw new Error("Expected a state hash");
       }
@@ -164,7 +174,7 @@ describe("FileDurableContextStore", () => {
       await writeFile(statePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
 
       await expect(store.load(state.taskId)).rejects.toThrow(
-        new RegExp(`task-tampered-state.*${statePath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
+        new RegExp(`task-tampered-state.*${join(rootPath, state.taskId, "state.json").replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
       );
     } finally {
       await rm(rootPath, { recursive: true, force: true });
@@ -178,8 +188,8 @@ describe("FileDurableContextStore", () => {
 
     try {
       const manifest = await store.save(state);
-      const manifestPath = join(rootPath, state.taskId, "manifest.json");
-      const expectedHash = manifest.hashes[manifestPath];
+      const manifestPath = join(rootPath, state.taskId, "generations", manifest.manifestId, "manifest.json");
+      const expectedHash = manifest.hashes[join(rootPath, state.taskId, "manifest.json")];
       if (expectedHash === undefined) {
         throw new Error("Expected a manifest hash");
       }
@@ -188,7 +198,7 @@ describe("FileDurableContextStore", () => {
       await writeFile(manifestPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
 
       await expect(store.load(state.taskId)).rejects.toThrow(
-        new RegExp(`task-tampered-manifest.*${manifestPath.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
+        new RegExp(`task-tampered-manifest.*${join(rootPath, state.taskId, "manifest.json").replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*${expectedHash}.*[a-f0-9]{64}`),
       );
     } finally {
       await rm(rootPath, { recursive: true, force: true });
@@ -202,8 +212,8 @@ describe("FileDurableContextStore", () => {
 
     try {
       const manifest = await store.save(state);
-      const evidencePath = join(rootPath, state.taskId, "evidence.json");
-      const expectedHash = manifest.hashes[evidencePath];
+      const evidencePath = join(rootPath, state.taskId, "generations", manifest.manifestId, "evidence.json");
+      const expectedHash = manifest.hashes[join(rootPath, state.taskId, "evidence.json")];
       if (expectedHash === undefined) {
         throw new Error("Expected an evidence hash");
       }
@@ -221,10 +231,11 @@ describe("FileDurableContextStore", () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
     const state = createState("task-missing-state", "Require the durable state commit marker");
-    const statePath = join(rootPath, state.taskId, "state.json");
+    let statePath: string;
 
     try {
-      await store.save(state);
+      const manifest = await store.save(state);
+      statePath = join(rootPath, state.taskId, "generations", manifest.manifestId, "state.json");
       await rm(statePath);
 
       await expect(store.load(state.taskId)).rejects.toThrow(
@@ -239,10 +250,11 @@ describe("FileDurableContextStore", () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
     const state = createState(`task-missing-${artifact.replace(".json", "")}`, `Require ${artifact}`);
-    const artifactPath = join(rootPath, state.taskId, artifact);
+    let artifactPath: string;
 
     try {
-      await store.save(state);
+      const manifest = await store.save(state);
+      artifactPath = join(rootPath, state.taskId, "generations", manifest.manifestId, artifact);
       await rm(artifactPath);
 
       await expect(store.load(state.taskId)).rejects.toThrow(/required durable artifact|missing|integrity/i);
@@ -254,10 +266,11 @@ describe("FileDurableContextStore", () => {
   it("rejects invalid persisted state during recovery", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
-    const statePath = join(rootPath, "task-invalid", "state.json");
+    let statePath: string;
 
     try {
-      await store.save(createState("task-invalid", "Reject invalid state"));
+      const manifest = await store.save(createState("task-invalid", "Reject invalid state"));
+      statePath = join(rootPath, "task-invalid", "generations", manifest.manifestId, "state.json");
       await writeFile(statePath, "{\"taskId\":\"task-invalid\"}", { encoding: "utf8" });
 
       await expect(store.load("task-invalid")).rejects.toThrow("Invalid task state");
@@ -296,6 +309,25 @@ describe("FileDurableContextStore", () => {
     },
   );
 
+  it.each([
+    'credential="quoted-secret"',
+    "password=plain-secret",
+    "Authorization: Bearer plain-token",
+    'access-token="quoted-secret"',
+    "private_key='quoted-secret'",
+    'cookie="quoted-secret"',
+    "session-token='quoted-secret'",
+    "auth=plain-secret",
+  ])("rejects credential-shaped assignments before durable persistence: %s", async (goal) => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    try {
+      await expect(store.save({ ...createState(`task-quoted-${goal.slice(0, 5).replace(/[^A-Za-z0-9]/g, "x")}`, goal) })).rejects.toThrow(/secret-like|credential/i);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("atomically replaces a prior durable snapshot", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
@@ -304,7 +336,9 @@ describe("FileDurableContextStore", () => {
 
     try {
       await store.save(first);
-      await store.save(second);
+      await store.withTaskOwnership(second.taskId, second.environment, async (lease) => {
+        await store.save(second, lease);
+      });
 
       const statePath = join(rootPath, "task-replace", "state.json");
       const persisted = JSON.parse(await readFile(statePath, "utf8")) as { readonly goal: string };
@@ -378,7 +412,7 @@ describe("FileDurableContextStore", () => {
         });
       });
 
-      const transfer = JSON.parse(await readFile(join(rootPath, "task-transfer", "ownership", "1", "transfer.json"), "utf8")) as {
+      const transfer = JSON.parse(await readFile(join(await latestOwnershipGenerationPath(rootPath, "task-transfer"), "transfer.json"), "utf8")) as {
         readonly sourceEnvironment: string;
         readonly targetEnvironment: string;
       };
@@ -451,7 +485,7 @@ describe("FileDurableContextStore", () => {
       });
       await firstActive;
       const expiredAt = new Date(Date.now() - 30_001);
-      await utimes(join(rootPath, "task-stale-write", "ownership", "1", "lease"), expiredAt, expiredAt);
+      await utimes(join(await latestOwnershipGenerationPath(rootPath, "task-stale-write"), "lease"), expiredAt, expiredAt);
 
       const second = secondStore.withTaskOwnership("task-stale-write", "work", async (lease) => {
         await secondStore.save({ ...state, goal: "Successor goal", durableContext: null }, lease);
@@ -569,12 +603,12 @@ describe("FileDurableContextStore", () => {
       const recoveryContent = await readFile(recoveryPath, "utf8");
       expect(JSON.parse(recoveryContent)).toMatchObject({ recoverySnapshot: snapshot });
 
-      const statePath = join(rootPath, state.taskId, "state.json");
+      const statePath = join(rootPath, state.taskId, "generations", manifest.manifestId, "state.json");
       const persistedState = JSON.parse(await readFile(statePath, "utf8")) as { recoverySnapshot: { status: string } };
       persistedState.recoverySnapshot.status = "tampered";
       await writeFile(statePath, `${JSON.stringify(persistedState, null, 2)}\n`, "utf8");
       await expect(store.load(state.taskId)).rejects.toThrow(/canonical state hash mismatch|content hash mismatch/i);
-      expect(manifest.hashes[statePath]).toMatch(/^[a-f0-9]{64}$/);
+      expect(manifest.hashes[join(rootPath, state.taskId, "state.json")]).toMatch(/^[a-f0-9]{64}$/);
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }
@@ -638,19 +672,81 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("atomically creates a task once when two stores race to initialize it", async () => {
+    const rootPath = await createStoreRoot();
+    const firstStore = new FileDurableContextStore(rootPath);
+    const secondStore = new FileDurableContextStore(rootPath);
+    const firstState = createState("task-atomic-create", "First initializer");
+    const secondState = { ...firstState, goal: "Second initializer" };
+
+    try {
+      const results = await Promise.allSettled([
+        firstStore.save(firstState),
+        secondStore.createIfAbsent!(secondState),
+      ]);
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      await expect(firstStore.load(firstState.taskId)).resolves.toMatchObject({ goal: expect.stringMatching(/initializer/) });
+      await expect(firstStore.save({ ...firstState, goal: "unauthorized overwrite" })).rejects.toThrow(/require ownership|already exists/i);
+
+      const legacyState = createState("task-initial-save", "Initial save wins");
+      await firstStore.save(legacyState);
+      await expect(secondStore.createIfAbsent!(legacyState)).rejects.toThrow(/already exists|being created/i);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers a stale initial-creation reservation after an interrupted process", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-stale-initialization", "Recover interrupted initialization");
+    const reservationPath = join(rootPath, state.taskId, "initializing");
+    const staleAt = new Date(Date.now() - FILE_DURABLE_CONTEXT_LEASE_MS - 1_000);
+
+    try {
+      await mkdir(join(rootPath, state.taskId), { recursive: true });
+      await writeFile(reservationPath, `${state.taskId}\n`, "utf8");
+      await utimes(reservationPath, staleAt, staleAt);
+
+      await expect(store.createIfAbsent!(state)).resolves.toMatchObject({ taskId: state.taskId });
+      await expect(store.load(state.taskId)).resolves.toMatchObject({ taskId: state.taskId, goal: state.goal });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("loads the selected generation when a newer top-level companion mirror is unpublished", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
     const firstState = createState("task-unpublished-companion", "Published generation");
-    const secondState = { ...firstState, goal: "Unpublished generation" };
+    const secondState = {
+      ...firstState,
+      goal: "Unpublished generation",
+      contextManifest: ["workspace:unpublished"],
+      handoffState: "completed" as const,
+    };
 
     try {
       await store.withTaskOwnership(firstState.taskId, firstState.environment, async (lease) => {
         await store.save(firstState, lease);
-        await store.save(secondState);
+        await writeFile(
+          join(rootPath, firstState.taskId, "context.json"),
+          `${JSON.stringify({ goal: secondState.goal, constraints: secondState.constraints, contextManifest: secondState.contextManifest })}\n`,
+          "utf8",
+        );
+        await writeFile(
+          join(rootPath, firstState.taskId, "handoff.json"),
+          `${JSON.stringify({ handoffState: secondState.handoffState })}\n`,
+          "utf8",
+        );
       });
 
       await expect(store.load(firstState.taskId)).resolves.toMatchObject({ goal: firstState.goal });
+      await expect(store.load(firstState.taskId)).resolves.toMatchObject({
+        contextManifest: firstState.contextManifest,
+        handoffState: firstState.handoffState,
+      });
     } finally {
       await rm(rootPath, { recursive: true, force: true });
     }
@@ -685,6 +781,26 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("rejects an active pointer whose filename generation disagrees with its payload", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const state = createState("task-pointer-generation-mismatch", "Reject mismatched pointer");
+
+    try {
+      await store.withTaskOwnership(state.taskId, state.environment, async (lease) => {
+        await store.save(state, lease);
+      });
+
+      const pointerPath = join(rootPath, state.taskId, "active", "00000000000000000001.json");
+      const pointer = JSON.parse(await readFile(pointerPath, "utf8")) as { readonly manifestId: string; readonly ownershipGeneration: string };
+      await writeFile(pointerPath, `${JSON.stringify({ ...pointer, ownershipGeneration: "2" })}\n`, "utf8");
+
+      await expect(store.load(state.taskId)).rejects.toBeInstanceOf(InvalidTaskStateError);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("propagates a heartbeat renewal failure after the operation finishes", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
@@ -692,7 +808,7 @@ describe("FileDurableContextStore", () => {
     await store.save(state);
     try {
       await expect(store.withTaskOwnership("task-heartbeat-failure", "work", async () => {
-        const leasePath = join(rootPath, "task-heartbeat-failure", "ownership", "1", "lease");
+        const leasePath = join(await latestOwnershipGenerationPath(rootPath, "task-heartbeat-failure"), "lease");
         const leaseToken = await readFile(leasePath, "utf8");
         await rm(leasePath);
         await new Promise<void>((resolve) => setTimeout(resolve, FILE_DURABLE_CONTEXT_LEASE_MS / 3 + 250));

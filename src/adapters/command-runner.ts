@@ -26,9 +26,10 @@ export class CommandExecutionError extends Error {
   }
 }
 
-const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s"']+)/gi;
-const authorizationBearerPattern = /(authorization\s*:\s*bearer\s+)([^\s"']+)/gi;
-const bearerTokenPattern = /(bearer\s+)([^\s"']+)/gi;
+const secretAssignmentPattern = /((?:api[_-]?key|token|secret|password|passwd|auth|authorization|credential|access[_-]?token|private[_-]?key|cookie|session[_-]?token)\s*[:=]\s*)(?!bearer\b)(?:"[^"]*"|'[^']*'|[^\s"']+)/gi;
+const bearerValuePattern = '(?:"[^"]*"|\'[^\']*\'|[^\\s"\']+)';
+const authorizationBearerPattern = new RegExp(`(authorization\\s*:\\s*bearer\\s+)${bearerValuePattern}`, "gi");
+const bearerTokenPattern = new RegExp(`(bearer\\s+)${bearerValuePattern}`, "gi");
 
 export function redactSensitiveText(value: string): string {
   const redacted = value

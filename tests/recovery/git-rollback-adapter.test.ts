@@ -41,7 +41,7 @@ async function createRepository(): Promise<{ readonly root: string; readonly rec
   return { root, recoveryHead, currentHead, snapshot };
 }
 
-function state(snapshot: RecoverySnapshot): TaskState {
+function state(snapshot: RecoverySnapshot, rollbackAudit?: TaskState["rollbackAudit"]): TaskState {
   return {
     taskId: "task-git-rollback",
     goal: "rollback",
@@ -59,6 +59,7 @@ function state(snapshot: RecoverySnapshot): TaskState {
     approvalState: "approved",
     criticalUnsavedContext: [],
     durableContext: snapshot.stateManifest,
+    rollbackAudit,
   };
 }
 
@@ -102,7 +103,34 @@ describe("Git rollback adapter", () => {
     const fixture = await createRepository();
     try {
       const mismatched = { ...fixture.snapshot, status: " M artifact.txt" };
-      await expect(createGitRollbackTask(fixture.root)(state(mismatched), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/recovery point verification failed/i);
+      const result = await createGitRollbackTask(fixture.root)(state(mismatched), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
+      expect(result.verification).toMatchObject({ passed: false });
+      expect(result.actions.length).toBeGreaterThan(0);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not repeat Git mutations after a persisted partial rollback audit", async () => {
+    const fixture = await createRepository();
+    const partialAudit: NonNullable<TaskState["rollbackAudit"]> = {
+      archiveId: "archive-1",
+      patchDigest: "a".repeat(64),
+      actions: [{
+        command: "git",
+        arguments: ["revert", "--no-edit", fixture.currentHead],
+        stdout: "",
+        stderr: "",
+        exitCode: 0,
+      }],
+      verification: { passed: false, observedOutput: "", reason: "rollback interrupted" },
+      recordedAt: "2026-08-21T00:00:00.000Z",
+    };
+
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot, partialAudit), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/partial rollback|manual reconciliation|retry/i);
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
+      await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
