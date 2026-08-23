@@ -2,6 +2,8 @@
 
 ## Custom skills
 
+- [D-AI Codex Activation (canonical)](../skills/custom/d-ai/SKILL.md)
+  - [Compatibility entry point](../.agents/skills/d-ai/SKILL.md)
 - [Knowledge Manager (canonical)](../skills/custom/knowledge-manager/SKILL.md)
   - [Compatibility entry point](../.agents/skills/knowledge-manager/SKILL.md)
 - [Project Memory (canonical)](../skills/custom/project-memory/SKILL.md)

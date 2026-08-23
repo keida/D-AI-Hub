@@ -130,3 +130,32 @@ The canonical `project-memory` Skill is the owner of the progressive read contra
 **Revisit trigger**
 
 Reconsider after measuring at least five real project resumptions or if a client demonstrates that the conditional read rules omit required context.
+
+## 2026-08-23 — Separate the four product layers and keep D-AI as the only control plane
+
+**Context**
+
+The orchestrator runtime accumulated substantial verified implementation, while project status still described the Markdown Hub and PR readiness as if they proved a usable user entry. The approved v2 specification requires one logical `@D-AI` entry across Chat, Work, and Codex, but explicitly allows platform-specific activation syntax.
+
+**Decision**
+
+Treat D-AI-Hub as four non-interchangeable delivery layers:
+
+1. Markdown Hub owns canonical project/specification state.
+2. The orchestrator runtime owns normalized lifecycle, routing, durable state, gates, handoff, recovery, rollback, and close verdicts.
+3. Platform activation adapters translate a supported product invocation into the same raw logical `@D-AI` command and configured runtime.
+4. Chat, Work, and Codex capability connectors perform environment-specific operations and must advertise unavailable behavior as `BLOCKED`.
+
+Codex uses the user-discoverable `d-ai` Skill. Its user-facing form is `$d-ai @D-AI <command>`, with adapter-only `--task <task-id>` for explicit durable task selection in a fresh process. The `@D-AI` prefix remains a D-AI logical protocol and is not described as a Codex built-in command.
+
+**Rationale**
+
+This preserves the approved single-orchestrator design while preventing documentation, internal runtime tests, and platform availability from standing in for each other. Explicit task selection closes the fresh-process registry gap without changing the approved zero-argument logical `@D-AI close` command.
+
+**Consequences**
+
+Codex activation may be delivered before Chat and Work activation. Unconfigured execution, recovery, Git, GitHub, Chat, and Work capabilities remain fail-closed. A platform layer is not complete until its discoverable raw-command product boundary passes; runtime unit tests alone are insufficient.
+
+**Revisit trigger**
+
+Reconsider the Codex adapter syntax only if Codex provides an official native command registration mechanism that can preserve the same normalized command and hard-gate semantics.

@@ -2,13 +2,24 @@
 
 D-AI-Hub exposes two primary lifecycle command prefixes and one optional synchronization check for ChatGPT Web, Codex, and compatible agents. They are repository conventions, not built-in commands. Their authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains available internally when durable outcomes should be captured during a session. The actions each client can perform still depend on its available GitHub access and permissions.
 
+## Three layers
+
+1. **Logical command** — the user-facing protocol, such as `@D-AI status` or `@D-AI close`.
+2. **Codex Skill activation** — when a message begins with `@D-AI`, the `d-ai` Skill invokes the real runtime through `skills/custom/d-ai/scripts/invoke.ps1`.
+3. **CLI implementation** — the internal `npm run d-ai -- --workspace <path> --command "@D-AI status"` entry used by the Skill. Codex-only `--task <task-id>` is an explicit override.
+
+The logical prefix is a D-AI-Hub protocol, not a Codex built-in command. The Skill is the supported Codex activation surface.
+
 ## Quick reference
 
 | Command | Purpose |
 | --- | --- |
 | `@D-AI establish` | Establish D-AI-Hub in a new or uncertain environment. |
 | `@D-AI sync` | Optionally verify canonical GitHub freshness when remote state matters. |
+| `@D-AI status` | Show the uniquely discovered active task for the current workspace, or fail closed. |
 | `@D-AI close` | Finish the session by updating project memory/knowledge and syncing durable changes. |
+
+For `status` and `close`, the runtime automatically selects the unique active durable task whose persisted workspace identity matches the current workspace. Zero matches, multiple matches, and ownership conflicts fail closed. Add `--task <task-id>` only when the result asks for explicit disambiguation or recovery.
 
 ## `@D-AI establish`
 
@@ -126,4 +137,4 @@ Ordinary project continuation can name the project and task without a D-AI comma
 继续 DeepSeek Harness Desktop，先读取 STATUS 和未解决 BUGS，再决定下一步。
 ```
 
-When a D-AI command prefix is used, the agent should execute that protocol first and then continue the remainder of the user's request.
+When a D-AI command prefix is used, the Codex Skill should invoke the runtime first and then continue the remainder of the user's request. A response that only explains the convention is not activation.

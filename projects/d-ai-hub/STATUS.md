@@ -7,36 +7,38 @@
 
 ## Current checkpoint
 
-- Current task: Complete the independent-review P1/P2 repair set and keep PR #2 ready for final re-review.
-- Working state: The ownership-repair branch contains pushed commit `025ef7b`; three pre-existing untracked planning/spec documents remain untouched. No merge, reset, stash, or cleanup was performed.
-- Active plan: Await explicit merge approval. Do not merge PR #2 without separate explicit approval.
-- Latest verified evidence: Handoff transfer-back failure now persists a target-owned rejected coordination state; preserve-stage Git failures now produce complete partial rollback audits; Git rollback retries fail closed when a partial audit is persisted; durable and command redaction reject `auth=`; stale initial-creation reservations recover after lease expiry. Single-worker full validation passed: 21 test files and 446 tests, TypeScript build, and `git diff --check`. Release Gate read-only checks found no staged files before commit, preserved the three untracked planning/spec files, found no real secret-like additions, and remote verification confirms `origin/feat/d-ai-ownership-repair` at `025ef7b`; intentional secret-shaped matches were confined to test fixtures.
+- Current task: Restore the approved D-AI orchestrator v2 product intent and deliver a usable Codex activation entry without expanding Router, third-party Skill, or repository-health scope.
+- Authorized scope: Track the approved v2 specification; align project state; implement the minimum Codex raw-command activation, explicit durable task selection, and product-boundary acceptance. Preserve all existing modified and untracked files. Do not commit, push, merge, reset, stash, clean, or delete.
+- Working state: `main = origin/main = c958fbc` and its user-owned Skill-routing documentation edits remain untouched. The active implementation branch and its remote were `e81d74e` before this uncommitted activation work; the three pre-existing untracked repository-health/PR2 planning files remain untouched.
+- Active plan: Release candidate ready for human authorization; preserve the uncommitted implementation and do not cross the Git publication boundary.
 
-## Last verified progress
+## Four-layer delivery state
 
-- D-AI-Hub V1 foundation was merged into canonical `main`.
-- Codex operating context was subsequently committed and successfully pushed to GitHub `main`.
-- The root `AGENTS.md` bootstrap defines session-start, canonical ownership, security, branch, and session-close rules for Codex and compatible agents.
-- V1.1 hardening documents the safe ChatGPT Web ↔ GitHub ↔ Codex workflow and makes `skills/custom/` the only canonical custom Skill source.
-- V1.1 rollback hardening is implemented on the feature branch: explicit `@D-AI rollback`, ownership-gated runtime dispatch, durable DebugSession, RecoverySnapshot integrity, real Git revert/apply adapter, and durable RollbackAudit.
-- Verified evidence for the checkpoint: 400 tests passed, TypeScript build passed, and diff integrity passed. The checkpoint is committed and pushed to `feat/d-ai-ownership-repair`; it has not been merged.
-- The current Codex environment has verified GitHub authentication, `git fetch --prune origin`, `git pull --ff-only origin main`, and clean synchronization with `origin/main`.
-- The 2026-08-22 `@D-AI sync` read-only check verified local `main` and the feature branch against their remote heads; the feature worktree still contains uncommitted Task 1B code/test changes and untracked Task 1B/repository-health-check documents. No tests or builds were run during that sync check.
-- The current Codex environment has verified GitHub authentication, authenticated fetch/pull, and clean synchronization with `origin/main`.
-- A full Codex Hub audit was completed after establishment; the confirmed V1.1 consistency and workflow issues were fixed and post-reviewed with no remaining Critical or blocking Important findings.
-- The Web operating pattern is now intentionally short-session based: use D-AI-Hub as durable memory rather than relying on very long ChatGPT conversation history. New durable sessions should restore only the narrowest relevant project, Skill, and knowledge context instead of loading the entire Hub.
-- The P0 consistency audit verified the scoped document links, canonical Skill frontmatter and compatibility targets, secret-like filenames/content, and `git diff --check`.
-- The P0 audit was a static documentation and consistency audit; it did not verify command behavior end to end.
-- The current change set introduced Fast Read, Write Gate, Release Gate, and a replace-in-place progress checkpoint; it repositions `@D-AI sync` as an optional explicit canonical-freshness check. Progressive project-memory loading is now present on canonical `main` at `483e06d`.
+1. **Markdown Hub — established, canonical integration pending.** `main` remains the canonical GitHub branch. The approved v2 product specification is now present byte-for-byte at `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md` on the active branch, and project state is being corrected locally. None of these new changes are committed or pushed.
+2. **Orchestrator runtime — implemented on the feature branch, not merged.** Parser, routing, handoff, durable state, verification, recovery, rollback, and close logic exist. The branch contains 75 commits and 85 files / 17,665 insertions beyond `origin/main`; the last pushed checkpoint is `e81d74e`.
+3. **Codex activation — release candidate ready for human authorization.** The canonical `d-ai` Skill, compatibility entry, raw-command adapter, CLI, and explicit `activeTaskId` recovery seam exist as uncommitted changes. A reversible user-level junction at `~/.agents/skills/d-ai` points to the canonical Skill source. Fresh `@D-AI status`/`@D-AI close` auto-select one active durable task by persisted workspace identity; zero, multiple, mismatch, malformed/duplicate identity, closed-task, and ownership cases remain `BLOCKED`. Targeted tests prove canonical paths, junctions, Windows case variants, cross-workspace isolation, dirty-worktree `NO`, missing-credentials `BLOCKED`, remote-SHA-mismatch `NO`, and unconfigured execution connector `BLOCKED`.
+4. **Chat/Work adapters — contract only, not product-activated.** Runtime adapter classes and logical command semantics exist, but no supported Chat or Work activation surface or configured execution/durable connector has been delivered. Their unavailable capabilities remain `BLOCKED` and must not be reported as complete.
+
+## Verified evidence
+
+- Live remote read: `refs/heads/main = c958fbc88c7e1c76fcfa5cd58b1049c3c0c93c95`; `refs/heads/feat/d-ai-ownership-repair = e81d74e9753a3c5684978f8c88882d32abaa8c35`.
+- Approved-spec source and tracked copy share SHA-256 `5224053CC37E695EC6A0C8047E2AEFBBC836FEFF8D826847FF0518AAF10BCB4F`.
+- Targeted activation verification passed: runtime 77/77; entry 3/3; external Skill boundary 2/2; configured close boundary 14/14.
+- Real user-level smoke from an unrelated temporary workspace resolved `~/.agents/skills/d-ai`, entered the configured Codex runtime, and returned exit code 2 with `taskId=unassigned`, `status=blocked`, and workspace-scoped retry guidance.
+- Final complete verification passed 25/25 test files and 477/477 tests with one worker, `npm run build`, and `git diff --check`. Secret-shaped scan found no non-test credentials; three matches are intentional sentinel values in existing rejection tests.
+- Earlier pushed runtime checkpoint verification passed 21 test files and 457/457 tests; the current 25/477 result supersedes that local validation baseline.
+
+## Uncommitted release-candidate scope
+
+- Tracked modified: `docs/commands.md`, `indexes/SKILLS.md`, `package-lock.json`, `package.json`, `projects/d-ai-hub/DECISIONS.md`, `projects/d-ai-hub/REFERENCES.md`, `projects/d-ai-hub/ROADMAP.md`, `projects/d-ai-hub/STATUS.md`, `src/runtime/d-ai-runtime.ts`, `src/state/durable-context-store.ts`, `src/state/file-durable-context-store.ts`, `tests/runtime/d-ai-runtime.test.ts`, `tests/skills/registry.test.ts`.
+- Untracked preserved: `.agents/skills/d-ai/`, `docs/specs/`, the three existing repository-health/PR2 planning/spec files, `skills/custom/d-ai/`, `src/entry/`, `src/state/workspace-identity.ts`, and the Codex entry/integration tests.
 
 ## Current blockers
 
-The previous independent review's two P1 findings and P2 durable handoff coverage gap are implemented and locally verified. Final independent re-review found no new P1/P2; PR #2 is no longer code-review blocked, but still requires explicit merge approval. BUG-002 is resolved; BUG-001 remains open for authentication behavior in affected environments. New checkouts and environments must authenticate before treating GitHub state as current.
+- Independent two-axis review completed with separate GPT-5.6 Luna High reviewers. Standards: no new hard violation; PR2 plan source traceability remains partial because the original review artifact/issue ID is not present in the repository. Spec: the requested Codex slice is resolved; the workspace hash is intentionally a snapshot fingerprint and path is the stable discovery key.
+- Chat and Work product activation/connectors remain unavailable and correctly remain `BLOCKED`.
+- Canonical `main` cannot be updated from this task because commit/push/merge are not authorized and its working tree contains preserved user edits.
 
 ## Next concrete action
 
-Review the pushed PR #2 and decide whether to merge; keep context-pack and additional fabricated samples deferred.
-
-## Verification notes
-
-Remote GitHub updates have been successfully performed after the original setup session. The remote-ahead validation fast-forwarded clean `main` from `526e32f` to `740385b`, the resolved BUG-002 record was pushed as `aacc3e8`, and the independent recovery sample was pushed as `b8c7da9`; final `HEAD = origin/main = b8c7da9`, ahead/behind `0/0`, and the worktree was clean. Automated validation on the canonical checkout passed `git diff --check`; no package, test-runner, or build entry point is present, so no code test suite was run.
+Human reviews the release-candidate diff and explicitly authorizes any later commit/push/merge; do not alter canonical `main` in this task.
