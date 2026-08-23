@@ -84,7 +84,7 @@ function commandFailure(command: string, error: CommandExecutionError): GitLocal
 }
 
 async function runGitRead(repositoryPath: string | null, argumentsList: readonly string[], commandLabel: string): Promise<CommandResult> {
-  return runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath }).then(
+  return runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath, timeoutMs: 30_000, maxOutputBytes: 1_048_576 }).then(
     (result) => result,
     (error: CommandExecutionError) => {
       if (!(error instanceof CommandExecutionError)) {
@@ -104,7 +104,7 @@ async function runGitOptionalConfigQuery(
   argumentsList: readonly string[],
   commandLabel: string,
 ): Promise<CommandResult | null> {
-  return runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath }).then(
+  return runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath, timeoutMs: 30_000, maxOutputBytes: 1_048_576 }).then(
     (result) => result,
     (error: CommandExecutionError) => {
       if (!(error instanceof CommandExecutionError)) {
@@ -236,7 +236,17 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) {
     throw new GitLocalStateError("ambiguous", `Git HEAD is not a full object id: ${head}`);
   }
-  const worktreeStatus = (await runGitRead(repositoryPath, ["status", "--porcelain=v1"], "status --porcelain=v1")).stdout.trim();
+  const trackedDurableState = (await runGitRead(root, ["ls-files", "--", ".d-ai"], "ls-files .d-ai")).stdout.trim();
+  const statusArguments = trackedDurableState.length === 0
+    ? ["status", "--porcelain=v1", "--", ".", ":(exclude).d-ai"]
+    : ["status", "--porcelain=v1"];
+  const worktreeStatus = (await runGitRead(
+    root,
+    statusArguments,
+    trackedDurableState.length === 0
+      ? "status --porcelain=v1 (excluding untracked D-AI durable state)"
+      : "status --porcelain=v1",
+  )).stdout.trim();
   const remoteUrls = await readGitConfigValues(root, `remote.${normalizedRemote}.url`, "Git remote URL");
   if (remoteUrls.length !== 1) {
     throw new GitLocalStateError("ambiguous", `Git remote URL must resolve to exactly one endpoint; observed ${remoteUrls.length}`);
@@ -263,13 +273,22 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
   };
 }
 
+export async function inspectCurrentGitState(repositoryPath: string, remote: string): Promise<LocalGitState> {
+  const root = outputValue(await runGitRead(repositoryPath, ["rev-parse", "--show-toplevel"], "rev-parse --show-toplevel"), "Git repository root");
+  const branch = outputValue(await runGitRead(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], "symbolic-ref --short HEAD"), "Git branch");
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..") || branch.endsWith("/")) {
+    throw new GitLocalStateError("ambiguous", `Git branch is invalid: ${branch}`);
+  }
+  return inspectLocalGitState(root, remote, `refs/heads/${branch}`);
+}
+
 export async function pushGitRef(repositoryPath: string, endpoint: string, ref: string, head: string): Promise<GitPushResult> {
   const normalizedEndpoint = assertNonEmpty(endpoint, "Git push endpoint");
   const normalizedRef = assertTargetRef(ref);
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) {
     throw new InvalidTaskStateError("Git push HEAD must be a full Git object id");
   }
-  return runCommand({ command: "git", arguments: ["push", normalizedEndpoint, `${head}:${normalizedRef}`], cwd: repositoryPath }).then(
+  return runCommand({ command: "git", arguments: ["push", normalizedEndpoint, `${head}:${normalizedRef}`], cwd: repositoryPath, timeoutMs: 60_000, maxOutputBytes: 1_048_576 }).then(
     (result) => ({ pushed: true, observedOutput: formatCommandOutput(result), exitCode: 0, failureCategory: null }),
     (error: CommandExecutionError) => {
       if (!(error instanceof CommandExecutionError)) {

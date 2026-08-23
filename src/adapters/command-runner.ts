@@ -6,6 +6,8 @@ export interface CommandRequest {
   readonly command: string;
   readonly arguments: readonly string[];
   readonly cwd: string | null;
+  readonly timeoutMs?: number | undefined;
+  readonly maxOutputBytes?: number | undefined;
 }
 
 export interface CommandResult {
@@ -64,6 +66,12 @@ function assertCommandRequest(request: CommandRequest): void {
   if (request.command.includes("\0") || request.arguments.some((argument) => argument.includes("\0"))) {
     throw new InvalidTaskStateError("Command and arguments must not contain null bytes");
   }
+  if (request.timeoutMs !== undefined && (!Number.isInteger(request.timeoutMs) || request.timeoutMs <= 0)) {
+    throw new InvalidTaskStateError("Command timeout must be a positive integer when configured");
+  }
+  if (request.maxOutputBytes !== undefined && (!Number.isInteger(request.maxOutputBytes) || request.maxOutputBytes <= 0)) {
+    throw new InvalidTaskStateError("Command output limit must be a positive integer when configured");
+  }
 }
 
 function createResult(request: CommandRequest, stdout: string, stderr: string, exitCode: number | null): CommandResult {
@@ -86,20 +94,47 @@ export async function runCommand(request: CommandRequest): Promise<CommandResult
     });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timeout: NodeJS.Timeout | undefined;
+    const rejectWithResult = (result: CommandResult): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
+      reject(new CommandExecutionError(result));
+    };
+    const appendOutput = (target: "stdout" | "stderr", chunk: string): void => {
+      if (settled) return;
+      if (target === "stdout") stdout += chunk;
+      else stderr += chunk;
+      const outputBytes = Buffer.byteLength(stdout, "utf8") + Buffer.byteLength(stderr, "utf8");
+      if (request.maxOutputBytes !== undefined && outputBytes > request.maxOutputBytes) {
+        child.kill();
+        rejectWithResult(createResult(request, stdout.slice(0, request.maxOutputBytes), "Command output exceeded the configured limit", null));
+      }
+    };
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.stdout.on("data", (chunk: string) => appendOutput("stdout", chunk));
+    child.stderr.on("data", (chunk: string) => appendOutput("stderr", chunk));
     child.once("error", (error: Error) => {
-      reject(new CommandExecutionError(createResult(request, stdout, `Process launch failed: ${error.message}`, null)));
+      rejectWithResult(createResult(request, stdout, `Process launch failed: ${error.message}`, null));
     });
     child.once("close", (exitCode: number | null) => {
+      if (settled) return;
       const result = createResult(request, stdout, stderr, exitCode);
       if (exitCode !== 0) {
-        reject(new CommandExecutionError(result));
+        rejectWithResult(result);
         return;
       }
+      settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
       resolve(result);
     });
+    if (request.timeoutMs !== undefined) {
+      timeout = setTimeout(() => {
+        child.kill();
+        rejectWithResult(createResult(request, stdout, "Command timed out", null));
+      }, request.timeoutMs);
+    }
   });
 }

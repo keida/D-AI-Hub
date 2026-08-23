@@ -3,6 +3,7 @@ import { z } from "zod";
 import { CommandExecutionError, redactSensitiveText } from "../adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js";
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
+import { createCodexExecutionAdapter, createCodexRecoveryPointCapture } from "../adapters/codex-local.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
 import { GitHubCliAdapter, type GitHubAdapter } from "../adapters/github.js";
 import { bootstrapTask, prepareBootstrapTask } from "../bootstrap/bootstrap-task.js";
@@ -83,6 +84,7 @@ export interface EnvironmentExecutionRequest {
 export interface EnvironmentExecutionResult {
   readonly status: "completed" | "blocked" | "failed";
   readonly evidence: readonly VerificationEvidence[];
+  readonly contextManifestEntries?: readonly string[] | undefined;
   readonly message: string;
 }
 
@@ -178,6 +180,7 @@ const evidenceSchema = z.object({
 const executionResultSchema = z.object({
   status: z.enum(["completed", "blocked", "failed"]),
   evidence: z.array(evidenceSchema),
+  contextManifestEntries: z.array(z.string().trim().min(1)).optional(),
   message: z.string().trim().min(1),
 }).strict();
 const recoveryPointSchema = z.object({
@@ -349,6 +352,28 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
     evidence: parsed.data.evidence.map(redactEvidence),
     message: redactSensitiveText(parsed.data.message),
   };
+}
+
+function validateExecutionContextManifestEntries(entries: readonly string[] | undefined): readonly string[] {
+  if (entries === undefined) return [];
+  if (new Set(entries).size !== entries.length) {
+    throw new InvalidTaskStateError("Environment execution context manifest entries must not contain duplicates");
+  }
+  return entries.map((entry) => {
+    if (redactSensitiveText(entry) !== entry || containsSecretShapedValue(entry)) {
+      throw new InvalidTaskStateError("Environment execution context manifest entry contains secret-like content");
+    }
+    if (
+      !/^branch:[A-Za-z0-9._/-]+$/.test(entry)
+      && !/^remote:[A-Za-z0-9._-]+$/.test(entry)
+      && !/^ref:refs\/heads\/[A-Za-z0-9._/-]+$/.test(entry)
+      && !/^artifact:commit:[a-f0-9]{40,64}$/i.test(entry)
+      && entry !== "local-state:clean-required"
+    ) {
+      throw new InvalidTaskStateError(`Environment execution context manifest entry is not an approved identity fact: ${entry}`);
+    }
+    return entry;
+  });
 }
 
 function redactEvidence(evidence: VerificationEvidence): VerificationEvidence {
@@ -956,9 +981,11 @@ async function executeRoutedState(
     }, authorization);
     return enterRecovery(executedState, execution.message, dependencies, authorization);
   }
+  const executionContextEntries = validateExecutionContextManifestEntries(execution.contextManifestEntries);
   const inspectedTransition = transitionState(routedState, "inspect", "evidence-collector", routedState.environment);
   const inspectedState = await persistState(dependencies.store, {
     ...inspectedTransition,
+    contextManifest: [...inspectedTransition.contextManifest, ...executionContextEntries],
     verificationEvidence: [...inspectedTransition.verificationEvidence, ...execution.evidence],
   }, authorization);
   const preliminaryVerifyState = await persistState(
@@ -981,11 +1008,28 @@ async function executeRoutedState(
   if (recoveryPointValidation.kind === "blocked") {
     return enterRecovery(preliminaryVerifyState, recoveryPointValidation.message, dependencies, authorization);
   }
+  const recoveryPointId = recoveryPointValidation.value.recoveryPoint.recoveryPointId;
+  const postCaptureEvidence: readonly VerificationEvidence[] = [
+    ...(preliminaryVerifyState.verificationEvidence.some((item) => item.evidenceId === "gate:recovery") ? [] : [{
+      evidenceId: "gate:recovery",
+      stage: preliminaryVerifyState.stage,
+      environment: preliminaryVerifyState.environment,
+      role: preliminaryVerifyState.role,
+      selectedModel: preliminaryVerifyState.routingDecision?.selectedModel ?? "",
+      command: "d-ai recovery capture",
+      observedOutput: `Recovery point ${recoveryPointId} was captured and validated`,
+      exitCode: 0,
+      interpretation: "Recovery point capture passed",
+      passed: true,
+      recoveryPointId,
+      recordedAt: dependencies.now().toISOString(),
+    } satisfies VerificationEvidence]),
+  ];
   const verifiedState = await persistState(dependencies.store, {
     ...preliminaryVerifyState,
-    verificationEvidence: preliminaryVerifyState.verificationEvidence.map((verification) => ({
+    verificationEvidence: [...preliminaryVerifyState.verificationEvidence, ...postCaptureEvidence].map((verification) => ({
       ...verification,
-      recoveryPointId: recoveryPointValidation.value.recoveryPoint.recoveryPointId,
+      recoveryPointId,
     })),
     recoveryPoint: recoveryPointValidation.value.recoveryPoint,
     recoverySnapshot: recoveryPointValidation.value.recoverySnapshot,
@@ -1670,15 +1714,36 @@ async function closeActiveTaskExclusive(
   if (!registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is not owned by ${request.sourceEnvironment}`);
   }
-  const state = await dependencies.store.load(taskId);
+  let state = await dependencies.store.load(taskId);
   if (state === null || !registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} became unavailable while close was loading durable state`);
   }
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
   }
+  const closeReadyState = state.verificationEvidence.some((item) => item.evidenceId === "gate:handoff")
+    || (state.handoffState !== "none" && state.handoffState !== "completed")
+    ? state
+    : await persistState(dependencies.store, {
+      ...state,
+      verificationEvidence: [...state.verificationEvidence, {
+        evidenceId: "gate:handoff",
+        stage: state.stage,
+        environment: state.environment,
+        role: state.role,
+        selectedModel: state.routingDecision?.selectedModel ?? "unrecorded-model",
+        command: "d-ai handoff state check",
+        observedOutput: `Handoff state is ${state.handoffState}`,
+        exitCode: 0,
+        interpretation: "No unresolved handoff remains",
+        passed: true,
+        recoveryPointId: state.recoveryPoint?.recoveryPointId ?? null,
+        recordedAt: dependencies.now().toISOString(),
+      }],
+    }, lease);
+  state = closeReadyState;
   await assertOwnership();
-  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(state, lease, assertOwnership), closeConnectorFailure);
+  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(closeReadyState, lease, assertOwnership), closeConnectorFailure);
   if (closeOutcome.kind === "blocked") {
     return response(state, "blocked", `Close connector blocked: ${closeOutcome.message}`);
   }
@@ -1890,10 +1955,6 @@ function defaultRecovery(state: TaskState, reason: string): Promise<TaskState> {
   });
 }
 
-function defaultCaptureRecoveryPoint(state: TaskState): Promise<RecoveryPoint> {
-  return Promise.reject(new InvalidTaskStateError(`No recovery point connector is configured for ${state.taskId}`));
-}
-
 export interface ConfiguredDAIRuntimeOptions {
   readonly workspacePath: string;
   readonly durableRoot?: string;
@@ -1912,10 +1973,12 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     enterpriseHost: options.githubEnterpriseHost ?? process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null,
     credentialsConfigured: options.githubCredentialsConfigured ?? process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED === "1",
   });
+  const codexExecution = createCodexExecutionAdapter(() => new Date());
+  const codexRecovery = createCodexRecoveryPointCapture(() => new Date());
   const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
     chat: new ChatEnvironmentAdapter(handoffService, defaultExecutionAdapter),
     work: new WorkEnvironmentAdapter(handoffService, defaultExecutionAdapter),
-    codex: new CodexEnvironmentAdapter(handoffService, defaultExecutionAdapter),
+    codex: new CodexEnvironmentAdapter(handoffService, codexExecution),
   };
   return {
     store,
@@ -1934,7 +1997,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     loadSelectedSkill,
     evaluateHardGates,
     createDebugSession,
-    captureRecoveryPoint: defaultCaptureRecoveryPoint,
+    captureRecoveryPoint: codexRecovery,
     recover: defaultRecovery,
     rollbackTask: createGitRollbackTask(root),
     rerunOriginalCheck: async (state): Promise<readonly VerificationEvidence[]> => {
