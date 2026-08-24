@@ -1,6 +1,6 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../adapters/github.js";
-import type { GitFailureCategory } from "../adapters/git.js";
+import { isValidGitBranchName, isValidGitTargetRef, type GitFailureCategory } from "../adapters/git.js";
 import { CloseBlockedError } from "../domain/errors.js";
 import type { CloseCandidate, CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
 import { isSafeManifestId } from "../domain/manifest-id.js";
@@ -23,6 +23,7 @@ const evidenceGateNames = [
 
 interface CloseConfiguration {
   readonly repositoryPath: string;
+  readonly expectedRepository: string;
   readonly remote: string;
   readonly ref: string;
   readonly commitSha: string;
@@ -156,10 +157,18 @@ function preflight(state: TaskState, now: Date, snapshotManifest: DurableContext
     reasons.push(failure("Required durable artifact correspondence is incomplete", "restore the durable artifact manifest and matching recovery point"));
   }
   const repositoryPath = repositoryPathFromManifest(state.contextManifest, reasons);
+  const branch = oneManifestValue(state.contextManifest, "branch:", "Branch", reasons);
   const remote = oneManifestValue(state.contextManifest, "remote:", "Configured remote", reasons);
   const ref = oneManifestValue(state.contextManifest, "ref:", "Target ref", reasons);
+  const expectedRepository = oneManifestValue(state.contextManifest, "remote-repository:", "Remote repository identity", reasons);
   const commitSha = commitArtifactFromManifest(state.contextManifest, reasons);
   const policy = oneManifestValue(state.contextManifest, "local-state:", "Local-state policy", reasons);
+  if (branch !== null && !isValidGitBranchName(branch)) {
+    reasons.push(failure("Branch identity is malformed", "record a valid Git branch path matching the target ref"));
+  }
+  if (branch !== null && ref !== null && ref !== `refs/heads/${branch}`) {
+    reasons.push(failure("Branch and target ref do not match", "record branch:<name> matching ref:refs/heads/<name>"));
+  }
   if (policy !== null && policy !== "clean-required") {
     reasons.push(failure("Local-state policy is not the supported clean-required policy", "record local-state:clean-required before close"));
   }
@@ -169,10 +178,10 @@ function preflight(state: TaskState, now: Date, snapshotManifest: DurableContext
       reasons.push(failure(`Hard gate ${result.gate} failed: ${result.reason}`, "rerun and record fresh passing evidence for this gate"));
     }
   }
-  if (repositoryPath === null || remote === null || ref === null || commitSha === null || policy === null || reasons.length > 0) {
+  if (repositoryPath === null || branch === null || expectedRepository === null || remote === null || ref === null || commitSha === null || policy === null || reasons.length > 0) {
     return { reasons, configuration: null };
   }
-  return { reasons, configuration: { repositoryPath, remote, ref, commitSha } };
+  return { reasons, configuration: { repositoryPath, expectedRepository, remote, ref, commitSha } };
 }
 
 function createCloseCandidate(state: TaskState, configuration: CloseConfiguration, recordedAt: string): CloseCandidate {
@@ -248,7 +257,7 @@ function validObjectId(value: string): boolean {
 }
 
 function validTargetRef(value: string): boolean {
-  return /^refs\/heads\/[A-Za-z0-9._/-]+$/.test(value) && !value.includes("..") && !value.endsWith("/");
+  return isValidGitTargetRef(value);
 }
 
 function validRepository(value: string): boolean {
@@ -274,6 +283,7 @@ function pushEvidenceFailure(evidence: GitPushEvidence, configuration: CloseConf
   if (typeof evidence.remote !== "string" || !/^[A-Za-z0-9._-]+$/.test(evidence.remote)) return "Push evidence remote is malformed";
   if (evidence.remote !== configuration.remote) return "Push evidence remote does not match the configured remote";
   if (typeof evidence.repository !== "string" || !validRepository(evidence.repository)) return "Push evidence repository is malformed";
+  if (evidence.repository !== configuration.expectedRepository) return "Push evidence repository does not match the durable repository identity";
   if (typeof evidence.ref !== "string" || !validTargetRef(evidence.ref)) return "Push evidence ref is malformed";
   if (evidence.ref !== configuration.ref) return "Push evidence ref does not match the configured target ref";
   if (typeof evidence.localSha !== "string" || !validObjectId(evidence.localSha)) return "Push evidence local SHA is not a full Git object id";
@@ -289,6 +299,7 @@ function pushEvidenceFailure(evidence: GitPushEvidence, configuration: CloseConf
 function remoteEvidenceFailure(remote: RemoteState, push: GitPushEvidence, configuration: CloseConfiguration): string | null {
   if (typeof remote.repository !== "string" || !validRepository(remote.repository)) return "Remote state repository is malformed";
   if (remote.repository !== push.repository) return "Remote state repository does not match the validated push evidence";
+  if (remote.repository !== configuration.expectedRepository) return "Remote state repository does not match the durable repository identity";
   if (typeof remote.ref !== "string" || !validTargetRef(remote.ref)) return "Remote state ref is malformed";
   if (remote.ref !== configuration.ref || remote.ref !== push.ref) return "Remote state ref does not match the configured target ref";
   if (typeof remote.remoteSha !== "string" || (remote.remoteSha.length > 0 && !validObjectId(remote.remoteSha))) return "Remote state SHA is malformed";
@@ -420,7 +431,7 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before push: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], state.verificationEvidence);
   }
-  const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref, configuration.commitSha).then(
+  const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref, configuration.commitSha, configuration.expectedRepository).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as GitPushEvidence | null, error }),
   );
@@ -471,7 +482,7 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before remote verification: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
   }
-  const remoteResult = await dependencies.gitHub.verifyRemoteState(pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha).then(
+  const remoteResult = await dependencies.gitHub.verifyRemoteState(configuration.repositoryPath, configuration.remote, pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha, configuration.expectedRepository).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as RemoteState | null, error }),
   );

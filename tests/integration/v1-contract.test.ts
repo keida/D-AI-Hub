@@ -68,11 +68,11 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
   const { bootstrapTask, prepareBootstrapTask } = await import("../../src/bootstrap/bootstrap-task.js");
   const bootstrap = async (input: Parameters<typeof bootstrapTask>[0], targetStore: Parameters<typeof bootstrapTask>[1]): Promise<TaskState> => {
     const state = await bootstrapTask(input, targetStore);
-    return { ...state, constraints: ["Use only the disposable Task 10 repository"], contextManifest: [...state.contextManifest, "remote:origin", `ref:${fixture.ref}`, "local-state:clean-required", `artifact:commit:${fixture.commitSha}`], durableContext: null };
+    return { ...state, constraints: ["Use only the disposable Task 10 repository"], contextManifest: [...state.contextManifest, `branch:${fixture.branch}`, "remote:origin", `ref:${fixture.ref}`, "local-state:clean-required", `artifact:commit:${fixture.commitSha}`, "remote-repository:github.com/d-ai-contract/known-good"], durableContext: null };
   };
   const prepareBootstrap = async (input: Parameters<typeof prepareBootstrapTask>[0], targetStore: Parameters<typeof prepareBootstrapTask>[1]): Promise<TaskState> => {
     const state = await prepareBootstrapTask(input, targetStore);
-    return { ...state, constraints: ["Use only the disposable Task 10 repository"], contextManifest: [...state.contextManifest, "remote:origin", `ref:${fixture.ref}`, "local-state:clean-required", `artifact:commit:${fixture.commitSha}`], durableContext: null };
+    return { ...state, constraints: ["Use only the disposable Task 10 repository"], contextManifest: [...state.contextManifest, `branch:${fixture.branch}`, "remote:origin", `ref:${fixture.ref}`, "local-state:clean-required", `artifact:commit:${fixture.commitSha}`, "remote-repository:github.com/d-ai-contract/known-good"], durableContext: null };
   };
   const executor = async (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> => {
     const durableBeforeExecution = await store.load(request.state.taskId);

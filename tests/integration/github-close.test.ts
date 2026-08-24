@@ -101,10 +101,12 @@ function stateFor(repositoryPath: string, commitSha: string, now: string, remote
     selectedCapabilities: ["shell"],
     contextManifest: [
       `identity:repository:${repositoryPath}:${createHash("sha256").update(repositoryPath, "utf8").digest("hex")}`,
+      "branch:main",
       `remote:${remote}`,
       `ref:${ref}`,
       "local-state:clean-required",
       `artifact:commit:${commitSha}`,
+      "remote-repository:github.com/acme/d-ai",
     ],
     handoffState: "completed",
     verificationEvidence: verificationEvidence(now),

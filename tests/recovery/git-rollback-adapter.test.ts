@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -42,7 +42,7 @@ async function createRepository(): Promise<{ readonly root: string; readonly rec
   return { root, recoveryHead, currentHead, snapshot };
 }
 
-function state(snapshot: RecoverySnapshot, rollbackAudit?: TaskState["rollbackAudit"]): TaskState {
+function state(snapshot: RecoverySnapshot, rollbackAudit?: TaskState["rollbackAudit"], repositoryIdentityPaths: readonly string[] = [snapshot.workspacePath]): TaskState {
   return {
     taskId: "task-git-rollback",
     goal: "rollback",
@@ -52,7 +52,7 @@ function state(snapshot: RecoverySnapshot, rollbackAudit?: TaskState["rollbackAu
     role: "evidence-collector",
     routingDecision: null,
     selectedCapabilities: [],
-    contextManifest: [],
+    contextManifest: repositoryIdentityPaths.map((path) => `identity:repository:${path}:${createHash("sha256").update(path, "utf8").digest("hex")}`),
     handoffState: "none",
     verificationEvidence: snapshot.verificationResults,
     recoveryPoint: { recoveryPointId: "recovery-git-rollback", taskId: "task-git-rollback", stage: "verify", environment: "codex", role: "evidence-collector", durablePaths: ["state.json"], hashes: { "state.json": "a".repeat(64) }, restorationInstructions: "restore", createdAt: "2026-08-21T00:00:00.000Z", snapshotManifestId: snapshot.stateManifest.manifestId },
@@ -97,6 +97,83 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed before mutation when the persisted repository identity is missing or ambiguous", async () => {
+    const fixture = await createRepository();
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot, undefined, []), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/repository identity/i);
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot, undefined, [fixture.root, `${fixture.root}-other`]), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/repository identity/i);
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
+      await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed before mutation when the persisted repository identity mismatches the resolved Git root", async () => {
+    const fixture = await createRepository();
+    try {
+      await expect(createGitRollbackTask(fixture.root)(state(fixture.snapshot, undefined, [`${fixture.root}-other`]), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/repository identity/i);
+      await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
+      await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves nested logical workspace identity while rolling back from the repository root", async () => {
+    const fixture = await createRepository();
+    const nestedWorkspace = join(fixture.root, "nested-workspace");
+    try {
+      await mkdir(nestedWorkspace, { recursive: true });
+      await writeFile(join(nestedWorkspace, "nested-user-work.txt"), "must survive\n", "utf8");
+      const nestedSnapshot = { ...fixture.snapshot, workspacePath: nestedWorkspace };
+      const result = await createGitRollbackTask(nestedWorkspace)(state(nestedSnapshot, undefined, [fixture.root]), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
+      expect(result.verification.passed).toBe(true);
+      expect(result.verification.reason).toContain("workspace verified");
+      await expect(git(fixture.root, ["show", "HEAD:artifact.txt"])).resolves.toBe("known good");
+      await expect(git(fixture.root, ["stash", "show", "--include-untracked", "--name-only", result.preservedUserWork.archiveId])).resolves.toContain("nested-workspace/nested-user-work.txt");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")("accepts a junction workspace alias without weakening repository fencing", async () => {
+    const fixture = await createRepository();
+    const workspaceAlias = join(tmpdir(), "d-ai-rollback-junction-alias");
+    try {
+      await symlink(fixture.root, workspaceAlias, "junction");
+      const result = await createGitRollbackTask(workspaceAlias)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
+      expect(result.verification.passed).toBe(true);
+    } finally {
+      await rm(workspaceAlias, { recursive: true, force: true });
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "win32")("accepts a case-variant workspace alias without authorizing a different repository", async () => {
+    const fixture = await createRepository();
+    const workspaceAlias = fixture.root.replace(/[a-z]/g, (letter) => letter.toUpperCase());
+    try {
+      const result = await createGitRollbackTask(workspaceAlias)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
+      expect(result.verification.passed).toBe(true);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a different resolved repository before any rollback mutation", async () => {
+    const fixture = await createRepository();
+    const other = await createRepository();
+    try {
+      const aliasedSnapshot = { ...fixture.snapshot, workspacePath: other.root };
+      await expect(createGitRollbackTask(other.root)(state(aliasedSnapshot, undefined, [fixture.root]), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/repository identity/i);
+      await expect(git(other.root, ["rev-parse", "HEAD"])).resolves.toBe(other.currentHead);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+      await rm(other.root, { recursive: true, force: true });
     }
   });
 
