@@ -2015,15 +2015,18 @@ export interface ConfiguredDAIRuntimeOptions {
 function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRuntimeDependencies {
   const root = resolve(options.workspacePath);
   const durableRoot = resolve(options.durableRoot ?? join(root, ".d-ai"));
+  const enterpriseHost = options.githubEnterpriseHost !== undefined
+    ? options.githubEnterpriseHost
+    : process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null;
   const store = new FileDurableContextStore(durableRoot);
   const handoffService = new PersistentHandoffService(new FileHandoffPersistence(join(durableRoot, "handoffs.json")));
   const gitHub = options.gitHub ?? GitHubCliAdapter.create({
     mode: "external",
-    enterpriseHost: options.githubEnterpriseHost ?? process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null,
+    enterpriseHost,
     credentialsConfigured: options.githubCredentialsConfigured ?? process.env.D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED === "1",
   });
-  const codexExecution = createCodexExecutionAdapter(() => new Date());
-  const codexRecovery = createCodexRecoveryPointCapture(() => new Date());
+  const codexExecution = createCodexExecutionAdapter(() => new Date(), enterpriseHost);
+  const codexRecovery = createCodexRecoveryPointCapture(() => new Date(), enterpriseHost);
   const prepareConfiguredBootstrapTask = async (input: BootstrapInput, configuredStore: DurableContextStore): Promise<TaskState> => {
     if (input.environment === "codex" && input.workspacePath !== null && input.repositoryPath === root) {
       let repositoryPath: string;
@@ -2041,7 +2044,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
       }
       let remoteRepository: string;
       try {
-        remoteRepository = resolveGitHubRepository(local.remoteUrl, process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null).repository;
+        remoteRepository = resolveGitHubRepository(local.remoteUrl, enterpriseHost).repository;
       } catch {
         return prepared;
       }

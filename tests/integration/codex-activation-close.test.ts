@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { GitHubCliAdapter } from "../../src/adapters/github.js";
-import type { GitTransport } from "../../src/adapters/git.js";
+import { pushGitRef, readRemoteRef, type GitTransport } from "../../src/adapters/git.js";
 import type { Environment, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
 import { createConfiguredDAIRuntime } from "../../src/runtime/d-ai-runtime.js";
@@ -533,6 +533,55 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       expect(result.message).not.toContain(fixture.state.taskId);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors an explicit Enterprise GitHub host through Codex bootstrap, execution, recovery, and close", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-codex-enterprise-host-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(workspacePath, ".d-ai");
+    const bareRemotePath = join(root, "remote.git");
+    const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
+    const previousEnterpriseHost = process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST;
+    try {
+      process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST = "wrong.example.test";
+      await mkdir(verificationSkillPath, { recursive: true });
+      await writeFile(join(verificationSkillPath, "SKILL.md"), `---\nname: verify-local\ndescription: Bounded local verification\nmetadata:\n  triggers: '["verify"]'\n  compatibleEnvironments: '["codex"]'\n  compatibleStages: '["execute"]'\n---\n\n# Bounded local verification\n`, "utf8");
+      await writeFile(join(workspacePath, "artifact.txt"), "enterprise artifact\n", "utf8");
+      await git(null, ["init", "--bare", bareRemotePath]);
+      await git(workspacePath, ["init", "--initial-branch=main"]);
+      await git(workspacePath, ["config", "user.email", "d-ai@example.test"]);
+      await git(workspacePath, ["config", "user.name", "D-AI Test"]);
+      await git(workspacePath, ["add", "."]);
+      await git(workspacePath, ["commit", "-m", "enterprise verification fixture"]);
+      await git(workspacePath, ["remote", "add", "origin", "https://git.example.test/acme/d-ai.git"]);
+      const transport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, bareRemotePath, ref, head),
+        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(bareRemotePath, ref, null),
+      };
+      const runtime = createConfiguredDAIRuntime({
+        workspacePath,
+        durableRoot,
+        githubEnterpriseHost: "git.example.test",
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: "git.example.test" }, transport),
+      });
+      const activate = createCodexActivation(runtime);
+
+      const verified = await activate({ rawCommand: "@D-AI verify Enterprise workspace", taskId: null });
+      expect(verified).toMatchObject({ environment: "codex", status: "completed", stage: "verify" });
+      expect(verified.message).toMatch(/verification/i);
+      const task = await new FileDurableContextStore(durableRoot).load(verified.taskId);
+      expect(task?.contextManifest).toContain("remote-repository:git.example.test/acme/d-ai");
+      expect(task?.recoveryPoint).not.toBeNull();
+
+      const closed = await activate({ rawCommand: "@D-AI close", taskId: verified.taskId });
+      expect(closed).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "completed", stage: "close" });
+      expect(closed.message).toMatch(/YES/i);
+      await expect(git(bareRemotePath, ["rev-parse", "refs/heads/main"])).resolves.toMatch(/^[a-f0-9]{40}$/);
+    } finally {
+      if (previousEnterpriseHost === undefined) delete process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST;
+      else process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST = previousEnterpriseHost;
+      await rm(root, { recursive: true, force: true });
     }
   });
 });
