@@ -1,6 +1,6 @@
 # Roadmap
 
-## Now — Codex-first D-AI V1
+## Now — Codex-first D-AI V1 (accepted)
 
 1. Keep the superseding Codex-first scope decision in `projects/d-ai-hub/DECISIONS.md` and retain the 2026-08-21 v2 document as a traceable historical/future architecture reference.
 2. Deliver and verify one Codex local control path through the canonical `d-ai` Skill, raw-command CLI, workspace-scoped durable task discovery, ownership fencing, verification gates, recovery, rollback, and close.
@@ -23,6 +23,7 @@
 - Fresh-runtime workspace-scoped durable task selection for active-state commands.
 - Canonical repository Skill source, compatibility entry, CLI, and external-workspace activation tests.
 - Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.
+- Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
 
 ## Future / Deferred
 
@@ -35,7 +36,7 @@
 - Repository health-check automation and the three existing untracked health-check/PR2 planning documents.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 
-## Remaining V1 acceptance work
+## Post-V1 boundary
 
-- A controlled real-environment `Safe-to-delete: YES` demonstration with exact GitHub remote SHA evidence remains an acceptance task for the Codex close gate. It is independent of Chat/Work activation.
+- Codex-first V1 acceptance is complete for the verified configured GitHub path; the close response returned `Safe-to-delete: YES`, while missing credentials or remote proof remains `BLOCKED`/`NO`.
 - Any future Chat/Work work requires a new scope decision, supported connector, capability/ownership design, and separate acceptance review.

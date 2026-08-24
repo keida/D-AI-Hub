@@ -3,14 +3,14 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-23
+- Last updated: 2026-08-24
 
 ## Current checkpoint
 
-- Current task: narrow D-AI product scope to Codex-first V1 without changing the merged runtime or canonical main worktree.
-- Working state: this isolated documentation branch is based on `origin/main` at `3829f731`. The canonical `main` worktree remains dirty with pre-existing Skill-routing changes; the ownership-repair worktree and branch are preserved and are not being reused.
+- Current task: close out and publish the verified Codex-first V1 scope without changing the runtime or canonical main worktree.
+- Working state: the fresh private-repository acceptance lifecycle passed on current main. The canonical `main` worktree remains dirty with pre-existing Skill-routing changes; all existing worktrees, branches, and fixtures are preserved.
 - Authorized file scope: product documentation and project state only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
-- Scope decision: D-AI V1 is Codex local control + GitHub durable evidence + D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only, not a runtime dependency. Native Chat, native Work, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred.
+- Scope decision: D-AI V1 is Codex local control + GitHub durable evidence + D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only, not a D-AI runtime dependency; any separate authorized repository-hosted maintenance remains outside V1 activation. Native Chat, native Work, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred.
 
 ## Delivery state
 
@@ -20,15 +20,15 @@
 
 ## Verified evidence
 
-- Fresh worktree created from refreshed `origin/main`; canonical main status was audited before creation and was not changed.
-- Existing controlled smoke: normal `@D-AI status` selected one durable task after fresh runtime restart; normal `@D-AI close` safely returned `BLOCKED` without GitHub credentials/remote evidence; cross-workspace discovery returned `unassigned/BLOCKED`.
-- The 2026-08-21 v2 spec remains tracked and now carries an explicit note that its cross-environment delivery scope is superseded by the 2026-08-23 Codex-first decision.
+- A new private-repository acceptance task was established from current main with fresh durable state and a recovery point.
+- Normal `@D-AI status` uniquely discovered the active task without `--task`; normal `@D-AI close` completed with all 11 evidence gates passing, including push and exact remote repository/ref/SHA verification.
+- The runtime close response returned `Safe-to-delete: YES`; critical unsaved context was empty, durable context was saved, the worktree was clean at the execution boundary, and no secret-like material was found in the durable evidence. The exact command results and GitHub visibility proof remain in the temporary acceptance report, not in project memory.
+- The 2026-08-21 v2 spec remains tracked and carries an explicit note that its cross-environment delivery scope is superseded by the Codex-first decision.
 
 ## Current blockers
 
-- The Codex close gate still needs a separately controlled configured GitHub repository/evidence run to demonstrate a real positive `YES`; this is a V1 acceptance blocker, not a Chat/Work blocker.
-- This scope branch has uncommitted documentation changes pending human review and explicit publication authorization.
+- Local Git authentication remains environment-dependent and is tracked by BUG-001; it does not invalidate the verified configured acceptance path.
 
 ## Next concrete action
 
-Review the uncommitted Codex-first documentation diff and its independent consistency review. If accepted, run the documentation gate and request explicit authorization before any commit or push; do not start Work activation or native Chat/Work integration.
+Review PR #9. If head/base remain unchanged, no new P0/P1 findings appear, and the PR remains mergeable, wait for explicit merge authorization. Do not start Work activation or native Chat/Work integration.
