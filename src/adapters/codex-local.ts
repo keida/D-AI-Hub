@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { runCommand, redactSensitiveText } from "./command-runner.js";
 import { inspectCurrentGitState, summarizeLocalGitState } from "./git.js";
+import { resolveGitHubRepository } from "./github.js";
 import { createRecoveryPoint } from "../recovery/recovery-point-service.js";
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
 import type { EnvironmentExecutionRequest, EnvironmentExecutionResult, EnvironmentExecutor } from "../runtime/d-ai-runtime.js";
@@ -49,14 +51,36 @@ function evidenceFor(
   };
 }
 
-function contextEntries(branch: string, remote: string, ref: string, head: string): readonly string[] {
+function contextEntries(branch: string, remote: string, ref: string, head: string, repository: string | null): readonly string[] {
   return [
     `branch:${branch}`,
     `remote:${remote}`,
     `ref:${ref}`,
     `artifact:commit:${head}`,
     "local-state:clean-required",
+    ...(repository === null ? [] : [`remote-repository:${repository}`]),
   ];
+}
+
+function identityPath(state: TaskState, kind: "workspace" | "repository"): string | undefined {
+  const prefix = `identity:${kind}:`;
+  const entries = state.contextManifest.filter((entry) => entry.startsWith(prefix));
+  if (entries.length !== 1) return undefined;
+  const match = new RegExp(`^identity:${kind}:(.+):[a-f0-9]{64}$`, "i").exec(entries[0]!);
+  return match?.[1];
+}
+
+async function pathsResolveToSameRepository(expectedPath: string, actualPath: string): Promise<boolean> {
+  try {
+    return (await realpath(expectedPath)) === (await realpath(actualPath));
+  } catch {
+    return false;
+  }
+}
+
+function oneRemoteRepositoryIdentity(state: TaskState): string | undefined {
+  const entries = state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
+  return entries.length === 1 ? entries[0]?.slice("remote-repository:".length) : undefined;
 }
 
 export function createCodexExecutionAdapter(now: () => Date = () => new Date()): EnvironmentExecutor {
@@ -70,15 +94,32 @@ export function createCodexExecutionAdapter(now: () => Date = () => new Date()):
       };
     }
 
-    const repositoryPath = request.state.contextManifest
-      .find((entry) => entry.startsWith("identity:repository:"))
-      ?.replace(/^identity:repository:/, "")
-      .replace(/:[a-f0-9]{64}$/i, "");
-    if (repositoryPath === undefined || repositoryPath.trim().length === 0) {
-      return { status: "blocked", evidence: [], message: "Codex verification requires a persisted repository identity" };
+    const repositoryPath = identityPath(request.state, "repository");
+    const workspacePath = identityPath(request.state, "workspace");
+    if (repositoryPath === undefined || workspacePath === undefined) {
+      return { status: "blocked", evidence: [], message: "Codex verification requires exactly one persisted workspace and repository identity" };
     }
 
-    const local = await inspectCurrentGitState(repositoryPath, "origin");
+    let local;
+    try {
+      local = await inspectCurrentGitState(workspacePath, "origin");
+    } catch (error: unknown) {
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+      return { status: "blocked", evidence: [], message: `Codex verification could not resolve the configured Git repository: ${message}` };
+    }
+    if (!(await pathsResolveToSameRepository(repositoryPath, local.repositoryPath))) {
+      return { status: "blocked", evidence: [], message: "Codex verification repository identity does not match the inspected Git root" };
+    }
+    let actualRemoteRepository: string;
+    try {
+      actualRemoteRepository = resolveGitHubRepository(local.remoteUrl, process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null).repository;
+    } catch (error: unknown) {
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+      return { status: "blocked", evidence: [], message: `Codex verification requires a configured GitHub remote identity: ${message}` };
+    }
+    if (oneRemoteRepositoryIdentity(request.state) !== actualRemoteRepository) {
+      return { status: "blocked", evidence: [], message: "Codex verification remote repository identity does not match the inspected Git remote" };
+    }
     if (local.worktreeStatus.length > 0) {
       return { status: "blocked", evidence: [], message: "Codex verification requires a clean worktree" };
     }
@@ -113,7 +154,7 @@ export function createCodexExecutionAdapter(now: () => Date = () => new Date()):
     return {
       status: "completed",
       evidence,
-      contextManifestEntries: contextEntries(local.branch, local.remote, local.ref, local.head),
+      contextManifestEntries: contextEntries(local.branch, local.remote, local.ref, local.head, actualRemoteRepository),
       message: `Codex bounded verification completed for ${request.state.taskId}`,
     };
   };
@@ -121,17 +162,28 @@ export function createCodexExecutionAdapter(now: () => Date = () => new Date()):
 
 export function createCodexRecoveryPointCapture(now: () => Date = () => new Date()): (state: TaskState) => Promise<CapturedRecoveryPoint> {
   return async (state): Promise<CapturedRecoveryPoint> => {
-    const repositoryPath = state.contextManifest
-      .find((entry) => entry.startsWith("identity:repository:"))
-      ?.replace(/^identity:repository:/, "")
-      .replace(/:[a-f0-9]{64}$/i, "");
-    if (repositoryPath === undefined || repositoryPath.trim().length === 0) {
-      throw new Error("Codex recovery capture requires a persisted repository identity");
+    const repositoryPath = identityPath(state, "repository");
+    const workspacePath = identityPath(state, "workspace");
+    if (repositoryPath === undefined || workspacePath === undefined) {
+      throw new Error("Codex recovery capture requires exactly one persisted workspace and repository identity");
     }
     if (state.durableContext === null) {
       throw new Error("Codex recovery capture requires durable context");
     }
-    const local = await inspectCurrentGitState(repositoryPath, "origin");
+    const local = await inspectCurrentGitState(workspacePath, "origin");
+    if (!(await pathsResolveToSameRepository(repositoryPath, local.repositoryPath))) {
+      throw new Error("Codex recovery repository identity does not match the inspected Git root");
+    }
+    let actualRemoteRepository: string;
+    try {
+      actualRemoteRepository = resolveGitHubRepository(local.remoteUrl, process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null).repository;
+    } catch (error: unknown) {
+      const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
+      throw new Error(`Codex recovery requires a configured GitHub remote identity: ${message}`);
+    }
+    if (oneRemoteRepositoryIdentity(state) !== actualRemoteRepository) {
+      throw new Error("Codex recovery remote repository identity does not match the inspected Git remote");
+    }
     if (local.worktreeStatus.length > 0) {
       throw new Error("Codex recovery capture refused because a complete staged, unstaged, or untracked snapshot is unavailable");
     }
@@ -149,7 +201,7 @@ export function createCodexRecoveryPointCapture(now: () => Date = () => new Date
       role: state.role,
       head: local.head,
       branch: local.branch,
-      workspacePath: local.repositoryPath,
+      workspacePath,
       status: local.worktreeStatus.length === 0 ? "clean" : local.worktreeStatus,
       binaryPatch,
       stateManifest: state.durableContext,

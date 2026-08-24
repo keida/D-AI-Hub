@@ -21,8 +21,8 @@ export interface RemoteState {
 }
 
 export interface GitHubAdapter {
-  pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string): Promise<GitPushEvidence>;
-  verifyRemoteState(repository: string, ref: string, expectedSha: string): Promise<RemoteState>;
+  pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string, expectedRepository: string): Promise<GitPushEvidence>;
+  verifyRemoteState(repositoryPath: string, remote: string, repository: string, ref: string, expectedSha: string, expectedRepository: string): Promise<RemoteState>;
 }
 
 export type GitHubRemotePolicy =
@@ -39,16 +39,6 @@ export class GitRemoteBlockedError extends CloseBlockedError {
     super(message);
     this.name = "GitRemoteBlockedError";
   }
-}
-
-interface RemoteEndpoint {
-  readonly endpoint: string;
-  readonly repositoryPath: string;
-  readonly ref: string;
-}
-
-function endpointKey(repository: string, ref: string): string {
-  return `${repository}\n${ref}`;
 }
 
 function normalizeHost(host: string): string {
@@ -162,7 +152,6 @@ export class GitHubCliAdapter implements GitHubAdapter {
   private readonly transport: GitTransport;
   private readonly mode: GitHubRemotePolicy["mode"];
   private readonly credentialsConfigured: boolean;
-  private readonly endpoints = new Map<string, RemoteEndpoint>();
 
   private constructor(policy: GitHubRemotePolicy, transport: GitTransport) {
     this.enterpriseHost = policy.enterpriseHost === null ? null : normalizeHost(policy.enterpriseHost);
@@ -179,12 +168,18 @@ export class GitHubCliAdapter implements GitHubAdapter {
     return new GitHubCliAdapter(policy, transport);
   }
 
-  public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string): Promise<GitPushEvidence> {
+  public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string, expectedRepository: string): Promise<GitPushEvidence> {
     this.assertConfigured();
+    if (typeof expectedRepository !== "string" || expectedRepository.trim().length === 0) {
+      throw new GitRemoteBlockedError("Durable GitHub repository identity is required for push verification");
+    }
     const expected = assertExpectedSha(expectedSha);
     const localState = await inspectLocalGitState(repositoryPath, remote, ref);
     const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
     const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
+    if (configuredRepository.repository !== expectedRepository) {
+      throw new GitRemoteBlockedError("Configured remote repository does not match the durable repository identity");
+    }
     if (pushRepository.repository !== configuredRepository.repository) {
       throw new GitRemoteBlockedError("Effective Git push transport conflicts with the configured remote repository identity");
     }
@@ -214,13 +209,6 @@ export class GitHubCliAdapter implements GitHubAdapter {
       };
     }
     const pushResult = await this.transport.pushRef(localState.repositoryPath, localState.pushUrl, localState.ref, localState.head);
-    if (pushResult.pushed) {
-      this.endpoints.set(endpointKey(configuredRepository.repository, localState.ref), {
-        endpoint: localState.pushUrl,
-        repositoryPath: localState.repositoryPath,
-        ref: localState.ref,
-      });
-    }
     return {
       remote: localState.remote,
       repository: configuredRepository.repository,
@@ -233,8 +221,14 @@ export class GitHubCliAdapter implements GitHubAdapter {
     };
   }
 
-  public async verifyRemoteState(repository: string, ref: string, expectedSha: string): Promise<RemoteState> {
+  public async verifyRemoteState(repositoryPath: string, remote: string, repository: string, ref: string, expectedSha: string, expectedRepository: string): Promise<RemoteState> {
     this.assertConfigured();
+    if (typeof expectedRepository !== "string" || expectedRepository.trim().length === 0) {
+      throw new GitRemoteBlockedError("Durable GitHub repository identity is required for remote verification");
+    }
+    if (repository !== expectedRepository) {
+      throw new GitRemoteBlockedError("Requested remote repository does not match the durable repository identity");
+    }
     const expected = assertExpectedSha(expectedSha);
     const parts = repository.split("/");
     const host = parts[0];
@@ -242,16 +236,21 @@ export class GitHubCliAdapter implements GitHubAdapter {
       throw new GitRemoteBlockedError("GitHub repository identity is empty");
     }
     assertAllowedHost(host, this.enterpriseHost);
-    const recordedEndpoint = this.endpoints.get(endpointKey(repository, ref));
-    if (recordedEndpoint === undefined || recordedEndpoint.ref !== ref) {
-      throw new GitRemoteBlockedError("Remote verification has no matching validated push endpoint for the repository and ref");
+    const localState = await inspectLocalGitState(repositoryPath, remote, ref);
+    const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
+    const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
+    if (configuredRepository.repository !== expectedRepository || configuredRepository.repository !== repository) {
+      throw new GitRemoteBlockedError("Inspected Git remote repository does not match the durable repository identity");
     }
-    const verificationEndpoint = await resolveGitEndpoint(recordedEndpoint.repositoryPath, recordedEndpoint.endpoint);
+    if (pushRepository.repository !== configuredRepository.repository) {
+      throw new GitRemoteBlockedError("Effective Git verification transport conflicts with the configured repository identity");
+    }
+    const verificationEndpoint = await resolveGitEndpoint(localState.repositoryPath, localState.pushUrl);
     const endpointRepository = resolveGitHubRepository(verificationEndpoint, this.enterpriseHost);
     if (endpointRepository.repository !== repository) {
-      throw new GitRemoteBlockedError("Recorded Git push endpoint no longer matches the requested repository identity");
+      throw new GitRemoteBlockedError("Resolved Git verification endpoint does not match the requested repository identity");
     }
-    const result = await this.transport.readRef(recordedEndpoint.repositoryPath, verificationEndpoint, ref);
+    const result = await this.transport.readRef(localState.repositoryPath, verificationEndpoint, ref);
     const remoteSha = parseRemoteSha(result.stdout, ref);
     return { repository, ref, remoteSha, matchesExpectedSha: remoteSha === expected };
   }

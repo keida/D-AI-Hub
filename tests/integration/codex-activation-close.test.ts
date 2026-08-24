@@ -73,10 +73,12 @@ async function seedCloseReadyTask(
     contextManifest: [
       `identity:workspace:${repositoryPath}:${createHash("sha256").update(repositoryPath, "utf8").digest("hex")}`,
       `identity:repository:${repositoryPath}:${createHash("sha256").update(repositoryPath, "utf8").digest("hex")}`,
+      "branch:main",
       "remote:origin",
       "ref:refs/heads/main",
       "local-state:clean-required",
       `artifact:commit:${commitSha}`,
+      "remote-repository:github.com/acme/d-ai",
     ],
     handoffState: "completed",
     verificationEvidence: evidence(now, null),
@@ -244,6 +246,106 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       expect(result.message).toMatch(/Close verdict BLOCKED.*credentials/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps identity facts unique across fresh status and normal close discovery", async () => {
+    const fixture = await createActivationFixture("d-ai-codex-fresh-close-idempotence-");
+    try {
+      const commitSha = fixture.state.contextManifest.find((entry) => entry.startsWith("artifact:commit:"))?.slice("artifact:commit:".length);
+      if (commitSha === undefined) throw new Error("Expected the fixture commit identity");
+      let pushCalls = 0;
+      let readCalls = 0;
+      const transport: GitTransport = {
+        pushRef: async () => {
+          pushCalls += 1;
+          return { pushed: true, observedOutput: "Push completed", exitCode: 0, failureCategory: null };
+        },
+        readRef: async (_repositoryPath, _endpoint, ref) => {
+          readCalls += 1;
+          return { command: "git", arguments: ["ls-remote", ref], stdout: `${commitSha}\t${ref}\n`, stderr: "", exitCode: 0 };
+        },
+      };
+      const firstGitHub = GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport);
+      const firstRuntime = createConfiguredDAIRuntime({ workspacePath: fixture.repositoryPath, durableRoot: fixture.durableRoot, gitHub: firstGitHub });
+      const firstStatus = await createCodexActivation(firstRuntime)({ rawCommand: "@D-AI status", taskId: null });
+      expect(firstStatus).toMatchObject({ taskId: fixture.state.taskId, status: "accepted", stage: "verify" });
+
+      const freshGitHub = GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport);
+      const freshRuntime = createConfiguredDAIRuntime({ workspacePath: fixture.repositoryPath, durableRoot: fixture.durableRoot, gitHub: freshGitHub });
+      const repeatedStatus = await createCodexActivation(freshRuntime)({ rawCommand: "@D-AI status", taskId: null });
+      expect(repeatedStatus).toMatchObject({ taskId: fixture.state.taskId, status: "accepted", stage: "verify" });
+      const beforeClose = await new FileDurableContextStore(fixture.durableRoot).load(fixture.state.taskId);
+      if (beforeClose === null) throw new Error("Expected the durable task before close");
+      for (const prefix of ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"]) {
+        expect(beforeClose.contextManifest.filter((entry) => entry.startsWith(prefix))).toHaveLength(1);
+      }
+
+      const closed = await createCodexActivation(freshRuntime)({ rawCommand: "@D-AI close", taskId: null });
+      expect(closed).toMatchObject({ taskId: fixture.state.taskId, status: "completed", stage: "close" });
+      expect(closed.message).toMatch(/YES/i);
+      expect(pushCalls).toBe(1);
+      expect(readCalls).toBe(1);
+      const afterClose = await new FileDurableContextStore(fixture.durableRoot).load(fixture.state.taskId);
+      if (afterClose === null) throw new Error("Expected the durable task after close");
+      for (const prefix of ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"]) {
+        expect(afterClose.contextManifest.filter((entry) => entry.startsWith(prefix))).toHaveLength(1);
+      }
+
+      const finalRuntime = createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
+      });
+      await expect(createCodexActivation(finalRuntime)({ rawCommand: "@D-AI close", taskId: null })).resolves.toMatchObject({ taskId: "unassigned", status: "blocked" });
+      expect(pushCalls).toBe(1);
+      expect(readCalls).toBe(1);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a nested workspace through production recovery capture and rollback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-codex-nested-rollback-"));
+    const repositoryRoot = join(root, "repository");
+    const workspacePath = join(repositoryRoot, "packages", "app");
+    const durableRoot = join(workspacePath, ".d-ai");
+    const skillPath = join(workspacePath, ".agents", "skills", "verify-local");
+    try {
+      await mkdir(skillPath, { recursive: true });
+      await writeFile(join(skillPath, "SKILL.md"), `---\nname: verify-local\ndescription: Bounded local verification\nmetadata:\n  triggers: '["verify"]'\n  compatibleEnvironments: '["codex"]'\n  compatibleStages: '["execute"]'\n---\n\n# Bounded local verification\n`, "utf8");
+      await writeFile(join(workspacePath, "artifact.txt"), "known good\n", "utf8");
+      await git(null, ["init", "--initial-branch=main", repositoryRoot]);
+      await git(repositoryRoot, ["config", "user.email", "d-ai@example.test"]);
+      await git(repositoryRoot, ["config", "user.name", "D-AI Test"]);
+      await git(repositoryRoot, ["add", "packages/app"]);
+      await git(repositoryRoot, ["commit", "-m", "test: nested recovery baseline"]);
+      await git(repositoryRoot, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+
+      const runtime = createConfiguredDAIRuntime({ workspacePath });
+      const activate = createCodexActivation(runtime);
+      const executed = await activate({ rawCommand: "@D-AI verify nested workspace", taskId: null });
+      expect(executed.status).toBe("completed");
+      const beforeRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
+      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+
+      await writeFile(join(workspacePath, "artifact.txt"), "regression\n", "utf8");
+      await git(repositoryRoot, ["add", "packages/app/artifact.txt"]);
+      await git(repositoryRoot, ["commit", "-m", "test: nested regression"]);
+      await writeFile(join(workspacePath, "user-work.txt"), "preserve me\n", "utf8");
+
+      const rolledBack = await activate({ rawCommand: "@D-AI rollback", taskId: executed.taskId });
+      const recoveryHead = beforeRollback?.recoverySnapshot?.head;
+      if (recoveryHead === undefined) throw new Error("Expected recovery head");
+      await expect(git(repositoryRoot, ["diff", "--name-status", recoveryHead, "HEAD"])).resolves.toBe("");
+      expect(rolledBack.message).toMatch(/rollback restored/i);
+      const afterRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
+      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(afterRollback?.rollbackAudit?.verification.passed).toBe(true);
+      await expect(git(repositoryRoot, ["show", "HEAD:packages/app/artifact.txt"])).resolves.toBe("known good");
+      await expect(git(repositoryRoot, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 

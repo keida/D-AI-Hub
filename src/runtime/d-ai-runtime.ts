@@ -5,8 +5,9 @@ import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { createCodexExecutionAdapter, createCodexRecoveryPointCapture } from "../adapters/codex-local.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
-import { GitHubCliAdapter, type GitHubAdapter } from "../adapters/github.js";
-import { bootstrapTask, prepareBootstrapTask } from "../bootstrap/bootstrap-task.js";
+import { inspectCurrentGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
+import { GitHubCliAdapter, resolveGitHubRepository, type GitHubAdapter } from "../adapters/github.js";
+import { bootstrapTask, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
 import { closeTask } from "../close/close-service.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
@@ -354,26 +355,66 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
   };
 }
 
+const executionIdentityPrefixes = ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"] as const;
+
 function validateExecutionContextManifestEntries(entries: readonly string[] | undefined): readonly string[] {
   if (entries === undefined) return [];
   if (new Set(entries).size !== entries.length) {
     throw new InvalidTaskStateError("Environment execution context manifest entries must not contain duplicates");
   }
+  const seenPrefixes = new Set<string>();
   return entries.map((entry) => {
     if (redactSensitiveText(entry) !== entry || containsSecretShapedValue(entry)) {
       throw new InvalidTaskStateError("Environment execution context manifest entry contains secret-like content");
     }
-    if (
-      !/^branch:[A-Za-z0-9._/-]+$/.test(entry)
-      && !/^remote:[A-Za-z0-9._-]+$/.test(entry)
-      && !/^ref:refs\/heads\/[A-Za-z0-9._/-]+$/.test(entry)
-      && !/^artifact:commit:[a-f0-9]{40,64}$/i.test(entry)
-      && entry !== "local-state:clean-required"
-    ) {
+    const approved = (entry.startsWith("branch:") && isValidGitBranchName(entry.slice("branch:".length)))
+      || /^remote:[A-Za-z0-9._-]+$/.test(entry)
+      || (entry.startsWith("ref:") && isValidGitTargetRef(entry.slice("ref:".length)))
+      || /^(?:artifact:commit:[a-f0-9]{40}|artifact:commit:[a-f0-9]{64})$/i.test(entry)
+      || /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(entry)
+      || entry === "local-state:clean-required";
+    if (!approved) {
       throw new InvalidTaskStateError(`Environment execution context manifest entry is not an approved identity fact: ${entry}`);
+    }
+    const prefix = executionIdentityPrefixes.find((candidate) => entry.startsWith(candidate));
+    if (prefix !== undefined) {
+      if (seenPrefixes.has(prefix)) {
+        throw new InvalidTaskStateError(`Environment execution context manifest contains conflicting ${prefix} identity facts`);
+      }
+      seenPrefixes.add(prefix);
     }
     return entry;
   });
+}
+
+function replaceExecutionIdentityEntries(
+  contextManifest: readonly string[],
+  entries: readonly string[],
+): readonly string[] {
+  const existingPrefixes = new Set<string>();
+  for (const entry of contextManifest) {
+    const prefix = executionIdentityPrefixes.find((candidate) => entry.startsWith(candidate));
+    if (prefix !== undefined) {
+      if (existingPrefixes.has(prefix)) {
+        throw new InvalidTaskStateError(`Durable context manifest contains conflicting ${prefix} identity facts`);
+      }
+      existingPrefixes.add(prefix);
+    }
+  }
+  if (entries.length === 0) return [...contextManifest];
+  const replacedPrefixes = new Set(
+    entries.flatMap((entry) => {
+      const prefix = executionIdentityPrefixes.find((candidate) => entry.startsWith(candidate));
+      return prefix === undefined ? [] : [prefix];
+    }),
+  );
+  return [
+    ...contextManifest.filter((entry) => {
+      const prefix = executionIdentityPrefixes.find((candidate) => entry.startsWith(candidate));
+      return prefix === undefined || !replacedPrefixes.has(prefix);
+    }),
+    ...entries,
+  ];
 }
 
 function redactEvidence(evidence: VerificationEvidence): VerificationEvidence {
@@ -981,11 +1022,19 @@ async function executeRoutedState(
     }, authorization);
     return enterRecovery(executedState, execution.message, dependencies, authorization);
   }
-  const executionContextEntries = validateExecutionContextManifestEntries(execution.contextManifestEntries);
+  let executionContextManifest: readonly string[];
+  try {
+    const executionContextEntries = validateExecutionContextManifestEntries(execution.contextManifestEntries);
+    executionContextManifest = replaceExecutionIdentityEntries(routedState.contextManifest, executionContextEntries);
+  } catch (error: unknown) {
+    const message = executionConnectorFailure(error instanceof Error ? error : new Error(String(error)))
+      ?? "Environment execution returned invalid identity facts";
+    return enterRecovery(routedState, message, dependencies, authorization);
+  }
   const inspectedTransition = transitionState(routedState, "inspect", "evidence-collector", routedState.environment);
   const inspectedState = await persistState(dependencies.store, {
     ...inspectedTransition,
-    contextManifest: [...inspectedTransition.contextManifest, ...executionContextEntries],
+    contextManifest: executionContextManifest,
     verificationEvidence: [...inspectedTransition.verificationEvidence, ...execution.evidence],
   }, authorization);
   const preliminaryVerifyState = await persistState(
@@ -1975,6 +2024,38 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
   });
   const codexExecution = createCodexExecutionAdapter(() => new Date());
   const codexRecovery = createCodexRecoveryPointCapture(() => new Date());
+  const prepareConfiguredBootstrapTask = async (input: BootstrapInput, configuredStore: DurableContextStore): Promise<TaskState> => {
+    if (input.environment === "codex" && input.workspacePath !== null && input.repositoryPath === root) {
+      let repositoryPath: string;
+      try {
+        repositoryPath = await resolveGitRepositoryRoot(input.workspacePath);
+      } catch {
+        return prepareBootstrapTask(input, configuredStore);
+      }
+      const prepared = await prepareBootstrapTask({ ...input, repositoryPath }, configuredStore);
+      let local;
+      try {
+        local = await inspectCurrentGitState(input.workspacePath, "origin");
+      } catch {
+        return prepared;
+      }
+      let remoteRepository: string;
+      try {
+        remoteRepository = resolveGitHubRepository(local.remoteUrl, process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null).repository;
+      } catch {
+        return prepared;
+      }
+      const remoteEntries = prepared.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
+      if (remoteEntries.length > 1 || (remoteEntries.length === 1 && remoteEntries[0] !== `remote-repository:${remoteRepository}`)) {
+        throw new InvalidTaskStateError("Bootstrap remote repository identity does not match the inspected Git remote");
+      }
+      if (remoteEntries.length === 0 && prepared.durableContext === null) {
+        return { ...prepared, contextManifest: [...prepared.contextManifest, `remote-repository:${remoteRepository}`] };
+      }
+      return prepared;
+    }
+    return prepareBootstrapTask(input, configuredStore);
+  };
   const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
     chat: new ChatEnvironmentAdapter(handoffService, defaultExecutionAdapter),
     work: new WorkEnvironmentAdapter(handoffService, defaultExecutionAdapter),
@@ -1989,7 +2070,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     adapters,
     handoffService,
     bootstrapTask,
-    prepareBootstrapTask,
+    prepareBootstrapTask: prepareConfiguredBootstrapTask,
     selectEnvironment,
     resolveModelRoute,
     discoverSkillMetadata,

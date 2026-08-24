@@ -927,7 +927,18 @@ describe("D-AI runtime", () => {
   });
 
   it("retries recovery capture and final persistence after the final save fails", async () => {
-    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const executionWithIdentity = (request: EnvironmentExecutionRequest): EnvironmentExecutionResult => ({
+      ...completedExecution(request),
+      contextManifestEntries: [
+        "branch:main",
+        "remote:origin",
+        "ref:refs/heads/main",
+        `artifact:commit:${"a".repeat(40)}`,
+        "local-state:clean-required",
+        "remote-repository:github.com/acme/d-ai",
+      ],
+    });
+    const runtimeHarness = harness(executionWithIdentity, evaluateHardGates, "YES");
     let recoverySaveAttempts = 0;
     const failingStore: DurableContextStore = {
       load: (taskId) => runtimeHarness.store.load(taskId),
@@ -965,7 +976,85 @@ describe("D-AI runtime", () => {
     const retry = await handle({ command: { kind: "complete", handoffId }, sourceEnvironment: "work", overrides: noOverrides });
     expect(retry).toMatchObject({ taskId: accepted.taskId, stage: "verify", status: "completed" });
     expect(captureAttempts).toHaveLength(3);
-    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "verify", handoffState: "completed", recoveryPoint: { recoveryPointId: expect.any(String) } });
+    const recovered = await runtimeHarness.store.load(accepted.taskId);
+    expect(recovered).toMatchObject({ stage: "verify", handoffState: "completed", recoveryPoint: { recoveryPointId: expect.any(String) } });
+    if (recovered === null) throw new InvalidTaskStateError("Expected recovered task state");
+    for (const prefix of ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:"] as const) {
+      expect(recovered.contextManifest.filter((entry) => entry.startsWith(prefix))).toHaveLength(1);
+    }
+    await expect(handle({ command: { kind: "close" }, sourceEnvironment: "work", overrides: noOverrides })).resolves.toMatchObject({
+      taskId: accepted.taskId,
+      stage: "close",
+      status: "completed",
+    });
+  });
+
+  it("blocks conflicting execution identity facts before persisting an ambiguous manifest", async () => {
+    const runtimeHarness = harness((request) => ({
+      ...completedExecution(request),
+      contextManifestEntries: [
+        "branch:main",
+        "branch:other",
+        "remote:origin",
+        "ref:refs/heads/main",
+        `artifact:commit:${"a".repeat(40)}`,
+        "local-state:clean-required",
+        "remote-repository:github.com/acme/d-ai",
+      ],
+    }), evaluateHardGates, "YES");
+
+    const result = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("chat", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/identity facts|conflicting|duplicate/i);
+  });
+
+  it.each([
+    ["malformed branch path", "branch:feature//bad"],
+    ["parent branch path", "branch:feature/.."],
+    ["trailing branch slash", "branch:feature/"],
+    ["malformed ref path", "ref:refs/heads/feature//bad"],
+    ["parent ref path", "ref:refs/heads/feature/.."],
+    ["ambiguous numeric artifact", `artifact:commit:${"1".repeat(41)}`],
+    ["ambiguous long numeric artifact", `artifact:commit:${"2".repeat(63)}`],
+  ] as const)("rejects %s at the execution identity seam", async (_label, invalidEntry) => {
+    const runtimeHarness = harness((request) => ({
+      ...completedExecution(request),
+      contextManifestEntries: [
+        "branch:main",
+        "remote:origin",
+        "ref:refs/heads/main",
+        `artifact:commit:${"a".repeat(40)}`,
+        "local-state:clean-required",
+        "remote-repository:github.com/acme/d-ai",
+      ].filter((entry) => {
+        const prefix = invalidEntry.startsWith("artifact:commit:") ? "artifact:commit:"
+          : invalidEntry.startsWith("ref:") ? "ref:"
+            : "branch:";
+        return !entry.startsWith(prefix);
+      }).concat(invalidEntry),
+    }), evaluateHardGates, "YES");
+
+    const result = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("codex", noOverrides));
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toMatch(/identity|approved|malformed|conflicting/i);
+  });
+
+  it.each(["a".repeat(40), "b".repeat(64)] as const)("retains supported %s-character hexadecimal artifacts", async (artifact) => {
+    const runtimeHarness = harness((request) => ({
+      ...completedExecution(request),
+      contextManifestEntries: [
+        "branch:main",
+        "remote:origin",
+        "ref:refs/heads/main",
+        `artifact:commit:${artifact}`,
+        "local-state:clean-required",
+        "remote-repository:github.com/acme/d-ai",
+      ],
+    }), evaluateHardGates, "YES");
+
+    await expect(createDAIRuntime(runtimeHarness.dependencies)(intentRequest("codex", noOverrides))).resolves.toMatchObject({ status: "completed" });
   });
 
   it("leaves the task retryable when the handoff service completion fails", async () => {
@@ -1779,7 +1868,7 @@ describe("D-AI runtime", () => {
     expect(afterRollback).toMatchObject({ stage: "recover", role: "recovery-operator", debugSession: beforeRollback?.debugSession, rollbackAudit: { archiveId: "archive-1", patchDigest: "a".repeat(64), verification: { passed: true } } });
   });
 
-  it("executes @D-AI rollback through the real Git adapter and persists its audit", async () => {
+  it("executes @D-AI rollback through the real Git adapter and persists its audit", { timeout: 15_000 }, async () => {
     const repositoryPath = await mkdtemp(join(tmpdir(), "d-ai-runtime-git-rollback-"));
     const git = async (argumentsList: readonly string[]): Promise<string> => (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
     try {

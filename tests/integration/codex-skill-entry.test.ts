@@ -91,7 +91,6 @@ describe("D-AI Codex Skill product boundary", { timeout: 20_000 }, () => {
     const workspacePath = join(root, "workspace");
     const canonicalSkillPath = join(process.cwd(), "skills", "custom", "d-ai");
     const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
-    const bareRemotePath = join(root, "remote.git");
     try {
       await mkdir(verificationSkillPath, { recursive: true });
       await writeFile(join(verificationSkillPath, "SKILL.md"), `---\nname: verify-local\ndescription: Bounded local verification\nmetadata:\n  triggers: '["verify"]'\n  compatibleEnvironments: '["codex"]'\n  compatibleStages: '["execute"]'\n---\n\n# Bounded local verification\n`, "utf8");
@@ -101,11 +100,8 @@ describe("D-AI Codex Skill product boundary", { timeout: 20_000 }, () => {
       await runGit(workspacePath, ["config", "user.name", "D-AI Test"]);
       await runGit(workspacePath, ["add", "."]);
       await runGit(workspacePath, ["commit", "-m", "test: bounded verification fixture"]);
-      await mkdir(bareRemotePath);
-      await runGit(bareRemotePath, ["init", "--bare"]);
       await runGit(workspacePath, ["branch", "-m", "verify/review"]);
-      await runGit(workspacePath, ["remote", "add", "origin", bareRemotePath]);
-      await runGit(workspacePath, ["push", "origin", "HEAD:refs/heads/verify/review"]);
+      await runGit(workspacePath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
 
       const entryPath = join(canonicalSkillPath, "scripts", "invoke.ps1");
       const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace");
@@ -124,6 +120,36 @@ describe("D-AI Codex Skill product boundary", { timeout: 20_000 }, () => {
       expect(state?.contextManifest).toContain("ref:refs/heads/verify/review");
       expect(state?.contextManifest).toContain("local-state:clean-required");
       expect(state?.verificationEvidence.map((item) => item.evidenceId)).toEqual(expect.arrayContaining(["gate:recovery"]));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks unsupported remotes at the public Skill execution boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-unsupported-remote-"));
+    const workspacePath = join(root, "workspace");
+    const canonicalSkillPath = join(process.cwd(), "skills", "custom", "d-ai");
+    const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
+    const bareRemotePath = join(root, "remote.git");
+    try {
+      await mkdir(verificationSkillPath, { recursive: true });
+      await writeFile(join(verificationSkillPath, "SKILL.md"), `---\nname: verify-local\ndescription: Bounded local verification\nmetadata:\n  triggers: '["verify"]'\n  compatibleEnvironments: '["codex"]'\n  compatibleStages: '["execute"]'\n---\n\n# Bounded local verification\n`, "utf8");
+      await writeFile(join(workspacePath, "fixture.txt"), "safe fixture\n", "utf8");
+      await runGit(workspacePath, ["init", "-b", "main"]);
+      await runGit(workspacePath, ["config", "user.email", "d-ai-test@example.invalid"]);
+      await runGit(workspacePath, ["config", "user.name", "D-AI Test"]);
+      await runGit(workspacePath, ["add", "."]);
+      await runGit(workspacePath, ["commit", "-m", "test: unsupported remote fixture"]);
+      await mkdir(bareRemotePath);
+      await runGit(bareRemotePath, ["init", "--bare"]);
+      await runGit(workspacePath, ["remote", "add", "origin", bareRemotePath]);
+      const entryPath = join(canonicalSkillPath, "scripts", "invoke.ps1");
+      const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace");
+
+      expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
+      const response = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(response).toMatchObject({ environment: "codex", status: "blocked", stage: "recover" });
+      expect(response.message).toMatch(/GitHub remote identity|github\.com|remote/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

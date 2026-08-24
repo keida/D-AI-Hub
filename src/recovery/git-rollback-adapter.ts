@@ -1,13 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { CommandExecutionError, redactSensitiveText, runCommand, type CommandResult } from "../adapters/command-runner.js";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
+import { resolveGitRepositoryRoot } from "../adapters/git.js";
 import type { TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
 import type { CapturedRecoveryPoint } from "./recovery-point-service.js";
 import { RollbackPartialFailureError, safeRollback, type AuditableGitAction, type RollbackResult } from "./rollback.js";
 import type { TaskState } from "../domain/types.js";
+
+const rollbackCommandTimeoutMs = 30_000;
+const rollbackCommandMaxOutputBytes = 1_048_576;
 
 function action(result: CommandResult): AuditableGitAction {
   return {
@@ -20,7 +24,13 @@ function action(result: CommandResult): AuditableGitAction {
 }
 
 async function git(repositoryPath: string, argumentsList: readonly string[]): Promise<CommandResult> {
-  return runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath });
+  return runCommand({
+    command: "git",
+    arguments: argumentsList,
+    cwd: repositoryPath,
+    timeoutMs: rollbackCommandTimeoutMs,
+    maxOutputBytes: rollbackCommandMaxOutputBytes,
+  });
 }
 
 async function gitAllowFailure(repositoryPath: string, argumentsList: readonly string[]): Promise<CommandResult> {
@@ -51,12 +61,43 @@ function patchDigest(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function createAdapter(repositoryPath: string, assertOwnership: TaskOwnershipGuard) {
+function durablePathSpec(repositoryPath: string, workspacePath: string): string {
+  const workspaceRelativePath = relative(repositoryPath, resolve(workspacePath)).replaceAll("\\", "/");
+  return workspaceRelativePath.length === 0 ? ".d-ai" : `${workspaceRelativePath}/.d-ai`;
+}
+
+function persistedRepositoryIdentityPath(contextManifest: readonly string[]): string | null {
+  const entries = contextManifest.filter((entry) => entry.startsWith("identity:repository:"));
+  if (entries.length !== 1) return null;
+  const payload = entries[0]!.slice("identity:repository:".length);
+  const separator = payload.lastIndexOf(":");
+  if (separator <= 0 || !/^[a-f0-9]{64}$/i.test(payload.slice(separator + 1))) return null;
+  return payload.slice(0, separator);
+}
+
+async function canonicalPath(path: string): Promise<string | null> {
+  try {
+    return await realpath(resolve(path));
+  } catch {
+    return null;
+  }
+}
+
+async function sameRepositoryPath(left: string, right: string): Promise<boolean> {
+  const [leftCanonical, rightCanonical] = await Promise.all([canonicalPath(left), canonicalPath(right)]);
+  if (leftCanonical === null || rightCanonical === null) return false;
+  return process.platform === "win32"
+    ? leftCanonical.toLowerCase() === rightCanonical.toLowerCase()
+    : leftCanonical === rightCanonical;
+}
+
+function createAdapter(repositoryPath: string, workspacePath: string, assertOwnership: TaskOwnershipGuard) {
+  const durablePath = durablePathSpec(repositoryPath, workspacePath);
   return {
     async preserveUncommittedWork() {
       await assertOwnership();
       const marker = `d-ai-rollback-${randomUUID()}`;
-      const stash = await git(repositoryPath, ["stash", "push", "--include-untracked", "--message", marker]);
+      const stash = await git(repositoryPath, ["stash", "push", "--include-untracked", "--message", marker, "--", ".", `:(exclude)${durablePath}`, `:(exclude)${durablePath}/**`]);
       if (/no local changes to save/i.test(stash.stdout)) {
         return { archiveId: `clean-worktree:${marker}`, patchDigest: patchDigest("") };
       }
@@ -113,20 +154,21 @@ function createAdapter(repositoryPath: string, assertOwnership: TaskOwnershipGua
       await assertOwnership();
       const branchResult = await git(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
       await assertOwnership();
-      const statusResult = await git(repositoryPath, ["status", "--porcelain=v1"]);
+      const statusResult = await git(repositoryPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", `:(exclude)${durablePath}`, `:(exclude)${durablePath}/**`]);
       await assertOwnership();
       const treeResult = await gitAllowFailure(repositoryPath, ["diff", "--quiet", recoveryPoint.snapshot.head, "HEAD"]);
       await assertOwnership();
       const observedHead = output(headResult);
       const observedBranch = output(branchResult);
       const observedStatus = output(statusResult);
+      const expectedStatus = recoveryPoint.snapshot.status === "clean" ? "" : recoveryPoint.snapshot.status;
       const passed = treeResult.exitCode === 0
         && observedBranch === recoveryPoint.snapshot.branch
-        && observedStatus === recoveryPoint.snapshot.status;
+        && observedStatus === expectedStatus;
       return {
         passed,
         observedOutput: `HEAD=${observedHead}; branch=${observedBranch}; status=${observedStatus || "clean"}`,
-        reason: passed ? "Recovery tree, branch, and workspace verified" : `Recovery point mismatch: expected tree=${recoveryPoint.snapshot.head}, branch=${recoveryPoint.snapshot.branch}, status=${recoveryPoint.snapshot.status || "clean"}; observed HEAD=${observedHead}, branch=${observedBranch}, status=${observedStatus || "clean"}`,
+        reason: passed ? "Recovery tree, branch, and workspace verified" : `Recovery point mismatch: tree comparison exit=${treeResult.exitCode}; expected tree=${recoveryPoint.snapshot.head}, branch=${recoveryPoint.snapshot.branch}, status=${expectedStatus || "clean"}; observed HEAD=${observedHead}, branch=${observedBranch}, status=${observedStatus || "clean"}`,
       };
     },
   };
@@ -149,18 +191,26 @@ export function createGitRollbackTask(repositoryPath: string): (
       throw new InvalidTaskStateError(`Task ${state.taskId} has a completed rollback audit; the rollback is terminal and must not be retried`);
     }
     const point = capturedPoint(state);
-    if (point.snapshot.workspacePath !== repositoryPath) throw new Error("Recovery workspace does not match the configured repository");
+    const repositoryRoot = await resolveGitRepositoryRoot(repositoryPath);
+    const canonicalWorkspacePath = await canonicalPath(repositoryPath);
+    if (canonicalWorkspacePath === null || !(await sameRepositoryPath(point.snapshot.workspacePath, repositoryPath))) {
+      throw new Error("Recovery workspace does not match the configured workspace");
+    }
+    const expectedRepositoryPath = persistedRepositoryIdentityPath(state.contextManifest);
+    if (expectedRepositoryPath === null || !(await sameRepositoryPath(expectedRepositoryPath, repositoryRoot))) {
+      throw new InvalidTaskStateError(`Task ${state.taskId} repository identity does not match the resolved Git root`);
+    }
     await assertOwnership();
-    const currentHead = output(await git(repositoryPath, ["rev-parse", "HEAD"]));
+    const currentHead = output(await git(repositoryRoot, ["rev-parse", "HEAD"]));
     await assertOwnership();
-    const ancestry = await gitAllowFailure(repositoryPath, ["merge-base", "--is-ancestor", point.snapshot.head, currentHead]);
+    const ancestry = await gitAllowFailure(repositoryRoot, ["merge-base", "--is-ancestor", point.snapshot.head, currentHead]);
     await assertOwnership();
     if (ancestry.exitCode !== 0) {
       throw new InvalidTaskStateError(`Recovery point ${point.snapshot.head} is not an ancestor of current HEAD ${currentHead}; rollback history is divergent`);
     }
     const commitsToRevert = currentHead === point.snapshot.head
       ? []
-      : output(await git(repositoryPath, ["rev-list", `${point.snapshot.head}..${currentHead}`])).split(/\r?\n/).filter((commit) => commit.length > 0);
-    return safeRollback({ recoveryPoint: point, commitsToRevert, adapter: createAdapter(repositoryPath, assertOwnership) });
+      : output(await git(repositoryRoot, ["rev-list", `${point.snapshot.head}..${currentHead}`])).split(/\r?\n/).filter((commit) => commit.length > 0);
+    return safeRollback({ recoveryPoint: point, commitsToRevert, adapter: createAdapter(repositoryRoot, canonicalWorkspacePath, assertOwnership) });
   };
 }

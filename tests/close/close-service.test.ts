@@ -76,10 +76,12 @@ function closeReadyState(now: string): TaskState {
     selectedCapabilities: ["shell"],
     contextManifest: [
       "identity:repository:C:/repo:" + "d".repeat(64),
+      "branch:main",
       "remote:origin",
       "ref:refs/heads/main",
       "local-state:clean-required",
       "artifact:commit:" + "e".repeat(40),
+      "remote-repository:github.com/acme/d-ai",
     ],
     handoffState: "completed",
     verificationEvidence: evidence(now),
@@ -768,6 +770,19 @@ describe("closeTask", () => {
     expect(verdict.reasons.join(" ")).toMatch(/remote state|repository|ref/i);
   });
 
+  it("returns NO before pushing when branch and target ref identity facts disagree", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const mismatchedState = {
+      ...state,
+      contextManifest: state.contextManifest.map((entry) => entry.startsWith("ref:") ? "ref:refs/heads/other" : entry),
+    };
+
+    const verdict = await closeTask(mismatchedState, { store: storeFor(mismatchedState), gitHub: unexpectedGitHub() });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/branch|target ref|match/i);
+  });
+
   it.each([
     ["duplicate commit artifacts", ["artifact:commit:" + "e".repeat(40), "artifact:commit:" + "e".repeat(40)]],
     ["conflicting commit artifacts", ["artifact:commit:" + "e".repeat(40), "artifact:commit:" + "f".repeat(40)]],
@@ -781,5 +796,18 @@ describe("closeTask", () => {
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/commit artifact/i);
+  });
+
+  it("returns NO before calling the adapter for a malformed branch path", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    const invalidState = {
+      ...state,
+      contextManifest: state.contextManifest.map((entry) => entry.startsWith("branch:") ? "branch:feature//bad" : entry),
+    };
+
+    const verdict = await closeTask(invalidState, { store: storeFor(invalidState), gitHub: unexpectedGitHub() });
+
+    expect(verdict.status).toBe("NO");
+    expect(verdict.reasons.join(" ")).toMatch(/branch|malformed/i);
   });
 });

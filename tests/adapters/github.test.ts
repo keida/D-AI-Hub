@@ -56,7 +56,7 @@ describe("GitHubCliAdapter external boundary", () => {
   it("blocks before transport when external credentials are not configured", async () => {
     const external = GitHubCliAdapter.create({ mode: "external", enterpriseHost: null, credentialsConfigured: false });
 
-    await expect(external.pushExpectedCommit("not-a-repository", "origin", "refs/heads/main", "0".repeat(40))).rejects.toThrow(/credentials|configuration/i);
+    await expect(external.pushExpectedCommit("not-a-repository", "origin", "refs/heads/main", "0".repeat(40), "github.com/acme/d-ai")).rejects.toThrow(/credentials|configuration/i);
   });
 
   it("does not push a local HEAD that differs from the durable commit artifact", async () => {
@@ -84,7 +84,7 @@ describe("GitHubCliAdapter external boundary", () => {
       await git(["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
       const localHead = await git(["rev-parse", "HEAD"]);
 
-      const evidence = await adapter.pushExpectedCommit(repositoryPath, "origin", "refs/heads/main", "0".repeat(40));
+      const evidence = await adapter.pushExpectedCommit(repositoryPath, "origin", "refs/heads/main", "0".repeat(40), "github.com/acme/d-ai");
 
       expect(pushCalls).toBe(0);
       expect(evidence).toMatchObject({ localSha: localHead, pushed: false, exitCode: 1, failureCategory: "verification-mismatch" });
@@ -92,5 +92,62 @@ describe("GitHubCliAdapter external boundary", () => {
     } finally {
       await rm(repositoryPath, { recursive: true, force: true });
     }
+  });
+
+  it("blocks a remote repository change before transport when close supplies the durable identity", async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), "d-ai-github-repository-identity-"));
+    const git = async (argumentsList: readonly string[]): Promise<string> => (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
+    let pushCalls = 0;
+    const adapter = GitHubCliAdapter.forTestTransport(
+      { mode: "test", enterpriseHost: null },
+      {
+        pushRef: async () => {
+          pushCalls += 1;
+          return { pushed: true, observedOutput: "pushed", exitCode: 0, failureCategory: null };
+        },
+        readRef: async () => ({ command: "git", arguments: ["ls-remote"], stdout: "", stderr: "", exitCode: 0 }),
+      },
+    );
+
+    try {
+      await git(["init", "--initial-branch=main"]);
+      await git(["config", "user.email", "d-ai@example.test"]);
+      await git(["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "known good\n", "utf8");
+      await git(["add", "artifact.txt"]);
+      await git(["commit", "-m", "known good"]);
+      await git(["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+
+      await expect(adapter.pushExpectedCommit(repositoryPath, "origin", "refs/heads/main", "0".repeat(40), "github.com/other/repository")).rejects.toThrow(/repository identity/i);
+      expect(pushCalls).toBe(0);
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks when a direct caller omits the durable repository identity", async () => {
+    const adapter = GitHubCliAdapter.forTestTransport(
+      { mode: "test", enterpriseHost: null },
+      { pushRef: async () => ({ pushed: true, observedOutput: "pushed", exitCode: 0, failureCategory: null }), readRef: async () => ({ command: "git", arguments: [], stdout: "", stderr: "", exitCode: 0 }) },
+    );
+    await expect(adapter.pushExpectedCommit("not-a-repository", "origin", "refs/heads/main", "0".repeat(40), undefined as unknown as string)).rejects.toThrow(/repository identity/i);
+  });
+
+  it("requires the durable repository identity before remote verification transport", async () => {
+    let readCalls = 0;
+    const adapter = GitHubCliAdapter.forTestTransport(
+      { mode: "test", enterpriseHost: null },
+      {
+        pushRef: async () => ({ pushed: true, observedOutput: "pushed", exitCode: 0, failureCategory: null }),
+        readRef: async () => {
+          readCalls += 1;
+          return { command: "git", arguments: [], stdout: `${"a".repeat(40)}\trefs/heads/main\n`, stderr: "", exitCode: 0 };
+        },
+      },
+    );
+
+    await expect(adapter.verifyRemoteState("not-a-repository", "origin", "github.com/acme/d-ai", "refs/heads/main", "a".repeat(40), "github.com/other/d-ai" as string)).rejects.toThrow(/repository identity/i);
+    await expect(adapter.verifyRemoteState("not-a-repository", "origin", "github.com/acme/d-ai", "refs/heads/main", "a".repeat(40), undefined as unknown as string)).rejects.toThrow(/repository identity/i);
+    expect(readCalls).toBe(0);
   });
 });

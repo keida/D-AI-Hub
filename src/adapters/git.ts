@@ -1,5 +1,6 @@
 import { CommandExecutionError, redactSensitiveText, runCommand, type CommandResult } from "./command-runner.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../domain/errors.js";
+import { isAbsolute, relative, resolve } from "node:path";
 
 export interface LocalGitState {
   readonly repositoryPath: string;
@@ -48,6 +49,14 @@ export class GitLocalStateError extends CloseBlockedError {
   }
 }
 
+function durableStatePath(repositoryRoot: string, workspacePath: string): string {
+  const workspaceRelativePath = relative(repositoryRoot, resolve(workspacePath)).replaceAll("\\", "/");
+  if (isAbsolute(workspaceRelativePath) || workspaceRelativePath === ".." || workspaceRelativePath.startsWith("../")) {
+    throw new GitLocalStateError("ambiguous", "Configured workspace must be inside the Git repository root");
+  }
+  return workspaceRelativePath.length === 0 ? ".d-ai" : `${workspaceRelativePath}/.d-ai`;
+}
+
 function assertNonEmpty(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) {
@@ -64,9 +73,18 @@ function assertRemoteName(remote: string): string {
   return normalized;
 }
 
+export function isValidGitBranchName(value: string): boolean {
+  if (!/^[A-Za-z0-9._/@-]+$/.test(value) || value.startsWith("-") || value === "@" || value.includes("@{") || value.includes("..") || value.includes("//") || value.startsWith("/") || value.endsWith("/")) return false;
+  return value.split("/").every((segment) => segment.length > 0 && !segment.startsWith(".") && !segment.endsWith(".") && !/\.lock$/i.test(segment));
+}
+
+export function isValidGitTargetRef(value: string): boolean {
+  return value.startsWith("refs/heads/") && isValidGitBranchName(value.slice("refs/heads/".length));
+}
+
 function assertTargetRef(ref: string): string {
   const normalized = assertNonEmpty(ref, "Git target ref");
-  if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(normalized) || normalized.includes("..") || normalized.endsWith("/")) {
+  if (!isValidGitTargetRef(normalized)) {
     throw new InvalidTaskStateError(`Git target ref is invalid: ${normalized}`);
   }
   return normalized;
@@ -227,25 +245,27 @@ export function classifyGitFailure(observedOutput: string): GitFailureCategory {
   return "ambiguous";
 }
 
-export async function inspectLocalGitState(repositoryPath: string, remote: string, ref: string): Promise<LocalGitState> {
+export async function inspectLocalGitState(repositoryPath: string, remote: string, ref: string, workspacePath = repositoryPath): Promise<LocalGitState> {
   const normalizedRemote = assertRemoteName(remote);
   const normalizedRef = assertTargetRef(ref);
-  const root = outputValue(await runGitRead(repositoryPath, ["rev-parse", "--show-toplevel"], "rev-parse --show-toplevel"), "Git repository root");
-  const branch = outputValue(await runGitRead(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"], "symbolic-ref --short HEAD"), "Git branch");
-  const head = outputValue(await runGitRead(repositoryPath, ["rev-parse", "HEAD"], "rev-parse HEAD"), "Git HEAD");
+  const root = await resolveGitRepositoryRoot(repositoryPath);
+  const branch = outputValue(await runGitRead(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], "symbolic-ref --short HEAD"), "Git branch");
+  if (!isValidGitBranchName(branch)) {
+    throw new GitLocalStateError("ambiguous", `Git branch is malformed: ${branch}`);
+  }
+  if (`refs/heads/${branch}` !== normalizedRef) {
+    throw new GitLocalStateError("verification-mismatch", `Git branch ${branch} does not match configured target ref ${normalizedRef}`);
+  }
+  const head = outputValue(await runGitRead(root, ["rev-parse", "HEAD"], "rev-parse HEAD"), "Git HEAD");
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) {
     throw new GitLocalStateError("ambiguous", `Git HEAD is not a full object id: ${head}`);
   }
-  const trackedDurableState = (await runGitRead(root, ["ls-files", "--", ".d-ai"], "ls-files .d-ai")).stdout.trim();
-  const statusArguments = trackedDurableState.length === 0
-    ? ["status", "--porcelain=v1", "--", ".", ":(exclude).d-ai"]
-    : ["status", "--porcelain=v1"];
+  const durablePath = durableStatePath(root, workspacePath);
+  const statusArguments = ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", `:(exclude)${durablePath}`, `:(exclude)${durablePath}/**`];
   const worktreeStatus = (await runGitRead(
     root,
     statusArguments,
-    trackedDurableState.length === 0
-      ? "status --porcelain=v1 (excluding untracked D-AI durable state)"
-      : "status --porcelain=v1",
+    `status --porcelain=v1 (excluding durable ${durablePath})`,
   )).stdout.trim();
   const remoteUrls = await readGitConfigValues(root, `remote.${normalizedRemote}.url`, "Git remote URL");
   if (remoteUrls.length !== 1) {
@@ -273,13 +293,20 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
   };
 }
 
+export async function resolveGitRepositoryRoot(repositoryPath: string): Promise<string> {
+  return outputValue(
+    await runGitRead(null, ["-C", repositoryPath, "rev-parse", "--show-toplevel"], "rev-parse --show-toplevel"),
+    "Git repository root",
+  );
+}
+
 export async function inspectCurrentGitState(repositoryPath: string, remote: string): Promise<LocalGitState> {
-  const root = outputValue(await runGitRead(repositoryPath, ["rev-parse", "--show-toplevel"], "rev-parse --show-toplevel"), "Git repository root");
+  const root = await resolveGitRepositoryRoot(repositoryPath);
   const branch = outputValue(await runGitRead(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], "symbolic-ref --short HEAD"), "Git branch");
-  if (!/^[A-Za-z0-9._/-]+$/.test(branch) || branch.includes("..") || branch.endsWith("/")) {
+  if (!isValidGitBranchName(branch)) {
     throw new GitLocalStateError("ambiguous", `Git branch is invalid: ${branch}`);
   }
-  return inspectLocalGitState(root, remote, `refs/heads/${branch}`);
+  return inspectLocalGitState(root, remote, `refs/heads/${branch}`, repositoryPath);
 }
 
 export async function pushGitRef(repositoryPath: string, endpoint: string, ref: string, head: string): Promise<GitPushResult> {
