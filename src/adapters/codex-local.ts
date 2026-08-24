@@ -83,7 +83,8 @@ function oneRemoteRepositoryIdentity(state: TaskState): string | undefined {
   return entries.length === 1 ? entries[0]?.slice("remote-repository:".length) : undefined;
 }
 
-export function createCodexExecutionAdapter(now: () => Date = () => new Date()): EnvironmentExecutor {
+export function createCodexExecutionAdapter(now: () => Date = () => new Date(), enterpriseHost?: string | null): EnvironmentExecutor {
+  const configuredEnterpriseHost = enterpriseHost === undefined ? process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null : enterpriseHost;
   return async (request): Promise<EnvironmentExecutionResult> => {
     const selectedSkill = request.skills.find((skill) => skill.descriptor.triggers.includes("verify"));
     if (!boundedGoal(request) || selectedSkill === undefined || selectedSkill.instructions.trim().length === 0) {
@@ -112,7 +113,7 @@ export function createCodexExecutionAdapter(now: () => Date = () => new Date()):
     }
     let actualRemoteRepository: string;
     try {
-      actualRemoteRepository = resolveGitHubRepository(local.remoteUrl, process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null).repository;
+      actualRemoteRepository = resolveGitHubRepository(local.remoteUrl, configuredEnterpriseHost).repository;
     } catch (error: unknown) {
       const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
       return { status: "blocked", evidence: [], message: `Codex verification requires a configured GitHub remote identity: ${message}` };
@@ -160,7 +161,8 @@ export function createCodexExecutionAdapter(now: () => Date = () => new Date()):
   };
 }
 
-export function createCodexRecoveryPointCapture(now: () => Date = () => new Date()): (state: TaskState) => Promise<CapturedRecoveryPoint> {
+export function createCodexRecoveryPointCapture(now: () => Date = () => new Date(), enterpriseHost?: string | null): (state: TaskState) => Promise<CapturedRecoveryPoint> {
+  const configuredEnterpriseHost = enterpriseHost === undefined ? process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null : enterpriseHost;
   return async (state): Promise<CapturedRecoveryPoint> => {
     const repositoryPath = identityPath(state, "repository");
     const workspacePath = identityPath(state, "workspace");
@@ -176,7 +178,7 @@ export function createCodexRecoveryPointCapture(now: () => Date = () => new Date
     }
     let actualRemoteRepository: string;
     try {
-      actualRemoteRepository = resolveGitHubRepository(local.remoteUrl, process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null).repository;
+      actualRemoteRepository = resolveGitHubRepository(local.remoteUrl, configuredEnterpriseHost).repository;
     } catch (error: unknown) {
       const message = redactSensitiveText(error instanceof Error ? error.message : String(error));
       throw new Error(`Codex recovery requires a configured GitHub remote identity: ${message}`);

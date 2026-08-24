@@ -21,8 +21,8 @@ export interface RemoteState {
 }
 
 export interface GitHubAdapter {
-  pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string, expectedRepository: string): Promise<GitPushEvidence>;
-  verifyRemoteState(repositoryPath: string, remote: string, repository: string, ref: string, expectedSha: string, expectedRepository: string): Promise<RemoteState>;
+  pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string, expectedRepository: string, workspacePath?: string): Promise<GitPushEvidence>;
+  verifyRemoteState(repositoryPath: string, remote: string, repository: string, ref: string, expectedSha: string, expectedRepository: string, workspacePath?: string): Promise<RemoteState>;
 }
 
 export type GitHubRemotePolicy =
@@ -168,13 +168,13 @@ export class GitHubCliAdapter implements GitHubAdapter {
     return new GitHubCliAdapter(policy, transport);
   }
 
-  public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string, expectedRepository: string): Promise<GitPushEvidence> {
+  public async pushExpectedCommit(repositoryPath: string, remote: string, ref: string, expectedSha: string, expectedRepository: string, workspacePath = repositoryPath): Promise<GitPushEvidence> {
     this.assertConfigured();
     if (typeof expectedRepository !== "string" || expectedRepository.trim().length === 0) {
       throw new GitRemoteBlockedError("Durable GitHub repository identity is required for push verification");
     }
     const expected = assertExpectedSha(expectedSha);
-    const localState = await inspectLocalGitState(repositoryPath, remote, ref);
+    const localState = await inspectLocalGitState(repositoryPath, remote, ref, workspacePath);
     const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
     const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
     if (configuredRepository.repository !== expectedRepository) {
@@ -221,7 +221,7 @@ export class GitHubCliAdapter implements GitHubAdapter {
     };
   }
 
-  public async verifyRemoteState(repositoryPath: string, remote: string, repository: string, ref: string, expectedSha: string, expectedRepository: string): Promise<RemoteState> {
+  public async verifyRemoteState(repositoryPath: string, remote: string, repository: string, ref: string, expectedSha: string, expectedRepository: string, workspacePath = repositoryPath): Promise<RemoteState> {
     this.assertConfigured();
     if (typeof expectedRepository !== "string" || expectedRepository.trim().length === 0) {
       throw new GitRemoteBlockedError("Durable GitHub repository identity is required for remote verification");
@@ -236,7 +236,7 @@ export class GitHubCliAdapter implements GitHubAdapter {
       throw new GitRemoteBlockedError("GitHub repository identity is empty");
     }
     assertAllowedHost(host, this.enterpriseHost);
-    const localState = await inspectLocalGitState(repositoryPath, remote, ref);
+    const localState = await inspectLocalGitState(repositoryPath, remote, ref, workspacePath);
     const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
     const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);
     if (configuredRepository.repository !== expectedRepository || configuredRepository.repository !== repository) {

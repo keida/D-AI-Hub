@@ -6,6 +6,7 @@ import type { CloseCandidate, CloseVerdict, DurableContextManifest, TaskState, V
 import { isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import type { DurableContextStore, TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
+import { canonicalWorkspaceIdentityPath } from "../state/workspace-identity.js";
 import { evaluateHardGates, type GateEvidence, type GateName } from "../verification/gates.js";
 
 const maximumEvidenceAgeMs = 5 * 60 * 1_000;
@@ -23,6 +24,7 @@ const evidenceGateNames = [
 
 interface CloseConfiguration {
   readonly repositoryPath: string;
+  readonly workspacePath: string;
   readonly expectedRepository: string;
   readonly remote: string;
   readonly ref: string;
@@ -92,6 +94,21 @@ function repositoryPathFromManifest(values: readonly string[], reasons: string[]
   return repositoryPath;
 }
 
+function workspacePathFromManifest(values: readonly string[], repositoryPath: string, reasons: string[]): string | null {
+  const entries = values.filter((value) => value.startsWith("identity:workspace:"));
+  if (entries.length === 0) return repositoryPath;
+  if (entries.length !== 1) {
+    reasons.push(failure("Workspace identity is missing or ambiguous", "record exactly one workspace identity during bootstrap"));
+    return null;
+  }
+  const workspacePath = canonicalWorkspaceIdentityPath(values);
+  if (workspacePath === null) {
+    reasons.push(failure("Workspace identity is malformed", "re-bootstrap the task against the intended workspace"));
+    return null;
+  }
+  return workspacePath;
+}
+
 function hasExactArtifacts(manifest: DurableContextManifest, state: TaskState, snapshotManifest: DurableContextManifest | null): boolean {
   const recoveryPoint = state.recoveryPoint;
   if (recoveryPoint === null || recoveryPoint.recoveryPointId !== manifest.recoveryPointId) {
@@ -157,6 +174,7 @@ function preflight(state: TaskState, now: Date, snapshotManifest: DurableContext
     reasons.push(failure("Required durable artifact correspondence is incomplete", "restore the durable artifact manifest and matching recovery point"));
   }
   const repositoryPath = repositoryPathFromManifest(state.contextManifest, reasons);
+  const workspacePath = repositoryPath === null ? null : workspacePathFromManifest(state.contextManifest, repositoryPath, reasons);
   const branch = oneManifestValue(state.contextManifest, "branch:", "Branch", reasons);
   const remote = oneManifestValue(state.contextManifest, "remote:", "Configured remote", reasons);
   const ref = oneManifestValue(state.contextManifest, "ref:", "Target ref", reasons);
@@ -178,10 +196,10 @@ function preflight(state: TaskState, now: Date, snapshotManifest: DurableContext
       reasons.push(failure(`Hard gate ${result.gate} failed: ${result.reason}`, "rerun and record fresh passing evidence for this gate"));
     }
   }
-  if (repositoryPath === null || branch === null || expectedRepository === null || remote === null || ref === null || commitSha === null || policy === null || reasons.length > 0) {
+  if (repositoryPath === null || workspacePath === null || branch === null || expectedRepository === null || remote === null || ref === null || commitSha === null || policy === null || reasons.length > 0) {
     return { reasons, configuration: null };
   }
-  return { reasons, configuration: { repositoryPath, expectedRepository, remote, ref, commitSha } };
+  return { reasons, configuration: { repositoryPath, workspacePath, expectedRepository, remote, ref, commitSha } };
 }
 
 function createCloseCandidate(state: TaskState, configuration: CloseConfiguration, recordedAt: string): CloseCandidate {
@@ -431,7 +449,7 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before push: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], state.verificationEvidence);
   }
-  const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref, configuration.commitSha, configuration.expectedRepository).then(
+  const pushResult = await dependencies.gitHub.pushExpectedCommit(configuration.repositoryPath, configuration.remote, configuration.ref, configuration.commitSha, configuration.expectedRepository, configuration.workspacePath).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as GitPushEvidence | null, error }),
   );
@@ -482,7 +500,7 @@ export async function closeTask(
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Close ownership was lost before remote verification: ${redactSensitiveText(message)}`, "reacquire task ownership and rerun close")], [...state.verificationEvidence, recordedPushEvidence]);
   }
-  const remoteResult = await dependencies.gitHub.verifyRemoteState(configuration.repositoryPath, configuration.remote, pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha, configuration.expectedRepository).then(
+  const remoteResult = await dependencies.gitHub.verifyRemoteState(configuration.repositoryPath, configuration.remote, pushResult.value.repository, pushResult.value.ref, pushResult.value.localSha, configuration.expectedRepository, configuration.workspacePath).then(
     (value) => ({ value, error: null as Error | null }),
     (error: Error) => ({ value: null as RemoteState | null, error }),
   );

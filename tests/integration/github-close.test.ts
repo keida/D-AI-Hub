@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -75,7 +75,7 @@ function externalIntegrationConfiguration(): ExternalIntegrationConfiguration | 
   };
 }
 
-function stateFor(repositoryPath: string, commitSha: string, now: string, remote: string, ref: string): TaskState {
+function stateFor(repositoryPath: string, commitSha: string, now: string, remote: string, ref: string, workspacePath = repositoryPath): TaskState {
   const durablePaths = ["context.json", "evidence.json", "recovery.json"];
   const hashes = {
     "context.json": "a".repeat(64),
@@ -100,6 +100,7 @@ function stateFor(repositoryPath: string, commitSha: string, now: string, remote
     },
     selectedCapabilities: ["shell"],
     contextManifest: [
+      `identity:workspace:${workspacePath}:${createHash("sha256").update(workspacePath, "utf8").digest("hex")}`,
       `identity:repository:${repositoryPath}:${createHash("sha256").update(repositoryPath, "utf8").digest("hex")}`,
       "branch:main",
       `remote:${remote}`,
@@ -150,9 +151,10 @@ async function createRealCloseFixture(
   now: string,
   remote: string,
   ref: string,
+  workspacePath = repositoryPath,
 ): Promise<RealCloseFixture> {
   const store = new FileDurableContextStore(durableContextRoot);
-  const initial = stateFor(repositoryPath, commitSha, now, remote, ref);
+  const initial = stateFor(repositoryPath, commitSha, now, remote, ref, workspacePath);
   const baseState: TaskState = {
     ...initial,
     verificationEvidence: verificationEvidence(now).map((item) => ({ ...item, recoveryPointId: null })),
@@ -191,7 +193,7 @@ interface BareCloseFixture {
   readonly close: RealCloseFixture;
 }
 
-async function createBareCloseFixture(prefix: string): Promise<BareCloseFixture> {
+async function createBareCloseFixture(prefix: string, workspaceRelativePath = ""): Promise<BareCloseFixture> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   const repositoryPath = join(root, "repository");
   const bareRemotePath = join(root, "remote.git");
@@ -204,7 +206,7 @@ async function createBareCloseFixture(prefix: string): Promise<BareCloseFixture>
   await git(repositoryPath, ["commit", "-m", "integration artifact"]);
   const commitSha = await git(repositoryPath, ["rev-parse", "HEAD"]);
   await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
-  const close = await createRealCloseFixture(join(root, "durable"), repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main");
+  const close = await createRealCloseFixture(join(root, "durable"), repositoryPath, commitSha, new Date().toISOString(), "origin", "refs/heads/main", join(repositoryPath, workspaceRelativePath));
   return { root, repositoryPath, bareRemotePath, close };
 }
 
@@ -343,6 +345,59 @@ describe("GitHub close integration", () => {
       expect(await close.store.loadCloseCandidate(close.state.taskId)).toEqual(verdict.closeCandidate);
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("completes nested workspace close when only the logical workspace durable state is dirty", async () => {
+    const fixture = await createBareCloseFixture("d-ai-github-close-nested-workspace-", "packages/service");
+    const nestedDurablePath = join(fixture.repositoryPath, "packages", "service", ".d-ai", "tasks", "state.json");
+    try {
+      await mkdir(join(fixture.repositoryPath, "packages", "service", ".d-ai", "tasks"), { recursive: true });
+      await writeFile(nestedDurablePath, "durable task state\n", "utf8");
+      const transport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head),
+        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
+      };
+
+      const verdict = await closeWithOwnership(fixture.close.state, {
+        store: fixture.close.store,
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
+      });
+
+      expect(verdict).toMatchObject({ status: "YES", reasons: [] });
+      expect(await git(fixture.bareRemotePath, ["rev-parse", "refs/heads/main"])).toBe(fixture.close.commitSha);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks nested workspace close when an unrelated file is dirty alongside durable state", async () => {
+    const fixture = await createBareCloseFixture("d-ai-github-close-nested-dirty-", "packages/service");
+    const nestedWorkspace = join(fixture.repositoryPath, "packages", "service");
+    let pushCalls = 0;
+    try {
+      await mkdir(join(nestedWorkspace, ".d-ai", "tasks"), { recursive: true });
+      await writeFile(join(nestedWorkspace, ".d-ai", "tasks", "state.json"), "durable task state\n", "utf8");
+      await writeFile(join(nestedWorkspace, "notes.txt"), "unrelated dirty file\n", "utf8");
+      const transport: GitTransport = {
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) => {
+          pushCalls += 1;
+          return pushGitRef(localRepositoryPath, fixture.bareRemotePath, ref, head);
+        },
+        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(fixture.bareRemotePath, ref, null),
+      };
+
+      const verdict = await closeWithOwnership(fixture.close.state, {
+        store: fixture.close.store,
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
+      });
+
+      expect(verdict.status).toBe("NO");
+      expect(verdict.reasons.join(" ")).toMatch(/worktree is not clean|dirty/i);
+      expect(pushCalls).toBe(0);
+      await expect(git(fixture.bareRemotePath, ["rev-parse", "--verify", "refs/heads/main"])).rejects.toThrow();
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
     }
   });
 
