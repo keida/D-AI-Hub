@@ -2,13 +2,13 @@
 
 ## State
 
-- Lifecycle: active
+- Lifecycle: completed
 - Last updated: 2026-08-24
 
 ## Current checkpoint
 
-- Current task: close out and publish the verified Codex-first V1 scope without changing the runtime or canonical main worktree.
-- Working state: the fresh private-repository acceptance lifecycle passed on current main. The canonical `main` worktree remains dirty with pre-existing Skill-routing changes; all existing worktrees, branches, and fixtures are preserved.
+- Current task: none. Codex-first V1 is completed and passed real acceptance; PR #9 was merged into `main` with a normal merge commit.
+- Working state: the project is in a stable post-merge state with no active development task. The canonical `main` worktree remains dirty with pre-existing Skill-routing changes; all existing worktrees, branches, and fixtures are preserved.
 - Authorized file scope: product documentation and project state only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
 - Scope decision: D-AI V1 is Codex local control + GitHub durable evidence + D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only, not a D-AI runtime dependency; any separate authorized repository-hosted maintenance remains outside V1 activation. Native Chat, native Work, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred.
 
@@ -20,15 +20,15 @@
 
 ## Verified evidence
 
-- A new private-repository acceptance task was established from current main with fresh durable state and a recovery point.
-- Normal `@D-AI status` uniquely discovered the active task without `--task`; normal `@D-AI close` completed with all 11 evidence gates passing, including push and exact remote repository/ref/SHA verification.
-- The runtime close response returned `Safe-to-delete: YES`; critical unsaved context was empty, durable context was saved, the worktree was clean at the execution boundary, and no secret-like material was found in the durable evidence. The exact command results and GitHub visibility proof remain in the temporary acceptance report, not in project memory.
+- PR #9 was merged into `main` with a normal merge commit after the tracked documentation diff and GitHub PR review gates passed.
+- The merged PR's tracked diff and GitHub PR record document the Codex-first V1 acceptance conclusion, preservation of known gaps, and explicit Chat/Work deferral; detailed execution evidence is intentionally not repeated in project memory.
 - The 2026-08-21 v2 spec remains tracked and carries an explicit note that its cross-environment delivery scope is superseded by the Codex-first decision.
 
 ## Current blockers
 
-- Local Git authentication remains environment-dependent and is tracked by BUG-001; it does not invalidate the verified configured acceptance path.
+- None for the completed Codex-first V1 scope. BUG-001 remains a known environment-dependent gap, not an active task.
+- Chat/Work remains deferred and is not a current task; any future continuation requires a new independent scope and task.
 
 ## Next concrete action
 
-Review PR #9. If head/base remain unchanged, no new P0/P1 findings appear, and the PR remains mergeable, wait for explicit merge authorization. Do not start Work activation or native Chat/Work integration.
+No action; wait for a new explicit scope/task. Do not start Chat/Work without that independent scope and task.
