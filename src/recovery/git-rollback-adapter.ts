@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { CommandExecutionError, redactSensitiveText, runCommand, type CommandResult } from "../adapters/command-runner.js";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
-import { resolveGitRepositoryRoot } from "../adapters/git.js";
+import { literalExcludePathspec, resolveGitRepositoryRoot } from "../adapters/git.js";
 import type { TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
 import type { CapturedRecoveryPoint } from "./recovery-point-service.js";
 import { RollbackPartialFailureError, safeRollback, type AuditableGitAction, type RollbackResult } from "./rollback.js";
@@ -97,7 +97,7 @@ function createAdapter(repositoryPath: string, workspacePath: string, assertOwne
     async preserveUncommittedWork() {
       await assertOwnership();
       const marker = `d-ai-rollback-${randomUUID()}`;
-      const stash = await git(repositoryPath, ["stash", "push", "--include-untracked", "--message", marker, "--", ".", `:(exclude)${durablePath}`, `:(exclude)${durablePath}/**`]);
+      const stash = await git(repositoryPath, ["stash", "push", "--include-untracked", "--message", marker, "--", ".", literalExcludePathspec(durablePath)]);
       if (/no local changes to save/i.test(stash.stdout)) {
         return { archiveId: `clean-worktree:${marker}`, patchDigest: patchDigest("") };
       }
@@ -154,7 +154,7 @@ function createAdapter(repositoryPath: string, workspacePath: string, assertOwne
       await assertOwnership();
       const branchResult = await git(repositoryPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
       await assertOwnership();
-      const statusResult = await git(repositoryPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", `:(exclude)${durablePath}`, `:(exclude)${durablePath}/**`]);
+      const statusResult = await git(repositoryPath, ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", literalExcludePathspec(durablePath)]);
       await assertOwnership();
       const treeResult = await gitAllowFailure(repositoryPath, ["diff", "--quiet", recoveryPoint.snapshot.head, "HEAD"]);
       await assertOwnership();

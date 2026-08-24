@@ -57,6 +57,10 @@ function durableStatePath(repositoryRoot: string, workspacePath: string): string
   return workspaceRelativePath.length === 0 ? ".d-ai" : `${workspaceRelativePath}/.d-ai`;
 }
 
+export function literalExcludePathspec(path: string): string {
+  return `:(exclude,literal)${path}`;
+}
+
 function assertNonEmpty(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) {
@@ -261,7 +265,7 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
     throw new GitLocalStateError("ambiguous", `Git HEAD is not a full object id: ${head}`);
   }
   const durablePath = durableStatePath(root, workspacePath);
-  const statusArguments = ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", `:(exclude)${durablePath}`, `:(exclude)${durablePath}/**`];
+  const statusArguments = ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", literalExcludePathspec(durablePath)];
   const worktreeStatus = (await runGitRead(
     root,
     statusArguments,
