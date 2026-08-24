@@ -140,6 +140,26 @@ describe("Git rollback adapter", () => {
     }
   });
 
+  it("preserves sibling durable-like dirt when the nested workspace path contains brackets", async () => {
+    const fixture = await createRepository();
+    const nestedWorkspace = join(fixture.root, "nested[one]");
+    const siblingDurable = join(fixture.root, "nestedo", ".d-ai");
+    try {
+      await mkdir(join(nestedWorkspace, ".d-ai"), { recursive: true });
+      await writeFile(join(nestedWorkspace, ".d-ai", "intended.txt"), "intended durable state\n", "utf8");
+      await mkdir(siblingDurable, { recursive: true });
+      await writeFile(join(siblingDurable, "sibling.txt"), "sibling dirty state\n", "utf8");
+      const nestedSnapshot = { ...fixture.snapshot, workspacePath: nestedWorkspace };
+      const result = await createGitRollbackTask(nestedWorkspace)(state(nestedSnapshot, undefined, [fixture.root]), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
+      const archive = await git(fixture.root, ["stash", "show", "--include-untracked", "--name-only", result.preservedUserWork.archiveId]);
+
+      expect(archive).toContain("nestedo/.d-ai/sibling.txt");
+      expect(archive).not.toContain("nested[one]/.d-ai/intended.txt");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(process.platform !== "win32")("accepts a junction workspace alias without weakening repository fencing", async () => {
     const fixture = await createRepository();
     const workspaceAlias = join(tmpdir(), "d-ai-rollback-junction-alias");
