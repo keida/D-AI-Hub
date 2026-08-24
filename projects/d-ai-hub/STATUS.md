@@ -31,4 +31,4 @@
 
 ## Next concrete action
 
-Complete the documentation gate and independent read-only reviews, then publish the minimal closeout documentation if all release checks remain green. Do not start Work activation or native Chat/Work integration.
+Review PR #9. If head/base remain unchanged, no new P0/P1 findings appear, and the PR remains mergeable, wait for explicit merge authorization. Do not start Work activation or native Chat/Work integration.
