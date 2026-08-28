@@ -346,7 +346,7 @@ describe("GitHub close integration", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("completes nested workspace close when only the logical workspace durable state is dirty", async () => {
     const fixture = await createBareCloseFixture("d-ai-github-close-nested-workspace-", "packages/service");
@@ -369,7 +369,7 @@ describe("GitHub close integration", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("blocks nested workspace close when an unrelated file is dirty alongside durable state", async () => {
     const fixture = await createBareCloseFixture("d-ai-github-close-nested-dirty-", "packages/service");

@@ -7,9 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: The guarded Memorix decision, lightweight engineering routing, direct upstream Matt Skills, Superpowers discovery, and Router deferral are integrated on `main` through PR #12.
-- Working state: `main` contains the merged documentation integration. The original dirty checkout and its existing worktrees remain untouched.
-- Authorized file scope: Memorix and routing documentation, third-party Skill records, discovery index, roadmap, references, and project state only. Runtime, tests, adapters, dependencies, Router implementation, and Memorix adapter implementation remain out of scope.
+- Current task: The local repository health check and its Windows test-stability repairs are committed locally on the isolated `codex/repository-health-check` branch. It remains unpushed; no release or synchronization claim is made.
+- Working state: the health check performs local Git/file inspections, then runs trusted workspace build and test scripts sequentially. Its finite per-command budget is 300 seconds and its finite output bound is 64 KiB. Inspections are local and read-only; trusted workspace scripts may have side effects or network access. The former 120-second health budget was insufficient; the new run completed the real build/test in approximately 171 seconds and reported `unhealthy` only because the feature worktree is dirty.
+- Verification: focused health tests passed 29/29; `npm run build` passed; `git diff --check` passed with only LF-to-CRLF working-copy warnings; independent reviews were clean. The Windows suite stability repair uses two workers and a 30-second default test budget; full `npm test` passed 28/28 files and 587/587 tests in approximately 185 seconds. Related cleanup assertions were stabilized and GitHub durable-identity preflight was repaired without adding network transport. The original dirty root checkout and other worktrees were untouched.
+- Authorized file scope: the health-check source, local CLI/package script, focused tests, design, and project state. Existing runtime lifecycle behavior, environment adapters, dependencies, Router implementation, and Memorix adapter implementation remain out of scope. The original dirty checkout and other worktrees were untouched.
 - Scope decision: Git/Markdown and D-AI-Hub remain canonical. Memorix remains an optional guarded local adapter proposal; the routing update adds no second control plane, external Router, native Chat/Work activation, or automatic cross-environment handoff.
 - PoC verdict: Memorix is PARTIAL; see its 2026-08-28 decision in `DECISIONS.md` for verified capabilities, limits, and the guarded adapter contract.
 
@@ -29,8 +30,8 @@
 
 ## Current blockers
 
-- No implementation blocker. Memorix and any external Router remain unimplemented and require separate authorization; Chat/Work remains deferred.
+- No current verification blocker. Memorix and any external Router remain unimplemented and require separate authorization; Chat/Work remains deferred.
 
 ## Next concrete action
 
-Choose one separately authorized D-AI-Hub roadmap action before further implementation. Do not implement the Memorix adapter or install an external Router without explicit authorization.
+Obtain the user decision on push or PR. Do not claim readiness, release, synchronization, push, PR, or merge; do not implement the Memorix adapter or install an external Router without explicit authorization.

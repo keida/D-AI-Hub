@@ -1,5 +1,5 @@
-import { redactSensitiveText } from "./command-runner.js";
-import { gitCliTransport, inspectLocalGitState, resolveGitEndpoint, summarizeLocalGitState, type GitFailureCategory, type GitTransport } from "./git.js";
+import { CommandExecutionError, redactSensitiveText, runCommand } from "./command-runner.js";
+import { gitCliTransport, inspectLocalGitState, resolveGitEndpoint, resolveGitRepositoryRoot, summarizeLocalGitState, type GitFailureCategory, type GitTransport } from "./git.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../domain/errors.js";
 
 export interface GitPushEvidence {
@@ -147,6 +147,60 @@ function parseRemoteSha(output: string, ref: string): string {
   return sha;
 }
 
+function assertPreflightRemoteName(remote: string): string {
+  const normalized = remote.trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(normalized)) {
+    throw new InvalidTaskStateError(`Git remote name is invalid: ${normalized}`);
+  }
+  return normalized;
+}
+
+async function readPreflightConfigValues(repositoryRoot: string, key: string): Promise<readonly string[]> {
+  try {
+    const result = await runCommand({
+      command: "git",
+      arguments: ["config", "--null", "--get-all", key],
+      cwd: repositoryRoot,
+      timeoutMs: 30_000,
+      maxOutputBytes: 1_048_576,
+    });
+    const values = result.stdout.split("\0");
+    const trailingValue = values.pop();
+    if (trailingValue !== "") {
+      throw new GitRemoteBlockedError("Git remote configuration has malformed command output");
+    }
+    return values;
+  } catch (error: unknown) {
+    if (error instanceof GitRemoteBlockedError) throw error;
+    if (error instanceof CommandExecutionError && error.result.exitCode === 1 && error.result.stdout.length === 0 && error.result.stderr.length === 0) {
+      return [];
+    }
+    throw new GitRemoteBlockedError("Unable to inspect configured Git remote before durable repository identity verification");
+  }
+}
+
+async function assertDurableRepositoryIdentityBeforeLocalInspection(repositoryPath: string, remote: string, expectedRepository: string, enterpriseHost: string | null): Promise<void> {
+  const normalizedRemote = assertPreflightRemoteName(remote);
+  const repositoryRoot = await resolveGitRepositoryRoot(repositoryPath);
+  const remoteUrls = await readPreflightConfigValues(repositoryRoot, `remote.${normalizedRemote}.url`);
+  if (remoteUrls.length !== 1 || remoteUrls[0] === undefined) {
+    throw new GitRemoteBlockedError(`Git remote URL must resolve to exactly one endpoint before durable repository identity verification; observed ${remoteUrls.length}`);
+  }
+  const configuredRepository = resolveGitHubRepository(remoteUrls[0], enterpriseHost);
+  const pushUrls = await readPreflightConfigValues(repositoryRoot, `remote.${normalizedRemote}.pushurl`);
+  if (pushUrls.length > 1) {
+    throw new GitRemoteBlockedError(`Git push URL must resolve to at most one endpoint before durable repository identity verification; observed ${pushUrls.length}`);
+  }
+  const pushEndpoint = await resolveGitEndpoint(repositoryRoot, pushUrls[0] ?? remoteUrls[0]);
+  const pushRepository = resolveGitHubRepository(pushEndpoint, enterpriseHost);
+  if (configuredRepository.repository !== expectedRepository) {
+    throw new GitRemoteBlockedError("Configured remote repository does not match the durable repository identity");
+  }
+  if (pushRepository.repository !== configuredRepository.repository) {
+    throw new GitRemoteBlockedError("Effective Git push transport conflicts with the configured remote repository identity");
+  }
+}
+
 export class GitHubCliAdapter implements GitHubAdapter {
   private readonly enterpriseHost: string | null;
   private readonly transport: GitTransport;
@@ -174,6 +228,7 @@ export class GitHubCliAdapter implements GitHubAdapter {
       throw new GitRemoteBlockedError("Durable GitHub repository identity is required for push verification");
     }
     const expected = assertExpectedSha(expectedSha);
+    await assertDurableRepositoryIdentityBeforeLocalInspection(repositoryPath, remote, expectedRepository, this.enterpriseHost);
     const localState = await inspectLocalGitState(repositoryPath, remote, ref, workspacePath);
     const configuredRepository = resolveGitHubRepository(localState.remoteUrl, this.enterpriseHost);
     const pushRepository = resolveGitHubRepository(localState.pushUrl, this.enterpriseHost);

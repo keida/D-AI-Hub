@@ -91,7 +91,14 @@ describe("redactSensitiveText", () => {
       : "process.stdout.write('stdout-diagnostic'); process.stderr.write('stderr-diagnostic'); process.stdout.write('x'.repeat(1000))";
     const runFailure = async (): Promise<{ stdout: string; stderr: string }> => {
       try {
-        await runCommand({ command: process.execPath, arguments: ["-e", script], cwd: null, timeoutMs: 1_000, maxOutputBytes });
+        await runCommand({
+          command: process.execPath,
+          arguments: ["-e", script],
+          cwd: null,
+          timeoutMs: 1_000,
+          maxOutputBytes,
+          ...(failureMode === "output-limit" ? { terminateProcessTree: async () => true } : {}),
+        });
       } catch (error: unknown) {
         return (error as { result: { stdout: string; stderr: string } }).result;
       }

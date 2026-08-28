@@ -79,7 +79,7 @@ describe("Git rollback adapter", () => {
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it("blocks divergent history before preserving work or issuing mutation commands", async () => {
     const fixture = await createRepository();
