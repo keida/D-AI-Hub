@@ -211,3 +211,21 @@ The adapter remains unimplemented until separately authorized. Any future implem
 **Revisit trigger**
 
 Revisit after a disposable integration test proves the adapter-owned secret, bundle integrity/lineage, duplicate, and explicit conflict checks, or after a pinned upstream release demonstrably supplies the missing native capabilities without weakening this boundary.
+
+## 2026-08-28 — Keep external routing optional and subordinate
+
+**Context**
+
+D-AI-Hub needs lightweight provider routing while preserving one control plane and progressive Skill loading.
+
+**Decision**
+
+Keep D-AI-Hub as the authoritative control plane. Use native execution for trivial work, the narrowest routine engineering Skill for normal work, Superpowers for justified complex escalation, and proportional independent review/QA/security. Defer installing an external Router.
+
+**Rationale**
+
+The current instruction-based routing is sufficient for the active scope and avoids adding a second policy surface, runtime, or maintenance dependency. A future Router may shortlist Skills only and must not override D-AI-Hub safety, state, or release rules.
+
+**Revisit trigger**
+
+Reconsider when a candidate demonstrates materially lower context/tool overhead with active maintenance, Codex compatibility, cross-provider discovery, lazy loading, and low integration cost.
