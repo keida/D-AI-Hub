@@ -75,6 +75,19 @@ Use the smallest gate that matches the action:
 
 Do not run Release Gate checks repeatedly during read-only work. A lower gate never authorizes an action that requires a higher gate.
 
+## Engineering workflow routing
+
+Use the least expensive workflow that provides sufficient confidence. Classify the task by complexity, ambiguity, risk, duration, affected components, reversibility, need for parallelism, and expected verification confidence; treat the current model as only a secondary signal.
+
+- Trivial, low-risk work stays native: make the smallest useful change and run targeted verification. Do not invoke a workflow Skill merely because it is available.
+- Routine engineering work uses the narrowest stable Skill that directly matches the task. Matt Pocock Skills are the current routine toolkit; use `ask-matt` when Matt-internal routing is unclear. D-AI-Hub does not maintain a large per-Skill routing table.
+- Complex or escalated work may use Superpowers for difficult planning, long-running or multi-module changes, parallel or multi-agent work, difficult debugging, autonomous execution, or high-confidence final verification. Superpowers is an escalation layer, not the default routine workflow.
+- Choose one primary workflow for each phase. Escalate only when evidence shows that the current workflow is insufficient; do not run overlapping Matt and Superpowers planning, TDD, debugging, review, or verification flows for ceremony.
+- Testing uses the cheapest level that provides reliable behavioral evidence: focused unit, integration, smoke, or end-to-end tests as appropriate. Interactive applications may require behavioral QA in addition to code review. Scale independent review, QA, and security checks with risk; medium/high-risk changes should not rely on the implementing agent as the sole final reviewer.
+- Provider roles are replaceable: native execution, routine engineering, complex escalation, and proportional review/QA/security are semantic roles rather than permanent model-specific trees.
+- Skill loading remains progressive: inspect lightweight metadata, classify, shortlist one provider/Skill, then load the narrow Skill. An external Router, if later adopted, is only an optional discovery helper and cannot override D-AI-Hub safety, state, or release controls.
+- Authority order is explicit user instruction, repository-local D-AI-Hub rules, D-AI engineering routing policy, optional external Router guidance, then individual Skill defaults.
+
 ## Progress checkpoints
 
 Keep one replace-in-place current checkpoint in each active project's `STATUS.md`. Update it when a meaningful event changes the current task, working state, verified evidence, blocker, authorized file scope, active plan, or next action.

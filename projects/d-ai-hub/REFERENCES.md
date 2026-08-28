@@ -58,3 +58,5 @@
 - `skills/custom/knowledge-manager/SKILL.md` — canonical durable-knowledge capture and retrieval workflow.
 - `skills/custom/project-memory/SKILL.md` — canonical project continuation and update workflow.
 - `skills/custom/d-ai/SKILL.md` — canonical Codex activation entry for logical D-AI commands.
+- `skills/external/matt-skills.md` — upstream provenance and local availability of the routine engineering toolkit.
+- `skills/external/superpowers.md` — upstream provenance and local availability of the complex-work escalation toolkit.

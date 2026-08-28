@@ -16,9 +16,12 @@ Management notes for locally authored skills live under `skills/custom/`.
 Third-party skills are referenced under `skills/external/` rather than copied into this repository.
 
 Initial registry:
+- [Matt Pocock Skills](../skills/external/matt-skills.md)
 - [Superpowers](../skills/external/superpowers.md)
 - [Taste Skill / `gpt-taste`](../skills/external/taste-skill.md)
 - [Darwin Skill](../skills/external/darwin-skill.md)
+
+Router decision: no independent external or general-purpose Router runtime is installed; D-AI-Hub routing remains authoritative. `ask-matt` is only an optional internal assistant for selecting Matt Skills.
 
 ## Rule
 

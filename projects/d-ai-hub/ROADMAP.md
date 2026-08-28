@@ -24,6 +24,7 @@
 - Canonical repository Skill source, compatibility entry, CLI, and external-workspace activation tests.
 - Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.
 - Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
+- Lightweight engineering routing documented; the selected Matt Skills and Superpowers are available through native discovery in the verified Codex environment, while no independent external or general-purpose Router runtime is installed.
 
 ## Future / Deferred
 
@@ -31,7 +32,7 @@
 - Native Work activation and a configured Work durable-context connector.
 - The previously proposed Work file-backed activation slice; it is cancelled as a V1 requirement.
 - Chat↔Work↔Codex automatic handoff and cross-environment automatic routing. The existing versioned handoff and routing contracts remain reference material.
-- External Router installation or evaluation.
+- External Router installation.
 - Additional third-party Skill evaluation.
 - Repository health-check automation and the three existing untracked health-check/PR2 planning documents.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
