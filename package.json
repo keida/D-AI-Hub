@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "d-ai": "tsx src/entry/codex-cli.ts",
+    "health-check": "tsx src/health/health-check-cli.ts",
     "test": "vitest run",
     "test:integration": "vitest run tests/integration --passWithNoTests",
     "lint": "tsc --noEmit"

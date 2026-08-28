@@ -57,6 +57,14 @@ Native Chat activation, native Work activation, the Work file-backed connector, 
 
 Never commit passwords, API keys, access tokens, private certificates, authentication cookies, secret environment files, or unauthorized employer-confidential data.
 
+## Local repository health check
+
+```text
+npm run health-check -- --workspace <repository-path>
+```
+
+The Git identity, required-file, Markdown-link, and working-tree checks are local and do not modify the workspace or call Git remotes. The command also runs the workspace's own `build` and `test` scripts; those execute arbitrary project code and may modify files or access the network. Use this command only with a trusted workspace. An initially dirty or script-modified working tree is reported as unhealthy. This command does not replace `@D-AI` lifecycle commands or release gates.
+
 ## V1 scope
 
 V1 intentionally stays simple: Markdown, Agent Skills, indexes, templates, project memory, and external skill references. Vector databases, embeddings, RAG infrastructure, background ingestion, and automatic sync services are deferred until file-based retrieval proves insufficient.

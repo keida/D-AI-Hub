@@ -125,6 +125,40 @@ describe("GitHubCliAdapter external boundary", () => {
     }
   });
 
+  it("fails closed on durable repository identity before a local status failure", async () => {
+    const repositoryPath = await mkdtemp(join(tmpdir(), "d-ai-github-preflight-identity-"));
+    const git = async (argumentsList: readonly string[]): Promise<string> => (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
+    let pushCalls = 0;
+    const adapter = GitHubCliAdapter.forTestTransport(
+      { mode: "test", enterpriseHost: null },
+      {
+        pushRef: async () => {
+          pushCalls += 1;
+          return { pushed: true, observedOutput: "pushed", exitCode: 0, failureCategory: null };
+        },
+        readRef: async () => ({ command: "git", arguments: ["ls-remote"], stdout: "", stderr: "", exitCode: 0 }),
+      },
+    );
+
+    try {
+      await git(["init", "--initial-branch=main"]);
+      await git(["config", "user.email", "d-ai@example.test"]);
+      await git(["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repositoryPath, "artifact.txt"), "known good\n", "utf8");
+      await git(["add", "artifact.txt"]);
+      await git(["commit", "-m", "known good"]);
+      await git(["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      await writeFile(join(repositoryPath, ".git", "index"), "corrupted index\n", "utf8");
+
+      const attempt = adapter.pushExpectedCommit(repositoryPath, "origin", "refs/heads/main", "0".repeat(40), "github.com/other/repository");
+      await expect(attempt).rejects.toThrow(GitRemoteBlockedError);
+      await expect(attempt).rejects.toThrow(/repository identity/i);
+      expect(pushCalls).toBe(0);
+    } finally {
+      await rm(repositoryPath, { recursive: true, force: true });
+    }
+  });
+
   it("blocks when a direct caller omits the durable repository identity", async () => {
     const adapter = GitHubCliAdapter.forTestTransport(
       { mode: "test", enterpriseHost: null },
