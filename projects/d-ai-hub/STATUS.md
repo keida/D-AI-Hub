@@ -22,8 +22,8 @@
 ## Verified evidence
 
 - The Memorix decision records an isolated PoC with local SQLite/Orama search and manual transfer, alongside its unproven sync, integrity, secrecy, and conflict semantics.
-- The local installer lock records 17 selected Matt Skills from `mattpocock/skills`, and all 17 are discoverable from the native user-level Skill root.
-- Superpowers is exposed through one native discovery junction from an upstream checkout at `v6.3.0` / `b36e0829c6d0140e93cfef2ca599b1b07d4a7797`.
+- Local verification snapshot (2026-08-28, environment-dependent): the installer lock records 17 selected Matt Skills from `mattpocock/skills`, and all 17 are discoverable from the native user-level Skill root; see `skills/external/matt-skills.md`.
+- Local verification snapshot (2026-08-28, environment-dependent): Superpowers is exposed through one native discovery junction from a checkout at `v6.3.0` / `b36e0829c6d0140e93cfef2ca599b1b07d4a7797`; see `skills/external/superpowers.md`.
 - The Routing decision, discovery links, references, and roadmap agree that no external Router is installed. Documentation link checks and `git diff --check` remain required before any release action.
 
 ## Current blockers
