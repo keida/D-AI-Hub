@@ -7,8 +7,8 @@
 
 ## Current checkpoint
 
-- Current task: Preserve the guarded Memorix decision while integrating lightweight engineering routing, direct upstream Matt Skills, Superpowers discovery, and Router deferral.
-- Working state: this integration branch combines the current `main` Memorix documentation with the routing documentation. The original dirty checkout and its existing worktrees remain untouched.
+- Current task: The guarded Memorix decision, lightweight engineering routing, direct upstream Matt Skills, Superpowers discovery, and Router deferral are integrated on `main` through PR #12.
+- Working state: `main` contains the merged documentation integration. The original dirty checkout and its existing worktrees remain untouched.
 - Authorized file scope: Memorix and routing documentation, third-party Skill records, discovery index, roadmap, references, and project state only. Runtime, tests, adapters, dependencies, Router implementation, and Memorix adapter implementation remain out of scope.
 - Scope decision: Git/Markdown and D-AI-Hub remain canonical. Memorix remains an optional guarded local adapter proposal; the routing update adds no second control plane, external Router, native Chat/Work activation, or automatic cross-environment handoff.
 - PoC verdict: Memorix is PARTIAL; see its 2026-08-28 decision in `DECISIONS.md` for verified capabilities, limits, and the guarded adapter contract.
@@ -25,6 +25,7 @@
 - Local verification snapshot (2026-08-28, environment-dependent): the installer lock records 17 selected Matt Skills from `mattpocock/skills`, and all 17 are discoverable from the native user-level Skill root; see `skills/external/matt-skills.md`.
 - Local verification snapshot (2026-08-28, environment-dependent): Superpowers is exposed through one native discovery junction from a checkout at `v6.3.0` / `b36e0829c6d0140e93cfef2ca599b1b07d4a7797`; see `skills/external/superpowers.md`.
 - The Routing decision, discovery links, references, and roadmap agree that no external Router is installed. Documentation link checks and `git diff --check` remain required before any release action.
+- PR #12 merged with the Boss internal review as its acceptance gate; its GitGuardian check passed and no external independent approval was required.
 
 ## Current blockers
 
@@ -32,4 +33,4 @@
 
 ## Next concrete action
 
-PR #12 is open and awaiting independent GitHub review. Do not merge, implement the Memorix adapter, or install an external Router without explicit authorization.
+Choose one separately authorized D-AI-Hub roadmap action before further implementation. Do not implement the Memorix adapter or install an external Router without explicit authorization.
