@@ -32,4 +32,4 @@
 
 ## Next concrete action
 
-Do not open a pull request, merge, implement the Memorix adapter, or install an external Router without explicit authorization.
+PR #12 is open and awaiting independent GitHub review. Do not merge, implement the Memorix adapter, or install an external Router without explicit authorization.
