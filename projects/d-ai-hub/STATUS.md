@@ -3,14 +3,15 @@
 ## State
 
 - Lifecycle: completed
-- Last updated: 2026-08-24
+- Last updated: 2026-08-28
 
 ## Current checkpoint
 
-- Current task: none. Codex-first V1 is completed and passed real acceptance; PR #9 was merged into `main` with a normal merge commit.
-- Working state: the project is in a stable post-merge state with no active development task. The canonical `main` worktree remains dirty with pre-existing Skill-routing changes; all existing worktrees, branches, and fixtures are preserved.
-- Authorized file scope: product documentation and project state only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
-- Scope decision: D-AI V1 is Codex local control + GitHub durable evidence + D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only, not a D-AI runtime dependency; any separate authorized repository-hosted maintenance remains outside V1 activation. Native Chat, native Work, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred.
+- Current task: record the user-approved 2026-08-28 Hub-first decision to keep Memorix as an optional, guarded local memory adapter; these two documents remain uncommitted, and committing or discarding them still requires the user's explicit decision. Do not implement the adapter.
+- Working state: isolated worktree branch `codex/memorix-adapter-contract` is based on `origin/main` at `45a650d`. The scoped diff is exactly the decision in `DECISIONS.md` plus this status checkpoint; both files are uncommitted.
+- Authorized file scope: `projects/d-ai-hub/DECISIONS.md` and `projects/d-ai-hub/STATUS.md` only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
+- PoC verdict: PARTIAL. Memorix v1.8.3 proved manual structured-record storage, local SQLite/Orama BM25 search, and JSON transfer of five synthetic records between two temporary profiles.
+- Known limits and risks: native GitHub sync, manifest/hash, device identity, base-version/delta, and bidirectional conflict resolution remain unproven or missing; transfer export preserved secret-shaped content, so export is not a secret-removal boundary.
 
 ## Delivery state
 
@@ -26,9 +27,9 @@
 
 ## Current blockers
 
-- None for the completed Codex-first V1 scope. BUG-001 remains a known environment-dependent gap, not an active task.
+- None for the completed Codex-first V1 scope. The Memorix adapter remains unimplemented and requires separate authorization; the PoC limits and export secret risk above remain visible.
 - Chat/Work remains deferred and is not a current task; any future continuation requires a new independent scope and task.
 
 ## Next concrete action
 
-No action; wait for a new explicit scope/task. Do not start Chat/Work without that independent scope and task.
+Review the two uncommitted documents (`DECISIONS.md` and this `STATUS.md`), then explicitly decide whether to commit or discard them. Do not implement the Memorix adapter.

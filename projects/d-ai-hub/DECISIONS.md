@@ -187,3 +187,27 @@ Codex activation may be delivered before Chat and Work activation. Unconfigured 
 **Revisit trigger**
 
 Reconsider the Codex adapter syntax only if Codex provides an official native command registration mechanism that can preserve the same normalized command and hard-gate semantics.
+
+## 2026-08-28 — Keep Memorix as an optional, guarded local memory adapter
+
+**Context**
+
+An isolated PoC of `AVIDS2/memorix` v1.8.3 demonstrated manual storage, local SQLite/Orama BM25 search, and JSON transfer of five synthetic structured records between two temporary profiles. It also showed that transfer export preserves secret-shaped content and that duplicate and fork imports are silently skipped without a conflict report. The PoC did not demonstrate native GitHub sync, manifest/hash, device identity, base-version, delta, or bidirectional conflict resolution.
+
+**Decision**
+
+Git/Markdown remains canonical. Memorix may be used only as an optional, pinned v1.8.3, per-workspace local index/cache; it is never an authority, sync engine, or replacement for D-AI-Hub records. Any future, separately authorized implementation must obey the following D-AI adapter contract; these are not current runtime capabilities. The adapter must disable hooks, LLM, embeddings, rerank, HTTP, Dashboard, Git/GitHub sync, and team/orchestration, and accept only manual, structured project records. D-AI must reject secret-shaped input before write or export and return redacted errors; it must never rely on Memorix export for secret removal.
+
+Under that future D-AI adapter contract, D-AI, not Memorix, would own any versioned snapshot wrapper: bundle format, project scope, record count, content hash, snapshot lineage, and import receipt. These are adapter contract fields and do not claim native Memorix manifest/hash/device/version/GitHub-sync features. A future implementation would verify that wrapper before calling Memorix: an exact already-applied bundle would be `NOOP_DUPLICATE`; a changed logical record or incompatible same-topic branch would be `CONFLICT`; unknown lineage, invalid integrity/version/scope, unavailable capability, or unsafe content would be `BLOCKED`. No automatic merge, conflict resolution, network transfer, or Git action would be permitted.
+
+**Rationale**
+
+This retains the PoC-proven local search and manual portability while preserving Hub-first ownership and failing closed where Memorix did not provide integrity, secrecy, or conflict semantics.
+
+**Consequences**
+
+The adapter remains unimplemented until separately authorized. Any future implementation must keep Memorix data rebuildable and non-canonical, expose only D-AI-owned receipts/conflicts, and verify the contract with isolated profiles; it must not infer unproven native capabilities from the PoC.
+
+**Revisit trigger**
+
+Revisit after a disposable integration test proves the adapter-owned secret, bundle integrity/lineage, duplicate, and explicit conflict checks, or after a pinned upstream release demonstrably supplies the missing native capabilities without weakening this boundary.
