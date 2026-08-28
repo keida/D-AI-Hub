@@ -7,11 +7,10 @@
 
 ## Current checkpoint
 
-- Current task: record the user-approved 2026-08-28 Hub-first decision to keep Memorix as an optional, guarded local memory adapter; these two documents remain uncommitted, and committing or discarding them still requires the user's explicit decision. Do not implement the adapter.
-- Working state: isolated worktree branch `codex/memorix-adapter-contract` is based on `origin/main` at `45a650d`. The scoped diff is exactly the decision in `DECISIONS.md` plus this status checkpoint; both files are uncommitted.
+- Current task: preserve the user-approved 2026-08-28 Hub-first decision to keep Memorix as an optional, guarded local memory adapter. The adapter remains unimplemented and requires separate authorization.
+- Working state: the 2026-08-28 decision is committed and pushed on isolated branch `codex/memorix-adapter-contract`, which awaits independent review and explicit PR/merge authorization.
 - Authorized file scope: `projects/d-ai-hub/DECISIONS.md` and `projects/d-ai-hub/STATUS.md` only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
-- PoC verdict: PARTIAL. Memorix v1.8.3 proved manual structured-record storage, local SQLite/Orama BM25 search, and JSON transfer of five synthetic records between two temporary profiles.
-- Known limits and risks: native GitHub sync, manifest/hash, device identity, base-version/delta, and bidirectional conflict resolution remain unproven or missing; transfer export preserved secret-shaped content, so export is not a secret-removal boundary.
+- PoC verdict: PARTIAL; see the 2026-08-28 decision in `DECISIONS.md` for the verified capabilities, limits, and guarded adapter contract.
 
 ## Delivery state
 
@@ -27,9 +26,9 @@
 
 ## Current blockers
 
-- None for the completed Codex-first V1 scope. The Memorix adapter remains unimplemented and requires separate authorization; the PoC limits and export secret risk above remain visible.
+- None for the completed Codex-first V1 scope. The Memorix adapter remains unimplemented and requires separate authorization; this branch awaits independent review and explicit PR/merge authorization.
 - Chat/Work remains deferred and is not a current task; any future continuation requires a new independent scope and task.
 
 ## Next concrete action
 
-Review the two uncommitted documents (`DECISIONS.md` and this `STATUS.md`), then explicitly decide whether to commit or discard them. Do not implement the Memorix adapter.
+Obtain independent review of this branch, then proceed only with explicit PR/merge authorization. Do not implement the Memorix adapter.
