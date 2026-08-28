@@ -3,14 +3,14 @@
 ## State
 
 - Lifecycle: completed
-- Last updated: 2026-08-24
+- Last updated: 2026-08-28
 
 ## Current checkpoint
 
-- Current task: none. Codex-first V1 is completed and passed real acceptance; PR #9 was merged into `main` with a normal merge commit.
-- Working state: the project is in a stable post-merge state with no active development task. The canonical `main` worktree remains dirty with pre-existing Skill-routing changes; all existing worktrees, branches, and fixtures are preserved.
-- Authorized file scope: product documentation and project state only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
-- Scope decision: D-AI V1 is Codex local control + GitHub durable evidence + D-AI-Hub Markdown knowledge/project memory. ChatGPT Web is for ordinary discussion and viewing only, not a D-AI runtime dependency; any separate authorized repository-hosted maintenance remains outside V1 activation. Native Chat, native Work, the Work file-backed connector, automatic cross-environment handoff, and automatic environment routing are Future/Deferred.
+- Current task: preserve the user-approved 2026-08-28 Hub-first decision to keep Memorix as an optional, guarded local memory adapter. The adapter remains unimplemented and requires separate authorization.
+- Working state: the 2026-08-28 decision is committed and pushed on isolated branch `codex/memorix-adapter-contract`, which awaits independent review and explicit PR/merge authorization.
+- Authorized file scope: `projects/d-ai-hub/DECISIONS.md` and `projects/d-ai-hub/STATUS.md` only. Runtime, tests, adapters, dependencies, Router, and third-party Skill records are out of scope.
+- PoC verdict: PARTIAL; see the 2026-08-28 decision in `DECISIONS.md` for the verified capabilities, limits, and guarded adapter contract.
 
 ## Delivery state
 
@@ -26,9 +26,9 @@
 
 ## Current blockers
 
-- None for the completed Codex-first V1 scope. BUG-001 remains a known environment-dependent gap, not an active task.
+- None for the completed Codex-first V1 scope. The Memorix adapter remains unimplemented and requires separate authorization; this branch awaits independent review and explicit PR/merge authorization.
 - Chat/Work remains deferred and is not a current task; any future continuation requires a new independent scope and task.
 
 ## Next concrete action
 
-No action; wait for a new explicit scope/task. Do not start Chat/Work without that independent scope and task.
+Obtain independent review of this branch, then proceed only with explicit PR/merge authorization. Do not implement the Memorix adapter.
