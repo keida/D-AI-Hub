@@ -7,8 +7,8 @@
 
 ## Current checkpoint
 
-- Current task: The approved next slice—ordered incremental transfer integrity—is implemented and verified locally on `codex/memory-sync-slice`. It closes BUG-005 without expanding beyond the manual single-writer boundary.
-- Working state: commit `291185857ad1c11d71283b6105ea966bd27e662c` requires every non-empty import to begin at sequence 1 on a missing reader or at the reader's current maximum plus 1. Gaps and overlaps return `BLOCKED` before records or receipts; exact older and latest bundle replays remain `NOOP_DUPLICATE`. The manual runbook and design explain `--after-sequence` and ordered imports. The commit is pushed on `codex/memory-sync-slice` and PR #17 is open against `main`; GitHub reports a clean merge state and GitGuardian passed. Merge remains unauthorized. The original dirty root checkout remains untouched, with no reset, stash, overwrite, automatic sync, or multi-writer expansion.
+- Current task: The ordered incremental transfer-integrity slice is complete on canonical `main`. Select the next separately scoped roadmap slice without expanding the manual single-writer boundary implicitly.
+- Working state: PR #17 merged through ordinary merge commit `2e12984addf28b2262ea596bf75b11a1a914e174`. Non-empty imports must begin at sequence 1 on a missing reader or at the reader's current maximum plus 1. Gaps and overlaps return `BLOCKED` before records or receipts; exact older and latest bundle replays remain `NOOP_DUPLICATE`. GitGuardian passed, and GitHub `main` was verified at the merge commit. The original dirty root checkout remains untouched, with no reset, stash, overwrite, automatic sync, or multi-writer expansion.
 - Authorized file scope: a new `src/memory/` boundary and its focused tests, the local CLI/package script, this project's decision/status/roadmap, and the matching design/implementation plan. Existing `DurableContextStore`, lifecycle runtime, handoff, recovery, rollback, GitHub adapter, Router, external-memory adapters, and dashboard remain out of scope except for reuse through their existing public helpers and patterns.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
 - Acceptance target: preserve all accepted phase-one behavior and prove ordered repeated transfers: bundle 1 then bundle 2 imports successfully, both IDs are readable, gaps and overlaps are rejected without mutation, and replaying either applied bundle remains `NOOP_DUPLICATE`. These code and CLI targets are verified locally; a second physical computer remains optional environment validation rather than a blocker.
@@ -38,8 +38,8 @@
 ## Current blockers
 
 - No implementation, integrity, or private-GitHub transport blocker remains for the accepted first slice or the locally verified ordered-increment slice. A genuinely separate physical-device run is optional environment validation and is not part of the completed evidence.
-- The original root checkout is intentionally not a valid write target because it has uncommitted changes and is behind `origin/main`; it was not touched. The current checkpoint update is local and uncommitted because no third status commit/push was authorized.
+- The original root checkout remains intentionally excluded from writes because it has unrelated uncommitted changes and is behind `origin/main`; it was not touched. No blocker remains for the merged ordered-increment slice.
 
 ## Next concrete action
 
-- Review PR #17 and obtain explicit merge authorization; do not merge before that authorization. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
+- Select the next separately scoped roadmap milestone. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
