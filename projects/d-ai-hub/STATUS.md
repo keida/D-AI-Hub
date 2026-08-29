@@ -7,11 +7,11 @@
 
 ## Current checkpoint
 
-- Current task: Integrate the verified Windows PowerShell object-JSON invocation guidance through PR #18 without changing Memory CLI behavior or expanding the manual sync boundary.
-- Working state: PR #18's runbook clarification and reconciled checkpoint are clean against current `main`; GitGuardian passed and an ordinary PR merge is explicitly authorized. No Memory CLI code change or new `--value-file` option is justified. The original dirty root checkout remains untouched.
-- Authorized file scope: `docs/memory-sync-manual-workflow.md` and this `STATUS.md` integration record only. The ordinary merge of PR #18 is authorized; automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work remain separately authorized.
+- Current task: Retire superseded draft PR #3 without merging it and preserve only its still-relevant repository health-check ideas as future candidates.
+- Working state: PR #3 is closed with `mergedAt=null`; its historical branch was not deleted. The draft targeted the old `feat/d-ai-ownership-repair` branch, was `DIRTY`/`CONFLICTING`, failed GitGuardian, and mixed a health-check prototype with broad outdated runtime changes and disabled Superpowers planning artifacts. Current `main` already has a newer repository health-check implementation. The original dirty root checkout remains untouched.
+- Authorized file scope: this continuity update is limited to `projects/d-ai-hub/STATUS.md` and `projects/d-ai-hub/ROADMAP.md`. Commit, push, and PR creation for these two documentation files are explicitly authorized. PR #3 code salvage, implementation, PR merge, automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work remain unauthorized.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
-- Acceptance target: retain the verified npm invocation boundary and Windows wrapper diagnosis, preserve every current `origin/main` policy and checkpoint change, leave no conflict markers, and reduce the PR's net change to the runbook clarification plus its durable status evidence.
+- Acceptance target: confirm PR #3 is closed and unmerged, prevent its old branch and Superpowers artifacts from re-entering `main`, and record only index freshness, Skill frontmatter, secret-like scanning, and UTF-8/path/symlink hardening as separately scoped future candidates.
 
 ## Delivery state
 
@@ -36,6 +36,7 @@
 - Local verification snapshot (2026-08-28, environment-dependent): the installer lock records 17 selected Matt Skills from `mattpocock/skills`, and all 17 are discoverable from the native user-level Skill root; see `skills/external/matt-skills.md`.
 - The 2026-08-28 Superpowers discovery snapshot is superseded: on 2026-08-29 its native user-level discovery junction was removed by explicit user decision. The preserved upstream checkout is inert and must not be treated as an active Skill source; see `skills/external/superpowers.md`.
 - Superpowers-disable release evidence: all native user and workspace Skill roots returned no Superpowers discovery entry; the disabled provenance links resolve; `git diff --check`, the changed-content secret scan, TypeScript build, and Markdown link validation passed; the final full suite passed 32/32 files and 649/649 tests. A prior full run's single Windows descendant-cleanup timing failure passed three focused reruns and the final full suite without implementation changes.
+- PR #3 retirement evidence: GitHub reports the draft `CLOSED` with no merge commit. Before closure it targeted a historical feature branch, was `DIRTY`/`CONFLICTING`, had a failed GitGuardian check, and changed about 61 files. Current `main` already covers required-file, Markdown-link, working-tree, build, test, CLI, and timeout checks; only the narrower hardening candidates recorded in `ROADMAP.md` remain potentially useful.
 - The Routing decision, discovery links, references, and roadmap agree that no external Router is installed. Documentation link checks and `git diff --check` remain required before any release action.
 - PR #12 merged with the Boss internal review as its acceptance gate; its GitGuardian check passed and no external independent approval was required.
 
@@ -46,4 +47,4 @@
 
 ## Next concrete action
 
-- With the Windows invocation guidance integrated, select the next separately scoped roadmap milestone. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
+- Review the published PR #3 retirement checkpoint and roadmap update and decide whether to merge it. Selecting or implementing any retained health-check candidate remains a separate scope decision. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
