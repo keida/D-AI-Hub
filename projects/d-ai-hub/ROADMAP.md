@@ -26,7 +26,7 @@
 - Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.
 - Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
 - Lightweight engineering routing documented; the selected Matt Skills and Superpowers are available through native discovery in the verified Codex environment, while no independent external or general-purpose Router runtime is installed.
-- Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and locally verified. Fail-closed fresh reader import, duplicate/tamper/secret/conflict handling, and same-ID read using separate writer/reader databases and directories on one machine are verified. Real second-device operation and private-GitHub push/pull are not verified; Git/GitHub transport remains manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
+- Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and accepted. Device A pushed an exact two-file bundle commit to private `main`; an isolated reader clone with a separate workspace/SQLite database and `core.autocrlf=true` verified the pulled digest, `IMPORTED`, `NOOP_DUPLICATE`, and same-ID read without writer access. This isolated device-B simulation satisfies phase-one implementation acceptance; a second physical computer is optional environment validation and remains unverified. Git/GitHub transport stays manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
 
 ## Future / Deferred
 
@@ -38,6 +38,7 @@
 - Additional third-party Skill evaluation.
 - External memory-product integration, including Memorix and Mem0.
 - Automatic or real-time memory synchronization, multi-writer automatic merge, Supabase, embeddings, RAG, and memory dashboards.
+- Optional second-physical-device environment rehearsal for the accepted manual memory-transfer runbook.
 - Repository health-check automation and the three existing untracked health-check/PR2 planning documents.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 

@@ -2,18 +2,6 @@
 
 ## Open
 
-### BUG-004 — Windows Git checkout can invalidate a memory bundle digest
-
-- Severity: high
-- Status: open
-- First observed: 2026-08-29
-- Reproduction: With no matching Git attributes and `core.autocrlf=true`, add an LF-terminated `memory-bundles/**/records.jsonl`, then let Git materialize the indexed file into the worktree.
-- Expected: The checked-out JSONL bytes retain the SHA-256 recorded in `manifest.json` on the writer device.
-- Actual: Git converts the final LF to CRLF, changing the JSONL byte digest and causing a valid cross-device import to be rejected as tampered.
-- Impact: The manual private-GitHub transfer can fail between Windows checkouts even when the committed bundle is unchanged.
-- Current evidence: A real temporary Git repository reproduced the extra CR byte under `core.autocrlf=true`. A test-first local fix declares memory bundle JSONL as `text eol=lf`; the regression then passed, all 59 memory tests passed, the full suite passed 32/32 files and 646/646 tests, the TypeScript build passed, and `git diff --check` passed. The fix is not committed, pushed, or merged.
-- Resolution condition: Integrate the Git attribute and regression test, verify a fresh Windows checkout preserves the manifest digest, then resume the real two-device import and same-ID read.
-
 ### BUG-001 — Local Git CLI authentication may be unavailable in a new environment
 
 - Severity: medium
@@ -29,6 +17,14 @@
 - Resolution condition: For each affected environment, configure a valid GitHub credential helper or GitHub CLI authentication, then complete a successful fetch/pull and verify local `main` against `origin/main`.
 
 ## Resolved
+
+### BUG-004 — Windows Git checkout could invalidate a memory bundle digest
+
+- Severity: high
+- Status: resolved on 2026-08-29
+- Resolution: Repository attribute `memory-bundles/**/records.jsonl text eol=lf` now keeps Git-tracked bundle JSONL byte-stable across Windows checkouts while retaining text diffs. The fix and real-Git regression merged through PR #15 as merge commit `0b37bb93df0a26a12f75444233b23ead2f648c6e`.
+- Evidence: The regression first reproduced the extra CR byte under `core.autocrlf=true`, then passed after the attribute. All 59 memory tests, 32/32 full-suite files and 646/646 tests, TypeScript build, diff check, and GitGuardian passed. A post-merge fresh clone with `core.autocrlf=true` checked out bundle commit `a156c2a0cfbb29424f7a7bf173d72a5a8e609093`; its JSONL remained LF-only and matched manifest SHA-256 `0a4773a8f3f08d6d23e839bc226398fd0375798abb88563fabe153871ff66e72`.
+- Limitation: The same-machine fresh reader proves private-GitHub transport and checkout behavior but does not replace the outstanding second-physical-device acceptance.
 
 ### BUG-003 — Mutable memory values could bypass secret validation between reads
 
