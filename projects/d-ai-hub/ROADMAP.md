@@ -39,7 +39,7 @@
 - External memory-product integration, including Memorix and Mem0.
 - Automatic or real-time memory synchronization, multi-writer automatic merge, Supabase, embeddings, RAG, and memory dashboards.
 - Optional second-physical-device environment rehearsal for the accepted manual memory-transfer runbook.
-- Repository health-check automation and the three existing untracked health-check/PR2 planning documents.
+- Selective repository health-check hardening on current `main`: consider index freshness, Skill frontmatter validation, secret-like scanning, and UTF-8/path/symlink handling only as separate narrow candidates. Draft PR #3 is closed as superseded and must not be merged or resurrected wholesale; its old architecture and Superpowers planning artifacts are historical only.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 
 ## Post-V1 boundary
