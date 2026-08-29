@@ -7,9 +7,9 @@
 
 ## Current checkpoint
 
-- Current task: Reconcile PR #18 with the latest canonical `main` while preserving its verified Windows PowerShell object-JSON invocation guidance.
-- Working state: PR #18's runbook clarification applies cleanly. A local merge imported the merged Superpowers-disable and post-merge checkpoint updates from `origin/main`; its single `STATUS.md` conflict is resolved by preserving the latest canonical state plus the Windows diagnosis evidence. The merge commit and push are explicitly authorized; no Memory CLI code change or new `--value-file` option is justified. The original dirty root checkout remains untouched.
-- Authorized file scope: `docs/memory-sync-manual-workflow.md` and this `STATUS.md` conflict resolution only. The local merge commit and branch push are authorized; merging PR #18 into `main`, automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work remain separately authorized.
+- Current task: Integrate the verified Windows PowerShell object-JSON invocation guidance through PR #18 without changing Memory CLI behavior or expanding the manual sync boundary.
+- Working state: PR #18's runbook clarification and reconciled checkpoint are clean against current `main`; GitGuardian passed and an ordinary PR merge is explicitly authorized. No Memory CLI code change or new `--value-file` option is justified. The original dirty root checkout remains untouched.
+- Authorized file scope: `docs/memory-sync-manual-workflow.md` and this `STATUS.md` integration record only. The ordinary merge of PR #18 is authorized; automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work remain separately authorized.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
 - Acceptance target: retain the verified npm invocation boundary and Windows wrapper diagnosis, preserve every current `origin/main` policy and checkpoint change, leave no conflict markers, and reduce the PR's net change to the runbook clarification plus its durable status evidence.
 
@@ -46,4 +46,4 @@
 
 ## Next concrete action
 
-- Review the updated PR #18 and its checks, then decide whether to merge it into `main`. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
+- With the Windows invocation guidance integrated, select the next separately scoped roadmap milestone. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
