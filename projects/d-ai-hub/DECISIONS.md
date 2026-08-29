@@ -229,3 +229,27 @@ The current instruction-based routing is sufficient for the active scope and avo
 **Revisit trigger**
 
 Reconsider when a candidate demonstrates materially lower context/tool overhead with active maintenance, Codex compatibility, cross-provider discovery, lazy loading, and low integration cost.
+
+## 2026-08-28 — Add a separate local-memory sync boundary, not a general Memory Core
+
+**Context**
+
+The next authorized slice needs one writer to persist agent runtime memory locally, transfer it safely between computers through a private GitHub repository, and let a second computer read the same logical record. Existing `DurableContextStore` is lifecycle state for task ownership, handoff, recovery, rollback, and close; it is not a generic memory abstraction.
+
+**Decision**
+
+Introduce a new, separately named local-memory sync boundary. A configured writer stores structured records in local SQLite. It exports deterministic JSONL plus a versioned manifest into a Git-tracked bundle directory. A reader computer manually pulls that Git history, validates the bundle before any write, imports it into its own SQLite database, and retrieves records by the same logical ID.
+
+The bundle identifies a portable logical scope, writer identity, sequence interval, record count, and SHA-256 digest. The first slice accepts one configured writer only. Reader-mode stores reject `put`; duplicate bundle imports return `NOOP_DUPLICATE`; mismatched scope, version, digest, writer, or same-ID different-content inputs return `BLOCKED`. Secret-shaped values are rejected before SQLite write and rechecked before export/import.
+
+**Rationale**
+
+This gives two devices a small, auditable, Git-versioned transfer loop without making an external memory product, a database, or GitHub transport the D-AI-Hub control plane. It reuses the existing manifest/hash, workspace-fencing, recovery, and GitHub identity-preflight patterns without coupling lifecycle task state to general memory records.
+
+**Consequences**
+
+`DurableContextStore`, `FileDurableContextStore`, lifecycle handoff, recovery, rollback, and close semantics remain unchanged. The initial implementation uses Node's built-in `node:sqlite`; it adds no external memory, vector, embedding, Router, dashboard, or automatic Git transport dependency. GitHub push/pull remains a manual operator action and no two devices may write in the first phase.
+
+**Revisit trigger**
+
+Reconsider the single-writer restriction only after a separately authorized design proves explicit writer election, conflict receipts, and multi-writer recovery behavior without automatic merges.

@@ -18,6 +18,14 @@
 
 ## Resolved
 
+### BUG-003 — Mutable memory values could bypass secret validation between reads
+
+- Severity: high
+- Status: resolved on 2026-08-29
+- Resolution: `put` and the direct `applyImportedBundle` seam now capture caller-controlled values once through a detached plain-data descriptor snapshot. Secret scanning, canonical serialization, hashing, SQLite writes, import validation, and returned values use only that snapshot. Accessors, cycles, symbols, sparse or extended arrays, hidden properties, non-plain objects, and inconsistent descriptor operations fail closed.
+- Evidence: Getter, Proxy/data-descriptor, direct-import, caller-mutation, and normal nested-JSON regressions passed. Fresh verification completed 58/58 memory tests, 645/645 full-suite tests, TypeScript build, tracked `git diff --check`, untracked trailing-whitespace/final-newline checks, production secret scan, and boundary scan. A separate read-only security reviewer found no Critical, High, or Important issue and marked BUG-003 ready to resolve.
+- Limitation: Returned snapshots are detached but remain mutable after return; input size/depth remains unbounded. Neither condition reopens the persistence TOCTOU and both are outside BUG-003.
+
 ### BUG-002 — `@D-AI sync` behavior is distinguished from ordinary local project continuation
 
 - Severity: medium

@@ -97,7 +97,7 @@ describe("redactSensitiveText", () => {
           cwd: null,
           timeoutMs: 1_000,
           maxOutputBytes,
-          ...(failureMode === "output-limit" ? { terminateProcessTree: async () => true } : {}),
+          terminateProcessTree: async (child) => child.kill("SIGKILL"),
         });
       } catch (error: unknown) {
         return (error as { result: { stdout: string; stderr: string } }).result;

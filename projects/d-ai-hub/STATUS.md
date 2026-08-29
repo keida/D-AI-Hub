@@ -3,16 +3,15 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-28
+- Last updated: 2026-08-29
 
 ## Current checkpoint
 
-- Current task: The local repository health check and its Windows test-stability repairs were merged into canonical `main` through PR #13. The merged remote `main` commit was verified; the feature branch and its local orchestration ledger remain retained.
-- Working state: the health check performs local Git/file inspections, then runs trusted workspace build and test scripts sequentially. Its finite per-command budget is 300 seconds and its finite output bound is 64 KiB. Inspections are local and read-only; trusted workspace scripts may have side effects or network access. The former 120-second health budget was insufficient; the new run completed the real build/test in approximately 171 seconds and reported `unhealthy` only because the feature worktree is dirty.
-- Verification: focused health tests passed 29/29; `npm run build` passed; `git diff --check` passed with only LF-to-CRLF working-copy warnings; independent reviews were clean. The Windows suite stability repair uses two workers and a 30-second default test budget; full `npm test` passed 28/28 files and 587/587 tests in approximately 185 seconds. Related cleanup assertions were stabilized and GitHub durable-identity preflight was repaired without adding network transport. PR #13 merged and the remote `main` commit was verified. The original dirty root checkout and other worktrees were untouched.
-- Authorized file scope: the health-check source, local CLI/package script, focused tests, design, and project state. Existing runtime lifecycle behavior, environment adapters, dependencies, Router implementation, and Memorix adapter implementation remain out of scope. The original dirty checkout and other worktrees were untouched.
-- Scope decision: Git/Markdown and D-AI-Hub remain canonical. Memorix remains an optional guarded local adapter proposal; the routing update adds no second control plane, external Router, native Chat/Work activation, or automatic cross-environment handoff.
-- PoC verdict: Memorix is PARTIAL; see its 2026-08-28 decision in `DECISIONS.md` for verified capabilities, limits, and the guarded adapter contract.
+- Current task: Complete verified merge-commit integration of PR #14, then perform the real private-GitHub/two-device bundle acceptance. BUG-003 is resolved; no implementation blocker remains in the authorized slice.
+- Working state: the merge-gate follow-up is limited to one test-only stabilization for an unrelated Windows cleanup timing assertion and this checkpoint; it does not change production code. The user authorized merge-commit integration after verification. The original root checkout is dirty and behind, and remains untouched; no reset, stash, overwrite, automatic sync, or multi-writer expansion is authorized.
+- Authorized file scope: a new `src/memory/` boundary and its focused tests, the local CLI/package script, this project's decision/status/roadmap, and the matching design/implementation plan. Existing `DurableContextStore`, lifecycle runtime, handoff, recovery, rollback, GitHub adapter, Router, external-memory adapters, and dashboard remain out of scope except for reuse through their existing public helpers and patterns.
+- Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
+- Acceptance target: restart reads succeed; bundle tampering is rejected before SQLite mutation; a repeated exact import returns `NOOP_DUPLICATE`; all persisted/exported content is validated from one detached snapshot; a separate reader database and directory on the same machine import and get the same logical ID. All local targets are verified. Real second-device operation and private-GitHub push/pull remain unverified manual actions outside this slice.
 
 ## Delivery state
 
@@ -22,7 +21,11 @@
 
 ## Verified evidence
 
-- The Memorix decision records an isolated PoC with local SQLite/Orama search and manual transfer, alongside its unproven sync, integrity, secrecy, and conflict semantics.
+- The prior isolated Memorix PoC remains historical evidence only; it is superseded for this slice by the separate local SQLite and versioned JSONL/manifest boundary in `DECISIONS.md`.
+- The local SQLite, deterministic bundle, fresh-reader import, workspace binding, reader-only import, exact-byte UTF-8 integrity, sole-owner transaction, CLI, manual runbook, and single-snapshot secret boundary are implemented. Current evidence: 17 store tests, 32 bundle tests, and 9 CLI tests — 58/58 memory tests passed. TypeScript build, tracked `git diff --check`, and untracked trailing-whitespace/final-newline checks passed.
+- Full-suite evidence after the BUG-003 fix: 31 test files and 645/645 tests passed. Getter, Proxy/data-descriptor, direct-import, caller-mutation, and normal nested-JSON regressions passed. A same-machine two-directory CLI probe previously completed writer `put`/`export` and fresh reader `IMPORTED`/same-ID `get`. The CLI/runbook are locally verified; real second-device and private-GitHub push/pull behavior is not verified.
+- Production secret-shaped and boundary scans returned zero matches. A separate read-only security reviewer exercised descriptor/Proxy and malformed-shape cases, found no Critical, High, or Important issue, and marked BUG-003 ready to resolve. Memory code still does not invoke Git/GitHub or `DurableContextStore`, reader-mode `put` remains blocked, and automatic sync/merge and multi-writer behavior remain excluded.
+- PR #14 is the integration path from `codex/memory-sync-slice` to `main`. At the merge gate, the existing timeout-diagnostics test exposed nondeterministic Windows cleanup text across two otherwise equivalent calls. The diagnostics test now injects a deterministic successful cleanup seam, while the dedicated real descendant-termination and fail-closed cleanup tests remain unchanged and pass. Focused diagnostics passed 2/2, the command-runner file passed 27/27, and the full suite passed 31/31 files and 645/645 tests after the stabilization.
 - Local verification snapshot (2026-08-28, environment-dependent): the installer lock records 17 selected Matt Skills from `mattpocock/skills`, and all 17 are discoverable from the native user-level Skill root; see `skills/external/matt-skills.md`.
 - Local verification snapshot (2026-08-28, environment-dependent): Superpowers is exposed through one native discovery junction from a checkout at `v6.3.0` / `b36e0829c6d0140e93cfef2ca599b1b07d4a7797`; see `skills/external/superpowers.md`.
 - The Routing decision, discovery links, references, and roadmap agree that no external Router is installed. Documentation link checks and `git diff --check` remain required before any release action.
@@ -30,8 +33,9 @@
 
 ## Current blockers
 
-- No current verification blocker. Memorix and any external Router remain unimplemented and require separate authorization; Chat/Work remains deferred.
+- No local implementation blocker remains in the authorized single-writer slice. BUG-003 is resolved with fresh verification and independent security review.
+- The original root checkout is intentionally not a valid write target because it has uncommitted changes and is behind `origin/main`; it was not touched. Feature-branch push and PR creation are verified, but real bundle transfer through private GitHub to a second device has not been performed.
 
 ## Next concrete action
 
-Choose the next authorized roadmap action. Do not implement the Memorix adapter or install an external Router without explicit authorization.
+- Verify the PR #14 merge result on canonical `main`, then perform the separately controlled real private-GitHub/two-device bundle acceptance milestone. Do not add automatic synchronization, merging, or a second writer.

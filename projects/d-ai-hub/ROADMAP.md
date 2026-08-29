@@ -7,6 +7,7 @@
 3. Use local durable state for task identity, ownership, context, and audit manifests; use the configured GitHub adapter for push evidence and exact remote repository/ref/SHA verification.
 4. Keep Markdown project memory (`STATUS.md`, `DECISIONS.md`, `ROADMAP.md`, and related records) as the durable human/agent project source of truth.
 5. Preserve the daily user commands `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`; zero/ambiguous/mismatched identity and unavailable connector cases remain fail closed.
+6. Keep the separately bounded local-memory sync slice within its verified single-writer and manual-transport boundary; any expansion requires a new scope decision.
 
 ## V1 product boundary
 
@@ -25,6 +26,7 @@
 - Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.
 - Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
 - Lightweight engineering routing documented; the selected Matt Skills and Superpowers are available through native discovery in the verified Codex environment, while no independent external or general-purpose Router runtime is installed.
+- Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and locally verified. Fail-closed fresh reader import, duplicate/tamper/secret/conflict handling, and same-ID read using separate writer/reader databases and directories on one machine are verified. Real second-device operation and private-GitHub push/pull are not verified; Git/GitHub transport remains manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
 
 ## Future / Deferred
 
@@ -34,6 +36,8 @@
 - Chat↔Work↔Codex automatic handoff and cross-environment automatic routing. The existing versioned handoff and routing contracts remain reference material.
 - External Router installation.
 - Additional third-party Skill evaluation.
+- External memory-product integration, including Memorix and Mem0.
+- Automatic or real-time memory synchronization, multi-writer automatic merge, Supabase, embeddings, RAG, and memory dashboards.
 - Repository health-check automation and the three existing untracked health-check/PR2 planning documents.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 
