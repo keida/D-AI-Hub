@@ -2,6 +2,18 @@
 
 ## Open
 
+### BUG-004 — Windows Git checkout can invalidate a memory bundle digest
+
+- Severity: high
+- Status: open
+- First observed: 2026-08-29
+- Reproduction: With no matching Git attributes and `core.autocrlf=true`, add an LF-terminated `memory-bundles/**/records.jsonl`, then let Git materialize the indexed file into the worktree.
+- Expected: The checked-out JSONL bytes retain the SHA-256 recorded in `manifest.json` on the writer device.
+- Actual: Git converts the final LF to CRLF, changing the JSONL byte digest and causing a valid cross-device import to be rejected as tampered.
+- Impact: The manual private-GitHub transfer can fail between Windows checkouts even when the committed bundle is unchanged.
+- Current evidence: A real temporary Git repository reproduced the extra CR byte under `core.autocrlf=true`. A test-first local fix declares memory bundle JSONL as `text eol=lf`; the regression then passed, all 59 memory tests passed, the full suite passed 32/32 files and 646/646 tests, the TypeScript build passed, and `git diff --check` passed. The fix is not committed, pushed, or merged.
+- Resolution condition: Integrate the Git attribute and regression test, verify a fresh Windows checkout preserves the manifest digest, then resume the real two-device import and same-ID read.
+
 ### BUG-001 — Local Git CLI authentication may be unavailable in a new environment
 
 - Severity: medium
