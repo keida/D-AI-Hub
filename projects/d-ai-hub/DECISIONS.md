@@ -253,3 +253,27 @@ This gives two devices a small, auditable, Git-versioned transfer loop without m
 **Revisit trigger**
 
 Reconsider the single-writer restriction only after a separately authorized design proves explicit writer election, conflict receipts, and multi-writer recovery behavior without automatic merges.
+
+## 2026-08-29 — Accept isolated reader simulation for the first memory-transfer slice
+
+**Context**
+
+The first local-memory slice requires evidence for SQLite persistence, deterministic JSONL/manifest export, private-GitHub transport, integrity enforcement, duplicate handling, and same-ID reader retrieval. A real second physical computer was available only as a future operational check, while the current environment could create a fresh private-GitHub clone with an independent workspace and SQLite database and force Windows `core.autocrlf=true` behavior.
+
+**Decision**
+
+Accept the isolated reader clone as the phase-one device-B simulation and mark the implementation slice complete. The simulation must use the actual private-GitHub bundle commit, an independent checkout and database, reader mode with no `put`, exact manifest/JSONL digest validation, a first `IMPORTED` receipt, a repeated `NOOP_DUPLICATE` receipt, and same-logical-ID retrieval.
+
+Do not describe this as evidence from a second physical computer. A future physical-device run is optional environment validation for credentials, installed tooling, filesystem behavior, and operator execution; it does not block the accepted implementation slice.
+
+**Rationale**
+
+The isolated clone exercises every implemented software and Git transport boundary while keeping the unverified hardware/environment distinction explicit. This closes the vertical slice without weakening the single-writer model or repeatedly re-testing already proven behavior.
+
+**Consequences**
+
+The first slice is complete at private `main` bundle commit `a156c2a0cfbb29424f7a7bf173d72a5a8e609093`. Automatic sync, merging, a second writer, external memory products, embeddings/RAG, Router expansion, and Dashboard work remain deferred and require separate authorization. Any later physical-device rehearsal records environment evidence only and must not rewrite the completed implementation result.
+
+**Revisit trigger**
+
+Revisit the acceptance level only if a later physical-device run exposes a reproducible repository-controlled defect rather than a machine-specific credential or tooling issue.
