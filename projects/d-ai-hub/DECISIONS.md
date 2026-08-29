@@ -214,6 +214,8 @@ Revisit after a disposable integration test proves the adapter-owned secret, bun
 
 ## 2026-08-28 — Keep external routing optional and subordinate
 
+> Superseded on 2026-08-29 only where this decision assigns complex escalation to Superpowers; see "Permanently disable Superpowers" below.
+
 **Context**
 
 D-AI-Hub needs lightweight provider routing while preserving one control plane and progressive Skill loading.
@@ -299,3 +301,25 @@ Operators must export subsequent bundles with `--after-sequence` set to the last
 **Revisit trigger**
 
 Revisit only if a separately authorized multi-writer or out-of-order delivery design supplies explicit lineage, conflict receipts, and recovery semantics.
+
+## 2026-08-29 — Permanently disable Superpowers
+
+**Context**
+
+The prior routing policy treated Superpowers as an optional escalation layer for complex or high-confidence engineering work. The user explicitly rejected that categorization and requested permanent removal because the extra workflow is unnecessary for the current way of working.
+
+**Decision**
+
+Disable Superpowers across D-AI-Hub. Remove its native discovery entry and do not invoke, rediscover, update, or reinstall it unless the user explicitly reverses this decision. Do not classify a task as needing a Superpowers escalation layer. Use native execution, D-AI-Hub custom Skills, the narrowest useful Matt Skill when one matches, and proportional independent review, QA, or security checks.
+
+**Rationale**
+
+The remaining workflow provides enough engineering discipline without a separate orchestration framework. Independent verification and review are confidence controls, not reasons to activate an additional provider.
+
+**Consequences**
+
+The earlier 2026-08-28 routing decision is superseded only where it assigns complex escalation to Superpowers. Historical provenance remains documented, but it is listed as disabled rather than active. An inert local checkout may remain to avoid destructive removal; it is not discoverable or authorized for use.
+
+**Revisit trigger**
+
+Re-enable only after a new explicit user instruction that reverses this permanent-disable decision.
