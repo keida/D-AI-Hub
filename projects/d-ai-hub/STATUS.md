@@ -3,15 +3,15 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-29
+- Last updated: 2026-08-30
 
 ## Current checkpoint
 
-- Current task: Permanently disable Superpowers as a D-AI-Hub workflow provider while preserving the completed manual single-writer memory slice and its accepted evidence.
-- Working state: The native user-level Superpowers discovery junction has been removed, while the upstream checkout remains inert and preserved. Routing, discovery, provenance, and decision records passed their release gate and are being integrated through PR #19 by an explicitly authorized ordinary merge; the original dirty root checkout remains untouched. Reset, stash, overwrite, automatic sync, and multi-writer expansion remain unauthorized.
-- Authorized file scope: a new `src/memory/` boundary and its focused tests, the local CLI/package script, this project's decision/status/roadmap, and the matching design/implementation plan. Existing `DurableContextStore`, lifecycle runtime, handoff, recovery, rollback, GitHub adapter, Router, external-memory adapters, and dashboard remain out of scope except for reuse through their existing public helpers and patterns.
+- Current task: Reconcile the post-merge project checkpoint and roadmap, then select the next separately scoped milestone without implicitly expanding the accepted V1 boundary.
+- Working state: PR #19 merged the permanent Superpowers disablement to canonical `main` as merge commit `fd5ded78679286710fd0623dbf2f8574f4956a25`; `origin/main` matched that commit and contained the PR head. Native discovery remains absent and the upstream checkout remains inert. The original dirty root checkout remains untouched.
+- Authorized file scope: this post-merge continuity repair is limited to `projects/d-ai-hub/STATUS.md` and `projects/d-ai-hub/ROADMAP.md`. No implementation, automatic sync, multi-writer behavior, RAG, Dashboard, Router, or external-memory work is authorized by this repair.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
-- Acceptance target: preserve all accepted phase-one behavior and prove ordered repeated transfers: bundle 1 then bundle 2 imports successfully, both IDs are readable, gaps and overlaps are rejected without mutation, and replaying either applied bundle remains `NOOP_DUPLICATE`. These code and CLI targets are verified locally; a second physical computer remains optional environment validation rather than a blocker.
+- Acceptance target: record the verified PR #19 merge, remove stale active-Superpowers wording from the roadmap, preserve the accepted manual single-writer memory evidence and deferred boundaries unchanged, and pass targeted documentation validation.
 
 ## Delivery state
 
@@ -45,4 +45,4 @@
 
 ## Next concrete action
 
-- With Superpowers disabled, select the next separately scoped roadmap milestone. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
+- Select the next separately scoped roadmap milestone. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
