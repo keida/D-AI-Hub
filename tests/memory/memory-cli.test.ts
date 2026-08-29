@@ -93,6 +93,48 @@ describe("memory CLI", () => {
     expect(parseJSON(readerGet)).toMatchObject({ memoryId: "note-1", value: { text: "hello" } });
   }, 60_000);
 
+  it("transfers two ordered bundles and treats a repeated incremental bundle as a duplicate", async () => {
+    const root = await createRoot();
+    const writerDatabase = join(root, "writer.sqlite");
+    const readerDatabase = join(root, "reader.sqlite");
+    const firstBundle = join(root, "bundle-1");
+    const secondBundle = join(root, "bundle-2");
+    const writerArguments = ["--database", writerDatabase, "--workspace", root, "--scope", "d-ai-hub", "--writer", "primary-device"];
+    const readerArguments = ["--database", readerDatabase, "--workspace", root, "--scope", "d-ai-hub", "--writer", "primary-device", "--mode", "reader"];
+
+    expect((await runMemoryCLI([
+      "put", ...writerArguments, "--mode", "writer", "--memory-id", "note-1", "--value", '{"text":"first"}',
+      "--recorded-at", "2026-08-28T00:00:00.000Z",
+    ])).exitCode).toBe(0);
+    expect(parseJSON(await runMemoryCLI([
+      "export", ...writerArguments, "--mode", "reader", "--bundle", firstBundle, "--bundle-id", "bundle-1",
+      "--created-at", "2026-08-28T00:01:00.000Z",
+    ]))).toMatchObject({ fromSequence: 1, toSequence: 1, recordCount: 1 });
+    expect((await runMemoryCLI([
+      "put", ...writerArguments, "--mode", "writer", "--memory-id", "note-2", "--value", '{"text":"second"}',
+      "--recorded-at", "2026-08-28T00:02:00.000Z",
+    ])).exitCode).toBe(0);
+    expect(parseJSON(await runMemoryCLI([
+      "export", ...writerArguments, "--mode", "reader", "--bundle", secondBundle, "--bundle-id", "bundle-2",
+      "--created-at", "2026-08-28T00:03:00.000Z", "--after-sequence", "1",
+    ]))).toMatchObject({ fromSequence: 2, toSequence: 2, recordCount: 1 });
+
+    expect(parseJSON(await runMemoryCLI(["import", ...readerArguments, "--bundle", firstBundle]))).toMatchObject({
+      outcome: "IMPORTED", bundleId: "bundle-1", importedCount: 1,
+    });
+    expect(parseJSON(await runMemoryCLI(["import", ...readerArguments, "--bundle", secondBundle]))).toMatchObject({
+      outcome: "IMPORTED", bundleId: "bundle-2", importedCount: 1,
+    });
+    expect(parseJSON(await runMemoryCLI(["import", ...readerArguments, "--bundle", firstBundle]))).toMatchObject({
+      outcome: "NOOP_DUPLICATE", bundleId: "bundle-1", importedCount: 0,
+    });
+    expect(parseJSON(await runMemoryCLI(["import", ...readerArguments, "--bundle", secondBundle]))).toMatchObject({
+      outcome: "NOOP_DUPLICATE", bundleId: "bundle-2", importedCount: 0,
+    });
+    expect(parseJSON(await runMemoryCLI(["get", ...readerArguments, "--memory-id", "note-1"]))).toMatchObject({ memoryId: "note-1", sequence: 1 });
+    expect(parseJSON(await runMemoryCLI(["get", ...readerArguments, "--memory-id", "note-2"]))).toMatchObject({ memoryId: "note-2", sequence: 2 });
+  }, 60_000);
+
   it("rejects reader-mode put with a non-zero exit and no SQLite mutation", async () => {
     const root = await createRoot();
     const databasePath = join(root, "reader.sqlite");

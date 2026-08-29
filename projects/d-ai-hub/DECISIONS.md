@@ -277,3 +277,25 @@ The first slice is complete at private `main` bundle commit `a156c2a0cfbb29424f7
 **Revisit trigger**
 
 Revisit the acceptance level only if a later physical-device run exposes a reproducible repository-controlled defect rather than a machine-specific credential or tooling issue.
+
+## 2026-08-29 — Require contiguous imports for the single-writer memory chain
+
+**Context**
+
+The accepted first transfer proved one complete bundle, but repeated manual transfers need an explicit ordering rule. Without it, a fresh reader could import a bundle beginning after sequence 1, or an existing reader could skip an unseen range while each individual bundle still passed its own manifest and digest checks.
+
+**Decision**
+
+For a configured scope and writer, every non-empty import must extend the reader's global sequence chain contiguously. A missing reader accepts a first sequence of 1. An initialized reader accepts a first sequence equal to its current maximum plus 1. Any gap or overlap returns `BLOCKED` without inserting records or an import receipt. Exact receipt identity remains higher priority and returns `NOOP_DUPLICATE`, including when replaying an older bundle after later bundles were applied. Empty-bundle behavior and manifest version 1 remain unchanged.
+
+**Rationale**
+
+This is the smallest fail-closed rule that prevents silent history omission during manual single-writer transfer while preserving deterministic duplicate handling and the existing bundle format.
+
+**Consequences**
+
+Operators must export subsequent bundles with `--after-sequence` set to the last verified imported `toSequence` and import them in order. This adds no Git automation, second writer, merge behavior, lineage graph, or manifest schema change.
+
+**Revisit trigger**
+
+Revisit only if a separately authorized multi-writer or out-of-order delivery design supplies explicit lineage, conflict receipts, and recovery semantics.
