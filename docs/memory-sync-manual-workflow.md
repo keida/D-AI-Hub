@@ -33,6 +33,8 @@ npm --silent run memory -- get --database $database --workspace $workspace --sco
 npm --silent run memory -- export --database $database --workspace $workspace --scope d-ai-hub --writer primary-device --mode reader --bundle $bundle --bundle-id bundle-2026-08-28 --created-at 2026-08-28T00:02:00.000Z
 ```
 
+On Windows PowerShell, keep object JSON in single quotes and invoke the CLI through the documented `npm --silent run memory -- ...` path. Do not substitute a direct call to `node_modules\.bin\tsx.cmd` for commands containing inline object JSON: the Windows command wrapper can strip the embedded double quotes before the CLI receives the value. This limitation belongs to that direct wrapper invocation; the documented npm path preserves the JSON object.
+
 Review the exact raw files before staging. Confirm the scope, writer, record count, values, digest, and absence of machine-local paths or secret-shaped content:
 
 ```powershell
