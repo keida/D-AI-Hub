@@ -8,8 +8,8 @@
 ## Current checkpoint
 
 - Current task: Retire superseded draft PR #3 without merging it and preserve only its still-relevant repository health-check ideas as future candidates.
-- Working state: PR #3 is closed with `mergedAt=null`; its historical branch was not deleted. The draft targeted the old `feat/d-ai-ownership-repair` branch, was `DIRTY`/`CONFLICTING`, failed GitGuardian, and mixed a health-check prototype with broad outdated runtime changes and disabled Superpowers planning artifacts. Current `main` already has a newer repository health-check implementation. The original dirty root checkout remains untouched.
-- Authorized file scope: this continuity update is limited to `projects/d-ai-hub/STATUS.md` and `projects/d-ai-hub/ROADMAP.md`. Commit, push, and PR creation for these two documentation files are explicitly authorized. PR #3 code salvage, implementation, PR merge, automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work remain unauthorized.
+- Working state: PR #3 is closed with `mergedAt=null`; its historical branch was not deleted. PR #21 records the retirement evidence and narrow future candidates, is clean against current `main`, passed GitGuardian, and has an explicitly authorized ordinary merge. Current `main` already has a newer repository health-check implementation. The original dirty root checkout remains untouched.
+- Authorized file scope: this continuity update is limited to `projects/d-ai-hub/STATUS.md` and `projects/d-ai-hub/ROADMAP.md`. The ordinary merge of PR #21 is authorized. PR #3 code salvage, candidate implementation, automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work remain unauthorized.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
 - Acceptance target: confirm PR #3 is closed and unmerged, prevent its old branch and Superpowers artifacts from re-entering `main`, and record only index freshness, Skill frontmatter, secret-like scanning, and UTF-8/path/symlink hardening as separately scoped future candidates.
 
@@ -47,4 +47,4 @@
 
 ## Next concrete action
 
-- Review the published PR #3 retirement checkpoint and roadmap update and decide whether to merge it. Selecting or implementing any retained health-check candidate remains a separate scope decision. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
+- With PR #3 retired, select the next separately scoped roadmap milestone. Selecting or implementing any retained health-check candidate remains a separate scope decision. Automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
