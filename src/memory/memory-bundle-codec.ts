@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { TextDecoder } from "node:util";
@@ -239,6 +240,9 @@ export async function importMemoryBundle(
     if (manifest.writerId !== configuredWriterId) return blocked("Memory bundle writer does not match the configured writer", manifest.bundleId, manifest.recordsSha256);
     if (createHash("sha256").update(recordsBytes).digest("hex") !== manifest.recordsSha256) return blocked("Memory bundle records digest does not match its manifest", manifest.bundleId, manifest.recordsSha256);
     const records = parseRecords(recordsJsonl, manifest);
+    if (!(target instanceof LocalSqliteMemoryStore) && records.length > 0 && !existsSync(target.databasePath) && records[0]!.sequence !== 1) {
+      return blocked("Memory bundle must begin at reader sequence 1", manifest.bundleId, manifest.recordsSha256);
+    }
     let store: LocalSqliteMemoryStore;
     let ownsStore = false;
     if (target instanceof LocalSqliteMemoryStore) {

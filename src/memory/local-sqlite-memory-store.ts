@@ -642,6 +642,24 @@ export class LocalSqliteMemoryStore {
           reason: "Bundle ID was already applied with a different records digest",
         };
       }
+      if (snapshotInput.records.length > 0) {
+        const latest = writeDatabase
+          .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM memory_records WHERE scope_id = ? AND writer_id = ?")
+          .get(this.options.scopeId, this.options.writerId) as { readonly sequence: number };
+        const expectedSequence = latest.sequence + 1;
+        if (snapshotInput.records[0]!.sequence !== expectedSequence) {
+          writeDatabase.exec("ROLLBACK");
+          transactionStarted = false;
+          return {
+            outcome: "BLOCKED",
+            bundleId: snapshotInput.bundleId,
+            recordsSha256: snapshotInput.recordsSha256,
+            appliedAt: snapshotInput.appliedAt,
+            importedCount: 0,
+            reason: `Memory bundle must begin at reader sequence ${expectedSequence}`,
+          };
+        }
+      }
       for (const record of snapshotInput.records) {
         const existingRecord = writeDatabase
           .prepare("SELECT value_sha256 FROM memory_records WHERE scope_id = ? AND memory_id = ?")

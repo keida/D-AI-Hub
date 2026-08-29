@@ -20,7 +20,7 @@ SQLite contains `memory_records` keyed by `(scope_id, memory_id)` and `applied_b
 
 An export writes `records.jsonl` and `manifest.json` under a caller-selected Git-tracked bundle directory. JSONL has one canonical JSON record per line, ordered by sequence. The manifest contains `formatVersion: 1`, `bundleId`, `scopeId`, `writerId`, `fromSequence`, `toSequence`, `recordCount`, `recordsSha256`, and `createdAt`.
 
-Import checks format, safe paths, scope, expected writer, strict sequence/order, record schema, SHA-256, count, and secret-shaped input before opening a write transaction. An already-applied `(scopeId, bundleId, recordsSha256)` returns `NOOP_DUPLICATE`; the same bundle ID with another digest, or an existing memory ID with another content digest, returns `BLOCKED`. No conflict resolution or automatic merge exists in this phase.
+Import checks format, safe paths, scope, expected writer, strict sequence/order, record schema, SHA-256, count, and secret-shaped input before opening a write transaction. A non-empty bundle must begin at the reader's next sequence: sequence `1` for an empty reader, otherwise the current maximum sequence plus one. Gaps and overlaps return `BLOCKED` without records or a receipt. An already-applied `(scopeId, bundleId, recordsSha256)` returns `NOOP_DUPLICATE` even after later bundles have been applied; the same bundle ID with another digest, or an existing memory ID with another content digest, returns `BLOCKED`. No conflict resolution or automatic merge exists in this phase.
 
 ## Manual Git workflow
 

@@ -97,9 +97,24 @@ npm --silent run memory -- get --database $database --workspace $workspace --sco
 
 A valid import creates a missing local reader database with the configured writer and resolved workspace binding, then applies the whole bundle in one SQLite transaction. Invalid or tampered input is rejected before database initialization, so it returns `BLOCKED` without creating a missing database.
 
+## Subsequent single-writer transfers
+
+Use the `toSequence` from the last reviewed and transferred manifest as the next export cursor. Do not guess the cursor from filenames or skip a bundle. After the sole writer adds another record, export only records after that verified sequence:
+
+```powershell
+$previousToSequence = 1
+$nextBundle = Join-Path $workspace 'memory-bundles\note-2026-08-29'
+
+npm --silent run memory -- put --database $database --workspace $workspace --scope d-ai-hub --writer primary-device --mode writer --memory-id note-2 --value '{"text":"second"}'
+npm --silent run memory -- export --database $database --workspace $workspace --scope d-ai-hub --writer primary-device --mode reader --bundle $nextBundle --bundle-id bundle-2026-08-29 --after-sequence $previousToSequence
+```
+
+Review, stage, commit, push, fetch, and verify the next bundle using the same exact two-file Git gate as the first transfer. Its non-empty manifest must start at `fromSequence = previousToSequence + 1`. On the reader, pull the verified commit and import bundles in sequence order. A missing predecessor, gap, or overlap returns `BLOCKED` without inserting records or an applied-bundle receipt. Re-importing an exact already-applied bundle remains `NOOP_DUPLICATE`.
+
 ## Expected responses
 
 - A first valid import prints a JSON receipt with `"outcome":"IMPORTED"` and exits zero.
 - Repeating the exact same bundle prints `"outcome":"NOOP_DUPLICATE"` and exits zero; no records are inserted again.
+- A non-empty first bundle that does not start at sequence `1`, or a later bundle that does not start at the reader's current maximum sequence plus one, prints `"outcome":"BLOCKED"` and exits non-zero; no records or receipt are added.
 - Tampered input, a scope/writer/workspace mismatch, a reused bundle ID with another digest, or a conflicting memory ID prints `"outcome":"BLOCKED"` and exits non-zero; the reader database is unchanged.
 - A `put` run with `--mode reader` prints a blocked JSON error and exits non-zero; it does not modify SQLite.

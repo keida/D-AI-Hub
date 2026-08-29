@@ -76,6 +76,72 @@ describe("memory bundle codec", () => {
     readOnlyReader.close();
   });
 
+  it("blocks an incremental bundle that starts after sequence 1 before initializing a missing reader", async () => {
+    const root = await createRoot();
+    const writer = createStore(join(root, "writer.sqlite"), "writer");
+    await writer.put({ memoryId: "note-1", value: { text: "first" }, recordedAt: "2026-08-28T00:00:00.000Z" });
+    await writer.put({ memoryId: "note-2", value: { text: "second" }, recordedAt: "2026-08-28T00:01:00.000Z" });
+    const bundleDirectory = join(root, "bundle-gap-fresh");
+    await exportMemoryBundle(writer, bundleDirectory, {
+      bundleId: "bundle-gap-fresh",
+      createdAt: "2026-08-28T00:02:00.000Z",
+      afterSequence: 1,
+    });
+    writer.close();
+
+    const readerPath = join(root, "missing-reader.sqlite");
+    const result = await importMemoryBundle({
+      databasePath: readerPath,
+      workspacePath: root,
+      mode: "reader",
+      scopeId: "d-ai-hub",
+      writerId: "primary-device",
+    }, bundleDirectory);
+
+    expect(result).toMatchObject({ outcome: "BLOCKED", importedCount: 0 });
+    expect(result.reason).toMatch(/sequence 1/i);
+    await expect(access(readerPath)).rejects.toThrow();
+  });
+
+  it("blocks a gap after the reader's current sequence without inserting records or a receipt", async () => {
+    const root = await createRoot();
+    const writer = createStore(join(root, "writer.sqlite"), "writer");
+    await writer.put({ memoryId: "note-1", value: { text: "first" }, recordedAt: "2026-08-28T00:00:00.000Z" });
+    const firstBundleDirectory = join(root, "bundle-first");
+    await exportMemoryBundle(writer, firstBundleDirectory, {
+      bundleId: "bundle-first",
+      createdAt: "2026-08-28T00:01:00.000Z",
+    });
+    await writer.put({ memoryId: "note-2", value: { text: "second" }, recordedAt: "2026-08-28T00:02:00.000Z" });
+    await writer.put({ memoryId: "note-3", value: { text: "third" }, recordedAt: "2026-08-28T00:03:00.000Z" });
+    const gapBundleDirectory = join(root, "bundle-gap-existing");
+    await exportMemoryBundle(writer, gapBundleDirectory, {
+      bundleId: "bundle-gap-existing",
+      createdAt: "2026-08-28T00:04:00.000Z",
+      afterSequence: 2,
+    });
+    writer.close();
+
+    const readerPath = join(root, "reader.sqlite");
+    const readerOptions = {
+      databasePath: readerPath,
+      workspacePath: root,
+      mode: "reader" as const,
+      scopeId: "d-ai-hub",
+      writerId: "primary-device",
+    };
+    expect(await importMemoryBundle(readerOptions, firstBundleDirectory)).toMatchObject({ outcome: "IMPORTED" });
+    const result = await importMemoryBundle(readerOptions, gapBundleDirectory);
+
+    expect(result).toMatchObject({ outcome: "BLOCKED", importedCount: 0 });
+    expect(result.reason).toMatch(/sequence 2/i);
+    const reader = createStore(readerPath, "reader");
+    expect(await reader.get("note-1")).toMatchObject({ sequence: 1 });
+    expect(await reader.get("note-3")).toBeNull();
+    expect(reader.getAppliedBundleReceipt("bundle-gap-existing")).toBeNull();
+    reader.close();
+  });
+
   it("blocks a tampered JSONL bundle without mutating the reader", async () => {
     const root = await createRoot();
     const writer = createStore(join(root, "writer.sqlite"), "writer");

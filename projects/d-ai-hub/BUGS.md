@@ -18,6 +18,14 @@
 
 ## Resolved
 
+### BUG-005 — Incremental memory bundles could skip an unseen sequence range
+
+- Severity: high
+- Status: resolved on 2026-08-29
+- Resolution: Every non-empty import now extends the configured scope/writer chain contiguously. A missing reader accepts only sequence 1; an initialized reader accepts only its current maximum sequence plus one. Gaps and overlaps return `BLOCKED` before inserting records or an import receipt, while an exact previously applied bundle still returns `NOOP_DUPLICATE`.
+- Evidence: Two focused regressions first failed because sequence 2 on a missing reader and sequence 3 after sequence 1 were imported. After the fix, 34/34 bundle-codec tests, 10/10 real CLI tests, 62/62 memory tests, and 32/32 full-suite files with 649/649 tests passed. The CLI acceptance imported bundles 1 and 2 in order, retrieved both IDs, and treated replays of both the older and latest bundle as `NOOP_DUPLICATE`.
+- Limitation: This is a single-writer ordered-import invariant, not automatic synchronization, multi-writer reconciliation, or merge support.
+
 ### BUG-004 — Windows Git checkout could invalidate a memory bundle digest
 
 - Severity: high
