@@ -8,6 +8,7 @@ Canonical durable knowledge lives under `knowledge/`.
   - [D-AI-Hub Operating Model](../knowledge/ai/d-ai-hub-operating-model.md)
 - [Data](../knowledge/data/)
 - [Development](../knowledge/development/)
+  - [Git line endings and hashed text artifacts](../knowledge/development/git-hashed-artifacts-line-endings.md)
 - [Banking](../knowledge/banking/)
 - [Career](../knowledge/career/)
 
