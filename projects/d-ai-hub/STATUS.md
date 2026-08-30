@@ -7,7 +7,7 @@
 
 ## Current checkpoint
 
-- Current task: Release the reviewed read-only index-freshness extension as a feature-branch PR without copying draft PR #3 or expanding into other health-check candidates.
+- Current task: Review the published index-freshness PR and wait for a separately authorized merge decision.
 - Working state: The public seam remains `runRepositoryHealthCheck`; its report now includes `index-freshness` after `required-files` and before `markdown-links`. The internal check derives required catalog targets only from tracked paths, requires exact single coverage, permits promoted knowledge links, excludes the external provenance README and project template, and fails closed on Git enumeration or index-read errors. `d-ai-hub-v2` is now indexed as planned. The original dirty root checkout remains untouched.
 - Authorized release scope: the ten reviewed files across `src/health/`, focused health tests, `indexes/PROJECTS.md`, the approved design, and the D-AI-Hub decision/roadmap/checkpoint records. Commit, feature-branch push, and PR creation are authorized. Merge, automatic repair, other health-check candidates, automatic sync, multi-writer behavior, RAG, Dashboard, Router, and external-memory work require separate authorization.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
@@ -48,4 +48,4 @@
 
 ## Next concrete action
 
-- Inspect the index-freshness PR checks and obtain explicit authorization before any merge to `main`. Automatic repair, other health-check candidates, automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
+- [PR #22](https://github.com/keida/D-AI-Hub/pull/22) is open from `codex/index-freshness-design` to `main`; the feature branch was pushed and its remote SHA verified. Inspect checks for the latest PR head and obtain explicit authorization before any merge. Automatic repair, other health-check candidates, automatic synchronization, merging behavior, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred unless separately authorized.
