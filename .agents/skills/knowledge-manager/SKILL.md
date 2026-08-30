@@ -1,8 +1,8 @@
 ---
 name: knowledge-manager
-description: Use when durable information should be captured, classified, normalized, linked, indexed, retrieved, or cleaned up inside D-AI-Hub. Do not use for transient chat, secrets, credentials, or project-only state that belongs under projects/.
+description: Curate and retrieve reusable knowledge or stable cross-project memory in D-AI-Hub; assess value, evidence, duplicates, and conflicts before saving. Route project-only progress to project-memory.
 metadata:
-  triggers: '["knowledge","durable","retrieve"]'
+  triggers: '["knowledge","durable","retrieve","memory","curation"]'
   compatibleEnvironments: '["chat","work","codex"]'
   compatibleStages: '["bootstrap","plan","execute","inspect","verify","close"]'
   requiredResources: '[]'
