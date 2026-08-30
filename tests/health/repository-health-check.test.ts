@@ -20,6 +20,11 @@ async function git(workspacePath: string, argumentsList: readonly string[]): Pro
   await runCommand({ command: "git", arguments: argumentsList, cwd: workspacePath });
 }
 
+async function commitFixtureChanges(workspacePath: string, message: string): Promise<void> {
+  await git(workspacePath, ["add", "."]);
+  await git(workspacePath, ["commit", "-m", message]);
+}
+
 type FixtureOptions = {
   readonly markdown?: string;
   readonly buildCommand?: string;
@@ -47,6 +52,24 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, `${relativePath}\n`, "utf8");
   }
+  const catalogFiles = [
+    "skills/custom/example/SKILL.md",
+    ".agents/skills/example/SKILL.md",
+    "skills/external/example.md",
+    "knowledge/ai/example.md",
+  ] as const;
+  for (const relativePath of catalogFiles) {
+    const filePath = join(workspacePath, relativePath);
+    await mkdir(dirname(filePath), { recursive: true });
+    await writeFile(filePath, `${relativePath}\n`, "utf8");
+  }
+  await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
+    "[custom](../skills/custom/example/SKILL.md)",
+    "[compatibility](../.agents/skills/example/SKILL.md)",
+    "[external](../skills/external/example.md)",
+  ].join("\n"), "utf8");
+  await writeFile(join(workspacePath, "indexes", "KNOWLEDGE.md"), "[AI](../knowledge/ai/)\n", "utf8");
+  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), "[D-AI-Hub](../projects/d-ai-hub/)\n", "utf8");
   await writeFile(join(workspacePath, "package.json"), `${JSON.stringify({
     name: "repository-health-fixture",
     private: true,
@@ -98,6 +121,11 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "repository-identity").status).toBe("passed");
     expect(checkWithId(report, "working-tree").status).toBe("passed");
     expect(checkWithId(report, "required-files").status).toBe("passed");
+    expect(checkWithId(report, "index-freshness")).toEqual({
+      id: "index-freshness",
+      status: "passed",
+      observation: "All required catalog targets are indexed exactly once",
+    });
     expect(checkWithId(report, "markdown-links").status).toBe("passed");
     expect(checkWithId(report, "build").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
@@ -128,12 +156,123 @@ describe("runRepositoryHealthCheck", () => {
       "repository-identity",
       "working-tree",
       "required-files",
+      "index-freshness",
       "markdown-links",
       "build",
       "test",
       "working-tree-final",
     ]);
   });
+
+  it.each([
+    ["indexes/SKILLS.md", "skills/custom/example/SKILL.md"],
+    ["indexes/KNOWLEDGE.md", "knowledge/ai"],
+    ["indexes/PROJECTS.md", "projects/d-ai-hub"],
+  ])("reports a missing catalog target from %s while later checks still run", async (indexPath, expectedTarget) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, indexPath), "# Empty catalog\n", "utf8");
+    await commitFixtureChanges(workspacePath, `remove catalog entry from ${indexPath}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(report.status).toBe("unhealthy");
+    const freshnessCheck = checkWithId(report, "index-freshness");
+    expect(freshnessCheck.status).toBe("failed");
+    expect(freshnessCheck.observation).toContain(indexPath);
+    expect(freshnessCheck.observation).toContain(expectedTarget);
+    expect(checkWithId(report, "markdown-links").status).toBe("passed");
+    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+  });
+
+  it("reports a duplicate required catalog target deterministically", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
+      "[custom one](../skills/custom/example/SKILL.md)",
+      "[custom two](../skills/custom/example/SKILL.md#usage)",
+      "[compatibility](../.agents/skills/example/SKILL.md)",
+      "[external](../skills/external/example.md)",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "duplicate custom skill entry");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness")).toEqual({
+      id: "index-freshness",
+      status: "failed",
+      observation: "Index freshness findings: indexes/SKILLS.md: skills/custom/example/SKILL.md (2 links)",
+    });
+  });
+
+  it("allows an additional promoted knowledge-note link", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "KNOWLEDGE.md"), [
+      "[AI](../knowledge/ai/)",
+      "[Promoted note](../knowledge/ai/example.md)",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "promote knowledge note");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").status).toBe("passed");
+  });
+
+  it("excludes the external provenance README and project template", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await mkdir(join(workspacePath, "projects", "_template"), { recursive: true });
+    await writeFile(join(workspacePath, "projects", "_template", "STATUS.md"), "template\n", "utf8");
+    await writeFile(join(workspacePath, "skills", "external", "README.md"), "provenance guide\n", "utf8");
+    await commitFixtureChanges(workspacePath, "add excluded catalog files");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").status).toBe("passed");
+  });
+
+  it("requires a tracked planned project to be indexed", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await mkdir(join(workspacePath, "projects", "planned-project"), { recursive: true });
+    await writeFile(join(workspacePath, "projects", "planned-project", "STATUS.md"), "planned\n", "utf8");
+    await commitFixtureChanges(workspacePath, "add planned project");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    const freshnessCheck = checkWithId(report, "index-freshness");
+    expect(freshnessCheck.status).toBe("failed");
+    expect(freshnessCheck.observation).toContain("projects/planned-project");
+  });
+
+  it("ignores untracked catalog candidates", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await mkdir(join(workspacePath, "projects", "untracked-project"), { recursive: true });
+    await writeFile(join(workspacePath, "projects", "untracked-project", "STATUS.md"), "untracked\n", "utf8");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "working-tree").status).toBe("failed");
+    expect(checkWithId(report, "index-freshness").status).toBe("passed");
+  });
+
+  it.each(["x".repeat(160), "中".repeat(50)])("blocks index freshness with a bounded diagnostic when tracked-path enumeration exceeds its limit (%#)", async (outputPadding) => {
+    const workspacePath = await createRepositoryFixture();
+    const bulkDirectory = join(workspacePath, "bulk");
+    await mkdir(bulkDirectory, { recursive: true });
+    for (let index = 0; index < 450; index += 1) {
+      const suffix = index.toString().padStart(4, "0");
+      await writeFile(join(bulkDirectory, `tracked-${suffix}-${outputPadding}.md`), "tracked\n", "utf8");
+    }
+    await commitFixtureChanges(workspacePath, "add oversized tracked catalog");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(report.status).toBe("blocked");
+    const freshnessCheck = checkWithId(report, "index-freshness");
+    expect(freshnessCheck.status).toBe("blocked");
+    expect(Buffer.byteLength(freshnessCheck.observation, "utf8")).toBeLessThanOrEqual(2_048);
+    expect(checkWithId(report, "markdown-links").status).toBe("blocked");
+    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+  }, 45_000);
 
   it("reports workspace changes created by a build script in the final working-tree check", async () => {
     const workspacePath = await createRepositoryFixture({

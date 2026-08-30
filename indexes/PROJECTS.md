@@ -6,6 +6,10 @@ Canonical project state lives under `projects/`.
 
 - [D-AI-Hub](../projects/d-ai-hub/)
 
+## Planned projects
+
+- [D-AI-Hub V2](../projects/d-ai-hub-v2/)
+
 ## Archived projects
 
 _No archived projects registered yet._
