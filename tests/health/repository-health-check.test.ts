@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -61,7 +61,20 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
   for (const relativePath of catalogFiles) {
     const filePath = join(workspacePath, relativePath);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, `${relativePath}\n`, "utf8");
+    if (relativePath.endsWith("/SKILL.md")) {
+      await writeFile(filePath, [
+        "---",
+        "name: example",
+        "description: Example fixture Skill",
+        "metadata:",
+        "  fixture: true",
+        "---",
+        `${relativePath}`,
+        "",
+      ].join("\n"), "utf8");
+    } else {
+      await writeFile(filePath, `${relativePath}\n`, "utf8");
+    }
   }
   await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
     "[custom](../skills/custom/example/SKILL.md)",
@@ -101,6 +114,12 @@ function checkWithId(report: Awaited<ReturnType<typeof runRepositoryHealthCheck>
   const check = report.checks.find((candidate) => candidate.id === id);
   expect(check).toBeDefined();
   return check!;
+}
+
+async function writeSkillFrontmatter(workspacePath: string, relativePath: string, content: string): Promise<void> {
+  const filePath = join(workspacePath, relativePath);
+  await mkdir(dirname(filePath), { recursive: true });
+  await writeFile(filePath, content, "utf8");
 }
 
 afterEach(async () => {
@@ -157,6 +176,7 @@ describe("runRepositoryHealthCheck", () => {
       "working-tree",
       "required-files",
       "index-freshness",
+      "skill-frontmatter",
       "markdown-links",
       "build",
       "test",
@@ -184,6 +204,154 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "build").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
+
+  it("accepts canonical and compatibility Skill frontmatter with extra metadata and CRLF", async () => {
+    const workspacePath = await createRepositoryFixture();
+    const frontmatter = [
+      "---",
+      "name: example",
+      "description: A fixture Skill",
+      "customMetadata:",
+      "  owner: tests",
+      "---",
+      "body",
+      "",
+    ].join("\r\n");
+    await writeSkillFrontmatter(workspacePath, "skills/custom/example/SKILL.md", `\ufeff${frontmatter}`);
+    await writeSkillFrontmatter(workspacePath, ".agents/skills/example/SKILL.md", frontmatter);
+    await commitFixtureChanges(workspacePath, "use CRLF Skill frontmatter");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "skill-frontmatter")).toEqual({
+      id: "skill-frontmatter",
+      status: "passed",
+      observation: "All tracked Skill frontmatter is valid",
+    });
+  });
+
+  it("fails malformed YAML and invalid required field types for both Skill entry points", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeSkillFrontmatter(workspacePath, "skills/custom/example/SKILL.md", [
+      "---",
+      "name: example",
+      "name: duplicate",
+      "description: secret-content-must-not-escape",
+      "---",
+    ].join("\n"));
+    await writeSkillFrontmatter(workspacePath, ".agents/skills/example/SKILL.md", [
+      "---",
+      "name: 42",
+      "description:",
+      "---",
+    ].join("\n"));
+    await commitFixtureChanges(workspacePath, "add invalid Skill frontmatter");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+    const skillCheck = checkWithId(report, "skill-frontmatter");
+
+    expect(report.status).toBe("unhealthy");
+    expect(skillCheck.status).toBe("failed");
+    expect(skillCheck.observation).toContain("skills/custom/example/SKILL.md");
+    expect(skillCheck.observation).toContain(".agents/skills/example/SKILL.md");
+    expect(skillCheck.observation).not.toContain("secret-content-must-not-escape");
+    expect(skillCheck.observation).not.toContain("Map keys must be unique");
+    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+  });
+
+  it("rejects missing frontmatter, non-mappings, unresolved aliases, and empty required fields", async () => {
+    const workspacePath = await createRepositoryFixture();
+    const cases = [
+      ["missing", "no frontmatter", "invalid YAML frontmatter"],
+      ["sequence", "---\n- one\n---", "frontmatter must be a mapping"],
+      ["alias", "---\nname: example\ndescription: okay\nmetadata: *missing\n---", "invalid YAML frontmatter"],
+      ["empty-name", "---\nname: '  '\ndescription: okay\n---", "name must be a non-empty string"],
+      ["empty-description", "---\nname: example\ndescription: '  '\n---", "description must be a non-empty string"],
+      ["description-type", "---\nname: example\ndescription: [one]\n---", "description must be a non-empty string"],
+    ] as const;
+    for (const [name, content] of cases) {
+      await writeSkillFrontmatter(workspacePath, `skills/custom/${name}/SKILL.md`, content);
+    }
+    await commitFixtureChanges(workspacePath, "add rejected metadata shapes");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+    const skillCheck = checkWithId(report, "skill-frontmatter");
+
+    expect(skillCheck.status).toBe("failed");
+    expect(skillCheck.observation).toBe(cases.map(([name, , reason]) =>
+      `skills/custom/${name}/SKILL.md: ${reason}`).sort().join(", "));
+  });
+
+  it("ignores untracked Skills and external provenance Markdown", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeSkillFrontmatter(workspacePath, "skills/custom/untracked/SKILL.md", "not frontmatter\n");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "working-tree").status).toBe("failed");
+    expect(checkWithId(report, "skill-frontmatter")).toEqual({
+      id: "skill-frontmatter",
+      status: "passed",
+      observation: "All tracked Skill frontmatter is valid",
+    });
+  });
+
+  it("blocks a missing tracked Skill while allowing subsequent checks to run", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await rm(join(workspacePath, "skills/custom/example/SKILL.md"));
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(report.status).toBe("blocked");
+    expect(checkWithId(report, "skill-frontmatter")).toEqual({
+      id: "skill-frontmatter",
+      status: "blocked",
+      observation: "skills/custom/example/SKILL.md: unable to read tracked Skill frontmatter",
+    });
+    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+  });
+
+  it("blocks a tracked Skill redirected outside the workspace", async () => {
+    const workspacePath = await createRepositoryFixture();
+    const outsideRoot = await mkdtemp(join(tmpdir(), "d-ai-skill-outside-"));
+    temporaryRoots.splice(temporaryRoots.length - 1, 0, outsideRoot);
+    await writeFile(join(outsideRoot, "SKILL.md"), "external-content-must-not-escape\n", "utf8");
+    const skillDirectory = join(workspacePath, "skills", "custom", "example");
+    await rename(skillDirectory, `${skillDirectory}-original`);
+    await symlink(outsideRoot, skillDirectory, "junction");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "skill-frontmatter")).toEqual({
+      id: "skill-frontmatter",
+      status: "blocked",
+      observation: "skills/custom/example/SKILL.md: tracked Skill path resolves outside the repository",
+    });
+    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+  });
+
+  it("sorts and bounds Skill frontmatter findings without exposing content", async () => {
+    const workspacePath = await createRepositoryFixture();
+    for (let index = 0; index < 24; index += 1) {
+      const skillName = `invalid-${index.toString().padStart(3, "0")}-${"中".repeat(20)}`;
+      await writeSkillFrontmatter(workspacePath, `skills/custom/${skillName}/SKILL.md`, "---\nname: invalid\n---\nsecret-content-must-not-escape\n");
+      await writeSkillFrontmatter(workspacePath, `.agents/skills/${skillName}/SKILL.md`, "---\nname: invalid\n---\nsecret-content-must-not-escape\n");
+    }
+    await commitFixtureChanges(workspacePath, "add many invalid Skills");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+    const skillCheck = checkWithId(report, "skill-frontmatter");
+
+    expect(skillCheck.status).toBe("failed");
+    expect(Buffer.byteLength(skillCheck.observation, "utf8")).toBeLessThanOrEqual(2_048);
+    expect(skillCheck.observation).not.toContain("secret-content-must-not-escape");
+    expect(skillCheck.observation.indexOf(".agents/skills/invalid-000-")).toBeLessThan(
+      skillCheck.observation.indexOf(".agents/skills/invalid-001-"),
+    );
+  }, 30_000);
 
   it("reports a duplicate required catalog target deterministically", async () => {
     const workspacePath = await createRepositoryFixture();

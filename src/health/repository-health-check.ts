@@ -3,6 +3,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { CommandExecutionError, redactSensitiveText, runCommand } from "../adapters/command-runner.js";
 import { validateIndexFreshness } from "./index-freshness.js";
 import { localMarkdownTarget, markdownDestinations } from "./markdown-targets.js";
+import { validateSkillFrontmatter } from "./skill-frontmatter.js";
 
 export type HealthStatus = "healthy" | "unhealthy" | "blocked";
 export type HealthCheckStatus = "passed" | "failed" | "blocked" | "skipped";
@@ -262,6 +263,7 @@ export async function runRepositoryHealthCheck(input: {
   if (requiredFilesCheck.status === "blocked") return { status: overallStatus(checks), workspacePath, checks };
 
   checks.push(await validateIndexFreshness(workspacePath, timeoutMs));
+  checks.push(await validateSkillFrontmatter(workspacePath, timeoutMs));
   checks.push(await validateTrackedMarkdownLinks(workspacePath, timeoutMs));
   const buildCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "build");
   const testCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "test");
