@@ -23,6 +23,9 @@ Initial registry:
 Disabled external skills:
 - [Superpowers — disabled by user decision](../skills/external/superpowers.md)
 
+Rule references only (not installed or activated):
+- [Knowledge curation patterns](../skills/external/knowledge-curation-patterns.md) — selective admission, evidence/scoping, and maintenance ideas used by the custom knowledge and project-memory Skills.
+
 Router decision: no independent external or general-purpose Router runtime is installed; D-AI-Hub routing remains authoritative. `ask-matt` is only an optional internal assistant for selecting Matt Skills.
 
 ## Rule
