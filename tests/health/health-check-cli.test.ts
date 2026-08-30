@@ -31,6 +31,7 @@ async function createRepositoryFixture(): Promise<string> {
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, `${relativePath}\n`, "utf8");
   }
+  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), "[D-AI-Hub](../projects/d-ai-hub/)\n", "utf8");
   await writeFile(join(workspacePath, "package.json"), `${JSON.stringify({
     name: "repository-health-cli-fixture",
     private: true,

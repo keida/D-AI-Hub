@@ -323,3 +323,25 @@ The earlier 2026-08-28 routing decision is superseded only where it assigns comp
 **Revisit trigger**
 
 Re-enable only after a new explicit user instruction that reverses this permanent-disable decision.
+
+## 2026-08-30 — Define index freshness as required catalog coverage
+
+**Context**
+
+The current repository health check verifies that tracked Markdown links resolve, but a newly added canonical Skill, knowledge domain, or project can remain undiscoverable when its owning index is not updated. Requiring every knowledge note to be indexed would conflict with the existing policy that only important notes need direct promotion.
+
+**Decision**
+
+Add a future read-only `index-freshness` health result that requires exactly one owning-index link for tracked canonical Skill entries, top-level knowledge domains, and non-template project directories with `STATUS.md`. Permit additional valid index links, including promoted knowledge notes. Keep active/planned/archived classification human-owned. Do not copy draft PR #3 code; implementation must use the current `runRepositoryHealthCheck` seam and requires separate authorization.
+
+**Rationale**
+
+Required catalog coverage detects actual discovery drift while preserving intentional editorial judgment inside the knowledge index. One unchanged external health-check interface keeps the module deep and prevents a second command or policy surface.
+
+**Consequences**
+
+The first implementation will expose the currently unindexed planned `d-ai-hub-v2` project and should repair `indexes/PROJECTS.md` explicitly. Index repair remains manual. Skill frontmatter, secret-like scanning, UTF-8, path, symlink, remote, and automation work remain separate candidates.
+
+**Revisit trigger**
+
+Revisit the target rules only if canonical ownership changes or section classification becomes machine-owned through a separately approved schema.

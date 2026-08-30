@@ -1,6 +1,8 @@
 import { open, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { CommandExecutionError, redactSensitiveText, runCommand } from "../adapters/command-runner.js";
+import { validateIndexFreshness } from "./index-freshness.js";
+import { localMarkdownTarget, markdownDestinations } from "./markdown-targets.js";
 
 export type HealthStatus = "healthy" | "unhealthy" | "blocked";
 export type HealthCheckStatus = "passed" | "failed" | "blocked" | "skipped";
@@ -81,33 +83,6 @@ function isWithinRepository(workspacePath: string, candidatePath: string): boole
 function relativeDisplayPath(workspacePath: string, filePath: string): string {
   const displayPath = relative(workspacePath, filePath).split(sep).join("/");
   return redactSensitiveText(displayPath.length === 0 ? "." : displayPath);
-}
-
-function markdownDestinations(markdown: string): readonly string[] {
-  const destinations: string[] = [];
-  const linkPattern = /!?(?:\[[^\]]*\])\(\s*(<[^>]*>|[^\s)]+)(?:\s+[^)]*)?\)/g;
-  for (const match of markdown.matchAll(linkPattern)) {
-    const destination = match[1];
-    if (destination === undefined) continue;
-    destinations.push(destination.startsWith("<") && destination.endsWith(">")
-      ? destination.slice(1, -1)
-      : destination);
-  }
-  return destinations;
-}
-
-function localMarkdownTarget(destination: string): string | null {
-  const trimmed = destination.trim();
-  if (trimmed.length === 0 || trimmed.startsWith("#") || trimmed.startsWith("//")) return null;
-  if (!/^[A-Za-z]:[\\/]/.test(trimmed) && /^[A-Za-z][A-Za-z\d+.-]*:/.test(trimmed)) return null;
-  const fragmentIndex = trimmed.indexOf("#");
-  const pathPart = fragmentIndex === -1 ? trimmed : trimmed.slice(0, fragmentIndex);
-  if (pathPart.length === 0) return null;
-  try {
-    return decodeURIComponent(pathPart);
-  } catch {
-    return pathPart;
-  }
 }
 
 async function validateTrackedMarkdownLinks(workspacePath: string, timeoutMs: number): Promise<HealthCheckResult> {
@@ -286,6 +261,7 @@ export async function runRepositoryHealthCheck(input: {
   checks.push(requiredFilesCheck);
   if (requiredFilesCheck.status === "blocked") return { status: overallStatus(checks), workspacePath, checks };
 
+  checks.push(await validateIndexFreshness(workspacePath, timeoutMs));
   checks.push(await validateTrackedMarkdownLinks(workspacePath, timeoutMs));
   const buildCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "build");
   const testCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "test");

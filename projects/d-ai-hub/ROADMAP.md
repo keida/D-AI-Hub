@@ -27,6 +27,7 @@
 - Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
 - Lightweight engineering routing documented; selected Matt Skills remain available through native discovery, Superpowers is permanently disabled and absent from native discovery, and no independent external or general-purpose Router runtime is installed.
 - Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and accepted. Device A pushed an exact two-file bundle commit to private `main`; an isolated reader clone with a separate workspace/SQLite database and `core.autocrlf=true` verified the pulled digest, `IMPORTED`, `NOOP_DUPLICATE`, and same-ID read without writer access. Subsequent non-empty bundles must now extend the reader's sequence chain exactly; missing ranges and overlaps fail closed without records or receipts, while exact old/new replays remain `NOOP_DUPLICATE`. This isolated device-B simulation satisfies phase-one implementation acceptance; a second physical computer is optional environment validation and remains unverified. Git/GitHub transport stays manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
+- Read-only repository index freshness: `runRepositoryHealthCheck` now reports deterministic required catalog coverage for tracked Skills, top-level knowledge domains, and projects. Missing and duplicate targets fail, allowed extras and exclusions remain valid, enumeration errors fail closed, and the planned `d-ai-hub-v2` baseline is indexed. The approved boundary is recorded in `docs/specs/2026-08-30-index-freshness-design.md`.
 
 ## Future / Deferred
 
@@ -39,7 +40,7 @@
 - External memory-product integration, including Memorix and Mem0.
 - Automatic or real-time memory synchronization, multi-writer automatic merge, Supabase, embeddings, RAG, and memory dashboards.
 - Optional second-physical-device environment rehearsal for the accepted manual memory-transfer runbook.
-- Selective repository health-check hardening on current `main`: consider index freshness, Skill frontmatter validation, secret-like scanning, and UTF-8/path/symlink handling only as separate narrow candidates. Draft PR #3 is closed as superseded and must not be merged or resurrected wholesale; its old architecture and Superpowers planning artifacts are historical only.
+- Selective repository health-check hardening beyond the completed index-freshness slice: Skill frontmatter validation, secret-like scanning, and UTF-8/path/symlink handling remain separate candidates. Draft PR #3 is closed as superseded and must not be merged or resurrected wholesale; its old architecture and Superpowers planning artifacts are historical only.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 
 ## Post-V1 boundary
