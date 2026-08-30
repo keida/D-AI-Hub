@@ -9,6 +9,10 @@
 5. Preserve the daily user commands `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`; zero/ambiguous/mismatched identity and unavailable connector cases remain fail closed.
 6. Keep the separately bounded local-memory sync slice within its verified single-writer and manual-transport boundary; any expansion requires a new scope decision.
 
+## Current authorized follow-up
+
+- Read-only Skill frontmatter health check, implemented and locally verified: validate YAML mappings and non-empty string `name`/`description` for tracked custom Skills and compatibility entries through the existing repository-health interface. Report failures without modifying Skill content; exclude external provenance and untracked files. Focused health tests passed 46/46 and the TypeScript build passed; see STATUS.md for evidence limits. Commit, push, and PR creation are authorized; merge requires separate authorization, and actual publication must be checked against the feature branch and PR. This is not a full native-loader compatibility certification.
+
 ## V1 product boundary
 
 - **Codex local control:** required and supported. It owns local repository/workspace inspection, bounded execution, tests, Git operations, recovery, rollback, and local evidence collection through the configured runtime.
@@ -40,7 +44,7 @@
 - External memory-product integration, including Memorix and Mem0.
 - Automatic or real-time memory synchronization, multi-writer automatic merge, Supabase, embeddings, RAG, and memory dashboards.
 - Optional second-physical-device environment rehearsal for the accepted manual memory-transfer runbook.
-- Selective repository health-check hardening beyond the completed index-freshness slice: Skill frontmatter validation, secret-like scanning, and UTF-8/path/symlink handling remain separate candidates. Draft PR #3 is closed as superseded and must not be merged or resurrected wholesale; its old architecture and Superpowers planning artifacts are historical only.
+- Selective repository health-check hardening beyond index freshness and the currently authorized Skill-frontmatter slice: secret-like scanning and broader UTF-8/path/symlink handling remain separate candidates. Draft PR #3 is closed as superseded and must not be merged or resurrected wholesale; its old architecture and Superpowers planning artifacts are historical only.
 - New graph runtimes, agent marketplaces, autonomous swarms, or a second top-level orchestrator.
 
 ## Post-V1 boundary
