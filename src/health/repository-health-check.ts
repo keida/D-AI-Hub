@@ -248,7 +248,11 @@ export async function runRepositoryHealthCheck(input: {
 
   if (!repositoryIdentityPassed) return { status: "blocked", workspacePath, checks };
 
-  checks.push(await runWorkingTreeCheck(workspacePath, timeoutMs, "working-tree"));
+  const workingTreeCheck = await runWorkingTreeCheck(workspacePath, timeoutMs, "working-tree");
+  checks.push(workingTreeCheck);
+  if (workingTreeCheck.status === "blocked") {
+    return { status: "blocked", workspacePath, checks };
+  }
 
   const missingFiles: string[] = [];
   for (const relativePath of requiredFiles) {

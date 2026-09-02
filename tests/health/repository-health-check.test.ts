@@ -591,6 +591,7 @@ describe("runRepositoryHealthCheck", () => {
       expect(report.status).toBe("blocked");
       expect(checkWithId(report, "working-tree").status).toBe("blocked");
       expect(checkWithId(report, "working-tree").observation).toMatch(/timed out/i);
+      expect(report.checks.map((check) => check.id)).toEqual(["repository-identity", "working-tree"]);
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
