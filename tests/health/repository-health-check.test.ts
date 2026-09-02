@@ -27,8 +27,9 @@ async function commitFixtureChanges(workspacePath: string, message: string): Pro
 
 type FixtureOptions = {
   readonly markdown?: string;
-  readonly buildCommand?: string;
+  readonly typecheckCommand?: string;
   readonly testCommand?: string;
+  readonly integrationCommand?: string;
   readonly sourceSymlinkOutside?: boolean;
   readonly nestedWorkspace?: boolean;
 };
@@ -36,8 +37,9 @@ type FixtureOptions = {
 async function createRepositoryFixture(options: FixtureOptions = {}): Promise<string> {
   const fixtureOptions = {
     markdown: "",
-    buildCommand: "node -e \"process.stdout.write('build ok')\"",
+    typecheckCommand: "node -e \"process.stdout.write('typecheck ok')\"",
     testCommand: "node -e \"process.stdout.write('test ok')\"",
+    integrationCommand: "node -e \"process.stdout.write('integration ok')\"",
     ...options,
   };
   const fixtureContainer = await mkdtemp(join(tmpdir(), "d-ai-repository-health-"));
@@ -87,8 +89,9 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
     name: "repository-health-fixture",
     private: true,
     scripts: {
-      build: fixtureOptions.buildCommand,
+      typecheck: fixtureOptions.typecheckCommand,
       test: fixtureOptions.testCommand,
+      "test:integration": fixtureOptions.integrationCommand,
     },
   })}\n`, "utf8");
   if (fixtureOptions.markdown.length > 0) {
@@ -146,8 +149,9 @@ describe("runRepositoryHealthCheck", () => {
       observation: "All required catalog targets are indexed exactly once",
     });
     expect(checkWithId(report, "markdown-links").status).toBe("passed");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
+    expect(checkWithId(report, "test:integration").status).toBe("passed");
   });
 
   it("validates tracked Markdown links while skipping external, mail, and anchor links", async () => {
@@ -178,8 +182,9 @@ describe("runRepositoryHealthCheck", () => {
       "index-freshness",
       "skill-frontmatter",
       "markdown-links",
-      "build",
+      "typecheck",
       "test",
+      "test:integration",
       "working-tree-final",
     ]);
   });
@@ -201,7 +206,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(freshnessCheck.observation).toContain(indexPath);
     expect(freshnessCheck.observation).toContain(expectedTarget);
     expect(checkWithId(report, "markdown-links").status).toBe("passed");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -256,7 +261,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(skillCheck.observation).toContain(".agents/skills/example/SKILL.md");
     expect(skillCheck.observation).not.toContain("secret-content-must-not-escape");
     expect(skillCheck.observation).not.toContain("Map keys must be unique");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -309,7 +314,7 @@ describe("runRepositoryHealthCheck", () => {
       status: "blocked",
       observation: "skills/custom/example/SKILL.md: unable to read tracked Skill frontmatter",
     });
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -329,7 +334,7 @@ describe("runRepositoryHealthCheck", () => {
       status: "blocked",
       observation: "skills/custom/example/SKILL.md: tracked Skill path resolves outside the repository",
     });
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -438,28 +443,28 @@ describe("runRepositoryHealthCheck", () => {
     expect(freshnessCheck.status).toBe("blocked");
     expect(Buffer.byteLength(freshnessCheck.observation, "utf8")).toBeLessThanOrEqual(2_048);
     expect(checkWithId(report, "markdown-links").status).toBe("blocked");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   }, 45_000);
 
-  it("reports workspace changes created by a build script in the final working-tree check", async () => {
+  it("reports workspace changes created by a typecheck script in the final working-tree check", async () => {
     const workspacePath = await createRepositoryFixture({
-      buildCommand: "node -e \"require('node:fs').writeFileSync('generated-by-build.txt', 'generated\\n')\"",
+      typecheckCommand: "node -e \"require('node:fs').writeFileSync('generated-by-typecheck.txt', 'generated\\n')\"",
     });
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("unhealthy");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
     expect(checkWithId(report, "working-tree-final")).toEqual({
       id: "working-tree-final",
       status: "failed",
-      observation: expect.stringContaining("generated-by-build.txt"),
+      observation: expect.stringContaining("generated-by-typecheck.txt"),
     });
   }, 20_000);
 
-  it("fails tracked Markdown links for missing and out-of-root targets but still runs build and test", async () => {
+  it("fails tracked Markdown links for missing and out-of-root targets but still runs typecheck and tests", async () => {
     const workspacePath = await createRepositoryFixture({
       nestedWorkspace: true,
       markdown: [
@@ -477,7 +482,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "markdown-links").observation).toContain("missing.md");
     expect(checkWithId(report, "markdown-links").observation).toContain("../outside.md");
     expect(checkWithId(report, "markdown-links").observation).not.toContain("outside-target-content-must-not-be-read");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -492,27 +497,41 @@ describe("runRepositoryHealthCheck", () => {
     expect(markdownLinksCheck.observation).toContain("docs/external/external.md");
     expect(markdownLinksCheck.observation).not.toContain("external-content-must-not-be-read");
     expect(markdownLinksCheck.observation).not.toContain("missing-external-target.md");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   }, 20_000);
 
-  it("reports build and test command failures independently with redacted diagnostics", async () => {
+  it("reports typecheck and test command failures independently with redacted diagnostics", async () => {
     const workspacePath = await createRepositoryFixture({
-      buildCommand: "node -e \"console.error('token=super-secret'); process.exit(1)\"",
+      typecheckCommand: "node -e \"console.error('token=super-secret'); process.exit(1)\"",
       testCommand: "node -e \"process.stdout.write('test ok')\"",
     });
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("unhealthy");
-    const buildCheck = checkWithId(report, "build");
-    expect(buildCheck.status).toBe("failed");
-    expect(buildCheck.observation).toContain("[REDACTED]");
-    expect(buildCheck.observation).not.toContain("super-secret");
+    const typecheckCheck = checkWithId(report, "typecheck");
+    expect(typecheckCheck.status).toBe("failed");
+    expect(typecheckCheck.observation).toContain("[REDACTED]");
+    expect(typecheckCheck.observation).not.toContain("super-secret");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
-  it("bounds a timed-out test command without suppressing the build check", async () => {
+  it("reports an integration command failure independently", async () => {
+    const workspacePath = await createRepositoryFixture({
+      integrationCommand: "node -e \"console.error('integration failed'); process.exit(1)\"",
+    });
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(report.status).toBe("unhealthy");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+    expect(checkWithId(report, "test:integration").status).toBe("failed");
+    expect(checkWithId(report, "test:integration").observation).toContain("integration failed");
+  });
+
+  it("bounds a timed-out test command without suppressing the typecheck check", async () => {
     const workspacePath = await createRepositoryFixture({
       testCommand: "node -e \"setTimeout(() => {}, 10000)\"",
     });
@@ -520,7 +539,7 @@ describe("runRepositoryHealthCheck", () => {
     const report = await runRepositoryHealthCheck({ workspacePath, timeoutMs: 3_000 });
 
     expect(report.status).toBe("unhealthy");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("failed");
     expect(checkWithId(report, "test").observation).toMatch(/timed out/i);
   }, 20_000);
@@ -534,15 +553,15 @@ describe("runRepositoryHealthCheck", () => {
     expect(report.checks.every((check) => check.status === "passed")).toBe(true);
   });
 
-  it("allows the default health check to complete a build longer than the former five-second budget", async () => {
+  it("allows the default health check to complete a typecheck longer than the former five-second budget", async () => {
     const workspacePath = await createRepositoryFixture({
-      buildCommand: "node -e \"setTimeout(() => {}, 6000)\"",
+      typecheckCommand: "node -e \"setTimeout(() => {}, 6000)\"",
     });
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("healthy");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   }, 30_000);
 
@@ -635,8 +654,9 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "required-files").status).toBe("blocked");
     expect(checkWithId(report, "required-files").observation).toContain("README.md");
     expect(report.checks.map((check) => check.id)).not.toContain("markdown-links");
-    expect(report.checks.map((check) => check.id)).not.toContain("build");
+    expect(report.checks.map((check) => check.id)).not.toContain("typecheck");
     expect(report.checks.map((check) => check.id)).not.toContain("test");
+    expect(report.checks.map((check) => check.id)).not.toContain("test:integration");
   });
 
   it("exposes a JSON healthy report through the npm health-check script", async () => {

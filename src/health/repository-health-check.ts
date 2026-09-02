@@ -180,7 +180,7 @@ async function runWorkingTreeCheck(
 async function runPackageManagerCheck(
   workspacePath: string,
   timeoutMs: number,
-  script: "build" | "test",
+  script: "typecheck" | "test" | "test:integration",
 ): Promise<HealthCheckResult> {
   try {
     const isWindows = process.platform === "win32";
@@ -204,6 +204,7 @@ async function runPackageManagerCheck(
 export async function runRepositoryHealthCheck(input: {
   readonly workspacePath: string;
   readonly timeoutMs?: number;
+  readonly structuralOnly?: boolean;
 }): Promise<RepositoryHealthReport> {
   if (input.workspacePath.trim().length === 0) {
     return {
@@ -265,9 +266,13 @@ export async function runRepositoryHealthCheck(input: {
   checks.push(await validateIndexFreshness(workspacePath, timeoutMs));
   checks.push(await validateSkillFrontmatter(workspacePath, timeoutMs));
   checks.push(await validateTrackedMarkdownLinks(workspacePath, timeoutMs));
-  const buildCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "build");
-  const testCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "test");
-  checks.push(buildCheck, testCheck);
+  if (input.structuralOnly !== true) {
+    checks.push(
+      await runPackageManagerCheck(workspacePath, timeoutMs, "typecheck"),
+      await runPackageManagerCheck(workspacePath, timeoutMs, "test"),
+      await runPackageManagerCheck(workspacePath, timeoutMs, "test:integration"),
+    );
+  }
   checks.push(await runWorkingTreeCheck(workspacePath, timeoutMs, "working-tree-final"));
 
   return { status: overallStatus(checks), workspacePath, checks };

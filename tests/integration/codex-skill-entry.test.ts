@@ -38,7 +38,7 @@ async function runGit(workspacePath: string, argumentsList: readonly string[]): 
   await runCommand({ command: "git", arguments: argumentsList, cwd: workspacePath });
 }
 
-describe("D-AI Codex Skill product boundary", { timeout: 20_000 }, () => {
+describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell product boundary", { timeout: 20_000 }, () => {
   it("discovers the Skill and sends a raw close command into the configured runtime from an unrelated workspace", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-e2e-"));
     const discoveryRoot = join(root, "user-skills");

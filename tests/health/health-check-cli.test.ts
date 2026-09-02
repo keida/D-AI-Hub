@@ -36,8 +36,9 @@ async function createRepositoryFixture(): Promise<string> {
     name: "repository-health-cli-fixture",
     private: true,
     scripts: {
-      build: "node -e \"process.stdout.write('build ok')\"",
+      typecheck: "node -e \"process.stdout.write('typecheck ok')\"",
       test: "node -e \"process.stdout.write('test ok')\"",
+      "test:integration": "node -e \"process.stdout.write('integration ok')\"",
     },
   })}\n`, "utf8");
   await git(workspacePath, ["add", "."]);
@@ -66,8 +67,29 @@ describe("runHealthCheckCLI", () => {
     await expect(runHealthCheckCLI([])).rejects.toThrow(/--workspace/i);
     await expect(runHealthCheckCLI(["--workspace"])).rejects.toThrow(/--workspace/i);
     await expect(runHealthCheckCLI(["--workspace", "   "])).rejects.toThrow(/non-empty/i);
-    await expect(runHealthCheckCLI(["--workspace", "one", "--workspace", "two"])).rejects.toThrow(/exactly one/i);
+    await expect(runHealthCheckCLI(["--workspace", "one", "--workspace", "two"])).rejects.toThrow(/requires --workspace/i);
     await expect(runHealthCheckCLI(["--other", "value"])).rejects.toThrow(/--workspace/i);
+    await expect(runHealthCheckCLI(["--workspace", "one", "--unknown"])).rejects.toThrow(/structural-only/i);
+  });
+
+  it("runs structural checks without recursively invoking package scripts", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "package.json"), `${JSON.stringify({
+      name: "repository-health-cli-fixture",
+      private: true,
+      scripts: {
+        typecheck: "node -e \"process.exit(9)\"",
+        test: "node -e \"process.exit(9)\"",
+        "test:integration": "node -e \"process.exit(9)\"",
+      },
+    })}\n`, "utf8");
+    await git(workspacePath, ["add", "package.json"]);
+    await git(workspacePath, ["commit", "-m", "make package scripts fail"]);
+
+    const result = await runHealthCheckCLI(["--workspace", workspacePath, "--structural-only"]);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.report.checks.map((check) => check.id)).not.toEqual(expect.arrayContaining(["typecheck", "test", "test:integration"]));
   });
 
   it("maps an unhealthy report to exit code one", async () => {

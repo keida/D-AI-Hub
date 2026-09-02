@@ -63,7 +63,18 @@ Never commit passwords, API keys, access tokens, private certificates, authentic
 npm run health-check -- --workspace <repository-path>
 ```
 
-The Git identity, required-file, Markdown-link, and working-tree checks are local and do not modify the workspace or call Git remotes. The command also runs the workspace's own `build` and `test` scripts; those execute arbitrary project code and may modify files or access the network. Use this command only with a trusted workspace. An initially dirty or script-modified working tree is reported as unhealthy. This command does not replace `@D-AI` lifecycle commands or release gates.
+The Git identity, required-file, Markdown-link, and working-tree checks are local and do not modify the workspace or call Git remotes. The command also runs the workspace's own `typecheck`, `test`, and `test:integration` scripts; those execute arbitrary project code and may modify files or access the network. Use this command only with a trusted workspace. An initially dirty or script-modified working tree is reported as unhealthy. This command does not replace `@D-AI` lifecycle commands or release gates.
+
+## Runtime and verification
+
+The repository produces no distributable bundle; `typecheck` is the compile-time gate. The legacy `build` and `lint` scripts are compatibility aliases for `typecheck`, not separate build or lint stages. Supported, CI-verified runtimes are Node 22 from 22.20.0 and Node 26 from 26.7.0, with npm 11.19.x and the committed lockfile.
+
+```text
+npm ci
+npm run verify
+```
+
+`verify` runs type checking, ordinary tests, the serial integration suite, and repository structural validation. CI runs the same boundaries on Windows and Linux. The public D-AI Skill entry wrapper remains PowerShell-specific, so its product-boundary test runs on Windows; the remaining integration suite and an explicit `node:sqlite` smoke test run on both operating systems. `health-check:structural` omits package-script execution so CI can validate repository structure without recursively rerunning tests.
 
 ## V1 scope
 
