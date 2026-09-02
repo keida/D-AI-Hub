@@ -29,9 +29,31 @@ async function createRepositoryFixture(): Promise<string> {
   for (const relativePath of requiredFiles) {
     const filePath = join(workspacePath, relativePath);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, `${relativePath}\n`, "utf8");
+    await writeFile(filePath, relativePath === "projects/d-ai-hub/STATUS.md" ? [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Active PR: none",
+      "## Current checkpoint",
+      "- Current PR: none",
+    ].join("\n") : `${relativePath}\n`, "utf8");
   }
-  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), "[D-AI-Hub](../projects/d-ai-hub/)\n", "utf8");
+  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+    "# Project Index",
+    "## Active projects",
+    "- [D-AI-Hub](../projects/d-ai-hub/)",
+    "## Continuation rule",
+    "Use progressive loading from the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md): read STATUS.md first. Read the complete project set only for close or audit.",
+  ].join("\n"), "utf8");
+  await mkdir(join(workspacePath, "skills", "custom", "project-memory"), { recursive: true });
+  await writeFile(join(workspacePath, "skills", "custom", "project-memory", "SKILL.md"), [
+    "---",
+    "name: example",
+    "description: Example fixture Skill",
+    "---",
+    "# Example",
+  ].join("\n"), "utf8");
+  await writeFile(join(workspacePath, "indexes", "SKILLS.md"), "[project memory](../skills/custom/project-memory/SKILL.md)\n", "utf8");
   await writeFile(join(workspacePath, "package.json"), `${JSON.stringify({
     name: "repository-health-cli-fixture",
     private: true,
