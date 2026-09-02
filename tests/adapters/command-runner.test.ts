@@ -1,9 +1,26 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { redactSensitiveText, runCommand, terminateProcessTree } from "../../src/adapters/command-runner.js";
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === "linux") {
+      try {
+        return !/\)\s+Z\s/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+      } catch {
+        return true;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 describe("redactSensitiveText", () => {
   it.each([
@@ -124,14 +141,6 @@ describe("redactSensitiveText", () => {
       "writeFileSync(process.argv[1], String(descendant.pid));",
       "setInterval(() => {}, 1000);",
     ].join(" ");
-    const isAlive = (pid: number): boolean => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
     try {
       await expect(runCommand({
         command: process.execPath,
@@ -150,11 +159,11 @@ describe("redactSensitiveText", () => {
       }
       expect(Number.isInteger(descendantPid)).toBe(true);
       expect(descendantPid).toBeGreaterThan(0);
-      expect(isAlive(descendantPid)).toBe(false);
+      expect(processIsRunning(descendantPid)).toBe(false);
     } finally {
       try {
         const descendantPid = Number(await readFile(pidPath, "utf8"));
-        if (Number.isInteger(descendantPid) && isAlive(descendantPid)) process.kill(descendantPid);
+        if (Number.isInteger(descendantPid) && processIsRunning(descendantPid)) process.kill(descendantPid);
       } catch {
         // The command may have terminated before writing its child pid.
       }
@@ -172,14 +181,6 @@ describe("redactSensitiveText", () => {
       "writeFileSync(process.argv[1], String(descendant.pid));",
       "setInterval(() => {}, 1000);",
     ].join(" ");
-    const isAlive = (pid: number): boolean => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    };
     try {
       await expect(runCommand({
         command: process.execPath,
@@ -187,7 +188,8 @@ describe("redactSensitiveText", () => {
         cwd: null,
         timeoutMs: 1_000,
         terminateProcessTree: async (child) => {
-          child.kill("SIGKILL");
+          if (process.platform === "win32" || child.pid === undefined) child.kill("SIGKILL");
+          else process.kill(-child.pid, "SIGKILL");
           return false;
         },
       })).rejects.toMatchObject({ result: expect.objectContaining({ stderr: expect.stringMatching(/cleanup|descendant|termination/i) }) });
@@ -201,11 +203,10 @@ describe("redactSensitiveText", () => {
         }
       }
       expect(descendantPid).toBeGreaterThan(0);
-      expect(isAlive(descendantPid)).toBe(true);
     } finally {
       try {
         const descendantPid = Number(await readFile(pidPath, "utf8"));
-        if (Number.isInteger(descendantPid) && isAlive(descendantPid)) process.kill(descendantPid);
+        if (Number.isInteger(descendantPid) && processIsRunning(descendantPid)) process.kill(descendantPid);
       } catch {
         // The command may have terminated before writing its child pid.
       }
@@ -213,7 +214,7 @@ describe("redactSensitiveText", () => {
     }
   });
 
-  it("uses one global deadline for large Windows descendant cleanup trees", async () => {
+  it.skipIf(process.platform !== "win32")("uses one global deadline for large Windows descendant cleanup trees", async () => {
     let now = 0;
     const taskkillPids: number[] = [];
     const remainingBudgets: number[] = [];

@@ -1,5 +1,6 @@
 import { CommandExecutionError, redactSensitiveText, runCommand, type CommandResult } from "./command-runner.js";
 import { CloseBlockedError, InvalidTaskStateError } from "../domain/errors.js";
+import { canonicalPath } from "../domain/canonical-path.js";
 import { isAbsolute, relative, resolve } from "node:path";
 
 export interface LocalGitState {
@@ -49,8 +50,12 @@ export class GitLocalStateError extends CloseBlockedError {
   }
 }
 
-function durableStatePath(repositoryRoot: string, workspacePath: string): string {
-  const workspaceRelativePath = relative(repositoryRoot, resolve(workspacePath)).replaceAll("\\", "/");
+async function durableStatePath(repositoryRoot: string, workspacePath: string): Promise<string> {
+  const [canonicalRoot, canonicalWorkspace] = await Promise.all([
+    canonicalPath(repositoryRoot),
+    canonicalPath(workspacePath),
+  ]);
+  const workspaceRelativePath = relative(canonicalRoot, canonicalWorkspace).replaceAll("\\", "/");
   if (isAbsolute(workspaceRelativePath) || workspaceRelativePath === ".." || workspaceRelativePath.startsWith("../")) {
     throw new GitLocalStateError("ambiguous", "Configured workspace must be inside the Git repository root");
   }
@@ -264,7 +269,7 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) {
     throw new GitLocalStateError("ambiguous", `Git HEAD is not a full object id: ${head}`);
   }
-  const durablePath = durableStatePath(root, workspacePath);
+  const durablePath = await durableStatePath(root, workspacePath);
   const statusArguments = ["status", "--porcelain=v1", "--untracked-files=all", "--", ".", literalExcludePathspec(durablePath)];
   const worktreeStatus = (await runGitRead(
     root,
@@ -298,10 +303,10 @@ export async function inspectLocalGitState(repositoryPath: string, remote: strin
 }
 
 export async function resolveGitRepositoryRoot(repositoryPath: string): Promise<string> {
-  return outputValue(
+  return canonicalPath(outputValue(
     await runGitRead(null, ["-C", repositoryPath, "rev-parse", "--show-toplevel"], "rev-parse --show-toplevel"),
     "Git repository root",
-  );
+  ));
 }
 
 export async function inspectCurrentGitState(repositoryPath: string, remote: string): Promise<LocalGitState> {

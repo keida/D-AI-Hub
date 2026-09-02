@@ -346,6 +346,20 @@ The first implementation will expose the currently unindexed planned `d-ai-hub-v
 
 Revisit the target rules only if canonical ownership changes or section classification becomes machine-owned through a separately approved schema.
 
+## 2026-09-03 — Pin the CI reproducibility support baseline
+
+**Context**
+
+PR #28 verified a cross-platform CI matrix on Windows and Linux with Node 22.20.0 and 26.7.0, but its package metadata and README allowed or described a wider npm range than the evidence covered.
+
+**Decision**
+
+The supported reproducibility baseline is Node 22.20.0 and Node 26.7.0 on Windows and Linux, with npm 11.19.0 exact. `packageManager`, package and lockfile root metadata, README, and CI must state and use that same contract. Widening the supported Node or npm set requires new matrix evidence. The CI and structural-health boundaries remain verification seams; they do not change the Codex-first control-plane or project-memory ownership boundaries.
+
+**Revisit trigger**
+
+Revisit only with executed evidence for the proposed additional runtime or package-manager version and an explicitly reviewed support decision.
+
 ## 2026-09-03 — Validate declared project lifecycle and index consistency
 
 **Context**

@@ -37,6 +37,11 @@ function parseJSON(result: CommandResult): Record<string, unknown> {
   return JSON.parse(result.stdout) as Record<string, unknown>;
 }
 
+function expectNoUnexpectedStderr(result: CommandResult): void {
+  const sqliteExperimentalWarning = /^\(node:\d+\) ExperimentalWarning: SQLite is an experimental feature and might change at any time\r?\n\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\r?\n?$/u;
+  expect(result.stderr === "" || sqliteExperimentalWarning.test(result.stderr)).toBe(true);
+}
+
 async function initializeDatabase(databasePath: string): Promise<void> {
   const store = new LocalSqliteMemoryStore({
     databasePath,
@@ -155,7 +160,7 @@ describe("memory CLI", () => {
     } finally {
       database.close();
     }
-    expect(result.stderr).toBe("");
+    expectNoUnexpectedStderr(result);
   });
 
   it("creates a missing reader database only for a valid import and returns NOOP_DUPLICATE on repeat", async () => {
@@ -229,7 +234,7 @@ describe("memory CLI", () => {
     ]);
     expect(result.exitCode).not.toBe(0);
     expect(parseJSON(result)).toMatchObject({ status: "blocked" });
-    expect(result.stderr).toBe("");
+    expectNoUnexpectedStderr(result);
   });
 
   it("requires an explicit workspace option", async () => {

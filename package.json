@@ -3,14 +3,22 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "npm@11.19.0",
+  "engines": {
+    "node": "22.20.0 || 26.7.0",
+    "npm": "11.19.0"
+  },
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "npm run typecheck",
     "d-ai": "tsx src/entry/codex-cli.ts",
     "health-check": "tsx src/health/health-check-cli.ts",
+    "health-check:structural": "tsx src/health/health-check-cli.ts --workspace . --structural-only",
+    "lint": "npm run typecheck",
     "memory": "tsx src/memory/memory-cli.ts",
-    "test": "vitest run",
-    "test:integration": "vitest run tests/integration --passWithNoTests",
-    "lint": "tsc --noEmit"
+    "test": "vitest run --exclude \"tests/integration/**\"",
+    "test:integration": "vitest run tests/integration --pool=forks --maxWorkers=1 --no-file-parallelism",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm run test && npm run test:integration && npm run health-check:structural"
   },
   "dependencies": {
     "yaml": "^2.8.1",

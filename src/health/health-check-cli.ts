@@ -12,15 +12,15 @@ export interface HealthCheckCLIResult {
   readonly report: RepositoryHealthReport;
 }
 
-function parseWorkspaceArgument(arguments_: readonly string[]): string {
-  if (arguments_.length !== 2 || arguments_[0] !== "--workspace") {
-    throw new InvalidTaskStateError("Health check requires exactly one --workspace <path> argument");
+function parseArguments(arguments_: readonly string[]): { readonly workspacePath: string; readonly structuralOnly: boolean } {
+  if ((arguments_.length !== 2 && arguments_.length !== 3) || arguments_[0] !== "--workspace" || (arguments_.length === 3 && arguments_[2] !== "--structural-only")) {
+    throw new InvalidTaskStateError("Health check requires --workspace <path> and optionally --structural-only");
   }
   const workspacePath = arguments_[1];
   if (workspacePath === undefined || workspacePath.trim().length === 0) {
     throw new InvalidTaskStateError("Health check requires a non-empty --workspace <path> argument");
   }
-  return resolve(workspacePath);
+  return { workspacePath: resolve(workspacePath), structuralOnly: arguments_[2] === "--structural-only" };
 }
 
 function exitCodeForStatus(status: RepositoryHealthReport["status"]): 0 | 1 | 2 {
@@ -50,9 +50,9 @@ function blockedReport(workspacePath: string, error: unknown): RepositoryHealthR
 }
 
 export async function runHealthCheckCLI(arguments_: readonly string[]): Promise<HealthCheckCLIResult> {
-  const workspacePath = parseWorkspaceArgument(arguments_);
+  const { workspacePath, structuralOnly } = parseArguments(arguments_);
   try {
-    const report = redactReport(await runRepositoryHealthCheck({ workspacePath }));
+    const report = redactReport(await runRepositoryHealthCheck({ workspacePath, structuralOnly }));
     return { exitCode: exitCodeForStatus(report.status), report };
   } catch (error: unknown) {
     const report = blockedReport(workspacePath, error);

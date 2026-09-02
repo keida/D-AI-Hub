@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -356,7 +356,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const executed = await activate({ rawCommand: "@D-AI verify nested workspace", taskId: null });
       expect(executed.status).toBe("completed");
       const beforeRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
-      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
 
       await writeFile(join(workspacePath, "artifact.txt"), "regression\n", "utf8");
       await git(repositoryRoot, ["add", "packages/app/artifact.txt"]);
@@ -369,7 +369,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       await expect(git(repositoryRoot, ["diff", "--name-status", recoveryHead, "HEAD"])).resolves.toBe("");
       expect(rolledBack.message).toMatch(/rollback restored/i);
       const afterRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
-      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
       expect(afterRollback?.rollbackAudit?.verification.passed).toBe(true);
       await expect(git(repositoryRoot, ["show", "HEAD:packages/app/artifact.txt"])).resolves.toBe("known good");
       await expect(git(repositoryRoot, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
@@ -435,7 +435,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("treats a case-variant workspace path as the same Windows workspace", async () => {
+  it.skipIf(process.platform !== "win32")("treats a case-variant workspace path as the same Windows workspace", async () => {
     const fixture = await createActivationFixture("d-ai-codex-case-workspace-");
     try {
       const caseVariantWorkspace = fixture.repositoryPath.replace(/[a-z]/g, (character) => character.toUpperCase());
@@ -445,6 +445,22 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       }))({ rawCommand: "@D-AI status", taskId: fixture.state.taskId });
 
       expect(result).toMatchObject({ taskId: fixture.state.taskId, status: "accepted" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("rejects a case-variant workspace path on a case-sensitive Linux filesystem", async () => {
+    const fixture = await createActivationFixture("d-ai-codex-case-sensitive-workspace-");
+    try {
+      const caseVariantWorkspace = fixture.repositoryPath.replace(/[a-z]/g, (character) => character.toUpperCase());
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: caseVariantWorkspace,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI status", taskId: fixture.state.taskId });
+
+      expect(result).toMatchObject({ taskId: fixture.state.taskId, status: "blocked" });
+      expect(result.message).toMatch(/different workspace/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

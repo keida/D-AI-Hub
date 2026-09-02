@@ -14,6 +14,10 @@ async function git(repositoryPath: string, argumentsList: readonly string[]): Pr
   return (await runCommand({ command: "git", arguments: argumentsList, cwd: repositoryPath })).stdout.trim();
 }
 
+async function removeTemporaryPath(path: string): Promise<void> {
+  await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
+
 async function createRepository(): Promise<{ readonly root: string; readonly recoveryHead: string; readonly currentHead: string; readonly snapshot: RecoverySnapshot }> {
   const root = await mkdtemp(join(tmpdir(), "d-ai-rollback-"));
   await git(root, ["init", "--initial-branch=main"]);
@@ -77,7 +81,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.not.toBe(fixture.recoveryHead);
       await expect(git(fixture.root, ["show", "HEAD:artifact.txt"])).resolves.toBe("known good");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   }, 30_000);
 
@@ -96,7 +100,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(divergentHead);
       await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -108,7 +112,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -119,7 +123,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -136,7 +140,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["show", "HEAD:artifact.txt"])).resolves.toBe("known good");
       await expect(git(fixture.root, ["stash", "show", "--include-untracked", "--name-only", result.preservedUserWork.archiveId])).resolves.toContain("nested-workspace/nested-user-work.txt");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -156,7 +160,7 @@ describe("Git rollback adapter", () => {
       expect(archive).toContain("nestedo/.d-ai/sibling.txt");
       expect(archive).not.toContain("nested[one]/.d-ai/intended.txt");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -168,8 +172,8 @@ describe("Git rollback adapter", () => {
       const result = await createGitRollbackTask(workspaceAlias)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
       expect(result.verification.passed).toBe(true);
     } finally {
-      await rm(workspaceAlias, { recursive: true, force: true });
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(workspaceAlias);
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -180,7 +184,7 @@ describe("Git rollback adapter", () => {
       const result = await createGitRollbackTask(workspaceAlias)(state(fixture.snapshot), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard);
       expect(result.verification.passed).toBe(true);
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -192,8 +196,8 @@ describe("Git rollback adapter", () => {
       await expect(createGitRollbackTask(other.root)(state(aliasedSnapshot, undefined, [fixture.root]), { taskId: "task-git-rollback", environment: "codex", generation: 1n, ownerToken: "00000000-0000-4000-8000-000000000001" }, activeOwnershipGuard)).rejects.toThrow(/repository identity/i);
       await expect(git(other.root, ["rev-parse", "HEAD"])).resolves.toBe(other.currentHead);
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
-      await rm(other.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
+      await removeTemporaryPath(other.root);
     }
   });
 
@@ -205,7 +209,7 @@ describe("Git rollback adapter", () => {
       expect(result.verification).toMatchObject({ passed: false });
       expect(result.actions.length).toBeGreaterThan(0);
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -230,7 +234,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -255,7 +259,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["stash", "list"])).resolves.toBe("");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -272,7 +276,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["status", "--porcelain=v1"])).resolves.toContain("?? user-work.txt");
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -296,7 +300,7 @@ describe("Git rollback adapter", () => {
       await expect(git(fixture.root, ["rev-parse", "HEAD"])).resolves.toBe(fixture.currentHead);
       await expect(git(fixture.root, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 
@@ -321,7 +325,7 @@ describe("Git rollback adapter", () => {
         },
       });
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await removeTemporaryPath(fixture.root);
     }
   });
 });

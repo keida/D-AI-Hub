@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -161,6 +161,30 @@ describe("inspectLocalGitState", () => {
 
       expect(state.worktreeStatus).toContain("notes.txt");
       expect(state.worktreeStatus).not.toContain(".d-ai");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a workspace alias that resolves outside the repository", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-git-outside-workspace-"));
+    const repository = join(root, "repository");
+    const outside = join(root, "outside");
+    const workspaceAlias = join(repository, "workspace-link");
+    try {
+      await mkdir(repository);
+      await mkdir(outside);
+      await git(repository, ["init", "-b", "main"]);
+      await git(repository, ["config", "user.email", "d-ai-test@example.invalid"]);
+      await git(repository, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(repository, "tracked.txt"), "tracked\n", "utf8");
+      await git(repository, ["add", "."]);
+      await git(repository, ["commit", "-m", "test: outside workspace alias"]);
+      await git(repository, ["remote", "add", "origin", "https://github.com/example/d-ai.git"]);
+      await symlink(outside, workspaceAlias, process.platform === "win32" ? "junction" : "dir");
+
+      await expect(inspectLocalGitState(repository, "origin", "refs/heads/main", workspaceAlias))
+        .rejects.toThrow(/inside the Git repository root/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
