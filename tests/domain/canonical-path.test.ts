@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +14,7 @@ describe("canonicalPath", () => {
       await mkdir(target);
       await symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
 
-      await expect(canonicalPath(join(alias, "missing", "child"))).resolves.toBe(join(target, "missing", "child"));
+      await expect(canonicalPath(join(alias, "missing", "child"))).resolves.toBe(join(await realpath(target), "missing", "child"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -139,7 +139,7 @@ describe("runRepositoryHealthCheck", () => {
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("healthy");
-    expect(report.workspacePath).toBe(resolve(workspacePath));
+    expect(report.workspacePath).toBe(await realpath(workspacePath));
     expect(checkWithId(report, "repository-identity").status).toBe("passed");
     expect(checkWithId(report, "working-tree").status).toBe("passed");
     expect(checkWithId(report, "required-files").status).toBe("passed");
