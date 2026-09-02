@@ -28,6 +28,7 @@ const pemPrivateKeys = [
 ] as const;
 
 function service(): PersistentHandoffService { return new PersistentHandoffService(new InMemoryHandoffPersistence()); }
+const activationConnector = async (): Promise<void> => {};
 
 class BlockingHandoffPersistence implements HandoffPersistence {
   private readonly delegate = new InMemoryHandoffPersistence();
@@ -74,7 +75,11 @@ describe("PersistentHandoffService", () => {
   ])("transfers the compatible %s to %s path", async (source, target) => {
     const handoffService = service();
     const envelope = await handoffService.create({ state: state(source), targetEnvironment: target });
-    const targetAdapter = target === "chat" ? new ChatEnvironmentAdapter(handoffService) : target === "work" ? new WorkEnvironmentAdapter(handoffService) : new CodexEnvironmentAdapter(handoffService);
+    const targetAdapter = target === "chat"
+      ? new ChatEnvironmentAdapter(handoffService, undefined, activationConnector)
+      : target === "work"
+        ? new WorkEnvironmentAdapter(handoffService, undefined, activationConnector)
+        : new CodexEnvironmentAdapter(handoffService, undefined, activationConnector);
 
     await targetAdapter.receive(envelope);
 
@@ -233,7 +238,7 @@ describe("PersistentHandoffService", () => {
   it("requires the verified recipient to complete", async () => {
     const handoffService = service();
     const envelope = await handoffService.create({ state: state("work"), targetEnvironment: "codex" });
-    const codex = new CodexEnvironmentAdapter(handoffService);
+    const codex = new CodexEnvironmentAdapter(handoffService, undefined, activationConnector);
     await codex.receive(envelope);
     await expect(handoffService.complete(envelope.handoffId, "work")).rejects.toThrow(InvalidHandoffError);
     await codex.complete(envelope.handoffId);
@@ -246,11 +251,25 @@ describe("PersistentHandoffService", () => {
     try {
       const first = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       const envelope = await first.create({ state: state("chat"), targetEnvironment: "work" });
-      await new WorkEnvironmentAdapter(first).receive(envelope);
+      await new WorkEnvironmentAdapter(first, undefined, activationConnector).receive(envelope);
       const restarted = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       await restarted.ready();
       expect(restarted.status(envelope.handoffId)).toEqual({ handoffId: envelope.handoffId, taskId: envelope.taskId, target: "work", state: "active", reason: null, owner: "work" });
-      const committedPath = join(`${persistencePath}.lock`, "2", "committed", "snapshot.json");
+      const generations = (await readdir(`${persistencePath}.lock`))
+        .filter((entry) => /^[1-9][0-9]*$/u.test(entry))
+        .map(Number)
+        .sort((left, right) => right - left);
+      let committedPath: string | null = null;
+      for (const generation of generations) {
+        const candidate = join(`${persistencePath}.lock`, generation.toString(), "committed", "snapshot.json");
+        try {
+          if ((await stat(candidate)).isFile()) {
+            committedPath = candidate;
+            break;
+          }
+        } catch {}
+      }
+      if (committedPath === null) throw new Error("Expected a committed handoff snapshot");
       await writeFile(committedPath, (await readFile(committedPath, "utf8")).replace('"owner":"work"', '"owner":"codex"'), "utf8");
       const tampered = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       await expect(tampered.ready()).rejects.toThrow(InvalidHandoffError);
@@ -283,7 +302,7 @@ describe("PersistentHandoffService", () => {
   it("preserves capability, ownership, and terminal-state checks", async () => {
     const handoffService = service();
     const envelope = await handoffService.create({ state: state("work"), targetEnvironment: "codex" });
-    const codex = new CodexEnvironmentAdapter(handoffService);
+    const codex = new CodexEnvironmentAdapter(handoffService, undefined, activationConnector);
     await expect(handoffService.acknowledge(envelope, { environment: "codex", capabilities: new Set<string>() })).rejects.toThrow(CapabilityMismatchError);
     await codex.receive(envelope);
     await expect(codex.receive(envelope)).rejects.toThrow(InvalidHandoffError);
@@ -295,17 +314,22 @@ describe("PersistentHandoffService", () => {
   it("keeps adapters environment-specific", async () => {
     const handoffService = service();
     const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
+    const executor = async () => ({ status: "blocked" as const, evidence: [], message: "fixture" });
     expect([...new ChatEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["approval", "status"]);
     expect([...new WorkEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["durable-context"]);
     expect([...new CodexEnvironmentAdapter(handoffService).capabilities().capabilities]).toEqual(["local-execution", "codex-evidence"]);
-    await expect(new CodexEnvironmentAdapter(handoffService).receive(envelope)).rejects.toThrow(InvalidHandoffError);
+    expect(new WorkEnvironmentAdapter(handoffService, executor).canReceiveHandoff()).toBe(false);
+    expect(new WorkEnvironmentAdapter(handoffService, undefined, activationConnector).canReceiveHandoff()).toBe(false);
+    expect(new WorkEnvironmentAdapter(handoffService, executor, activationConnector).canReceiveHandoff()).toBe(true);
+    await expect(new CodexEnvironmentAdapter(handoffService, undefined, activationConnector).receive(envelope)).rejects.toThrow(InvalidHandoffError);
   });
 
   it("serializes concurrent acknowledgements so exactly one owner succeeds", async () => {
     const persistence = new BlockingHandoffPersistence();
     const handoffService = new PersistentHandoffService(persistence);
     const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
-    const work = new WorkEnvironmentAdapter(handoffService);
+    let activationCount = 0;
+    const work = new WorkEnvironmentAdapter(handoffService, undefined, async () => { activationCount += 1; });
     persistence.blockNextSave();
 
     const first = work.receive(envelope);
@@ -316,6 +340,7 @@ describe("PersistentHandoffService", () => {
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(activationCount).toBe(1);
   });
 
   it("serializes concurrent creation so each successful handoff gets a unique sequence", async () => {
@@ -336,7 +361,7 @@ describe("PersistentHandoffService", () => {
     const persistence = new BlockingHandoffPersistence();
     const handoffService = new PersistentHandoffService(persistence);
     const envelope = await handoffService.create({ state: state("chat"), targetEnvironment: "work" });
-    const work = new WorkEnvironmentAdapter(handoffService);
+    const work = new WorkEnvironmentAdapter(handoffService, undefined, activationConnector);
     await work.receive(envelope);
     persistence.blockNextSave();
 
@@ -365,8 +390,8 @@ describe("PersistentHandoffService", () => {
       expect(new Set([firstEnvelope.handoffId, secondEnvelope.handoffId])).toEqual(new Set(["handoff-task-handoff-1", "handoff-task-handoff-2"]));
 
       const acknowledgement = await first.create({ state: state("chat"), targetEnvironment: "work" });
-      const firstWork = new WorkEnvironmentAdapter(first);
-      const secondWork = new WorkEnvironmentAdapter(second);
+      const firstWork = new WorkEnvironmentAdapter(first, undefined, activationConnector);
+      const secondWork = new WorkEnvironmentAdapter(second, undefined, activationConnector);
       const results = await Promise.allSettled([firstWork.receive(acknowledgement), secondWork.receive(acknowledgement)]);
 
       expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
@@ -385,6 +410,8 @@ describe("PersistentHandoffService", () => {
   it.each([
     { state: "pending", owner: "work", reason: null },
     { state: "pending", owner: null, reason: "Awaiting work" },
+    { state: "acknowledged", owner: "work", reason: null },
+    { state: "acknowledged", owner: null, reason: "Activation started" },
     { state: "active", owner: null, reason: null },
     { state: "active", owner: "codex", reason: null },
     { state: "active", owner: "work", reason: "Unexpected reason" },
@@ -721,7 +748,7 @@ describe("PersistentHandoffService", () => {
     try {
       const first = new PersistentHandoffService(new FileHandoffPersistence(persistencePath));
       const envelope = await first.create({ state: state("chat"), targetEnvironment: "work" });
-      const restartedWork = new WorkEnvironmentAdapter(new PersistentHandoffService(new FileHandoffPersistence(persistencePath)));
+      const restartedWork = new WorkEnvironmentAdapter(new PersistentHandoffService(new FileHandoffPersistence(persistencePath)), undefined, activationConnector);
 
       expect(() => restartedWork.status(envelope.handoffId)).toThrow(InvalidHandoffError);
       await restartedWork.ready();
