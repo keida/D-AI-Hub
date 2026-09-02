@@ -11,7 +11,7 @@
 - Current objective: Rework PR #29's explicit actor/session identity ADR as a documentation-only proposal that is owned by the D-AI-Hub project and is safe to re-review.
 - Cancelled side investigation: The user stopped the claude-mem comparison and integration proposal. Only source/rule comparison and environment preflight occurred; the A/B/C runtime comparison did not run. No claude-mem installation, provider setup, model call, or history ingestion was performed. Do not resume that investigation without a new user request.
 - Verified scope: This revision changes only the project ADR, `DECISIONS.md`, `STATUS.md`, and the PR #29 description. It adds no runtime implementation, Chat/Work activation, cross-chat communication, subagent/background execution, or merge authorization.
-- Working state: Publication will be complete after the authorized commit is pushed and the live PR is rechecked. The original dirty root remains untouched.
+- Working state: The documentation revision is published on the existing feature branch; the original dirty root remains untouched. Live PR state is rechecked at this checkpoint.
 - Authorized scope: Move and revise the ADR under the project-owned path, update the project decision and status records, update PR #29, commit and push the existing feature branch, and re-review the resulting open PR. Merge remains unauthorized.
 - Unresolved state: This is proposal review, not runtime activation; implementation and product activation require separate authorization.
 - Next action: Re-review PR #29 after the final push, including its canonical ADR link, role-bound authorization, migration order, doc-only boundary, and live GitHub state.
