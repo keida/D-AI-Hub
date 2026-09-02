@@ -86,6 +86,7 @@ interface ActorAuthorization {
   readonly authorizationId: string;
   readonly taskId: string;
   readonly subject: ActorSession;
+  readonly role: Role;
   readonly scopeRef: string;
   readonly scopeSha256: string;
   readonly allowedActions: readonly AuthorizedAction[];
@@ -103,9 +104,9 @@ interface TaskState {
 }
 ```
 
-`sessionId` must be non-empty, opaque, and stable for the life of the long-lived chat. It must not contain credentials or be treated as proof of authority by itself. `scopeRef` identifies the canonical approved task packet or scope record; `scopeSha256` binds the grant to its exact canonical bytes. The authorization validator applies explicit deny before allow. A normal Worker grant includes `implement`, `test`, and `collect-evidence` within the bound scope, and explicitly denies `merge` and `destructive-cleanup`. Exceptional Boss implementation mutation is a separately recorded, scope-bound, single-use grant rather than an implication of the `boss` actor value.
+`sessionId` must be non-empty, opaque, and stable for the life of the long-lived chat. It must not contain credentials or be treated as proof of authority by itself. `role` is recorded on each authorization and is checked against the caller's attested role and the action policy; it is never inferred from the actor, environment, model name, or request text. `scopeRef` identifies the canonical approved task packet or scope record; `scopeSha256` binds the grant to its exact canonical bytes. The authorization validator applies explicit deny before allow. A normal Worker grant includes `implement`, `test`, and `collect-evidence` within the bound scope, and explicitly denies `merge` and `destructive-cleanup`. Exceptional Boss implementation mutation is a separately recorded, scope-bound, single-use grant rather than an implication of the `boss` actor value.
 
-A write must match the persisted task, environment, actor/session binding, authorization scope digest, action, and ownership generation. Consuming a single-use grant increments the generation and records its nonce so it cannot be replayed. Free-text `goal` and `constraints` may be displayed but are not an enforceable authorization seam.
+A write must match the persisted task, environment, actor/session binding, authorization role, authorization scope digest, action, and ownership generation. Consuming a single-use grant increments the generation and records its nonce so it cannot be replayed. Free-text `goal` and `constraints` may be displayed but are not an enforceable authorization seam.
 
 ### Trusted bootstrap and rebinding
 
@@ -124,12 +125,12 @@ Boss review consumes actual diffs, tests, execution evidence, and Git/GitHub sta
 ## Migration plan
 
 1. Define version-2 durable schemas and canonical serialization for actor session, authorization receipts, ownership transitions, routing decisions, verification evidence, recovery points, close candidates, and handoff envelopes. New actor/session fields participate in v2 integrity hashes; existing v1 bytes and hashes are never silently reinterpreted or rewritten.
-2. Ship dual readers that accept strict v1 and strict v2 records, while writers continue to emit v1. Unknown versions and extra fields remain rejected. Add a capability/version handshake so a v2 envelope is emitted only to a target that explicitly advertises v2 support; a v1 receiver is never expected to accept a v2 envelope.
-3. Add the trusted host identity adapter and operator-approved initial-binding ceremony. Newly bound tasks receive a v2 actor/session authorization; legacy tasks remain readable, but actor-authorized mutations stay blocked until this ceremony succeeds. Do not infer identity from environment, role, model, task owner token, or request fields.
-4. Add `id`, `actor`, `priority`, `isDefault`, and `allowFallback` model-policy fields behind a compatibility adapter, plus a `policyId` routing override. Translate legacy policies into deterministic read-only IDs, and reject ambiguous legacy model-string overrides. Continue the current v1 selection path until every active configuration passes the explicit-default invariants.
-5. Extend the durable store with the atomic environment/actor/session transition and replay receipt. Only after all participating adapters advertise v2 may handoff write v2 and include the target attestation. Rollback restores the complete prior v2 lease/binding/authorization tuple; it never downgrades a v2 record to v1.
-6. Switch new task writes and default model selection to v2 behind an explicit migration gate. Preserve rollback by retaining v1 readers and snapshots until the configured retention boundary has passed. Remove v1 writers and the compatibility adapter only after mixed-version and recovery evidence is accepted.
-7. Keep Chat and Work product activation, automatic cross-chat communication, and automatic actor discovery out of this migration.
+2. Ship dual readers that accept strict v1 and strict v2 records, while writers continue to emit v1. Unknown versions and extra fields remain rejected. Keep v1 receivers from being presented with v2 envelopes.
+3. Add the v2 durable writer/store, including atomic authorization-plus-transition persistence and replay receipts, behind a disabled explicit migration gate. The v2 write path must fail closed until its schema, hash, and transaction prerequisites are present.
+4. Add the trusted host identity adapter and operator-approved initial-binding ceremony. Issue v2 actor/session authorizations only through the gated durable v2 path after steps 1–3 are available; legacy tasks remain readable, but actor-authorized mutations stay blocked until this ceremony succeeds. Do not infer identity from environment, role, model, task owner token, or request fields.
+5. Add `id`, `actor`, `priority`, `isDefault`, and `allowFallback` model-policy fields behind a compatibility adapter, plus a `policyId` routing override. Translate legacy policies into deterministic read-only IDs, and reject ambiguous legacy model-string overrides. Continue the v1 selection path until every active configuration passes the explicit-default invariants.
+6. Have participating components advertise v2 support, then enable v2 writes for new tasks and v2 handoff behind the explicit migration gate only after every component in that path advertises support. Rollback restores the complete prior v2 lease/binding/authorization tuple; it never downgrades a v2 record to v1.
+7. Retain v1 readers and snapshots through the configured retention boundary. Retire v1 writers and the compatibility adapter only after mixed-version, recovery, and rollback evidence is accepted. Keep Chat and Work product activation, automatic cross-chat communication, and automatic actor discovery out of this migration.
 
 Each step should be independently releasable. A partially migrated runtime must fail closed for actor-authorized mutations rather than inventing identity from legacy fields.
 
@@ -141,6 +142,7 @@ Each step should be independently releasable. A partially migrated runtime must 
 - Reject missing or ambiguous defaults, tied fallback priorities, incompatible environment/capability combinations, unknown `policyId` overrides, ambiguous legacy model-string overrides, and unauthorized model overrides.
 - Preserve legacy environment-only reads, while blocking actor-privileged writes until an explicit binding is established.
 - Reject self-declared initial actors, forged host attestations, replayed initial bindings, stale generations, reused nonces, scope-digest mismatches, and Worker attempts to issue or broaden authorization.
+- Reject an authorization grant replayed under a different role, even when its task, actor/session, scope digest, action, and ownership generation otherwise match.
 - Enforce action grants and explicit denies, including normal Worker denial of merge and destructive cleanup and single-use exceptional Boss mutation.
 - Reject stale, mismatched, or forged actor/session ownership on save, continue, handoff, recovery, rollback, close, and review receipts.
 - Prove that environment handoff does not silently change actor/session binding and that failed acknowledgement leaves neither partial ownership nor an orphan active handoff.

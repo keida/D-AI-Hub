@@ -345,3 +345,21 @@ The first implementation will expose the currently unindexed planned `d-ai-hub-v
 **Revisit trigger**
 
 Revisit the target rules only if canonical ownership changes or section classification becomes machine-owned through a separately approved schema.
+
+## 2026-09-03 — Own the explicit actor/session proposal under D-AI-Hub
+
+**Context**
+
+The explicit actor/session ADR is a D-AI-Hub project architecture proposal. Its canonical owner is the project record, so keeping the only copy under the repository-wide `docs/adr` path leaves ownership and project traceability ambiguous.
+
+**Decision**
+
+The canonical ADR is [Explicit actor and session identity](adr/0001-explicit-actor-and-session-identity.md). It remains a Proposed, documentation-only design. This ownership decision does not approve V1 runtime behavior, Chat/Work activation, cross-chat communication, subagent or background execution, or merge. The actor, role, authorization, model-policy, persistence, handoff, and migration details remain proposal content pending review.
+
+**Rationale**
+
+Project ownership gives the proposal one durable home and makes its review boundary explicit without implying implementation approval.
+
+**Revisit trigger**
+
+Revisit ownership if the project's canonical architecture-record location changes. Any runtime implementation, product activation, execution expansion, or merge requires separate authorization.

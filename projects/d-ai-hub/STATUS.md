@@ -3,14 +3,18 @@
 ## State
 
 - Lifecycle: active
-- Last updated: 2026-08-30
+- Current PR: #29 (open)
+- Last updated: 2026-09-03
 
 ## Current checkpoint
 
-- Current task: The user-approved read-only Skill frontmatter health check is implemented and locally verified through the existing repository-health interface. The bounded worker implemented the check and initial tests; the parent reviewed the actual diff, added missing-shape and outside-workspace coverage, and completed final focused verification. The user authorized committing and pushing the five-file change set and creating a PR to main, but not merging it. Verify actual publication from the feature branch and PR, not this authorization statement. The prior curation cycle and PR #24 merge are complete; their evidence remains below.
+- Current objective: Rework PR #29's explicit actor/session identity ADR as a documentation-only proposal that is owned by the D-AI-Hub project and is safe to re-review.
 - Cancelled side investigation: The user stopped the claude-mem comparison and integration proposal. Only source/rule comparison and environment preflight occurred; the A/B/C runtime comparison did not run. No claude-mem installation, provider setup, model call, or history ingestion was performed. Do not resume that investigation without a new user request.
-- Working state: Knowledge and stable Hub memory now use type-specific admission, attributable evidence, semantic duplicate checks, scope/conflict handling, and capture receipts. Project memory keeps bounded continuation state and promotes only qualifying knowledge/context. See the [canonical knowledge Skill](../../skills/custom/knowledge-manager/SKILL.md), [project Skill](../../skills/custom/project-memory/SKILL.md), and [selective upstream provenance](../../skills/external/knowledge-curation-patterns.md).
-- Authorized scope: Publish exactly `src/health/skill-frontmatter.ts`, `src/health/repository-health-check.ts`, `tests/health/repository-health-check.test.ts`, `projects/d-ai-hub/STATUS.md`, and `projects/d-ai-hub/ROADMAP.md` on `codex/index-freshness-design`, then create a PR to main. Retain the existing branch, worktree, earlier checkpoint evidence, and trial database. No merge, Skill-content edit, Memory runtime/database change, global configuration change, original dirty-root edit, or branch/worktree deletion is authorized.
+- Verified scope: This revision changes only the project ADR, `DECISIONS.md`, `STATUS.md`, and the PR #29 description. It adds no runtime implementation, Chat/Work activation, cross-chat communication, subagent/background execution, or merge authorization.
+- Working state: Publication will be complete after the authorized commit is pushed and the live PR is rechecked. The original dirty root remains untouched.
+- Authorized scope: Move and revise the ADR under the project-owned path, update the project decision and status records, update PR #29, commit and push the existing feature branch, and re-review the resulting open PR. Merge remains unauthorized.
+- Unresolved state: This is proposal review, not runtime activation; implementation and product activation require separate authorization.
+- Next action: Re-review PR #29 after the final push, including its canonical ADR link, role-bound authorization, migration order, doc-only boundary, and live GitHub state.
 - Completed prior scope: [PR #23](https://github.com/keida/D-AI-Hub/pull/23) merged normally as `f9c97415f95859ba9248b6154290f37b892263f3`; its MERGED state was checked again at this stage's start. PR #22 and the separate local reader-handoff trial remain completed prior work. None proves automatic new-chat recall.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
 - Acceptance target: `runRepositoryHealthCheck` reports `skill-frontmatter` for tracked `skills/custom/<name>/SKILL.md` and `.agents/skills/<name>/SKILL.md`; YAML must be a mapping with non-empty string name/description, while extra metadata is allowed. Invalid content fails, incomplete enumeration/read blocks, and later checks still run. Diagnostics are deterministic, redacted, content-free, and byte-bounded. Untracked files and external provenance are excluded; no automatic repair or new naming policy is introduced. Verify behavior through real temporary Git repositories, focused health tests, and the TypeScript build.
@@ -53,9 +57,9 @@
 
 ## Current blockers
 
-- No implementation, integrity, or private-GitHub transport blocker remains for the accepted first slice or the locally verified ordered-increment slice. A genuinely separate physical-device run is optional environment validation and is not part of the completed evidence.
-- The original root checkout remains intentionally excluded from writes because it has unrelated uncommitted changes and is behind `origin/main`; it was not touched. No blocker remains for the merged ordered-increment slice, two-bundle GitHub rehearsal, or fresh-clone bootstrap. The allowScripts warning is recorded as environment evidence, not a demonstrated runtime failure.
+- Proposal review remains unresolved. The ADR does not authorize runtime activation, Chat/Work product behavior, cross-chat communication, subagent/background execution, or merge.
+- The original root checkout remains intentionally excluded from writes because it has unrelated uncommitted changes; it was not touched.
 
 ## Next concrete action
 
-- Complete the authorized five-file publication through the existing PR workflow; inspect the PR for `codex/index-freshness-design` targeting main, verify its head, file scope, and checks, then obtain separate authorization before merge. Do not duplicate an existing PR or create a status-only release loop. Do not modify Skill content or treat a passing basic metadata check as proof of every native loader's requirements. Use the existing curation rules when genuine durable lessons arise. Automatic synchronization, a second writer, RAG, Dashboard, external memory integration, and Router expansion remain deferred.
+- Re-review PR #29 as a documentation-only proposal after publication. Keep merge and any runtime implementation outside this authorization.
