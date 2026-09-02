@@ -35,8 +35,12 @@ jobs:
         run: npm run typecheck
       - name: Run ordinary tests (shard 1 of 4)
         run: npm run test -- --shard=1/4
-      - name: Diagnose shard 2 - command runner
-        run: npm exec -- vitest run tests/adapters/command-runner.test.ts
+      - name: Diagnose command runner - ordinary cases
+        run: npm exec -- vitest run tests/adapters/command-runner.test.ts -t "^(?!.*terminates a descendant process|.*fails closed when injected process-tree cleanup).*$"
+      - name: Diagnose command runner - normal descendant cleanup
+        run: npm exec -- vitest run tests/adapters/command-runner.test.ts -t "terminates a descendant process"
+      - name: Diagnose command runner - rejected descendant cleanup
+        run: npm exec -- vitest run tests/adapters/command-runner.test.ts -t "fails closed when injected process-tree cleanup"
       - name: Diagnose shard 2 - Git adapter
         run: npm exec -- vitest run tests/adapters/git.test.ts
       - name: Diagnose shard 2 - canonical path
