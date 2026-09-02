@@ -9,7 +9,8 @@
 - PR #26: merged
 - PR #27: merged
 - PR #28: merged; its main-push CI failed only in Windows Node 22 integration run `33687769873`
-- PR #30: published; run `33694319752` passed Windows Node 22 Integration, while Ubuntu Node 22 Quality failed in the unchanged command-runner descendant cleanup test; Safe-to-merge remains NO and main is not restored
+- PR #30 first published CI run `33694319752`: Windows Node 22 Integration passed, while Ubuntu Node 22 Quality failed in the unchanged command-runner descendant cleanup test; main was not restored by that run
+- PR #30 current-head CI run `33697014816`: 8/8 CI jobs and GitGuardian passed for HEAD `6f627bb6fd5b93f96317c5b1edb36abfa595473e`
 - Main branch protection: disabled/not protected
 - Live PR status must be queried from GitHub.
 - Last verified: 2026-09-03
@@ -29,7 +30,7 @@
 
 ## Next concrete action
 
-Review PR #30's complete check matrix and request separate merge authorization only if the evidence supports it.
+PR review and checks are complete; merge only after separate explicit authorization. Main is not restored until merge and a green main-push run.
 
 ## Evidence pointers
 
