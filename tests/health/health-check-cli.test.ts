@@ -33,9 +33,9 @@ async function createRepositoryFixture(): Promise<string> {
       "# Status",
       "## State",
       "- Lifecycle: active",
-      "- Active PR: none",
-      "## Current checkpoint",
-      "- Current PR: none",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: none",
+      "- Live PR status must be queried from GitHub.",
     ].join("\n") : `${relativePath}\n`, "utf8");
   }
   await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [

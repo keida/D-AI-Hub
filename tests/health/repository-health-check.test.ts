@@ -190,6 +190,48 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "test:integration").status).toBe("passed");
   });
 
+  it("accepts stable delivery and proposal fields without a mutable Current PR", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: PR #29",
+      "- Live PR status must be queried from GitHub.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "use stable project PR fields");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness")).toEqual({
+      id: "index-freshness",
+      status: "passed",
+      observation: "All required catalog targets are indexed exactly once",
+    });
+  });
+
+  it.each([
+    ["missing last merged delivery", ["- Active proposal: none"], "invalid Last merged delivery"],
+    ["missing active proposal", ["- Last merged delivery: PR #28"], "invalid Active proposal"],
+    ["invalid last merged delivery", ["- Last merged delivery: merged #28", "- Active proposal: none"], "invalid Last merged delivery"],
+    ["invalid active proposal", ["- Last merged delivery: PR #28", "- Active proposal: #29"], "invalid Active proposal"],
+  ] as const)("rejects $0 in stable project PR fields", async (_caseName, fields, finding) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Live PR status must be queried from GitHub.",
+      ...fields,
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, `reject ${_caseName}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain(finding);
+  });
+
   it("validates tracked Markdown links while skipping external, mail, and anchor links", async () => {
     const workspacePath = await createRepositoryFixture({
       markdown: [

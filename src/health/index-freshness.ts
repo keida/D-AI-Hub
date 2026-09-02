@@ -105,6 +105,20 @@ function currentPullRequestState(value: string): CurrentPullRequestState | null 
   return match?.[1] as CurrentPullRequestState | undefined ?? null;
 }
 
+function legacyPullRequestFindings(project: string, lifecycle: string | null, currentPr: string | null, required: boolean): readonly string[] {
+  if (currentPr === null) return required ? [`${project}/STATUS.md: invalid Current PR`] : [];
+  if (currentPr === "none") return [];
+  const prState = currentPullRequestState(currentPr);
+  if (prState === null) return [`${project}/STATUS.md: invalid Current PR`];
+  if (["active", "blocked", "paused"].includes(lifecycle ?? "") && ["merged", "closed"].includes(prState)) {
+    return [`${project}/STATUS.md: Current PR state ${prState} conflicts with lifecycle ${lifecycle}`];
+  }
+  if (lifecycle === "planned" || (["archived", "completed", "superseded"].includes(lifecycle ?? "") && ["open", "draft"].includes(prState))) {
+    return [`${project}/STATUS.md: Current PR state ${prState} conflicts with lifecycle ${lifecycle}`];
+  }
+  return [];
+}
+
 function isWithinWorkspace(workspacePath: string, candidatePath: string): boolean {
   const relativePath = relative(workspacePath, candidatePath);
   return relativePath === ""
@@ -133,18 +147,22 @@ async function projectStateFindings(
       findings.push(`${project}: lifecycle ${lifecycle} is not indexed under ${expected} projects`);
     }
 
+    const lastMergedDelivery = oneField(status, "Last merged delivery");
+    const activeProposal = oneField(status, "Active proposal");
     const currentPr = oneField(status, "Current PR");
-    if (currentPr === null) {
-      findings.push(`${project}/STATUS.md: invalid Current PR`);
-    } else if (currentPr !== "none") {
-      const prState = currentPullRequestState(currentPr);
-      if (prState === null) {
-        findings.push(`${project}/STATUS.md: invalid Current PR`);
-      } else if (["active", "blocked", "paused"].includes(lifecycle ?? "") && ["merged", "closed"].includes(prState)) {
-        findings.push(`${project}/STATUS.md: Current PR state ${prState} conflicts with lifecycle ${lifecycle}`);
-      } else if (lifecycle === "planned" || (["archived", "completed", "superseded"].includes(lifecycle ?? "") && ["open", "draft"].includes(prState))) {
-        findings.push(`${project}/STATUS.md: Current PR state ${prState} conflicts with lifecycle ${lifecycle}`);
+    if (lastMergedDelivery === null && activeProposal === null) {
+      findings.push(...legacyPullRequestFindings(project, lifecycle, currentPr, true));
+    } else {
+      if (lastMergedDelivery === null || !/^PR #[1-9][0-9]*$/u.test(lastMergedDelivery)) {
+        findings.push(`${project}/STATUS.md: invalid Last merged delivery`);
       }
+      if (activeProposal === null || !/^(?:none|PR #[1-9][0-9]*)$/u.test(activeProposal)) {
+        findings.push(`${project}/STATUS.md: invalid Active proposal`);
+      }
+      if (!/Live PR status must be queried from GitHub/iu.test(status)) {
+        findings.push(`${project}/STATUS.md: missing live PR status boundary`);
+      }
+      findings.push(...legacyPullRequestFindings(project, lifecycle, currentPr, false));
     }
   }
 
