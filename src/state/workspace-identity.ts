@@ -1,5 +1,4 @@
-import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { canonicalPath } from "../domain/canonical-path.js";
 
 const workspaceIdentityPrefix = "identity:workspace:";
 const workspaceHashPattern = /^[a-f0-9]{64}$/i;
@@ -21,11 +20,11 @@ export function canonicalWorkspaceIdentityPath(contextManifest: readonly string[
 export async function matchesWorkspaceIdentity(contextManifest: readonly string[], workspacePath: string): Promise<boolean> {
   const storedPath = canonicalWorkspaceIdentityPath(contextManifest);
   if (storedPath === null) return false;
-  let configuredPath: string;
-  try {
-    configuredPath = await realpath(resolve(workspacePath));
-  } catch {
-    configuredPath = resolve(workspacePath);
-  }
-  return storedPath.toLowerCase() === configuredPath.toLowerCase();
+  const [storedCanonicalPath, configuredCanonicalPath] = await Promise.all([
+    canonicalPath(storedPath),
+    canonicalPath(workspacePath),
+  ]);
+  return process.platform === "win32"
+    ? storedCanonicalPath.toLowerCase() === configuredCanonicalPath.toLowerCase()
+    : storedCanonicalPath === configuredCanonicalPath;
 }

@@ -406,7 +406,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("treats a case-variant workspace path as the same Windows workspace", async () => {
+  it.skipIf(process.platform !== "win32")("treats a case-variant workspace path as the same Windows workspace", async () => {
     const fixture = await createActivationFixture("d-ai-codex-case-workspace-");
     try {
       const caseVariantWorkspace = fixture.repositoryPath.replace(/[a-z]/g, (character) => character.toUpperCase());
@@ -416,6 +416,22 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       }))({ rawCommand: "@D-AI status", taskId: fixture.state.taskId });
 
       expect(result).toMatchObject({ taskId: fixture.state.taskId, status: "accepted" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("rejects a case-variant workspace path on a case-sensitive Linux filesystem", async () => {
+    const fixture = await createActivationFixture("d-ai-codex-case-sensitive-workspace-");
+    try {
+      const caseVariantWorkspace = fixture.repositoryPath.replace(/[a-z]/g, (character) => character.toUpperCase());
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: caseVariantWorkspace,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI status", taskId: fixture.state.taskId });
+
+      expect(result).toMatchObject({ taskId: fixture.state.taskId, status: "blocked" });
+      expect(result.message).toMatch(/different workspace/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

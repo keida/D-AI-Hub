@@ -1,6 +1,7 @@
 import { open, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { CommandExecutionError, redactSensitiveText, runCommand } from "../adapters/command-runner.js";
+import { canonicalPath } from "../domain/canonical-path.js";
 import { validateIndexFreshness } from "./index-freshness.js";
 import { localMarkdownTarget, markdownDestinations } from "./markdown-targets.js";
 import { validateSkillFrontmatter } from "./skill-frontmatter.js";
@@ -213,7 +214,7 @@ export async function runRepositoryHealthCheck(input: {
       checks: [{ id: "repository-identity", status: "blocked", observation: "Workspace path must be non-empty" }],
     };
   }
-  const workspacePath = resolve(input.workspacePath);
+  const workspacePath = await canonicalPath(input.workspacePath);
   const timeoutMs = input.timeoutMs ?? defaultTimeoutMs;
   const checks: HealthCheckResult[] = [];
   let repositoryIdentityPassed = false;
