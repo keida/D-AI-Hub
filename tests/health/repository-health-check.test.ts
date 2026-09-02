@@ -519,7 +519,6 @@ describe("runRepositoryHealthCheck", () => {
     await writeFile(join(outsideRoot, "STATUS.md"), [
       "# External status",
       "- Lifecycle: active",
-      "- Active PR: none",
       "- Current PR: none",
     ].join("\n"), "utf8");
     await rename(join(workspacePath, "projects", "d-ai-hub"), join(workspacePath, "projects", "d-ai-hub-original"));

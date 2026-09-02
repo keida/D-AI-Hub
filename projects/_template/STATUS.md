@@ -3,7 +3,6 @@
 ## State
 
 - Lifecycle: planned | active | blocked | paused | completed | archived
-- Active PR: none
 - Last updated: YYYY-MM-DD
 
 ## Current checkpoint

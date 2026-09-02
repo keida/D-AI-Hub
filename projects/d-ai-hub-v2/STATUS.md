@@ -3,7 +3,6 @@
 ## State
 
 - Lifecycle: archived
-- Active PR: none
 - Last verified: 2026-09-02
 
 ## Current checkpoint
