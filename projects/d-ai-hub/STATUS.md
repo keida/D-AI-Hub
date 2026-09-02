@@ -3,15 +3,15 @@
 ## State
 
 - Lifecycle: active
-- Active PR: none
+- Active PR: #26
 - Last verified: 2026-09-02
 
 ## Current checkpoint
 
-- Current PR: none
+- Current PR: #26
 - Current objective: Correct canonical project state before the separately scoped default-handoff safety and CI/reproducibility work.
 - Verified state: GitHub reports PR #25 merged as `7beec52407fba58aca4e90aae06d88a1b7f335ed`, and canonical `main` contains that merge commit. The Skill frontmatter work is complete.
-- Working state: Work proceeds in an isolated clean worktree because the original local `main` has unrelated changes and is behind `origin/main`; the original checkout remains untouched.
+- Working state: PR #26 is open from the isolated worktree; the original local `main` remains untouched because it has unrelated changes and is behind `origin/main`.
 - Authorized scope: Project status, roadmap, archived V2 status, project index, and focused repository-health validation. Commit, push, and PR creation are authorized; merge is not.
 
 ## Current blockers
@@ -21,7 +21,7 @@
 
 ## Next concrete action
 
-Complete and publish the canonical-truth cleanup PR without merging it, then start the separately scoped default Chat/Work handoff safety PR from refreshed `main`.
+Review PR #26 without merging it, then start the separately scoped default Chat/Work handoff safety PR from refreshed `main`.
 
 ## Evidence pointers
 
