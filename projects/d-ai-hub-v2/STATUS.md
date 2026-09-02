@@ -2,38 +2,21 @@
 
 ## State
 
-- Lifecycle: planned
-- Last updated: 2026-08-23
+- Lifecycle: archived
+- Active PR: none
+- Last verified: 2026-09-02
 
 ## Current checkpoint
 
-- Current task: Establish D-AI-Hub V2 bootstrap and cross-environment command workflow.
-- Working state: V1 is merged to `main`; V2 has not entered implementation.
-- Active plan:
-  1. Create a single `feat/v2-bootstrap` working branch when implementation begins.
-  2. Add root `AGENTS.md` bootstrap instructions for Codex/compatible agents.
-  3. Define the D-AI command workflow: `@D-AI establish`, `@D-AI sync`, `@D-AI update`, and `@D-AI close`.
-  4. Define ChatGPT Web ↔ GitHub ↔ Codex synchronization/usage rules.
-  5. Integrate external-skill usage rules for Superpowers, Taste, and Darwin without duplicating upstream repositories.
-  6. Verify the workflow and merge through one PR.
-- Latest verified evidence: GitHub was checked on 2026-08-23; no V2 branch, V2 PR, V2 commit, root `AGENTS.md`, or formal D-AI command definition was found.
-
-## Last verified progress
-
-D-AI-Hub V1 foundation was reviewed and merged to `main`. V2 goals have been discussed and scoped at a high level, but implementation has not started.
+- Current PR: none
+- Disposition: Superseded as an implementation project by the accepted Codex-first D-AI V1. This directory remains a historical and future architecture reference.
+- Verified state: Root `AGENTS.md`, the D-AI command protocol, progressive project memory, and Codex activation now exist on canonical `main`. Superpowers is disabled by explicit user decision.
+- Reuse boundary: Future Chat/Work activation or cross-environment architecture may cite the retained design history, but must start as a separately authorized project from current `main` rather than resume this stale plan.
 
 ## Current blockers
 
-None.
+None. There is no active implementation scope for this archived project.
 
 ## Next concrete action
 
-Start the V2 Superpowers architectural/design workflow and, after design approval, implement on the single `feat/v2-bootstrap` branch.
-
-## Verification notes
-
-- Repository: `keida/D-AI-Hub`
-- Canonical branch: `main`
-- V1: merged
-- V2 implementation: not started as of 2026-08-23
-- Branch policy: one task → at most one working branch; small knowledge/content/index updates may commit directly to `main`.
+No action. Keep this record archived unless a new, explicitly authorized architecture project supersedes it.

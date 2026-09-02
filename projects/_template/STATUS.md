@@ -3,9 +3,12 @@
 ## State
 
 - Lifecycle: planned | active | blocked | paused | completed | archived
+- Active PR: none
 - Last updated: YYYY-MM-DD
 
 ## Current checkpoint
+
+- Current PR: none
 
 - Current task: State the active task in one sentence.
 - Working state: State whether work is read-only, uncommitted, committed, pushed, blocked, or complete.
