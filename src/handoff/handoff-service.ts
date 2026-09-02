@@ -13,12 +13,13 @@ export interface HandoffService {
   ready(): Promise<void>;
   create(input: { readonly state: TaskState; readonly targetEnvironment: Environment }): Promise<HandoffEnvelope>;
   recordsForTask(taskId: string): Promise<readonly HandoffPersistenceRecord[]>;
+  reserve(envelope: HandoffEnvelope, target: EnvironmentCapabilities): Promise<void>;
   acknowledge(envelope: HandoffEnvelope, target: EnvironmentCapabilities): Promise<void>;
   complete(handoffId: string, recipient: Environment): Promise<void>;
   reject(handoffId: string, reason: string): Promise<void>;
 }
 
-export interface HandoffStatus { readonly handoffId: string; readonly taskId: string; readonly target: Environment; readonly state: "pending" | "active" | "completed" | "rejected"; readonly reason: string | null; readonly owner: Environment | null; }
+export interface HandoffStatus { readonly handoffId: string; readonly taskId: string; readonly target: Environment; readonly state: "pending" | "acknowledged" | "active" | "completed" | "rejected"; readonly reason: string | null; readonly owner: Environment | null; }
 export interface HandoffPersistenceRecord { readonly envelope: HandoffEnvelope; readonly owner: Environment | null; readonly state: HandoffStatus["state"]; readonly reason: string | null; }
 export interface HandoffPersistence { load(): Promise<readonly HandoffPersistenceRecord[]>; save(records: readonly HandoffPersistenceRecord[]): Promise<void>; withExclusive<T>(operation: () => Promise<T>): Promise<T>; }
 
@@ -26,7 +27,7 @@ const environmentSchema = z.enum(["chat", "work", "codex"]);
 const targetSchema = z.object({ environment: environmentSchema, capabilities: z.set(z.string()) }).strict();
 const handoffIdSchema = z.string().regex(/^handoff-[A-Za-z0-9._-]+-[1-9][0-9]*$/);
 const reasonSchema = z.string().trim().min(1);
-const persistedRecordSchema = z.object({ envelope: handoffEnvelopeSchema, owner: environmentSchema.nullable(), state: z.enum(["pending", "active", "completed", "rejected"]), reason: z.string().nullable() }).strict();
+const persistedRecordSchema = z.object({ envelope: handoffEnvelopeSchema, owner: environmentSchema.nullable(), state: z.enum(["pending", "acknowledged", "active", "completed", "rejected"]), reason: z.string().nullable() }).strict();
 const persistedRecordsSchema = z.object({ records: z.array(persistedRecordSchema) }).strict();
 const persistenceDocumentSchema = persistedRecordsSchema.extend({ integrityHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 
@@ -59,6 +60,7 @@ function parsePersistenceRecords(value: object): readonly HandoffPersistenceReco
     const hasActionableReason = record.reason !== null && reasonSchema.safeParse(record.reason).success;
     const ownerMatchesTarget = record.owner === envelope.targetEnvironment;
     if (record.state === "pending" && (record.owner !== null || record.reason !== null)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: pending records require a null owner and reason`);
+    if (record.state === "acknowledged" && (record.owner !== null || record.reason !== null)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: acknowledged records require a null owner and reason`);
     if (record.state === "active" && (!ownerMatchesTarget || record.reason !== null)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: active records require the target owner and a null reason`);
     if (record.state === "completed" && (!ownerMatchesTarget || !hasActionableReason)) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: completed records require the target owner and an actionable reason`);
     if (record.state === "rejected" && (!hasActionableReason || (record.owner !== null && !ownerMatchesTarget))) throw new InvalidHandoffError(`Invalid persisted handoff lifecycle for ${envelope.handoffId}: rejected records require an actionable reason and a null or target owner`);
@@ -355,8 +357,23 @@ export class PersistentHandoffService implements HandoffService {
       if (received.targetEnvironment !== validatedTarget.environment) throw new InvalidHandoffError(`Handoff ${received.handoffId} targets ${received.targetEnvironment}, not ${validatedTarget.environment}`);
       const requiredCapabilities = received.capabilitySnapshot[validatedTarget.environment];
       if (!requiredCapabilities.every((capability) => validatedTarget.capabilities.has(capability))) throw new CapabilityMismatchError(`Handoff target ${validatedTarget.environment} does not cover required capabilities: ${requiredCapabilities.join(", ")}`);
-      if (record.owner !== null || record.state !== "pending") throw new InvalidHandoffError(`Handoff ${received.handoffId} already has an active owner or terminal state`);
+      if (record.owner !== null || record.state !== "acknowledged") throw new InvalidHandoffError(`Handoff ${received.handoffId} is not reserved for activation`);
       await this.replace({ ...record, owner: validatedTarget.environment, state: "active" });
+    });
+  }
+
+  public async reserve(envelope: HandoffEnvelope, target: EnvironmentCapabilities): Promise<void> {
+    await this.runExclusive(async () => {
+      const received = parseHandoffEnvelope(envelope);
+      const validatedTarget = parseTarget(target);
+      await this.initialize();
+      const record = this.requireRecord(received.handoffId);
+      if (record.envelope.integrityHash !== received.integrityHash) throw new InvalidHandoffError(`Handoff envelope does not match pending handoff: ${received.handoffId}`);
+      if (received.targetEnvironment !== validatedTarget.environment) throw new InvalidHandoffError(`Handoff ${received.handoffId} targets ${received.targetEnvironment}, not ${validatedTarget.environment}`);
+      const requiredCapabilities = received.capabilitySnapshot[validatedTarget.environment];
+      if (!requiredCapabilities.every((capability) => validatedTarget.capabilities.has(capability))) throw new CapabilityMismatchError(`Handoff target ${validatedTarget.environment} does not cover required capabilities: ${requiredCapabilities.join(", ")}`);
+      if (record.owner !== null || record.state !== "pending") throw new InvalidHandoffError(`Handoff ${received.handoffId} is already reserved, active, or terminal`);
+      await this.replace({ ...record, state: "acknowledged" });
     });
   }
 
@@ -379,7 +396,7 @@ export class PersistentHandoffService implements HandoffService {
       await this.initialize();
       const record = this.requireRecord(validatedHandoffId);
       if (record.state === "completed" || record.state === "rejected") throw new InvalidTaskStateError(`Handoff ${validatedHandoffId} cannot reject from terminal state ${record.state}`);
-      await this.replace({ ...record, state: "rejected", reason: validatedReason });
+      await this.replace({ ...record, owner: null, state: "rejected", reason: validatedReason });
     });
   }
 

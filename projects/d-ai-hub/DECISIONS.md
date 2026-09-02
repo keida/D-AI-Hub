@@ -363,3 +363,31 @@ Project ownership gives the proposal one durable home and makes its review bound
 **Revisit trigger**
 
 Revisit ownership if the project's canonical architecture-record location changes. Any runtime implementation, product activation, execution expansion, or merge requires separate authorization.
+
+## 2026-09-03 — Pin the CI reproducibility support baseline
+
+**Context**
+
+PR #28 verified a cross-platform CI matrix on Windows and Linux with Node 22.20.0 and 26.7.0, but its package metadata and README allowed or described a wider npm range than the evidence covered.
+
+**Decision**
+
+The supported reproducibility baseline is Node 22.20.0 and Node 26.7.0 on Windows and Linux, with npm 11.19.0 exact. `packageManager`, package and lockfile root metadata, README, and CI must state and use that same contract. Widening the supported Node or npm set requires new matrix evidence. The CI and structural-health boundaries remain verification seams; they do not change the Codex-first control-plane or project-memory ownership boundaries.
+
+**Revisit trigger**
+
+Revisit only with executed evidence for the proposed additional runtime or package-manager version and an explicitly reviewed support decision.
+
+## 2026-09-03 — Validate declared project lifecycle and index consistency
+
+**Context**
+
+The 2026-08-30 index-freshness decision kept active/planned/archived classification human-owned and required separate authorization for implementation. The user later authorized this PR to add project-index lifecycle consistency checks, including conflicts such as an archived or superseded project listed under active projects.
+
+**Decision**
+
+Humans continue to declare each project's `Lifecycle` in `STATUS.md` and its owning section in `indexes/PROJECTS.md`. The read-only health check may validate that those declared values agree, and may report structured current-PR state contradictions, but it must never edit, reclassify, or infer either value from broad free text. This authorization reconciles the implementation with the earlier ownership boundary; it does not make classification machine-owned or waive human review of lifecycle changes.
+
+**Revisit trigger**
+
+Revisit only if a separately approved schema changes who owns lifecycle or index-section declarations.

@@ -1,6 +1,7 @@
 import { open, readFile, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { CommandExecutionError, redactSensitiveText, runCommand } from "../adapters/command-runner.js";
+import { canonicalPath } from "../domain/canonical-path.js";
 import { validateIndexFreshness } from "./index-freshness.js";
 import { localMarkdownTarget, markdownDestinations } from "./markdown-targets.js";
 import { validateSkillFrontmatter } from "./skill-frontmatter.js";
@@ -180,7 +181,7 @@ async function runWorkingTreeCheck(
 async function runPackageManagerCheck(
   workspacePath: string,
   timeoutMs: number,
-  script: "build" | "test",
+  script: "typecheck" | "test" | "test:integration",
 ): Promise<HealthCheckResult> {
   try {
     const isWindows = process.platform === "win32";
@@ -204,6 +205,7 @@ async function runPackageManagerCheck(
 export async function runRepositoryHealthCheck(input: {
   readonly workspacePath: string;
   readonly timeoutMs?: number;
+  readonly structuralOnly?: boolean;
 }): Promise<RepositoryHealthReport> {
   if (input.workspacePath.trim().length === 0) {
     return {
@@ -212,7 +214,7 @@ export async function runRepositoryHealthCheck(input: {
       checks: [{ id: "repository-identity", status: "blocked", observation: "Workspace path must be non-empty" }],
     };
   }
-  const workspacePath = resolve(input.workspacePath);
+  const workspacePath = await canonicalPath(input.workspacePath);
   const timeoutMs = input.timeoutMs ?? defaultTimeoutMs;
   const checks: HealthCheckResult[] = [];
   let repositoryIdentityPassed = false;
@@ -246,7 +248,11 @@ export async function runRepositoryHealthCheck(input: {
 
   if (!repositoryIdentityPassed) return { status: "blocked", workspacePath, checks };
 
-  checks.push(await runWorkingTreeCheck(workspacePath, timeoutMs, "working-tree"));
+  const workingTreeCheck = await runWorkingTreeCheck(workspacePath, timeoutMs, "working-tree");
+  checks.push(workingTreeCheck);
+  if (workingTreeCheck.status === "blocked") {
+    return { status: "blocked", workspacePath, checks };
+  }
 
   const missingFiles: string[] = [];
   for (const relativePath of requiredFiles) {
@@ -265,9 +271,13 @@ export async function runRepositoryHealthCheck(input: {
   checks.push(await validateIndexFreshness(workspacePath, timeoutMs));
   checks.push(await validateSkillFrontmatter(workspacePath, timeoutMs));
   checks.push(await validateTrackedMarkdownLinks(workspacePath, timeoutMs));
-  const buildCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "build");
-  const testCheck = await runPackageManagerCheck(workspacePath, timeoutMs, "test");
-  checks.push(buildCheck, testCheck);
+  if (input.structuralOnly !== true) {
+    checks.push(
+      await runPackageManagerCheck(workspacePath, timeoutMs, "typecheck"),
+      await runPackageManagerCheck(workspacePath, timeoutMs, "test"),
+      await runPackageManagerCheck(workspacePath, timeoutMs, "test:integration"),
+    );
+  }
   checks.push(await runWorkingTreeCheck(workspacePath, timeoutMs, "working-tree-final"));
 
   return { status: overallStatus(checks), workspacePath, checks };

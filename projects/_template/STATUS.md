@@ -7,6 +7,8 @@
 
 ## Current checkpoint
 
+- Current PR: none
+
 - Current task: State the active task in one sentence.
 - Working state: State whether work is read-only, uncommitted, committed, pushed, blocked, or complete.
 - Active plan: List only the remaining high-level steps needed to resume without old chat.

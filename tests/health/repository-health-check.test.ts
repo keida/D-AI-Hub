@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -27,8 +27,9 @@ async function commitFixtureChanges(workspacePath: string, message: string): Pro
 
 type FixtureOptions = {
   readonly markdown?: string;
-  readonly buildCommand?: string;
+  readonly typecheckCommand?: string;
   readonly testCommand?: string;
+  readonly integrationCommand?: string;
   readonly sourceSymlinkOutside?: boolean;
   readonly nestedWorkspace?: boolean;
 };
@@ -36,8 +37,9 @@ type FixtureOptions = {
 async function createRepositoryFixture(options: FixtureOptions = {}): Promise<string> {
   const fixtureOptions = {
     markdown: "",
-    buildCommand: "node -e \"process.stdout.write('build ok')\"",
+    typecheckCommand: "node -e \"process.stdout.write('typecheck ok')\"",
     testCommand: "node -e \"process.stdout.write('test ok')\"",
+    integrationCommand: "node -e \"process.stdout.write('integration ok')\"",
     ...options,
   };
   const fixtureContainer = await mkdtemp(join(tmpdir(), "d-ai-repository-health-"));
@@ -50,10 +52,22 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
   for (const relativePath of requiredFiles) {
     const filePath = join(workspacePath, relativePath);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, `${relativePath}\n`, "utf8");
+    await writeFile(filePath, relativePath === "projects/d-ai-hub/STATUS.md" ? [
+      "# Status",
+      "",
+      "## State",
+      "",
+      "- Lifecycle: active",
+      "",
+      "## Current checkpoint",
+      "",
+      "- Current PR: none",
+      "",
+    ].join("\n") : `${relativePath}\n`, "utf8");
   }
   const catalogFiles = [
     "skills/custom/example/SKILL.md",
+    "skills/custom/project-memory/SKILL.md",
     ".agents/skills/example/SKILL.md",
     "skills/external/example.md",
     "knowledge/ai/example.md",
@@ -78,17 +92,38 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
   }
   await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
     "[custom](../skills/custom/example/SKILL.md)",
+    "[project memory](../skills/custom/project-memory/SKILL.md)",
     "[compatibility](../.agents/skills/example/SKILL.md)",
     "[external](../skills/external/example.md)",
   ].join("\n"), "utf8");
   await writeFile(join(workspacePath, "indexes", "KNOWLEDGE.md"), "[AI](../knowledge/ai/)\n", "utf8");
-  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), "[D-AI-Hub](../projects/d-ai-hub/)\n", "utf8");
+  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+    "# Project Index",
+    "",
+    "## Active projects",
+    "",
+    "- [D-AI-Hub](../projects/d-ai-hub/)",
+    "",
+    "## Planned projects",
+    "",
+    "_None._",
+    "",
+    "## Archived projects",
+    "",
+    "_None._",
+    "",
+    "## Continuation rule",
+    "",
+    "Use progressive loading from the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md): read STATUS.md first, then the task-matching file. Read the complete project set only for close, audit, conflict, or an explicit complete-context request.",
+    "",
+  ].join("\n"), "utf8");
   await writeFile(join(workspacePath, "package.json"), `${JSON.stringify({
     name: "repository-health-fixture",
     private: true,
     scripts: {
-      build: fixtureOptions.buildCommand,
+      typecheck: fixtureOptions.typecheckCommand,
       test: fixtureOptions.testCommand,
+      "test:integration": fixtureOptions.integrationCommand,
     },
   })}\n`, "utf8");
   if (fixtureOptions.markdown.length > 0) {
@@ -101,10 +136,14 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
     const outsideRoot = await mkdtemp(join(tmpdir(), "d-ai-repository-health-outside-"));
     temporaryRoots.splice(Math.max(0, temporaryRoots.length - 1), 0, outsideRoot);
     await writeFile(join(outsideRoot, "external.md"), "[external-content-must-not-be-read](missing-external-target.md)\n", "utf8");
-    await symlink(outsideRoot, join(workspacePath, "docs", "external"), "junction");
+    await symlink(
+      process.platform === "win32" ? outsideRoot : join(outsideRoot, "external.md"),
+      join(workspacePath, "docs", process.platform === "win32" ? "external" : "external.md"),
+      process.platform === "win32" ? "junction" : "file",
+    );
   }
   await git(workspacePath, fixtureOptions.sourceSymlinkOutside
-    ? ["add", ...requiredFiles, "package.json", "docs/external/external.md"]
+    ? ["add", ...requiredFiles, "package.json", process.platform === "win32" ? "docs/external/external.md" : "docs/external.md"]
     : ["add", "."]);
   await git(workspacePath, ["commit", "-m", "create health-check fixture"]);
   return workspacePath;
@@ -136,7 +175,7 @@ describe("runRepositoryHealthCheck", () => {
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("healthy");
-    expect(report.workspacePath).toBe(resolve(workspacePath));
+    expect(report.workspacePath).toBe(await realpath(workspacePath));
     expect(checkWithId(report, "repository-identity").status).toBe("passed");
     expect(checkWithId(report, "working-tree").status).toBe("passed");
     expect(checkWithId(report, "required-files").status).toBe("passed");
@@ -146,8 +185,9 @@ describe("runRepositoryHealthCheck", () => {
       observation: "All required catalog targets are indexed exactly once",
     });
     expect(checkWithId(report, "markdown-links").status).toBe("passed");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
+    expect(checkWithId(report, "test:integration").status).toBe("passed");
   });
 
   it("validates tracked Markdown links while skipping external, mail, and anchor links", async () => {
@@ -178,8 +218,9 @@ describe("runRepositoryHealthCheck", () => {
       "index-freshness",
       "skill-frontmatter",
       "markdown-links",
-      "build",
+      "typecheck",
       "test",
+      "test:integration",
       "working-tree-final",
     ]);
   });
@@ -201,7 +242,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(freshnessCheck.observation).toContain(indexPath);
     expect(freshnessCheck.observation).toContain(expectedTarget);
     expect(checkWithId(report, "markdown-links").status).toBe("passed");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -256,7 +297,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(skillCheck.observation).toContain(".agents/skills/example/SKILL.md");
     expect(skillCheck.observation).not.toContain("secret-content-must-not-escape");
     expect(skillCheck.observation).not.toContain("Map keys must be unique");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -309,7 +350,7 @@ describe("runRepositoryHealthCheck", () => {
       status: "blocked",
       observation: "skills/custom/example/SKILL.md: unable to read tracked Skill frontmatter",
     });
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -329,7 +370,7 @@ describe("runRepositoryHealthCheck", () => {
       status: "blocked",
       observation: "skills/custom/example/SKILL.md: tracked Skill path resolves outside the repository",
     });
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -358,6 +399,7 @@ describe("runRepositoryHealthCheck", () => {
     await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
       "[custom one](../skills/custom/example/SKILL.md)",
       "[custom two](../skills/custom/example/SKILL.md#usage)",
+      "[project memory](../skills/custom/project-memory/SKILL.md)",
       "[compatibility](../.agents/skills/example/SKILL.md)",
       "[external](../skills/external/example.md)",
     ].join("\n"), "utf8");
@@ -410,6 +452,148 @@ describe("runRepositoryHealthCheck", () => {
     expect(freshnessCheck.observation).toContain("projects/planned-project");
   });
 
+  it("reports a project indexed under a section that conflicts with its lifecycle", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Planned projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use progressive loading from the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md): read STATUS.md first. Read the complete project set only for close or audit.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "misclassify active project");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("lifecycle active is not indexed under active projects");
+  });
+
+  it("reports a semantically stale current pull request state", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "## Current checkpoint",
+      "- Current PR: #25 (merged)",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "conflict pull request state");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("Current PR state merged conflicts with lifecycle active");
+  });
+
+  it("reports the obsolete fixed project continuation order", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "When resuming a project, read in this order:",
+      "1. README.md",
+      "2. STATUS.md",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "restore obsolete continuation order");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
+  it("allows a numbered progressive continuation rule", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md):",
+      "1. Read STATUS.md first.",
+      "2. Read only the task-matching file.",
+      "Read the complete project set only for close or audit.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "use numbered progressive continuation");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").status).toBe("passed");
+  });
+
+  it("blocks an indexed project STATUS that resolves outside the repository", async () => {
+    const workspacePath = await createRepositoryFixture();
+    const outsideRoot = await mkdtemp(join(tmpdir(), "d-ai-project-status-outside-"));
+    temporaryRoots.splice(Math.max(0, temporaryRoots.length - 1), 0, outsideRoot);
+    await writeFile(join(outsideRoot, "STATUS.md"), [
+      "# External status",
+      "- Lifecycle: active",
+      "- Current PR: none",
+    ].join("\n"), "utf8");
+    await rename(join(workspacePath, "projects", "d-ai-hub"), join(workspacePath, "projects", "d-ai-hub-original"));
+    await symlink(outsideRoot, join(workspacePath, "projects", "d-ai-hub"), "junction");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness")).toMatchObject({
+      status: "blocked",
+      observation: expect.stringContaining("resolves outside the repository"),
+    });
+  });
+
+  it("rejects a continuation rule linked to the wrong Skill", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use [Project Memory Skill](../skills/custom/example/SKILL.md): read STATUS.md first.",
+      "Read the complete project set only for close or audit.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "link the wrong continuation Skill");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
+  it("rejects a non-numbered fixed full-project continuation order", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use [Project Memory Skill](../skills/custom/project-memory/SKILL.md).",
+      "Always read README.md, DECISIONS.md, BUGS.md, then STATUS.md.",
+      "Read the complete project set only for every continuation.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "restore a fixed full-project continuation order");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
+  it("rejects an unbounded continuation rule even when it mentions an allowed exception", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use [Project Memory Skill](../skills/custom/project-memory/SKILL.md).",
+      "Read STATUS.md first.",
+      "Read the complete project set only for every continuation, including close.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "allow every continuation");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
   it("ignores untracked catalog candidates", async () => {
     const workspacePath = await createRepositoryFixture();
     await mkdir(join(workspacePath, "projects", "untracked-project"), { recursive: true });
@@ -438,28 +622,28 @@ describe("runRepositoryHealthCheck", () => {
     expect(freshnessCheck.status).toBe("blocked");
     expect(Buffer.byteLength(freshnessCheck.observation, "utf8")).toBeLessThanOrEqual(2_048);
     expect(checkWithId(report, "markdown-links").status).toBe("blocked");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   }, 45_000);
 
-  it("reports workspace changes created by a build script in the final working-tree check", async () => {
+  it("reports workspace changes created by a typecheck script in the final working-tree check", async () => {
     const workspacePath = await createRepositoryFixture({
-      buildCommand: "node -e \"require('node:fs').writeFileSync('generated-by-build.txt', 'generated\\n')\"",
+      typecheckCommand: "node -e \"require('node:fs').writeFileSync('generated-by-typecheck.txt', 'generated\\n')\"",
     });
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("unhealthy");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
     expect(checkWithId(report, "working-tree-final")).toEqual({
       id: "working-tree-final",
       status: "failed",
-      observation: expect.stringContaining("generated-by-build.txt"),
+      observation: expect.stringContaining("generated-by-typecheck.txt"),
     });
   }, 20_000);
 
-  it("fails tracked Markdown links for missing and out-of-root targets but still runs build and test", async () => {
+  it("fails tracked Markdown links for missing and out-of-root targets but still runs typecheck and tests", async () => {
     const workspacePath = await createRepositoryFixture({
       nestedWorkspace: true,
       markdown: [
@@ -477,7 +661,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "markdown-links").observation).toContain("missing.md");
     expect(checkWithId(report, "markdown-links").observation).toContain("../outside.md");
     expect(checkWithId(report, "markdown-links").observation).not.toContain("outside-target-content-must-not-be-read");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
@@ -489,30 +673,44 @@ describe("runRepositoryHealthCheck", () => {
     expect(report.status).toBe("unhealthy");
     const markdownLinksCheck = checkWithId(report, "markdown-links");
     expect(markdownLinksCheck.status).toBe("failed");
-    expect(markdownLinksCheck.observation).toContain("docs/external/external.md");
+    expect(markdownLinksCheck.observation).toContain(process.platform === "win32" ? "docs/external/external.md" : "docs/external.md");
     expect(markdownLinksCheck.observation).not.toContain("external-content-must-not-be-read");
     expect(markdownLinksCheck.observation).not.toContain("missing-external-target.md");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   }, 20_000);
 
-  it("reports build and test command failures independently with redacted diagnostics", async () => {
+  it("reports typecheck and test command failures independently with redacted diagnostics", async () => {
     const workspacePath = await createRepositoryFixture({
-      buildCommand: "node -e \"console.error('token=super-secret'); process.exit(1)\"",
+      typecheckCommand: "node -e \"console.error('token=super-secret'); process.exit(1)\"",
       testCommand: "node -e \"process.stdout.write('test ok')\"",
     });
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("unhealthy");
-    const buildCheck = checkWithId(report, "build");
-    expect(buildCheck.status).toBe("failed");
-    expect(buildCheck.observation).toContain("[REDACTED]");
-    expect(buildCheck.observation).not.toContain("super-secret");
+    const typecheckCheck = checkWithId(report, "typecheck");
+    expect(typecheckCheck.status).toBe("failed");
+    expect(typecheckCheck.observation).toContain("[REDACTED]");
+    expect(typecheckCheck.observation).not.toContain("super-secret");
     expect(checkWithId(report, "test").status).toBe("passed");
   });
 
-  it("bounds a timed-out test command without suppressing the build check", async () => {
+  it("reports an integration command failure independently", async () => {
+    const workspacePath = await createRepositoryFixture({
+      integrationCommand: "node -e \"console.error('integration failed'); process.exit(1)\"",
+    });
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(report.status).toBe("unhealthy");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
+    expect(checkWithId(report, "test").status).toBe("passed");
+    expect(checkWithId(report, "test:integration").status).toBe("failed");
+    expect(checkWithId(report, "test:integration").observation).toContain("integration failed");
+  });
+
+  it("bounds a timed-out test command without suppressing the typecheck check", async () => {
     const workspacePath = await createRepositoryFixture({
       testCommand: "node -e \"setTimeout(() => {}, 10000)\"",
     });
@@ -520,7 +718,7 @@ describe("runRepositoryHealthCheck", () => {
     const report = await runRepositoryHealthCheck({ workspacePath, timeoutMs: 3_000 });
 
     expect(report.status).toBe("unhealthy");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("failed");
     expect(checkWithId(report, "test").observation).toMatch(/timed out/i);
   }, 20_000);
@@ -534,15 +732,15 @@ describe("runRepositoryHealthCheck", () => {
     expect(report.checks.every((check) => check.status === "passed")).toBe(true);
   });
 
-  it("allows the default health check to complete a build longer than the former five-second budget", async () => {
+  it("allows the default health check to complete a typecheck longer than the former five-second budget", async () => {
     const workspacePath = await createRepositoryFixture({
-      buildCommand: "node -e \"setTimeout(() => {}, 6000)\"",
+      typecheckCommand: "node -e \"setTimeout(() => {}, 6000)\"",
     });
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
     expect(report.status).toBe("healthy");
-    expect(checkWithId(report, "build").status).toBe("passed");
+    expect(checkWithId(report, "typecheck").status).toBe("passed");
     expect(checkWithId(report, "test").status).toBe("passed");
   }, 30_000);
 
@@ -572,6 +770,7 @@ describe("runRepositoryHealthCheck", () => {
       expect(report.status).toBe("blocked");
       expect(checkWithId(report, "working-tree").status).toBe("blocked");
       expect(checkWithId(report, "working-tree").observation).toMatch(/timed out/i);
+      expect(report.checks.map((check) => check.id)).toEqual(["repository-identity", "working-tree"]);
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
@@ -635,8 +834,9 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "required-files").status).toBe("blocked");
     expect(checkWithId(report, "required-files").observation).toContain("README.md");
     expect(report.checks.map((check) => check.id)).not.toContain("markdown-links");
-    expect(report.checks.map((check) => check.id)).not.toContain("build");
+    expect(report.checks.map((check) => check.id)).not.toContain("typecheck");
     expect(report.checks.map((check) => check.id)).not.toContain("test");
+    expect(report.checks.map((check) => check.id)).not.toContain("test:integration");
   });
 
   it("exposes a JSON healthy report through the npm health-check script", async () => {

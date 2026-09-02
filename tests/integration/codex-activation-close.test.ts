@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import { GitHubCliAdapter } from "../../src/adapters/github.js";
 import { pushGitRef, readRemoteRef, type GitTransport } from "../../src/adapters/git.js";
 import type { Environment, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
+import { FileHandoffPersistence } from "../../src/handoff/handoff-service.js";
 import { createConfiguredDAIRuntime } from "../../src/runtime/d-ai-runtime.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
@@ -136,6 +137,34 @@ async function createActivationFixture(prefix: string): Promise<{
 }
 
 describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
+  it.each(["chat", "work"] as const)("fails closed before ownership transfer when default %s activation is unavailable", async (target) => {
+    const fixture = await createActivationFixture(`d-ai-codex-handoff-${target}-`);
+    try {
+      const store = new FileDurableContextStore(fixture.durableRoot);
+      await store.withTaskOwnership(fixture.state.taskId, "codex", async (lease) => {
+        await store.save({ ...fixture.state, handoffState: "none" }, lease);
+      });
+      const activate = createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }));
+
+      const result = await activate({ rawCommand: `@D-AI handoff ${target}`, taskId: fixture.state.taskId });
+
+      expect(result).toMatchObject({ taskId: fixture.state.taskId, environment: "codex", status: "blocked" });
+      expect(result.message).toMatch(/activation|connector|receive/i);
+      await expect(store.load(fixture.state.taskId)).resolves.toMatchObject({ environment: "codex", handoffState: "none" });
+      await expect(new FileHandoffPersistence(join(fixture.durableRoot, "handoffs.json")).load()).resolves.toEqual([]);
+      const freshStatus = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI status", taskId: null });
+      expect(freshStatus).toMatchObject({ taskId: fixture.state.taskId, environment: "codex", status: "accepted" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("returns NO when the configured remote reports a different SHA", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-close-mismatch-"));
     const repositoryPath = join(root, "repository");
@@ -327,7 +356,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const executed = await activate({ rawCommand: "@D-AI verify nested workspace", taskId: null });
       expect(executed.status).toBe("completed");
       const beforeRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
-      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
 
       await writeFile(join(workspacePath, "artifact.txt"), "regression\n", "utf8");
       await git(repositoryRoot, ["add", "packages/app/artifact.txt"]);
@@ -340,7 +369,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       await expect(git(repositoryRoot, ["diff", "--name-status", recoveryHead, "HEAD"])).resolves.toBe("");
       expect(rolledBack.message).toMatch(/rollback restored/i);
       const afterRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
-      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
       expect(afterRollback?.rollbackAudit?.verification.passed).toBe(true);
       await expect(git(repositoryRoot, ["show", "HEAD:packages/app/artifact.txt"])).resolves.toBe("known good");
       await expect(git(repositoryRoot, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
@@ -406,7 +435,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("treats a case-variant workspace path as the same Windows workspace", async () => {
+  it.skipIf(process.platform !== "win32")("treats a case-variant workspace path as the same Windows workspace", async () => {
     const fixture = await createActivationFixture("d-ai-codex-case-workspace-");
     try {
       const caseVariantWorkspace = fixture.repositoryPath.replace(/[a-z]/g, (character) => character.toUpperCase());
@@ -416,6 +445,22 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       }))({ rawCommand: "@D-AI status", taskId: fixture.state.taskId });
 
       expect(result).toMatchObject({ taskId: fixture.state.taskId, status: "accepted" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("rejects a case-variant workspace path on a case-sensitive Linux filesystem", async () => {
+    const fixture = await createActivationFixture("d-ai-codex-case-sensitive-workspace-");
+    try {
+      const caseVariantWorkspace = fixture.repositoryPath.replace(/[a-z]/g, (character) => character.toUpperCase());
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: caseVariantWorkspace,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI status", taskId: fixture.state.taskId });
+
+      expect(result).toMatchObject({ taskId: fixture.state.taskId, status: "blocked" });
+      expect(result.message).toMatch(/different workspace/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

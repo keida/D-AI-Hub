@@ -15,7 +15,7 @@ import type {
   TaskOwnershipTransitionAuthorizer,
   TaskStateWriteAuthorization,
 } from "./durable-context-store.js";
-import { canonicalWorkspaceIdentityPath } from "./workspace-identity.js";
+import { matchesCanonicalWorkspaceIdentity } from "./workspace-identity.js";
 
 const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const credentialFieldPattern = /(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credential|cookie|password|private[_-]?key|secret|session[_-]?token)/i;
@@ -591,7 +591,7 @@ export class FileDurableContextStore implements DurableContextStore {
       if (!entry.isDirectory() || !taskIdPattern.test(entry.name)) continue;
       const state = await this.load(entry.name);
       if (state === null || state.stage === "close") continue;
-      if (canonicalWorkspaceIdentityPath(state.contextManifest) === canonicalWorkspacePath) {
+      if (await matchesCanonicalWorkspaceIdentity(state.contextManifest, canonicalWorkspacePath)) {
         candidates.push(state);
       }
     }

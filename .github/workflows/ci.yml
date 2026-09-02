@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22.20.0, 26.7.0]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Use verified npm
+        run: npm install --global npm@11.19.0
+      - name: Install from lockfile
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Run ordinary tests
+        run: npm run test
+      - name: Validate repository structure
+        run: npm run health-check:structural
+
+  integration:
+    name: Integration (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22.20.0, 26.7.0]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Use verified npm
+        run: npm install --global npm@11.19.0
+      - name: Install from lockfile
+        run: npm ci
+      - name: Verify node:sqlite
+        run: node --input-type=module -e "import { DatabaseSync } from 'node:sqlite'; const database = new DatabaseSync(':memory:'); database.exec('SELECT 1'); database.close();"
+      - name: Run serial integration tests
+        run: npm run test:integration
