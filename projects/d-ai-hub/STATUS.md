@@ -8,16 +8,14 @@
 
 ## Current checkpoint
 
-- Current objective: Rework PR #29's explicit actor/session identity ADR as a documentation-only proposal that is owned by the D-AI-Hub project and is safe to re-review.
+- Current objective: Keep PR #29's explicit actor/session identity ADR as a project-owned, documentation-only proposal ready for read-only re-review.
 - Cancelled side investigation: The user stopped the claude-mem comparison and integration proposal. Only source/rule comparison and environment preflight occurred; the A/B/C runtime comparison did not run. No claude-mem installation, provider setup, model call, or history ingestion was performed. Do not resume that investigation without a new user request.
 - Verified scope: This revision changes only the project ADR, `DECISIONS.md`, `STATUS.md`, and the PR #29 description. It adds no runtime implementation, Chat/Work activation, cross-chat communication, subagent/background execution, or merge authorization.
 - Working state: The documentation revision is published on the existing feature branch; the original dirty root remains untouched. Live PR state is rechecked at this checkpoint.
-- Authorized scope: Move and revise the ADR under the project-owned path, update the project decision and status records, update PR #29, commit and push the existing feature branch, and re-review the resulting open PR. Merge remains unauthorized.
+- Authorized scope: PR29-FIX publication is complete and exhausted; only read-only re-review is current. Merge, runtime implementation, and product activation remain unauthorized.
 - Unresolved state: This is proposal review, not runtime activation; implementation and product activation require separate authorization.
-- Next action: Re-review PR #29 after the final push, including its canonical ADR link, role-bound authorization, migration order, doc-only boundary, and live GitHub state.
 - Completed prior scope: [PR #23](https://github.com/keida/D-AI-Hub/pull/23) merged normally as `f9c97415f95859ba9248b6154290f37b892263f3`; its MERGED state was checked again at this stage's start. PR #22 and the separate local reader-handoff trial remain completed prior work. None proves automatic new-chat recall.
 - Boundary: local SQLite is a non-control-plane runtime store; Git-versioned JSONL/manifest bundles are the cross-device transfer artifact; Markdown/Git remains canonical for Skills, project state, knowledge, and decisions. One configured writer is allowed in this phase. Reader-mode stores reject writes and never auto-merge.
-- Acceptance target: `runRepositoryHealthCheck` reports `skill-frontmatter` for tracked `skills/custom/<name>/SKILL.md` and `.agents/skills/<name>/SKILL.md`; YAML must be a mapping with non-empty string name/description, while extra metadata is allowed. Invalid content fails, incomplete enumeration/read blocks, and later checks still run. Diagnostics are deterministic, redacted, content-free, and byte-bounded. Untracked files and external provenance are excluded; no automatic repair or new naming policy is introduced. Verify behavior through real temporary Git repositories, focused health tests, and the TypeScript build.
 
 ## Delivery state
 
