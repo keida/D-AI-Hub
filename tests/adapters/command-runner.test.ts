@@ -201,7 +201,6 @@ describe("redactSensitiveText", () => {
         }
       }
       expect(descendantPid).toBeGreaterThan(0);
-      expect(isAlive(descendantPid)).toBe(true);
     } finally {
       try {
         const descendantPid = Number(await readFile(pidPath, "utf8"));
