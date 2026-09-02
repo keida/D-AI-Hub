@@ -35,8 +35,22 @@ jobs:
         run: npm run typecheck
       - name: Run ordinary tests (shard 1 of 4)
         run: npm run test -- --shard=1/4
-      - name: Run ordinary tests (shard 2 of 4)
-        run: npm run test -- --shard=2/4
+      - name: Diagnose shard 2 - command runner
+        run: npm exec -- vitest run tests/adapters/command-runner.test.ts
+      - name: Diagnose shard 2 - Git adapter
+        run: npm exec -- vitest run tests/adapters/git.test.ts
+      - name: Diagnose shard 2 - canonical path
+        run: npm exec -- vitest run tests/domain/canonical-path.test.ts
+      - name: Diagnose shard 2 - SQLite memory store
+        run: npm exec -- vitest run tests/memory/local-sqlite-memory-store.test.ts
+      - name: Diagnose shard 2 - Skill registry
+        run: npm exec -- vitest run tests/skills/registry.test.ts
+      - name: Diagnose shard 2 - environment router
+        run: npm exec -- vitest run tests/routing/environment-router.test.ts
+      - name: Diagnose shard 2 - override parser
+        run: npm exec -- vitest run tests/routing/override-parser.test.ts
+      - name: Diagnose shard 2 - handoff service
+        run: npm exec -- vitest run tests/handoff/handoff-service.test.ts
       - name: Run ordinary tests (shard 3 of 4)
         run: npm run test -- --shard=3/4
       - name: Run ordinary tests (shard 4 of 4)
