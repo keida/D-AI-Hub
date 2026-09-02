@@ -11,11 +11,11 @@
 
 ## Current checkpoint
 
-- Current objective: Reconcile PR #28 with the latest origin/main and keep its CI/reproducibility support contract ready for read-only re-review.
+- Current objective: Complete the read-only Boss re-review of PR #28 and decide whether separate merge authorization should be requested.
 - Verified state: PR #26 and PR #27 are merged; this branch includes their accepted main contents plus PR #28's reproducibility and CI changes. PR #28 remains open and unmerged.
 - Toolchain contract: Supported CI baselines are Windows/Linux with Node 22.20.0 and 26.7.0 and npm 11.19.0 exact. Package metadata, lockfile root metadata, README, and CI must remain aligned; widening support requires new evidence.
 - Working state: The normal origin/main reconciliation is complete in this branch; the original dirty root remains untouched. No merge of PR #28 is authorized.
-- Authorized scope: Reconcile and publish the existing PR #28 branch, validate the integrated changes, and prepare it for review. Merge, PR #29 changes, and unrelated work remain unauthorized.
+- Authorized scope: Worker reconciliation and publication authority is complete and exhausted; no further writes or merge are authorized.
 
 ## Current blockers
 
