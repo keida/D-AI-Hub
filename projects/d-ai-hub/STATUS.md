@@ -3,25 +3,24 @@
 ## State
 
 - Lifecycle: active
-- Active PR: #26
-- Last verified: 2026-09-02
+- Current PR: #26 (open)
+- Last verified: 2026-09-03
 
 ## Current checkpoint
 
-- Current PR: #26
-- Current objective: Correct canonical project state before the separately scoped default-handoff safety and CI/reproducibility work.
-- Verified state: GitHub reports PR #25 merged as `7beec52407fba58aca4e90aae06d88a1b7f335ed`, and canonical `main` contains that merge commit. The Skill frontmatter work is complete.
-- Working state: PR #26 is open from the isolated worktree; the original local `main` remains untouched because it has unrelated changes and is behind `origin/main`.
-- Authorized scope: Project status, roadmap, archived V2 status, project index, and focused repository-health validation. Commit, push, and PR creation are authorized; merge is not.
+- Current objective: Resolve PR #26 review findings by keeping one canonical current-PR field, validating its structured lifecycle state, and restoring historical verification evidence without duplicating architecture boundaries.
+- Verified state: `STATUS.md` now has one `Current PR: #26 (open)` representation. Repository-health project checks pass 10/10, the TypeScript build passes, and `git diff --check` passes. The evidence history retains historical test counts, digests, and rehearsal milestones while linking architecture/product boundaries to [Decisions](DECISIONS.md) and [Roadmap](ROADMAP.md).
+- Working state: The isolated branch `codex/canonical-truth-cleanup-20260902` contains the four-file PR26-FIX change set; the original local `main` remains untouched because it has unrelated changes and is behind `origin/main`.
+- Authorized scope: `projects/d-ai-hub/STATUS.md`, `projects/d-ai-hub/EVIDENCE_HISTORY.md`, `src/health/index-freshness.ts`, and the existing health fixture `tests/health/repository-health-check.test.ts`. One normal commit and push to the existing PR branch are authorized; merge is not.
 
 ## Current blockers
 
-- The real `@D-AI continue D-AI-Hub` invocation returned `BLOCKED` because no durable task with that identifier was found in the original workspace. Repository work remains independently authorized.
-- GitHub branch-protection details are unavailable through the current private-repository plan/API response and remain `UNKNOWN`.
+- The complete health test file and aggregate `health-check` command were stopped after more than 90 seconds with no diagnostic output; focused coverage is verified, but those aggregate runs are not claimed.
+- Remote head and PR #26 open-state verification remain pending until the authorized push. GitHub branch-protection details remain `UNKNOWN`.
 
 ## Next concrete action
 
-Review PR #26 without merging it, then start the separately scoped default Chat/Work handoff safety PR from refreshed `main`.
+Commit and push this bounded fix, then verify the remote branch head and that PR #26 remains open; do not merge it.
 
 ## Evidence pointers
 

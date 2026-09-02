@@ -14,6 +14,7 @@ type Catalog = {
 };
 
 type ProjectSection = "active" | "planned" | "archived";
+type CurrentPullRequestState = "open" | "draft" | "merged" | "closed";
 
 function boundedDiagnostic(value: string): string {
   const redacted = redactSensitiveText(value);
@@ -99,6 +100,11 @@ function oneField(markdown: string, label: string): string | null {
   return matches.length === 1 ? matches[0]?.[1]?.trim() ?? null : null;
 }
 
+function currentPullRequestState(value: string): CurrentPullRequestState | null {
+  const match = /^#[1-9][0-9]* \((open|draft|merged|closed)\)$/u.exec(value);
+  return match?.[1] as CurrentPullRequestState | undefined ?? null;
+}
+
 function isWithinWorkspace(workspacePath: string, candidatePath: string): boolean {
   const relativePath = relative(workspacePath, candidatePath);
   return relativePath === ""
@@ -127,12 +133,18 @@ async function projectStateFindings(
       findings.push(`${project}: lifecycle ${lifecycle} is not indexed under ${expected} projects`);
     }
 
-    const activePr = oneField(status, "Active PR");
     const currentPr = oneField(status, "Current PR");
-    if (activePr === null || !/^(?:none|#[1-9][0-9]*)$/u.test(activePr)) {
-      findings.push(`${project}/STATUS.md: invalid Active PR`);
-    } else if (currentPr === null || currentPr !== activePr) {
-      findings.push(`${project}/STATUS.md: Active PR conflicts with Current PR`);
+    if (currentPr === null) {
+      findings.push(`${project}/STATUS.md: invalid Current PR`);
+    } else if (currentPr !== "none") {
+      const prState = currentPullRequestState(currentPr);
+      if (prState === null) {
+        findings.push(`${project}/STATUS.md: invalid Current PR`);
+      } else if (["active", "blocked", "paused"].includes(lifecycle ?? "") && ["merged", "closed"].includes(prState)) {
+        findings.push(`${project}/STATUS.md: Current PR state ${prState} conflicts with lifecycle ${lifecycle}`);
+      } else if (lifecycle === "planned" || (["archived", "completed", "superseded"].includes(lifecycle ?? "") && ["open", "draft"].includes(prState))) {
+        findings.push(`${project}/STATUS.md: Current PR state ${prState} conflicts with lifecycle ${lifecycle}`);
+      }
     }
   }
 

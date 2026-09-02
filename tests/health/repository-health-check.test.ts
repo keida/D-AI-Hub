@@ -56,7 +56,6 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
       "## State",
       "",
       "- Lifecycle: active",
-      "- Active PR: none",
       "",
       "## Current checkpoint",
       "",
@@ -460,21 +459,20 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "index-freshness").observation).toContain("lifecycle active is not indexed under active projects");
   });
 
-  it("reports conflicting active and current pull request state", async () => {
+  it("reports a semantically stale current pull request state", async () => {
     const workspacePath = await createRepositoryFixture();
     await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
       "# Status",
       "## State",
       "- Lifecycle: active",
-      "- Active PR: #25",
       "## Current checkpoint",
-      "- Current PR: none",
+      "- Current PR: #25 (merged)",
     ].join("\n"), "utf8");
     await commitFixtureChanges(workspacePath, "conflict pull request state");
 
     const report = await runRepositoryHealthCheck({ workspacePath });
 
-    expect(checkWithId(report, "index-freshness").observation).toContain("Active PR conflicts with Current PR");
+    expect(checkWithId(report, "index-freshness").observation).toContain("Current PR state merged conflicts with lifecycle active");
   });
 
   it("reports the obsolete fixed project continuation order", async () => {
