@@ -11,7 +11,7 @@
 
 ## Current authorized follow-up
 
-- Read-only Skill frontmatter health check, implemented and locally verified: validate YAML mappings and non-empty string `name`/`description` for tracked custom Skills and compatibility entries through the existing repository-health interface. Report failures without modifying Skill content; exclude external provenance and untracked files. Focused health tests passed 46/46 and the TypeScript build passed; see STATUS.md for evidence limits. Commit, push, and PR creation are authorized; merge requires separate authorization, and actual publication must be checked against the feature branch and PR. This is not a full native-loader compatibility certification.
+- Canonical truth cleanup: keep the project checkpoint concise, archive the superseded D-AI-Hub V2 implementation plan, align project continuation with progressive loading, and extend repository health checks for project lifecycle/index consistency. Runtime handoff safety and CI remain separate PRs.
 
 ## V1 product boundary
 
@@ -31,7 +31,7 @@
 - Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
 - Lightweight engineering routing documented; selected Matt Skills remain available through native discovery, Superpowers is permanently disabled and absent from native discovery, and no independent external or general-purpose Router runtime is installed.
 - Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and accepted. Device A pushed an exact two-file bundle commit to private `main`; an isolated reader clone with a separate workspace/SQLite database and `core.autocrlf=true` verified the pulled digest, `IMPORTED`, `NOOP_DUPLICATE`, and same-ID read without writer access. Subsequent non-empty bundles must now extend the reader's sequence chain exactly; missing ranges and overlaps fail closed without records or receipts, while exact old/new replays remain `NOOP_DUPLICATE`. This isolated device-B simulation satisfies phase-one implementation acceptance; a second physical computer is optional environment validation and remains unverified. Git/GitHub transport stays manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
-- Read-only repository index freshness: `runRepositoryHealthCheck` now reports deterministic required catalog coverage for tracked Skills, top-level knowledge domains, and projects. Missing and duplicate targets fail, allowed extras and exclusions remain valid, enumeration errors fail closed, and the planned `d-ai-hub-v2` baseline is indexed. The approved boundary is recorded in `docs/specs/2026-08-30-index-freshness-design.md`.
+- Read-only repository index freshness: `runRepositoryHealthCheck` reports deterministic required catalog coverage for tracked Skills, top-level knowledge domains, and projects. Missing and duplicate targets fail, allowed extras and exclusions remain valid, enumeration errors fail closed, and the now-archived `d-ai-hub-v2` reference remains indexed. The approved boundary is recorded in `docs/specs/2026-08-30-index-freshness-design.md`.
 
 ## Future / Deferred
 

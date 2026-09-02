@@ -50,10 +50,22 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
   for (const relativePath of requiredFiles) {
     const filePath = join(workspacePath, relativePath);
     await mkdir(dirname(filePath), { recursive: true });
-    await writeFile(filePath, `${relativePath}\n`, "utf8");
+    await writeFile(filePath, relativePath === "projects/d-ai-hub/STATUS.md" ? [
+      "# Status",
+      "",
+      "## State",
+      "",
+      "- Lifecycle: active",
+      "",
+      "## Current checkpoint",
+      "",
+      "- Current PR: none",
+      "",
+    ].join("\n") : `${relativePath}\n`, "utf8");
   }
   const catalogFiles = [
     "skills/custom/example/SKILL.md",
+    "skills/custom/project-memory/SKILL.md",
     ".agents/skills/example/SKILL.md",
     "skills/external/example.md",
     "knowledge/ai/example.md",
@@ -78,11 +90,31 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
   }
   await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
     "[custom](../skills/custom/example/SKILL.md)",
+    "[project memory](../skills/custom/project-memory/SKILL.md)",
     "[compatibility](../.agents/skills/example/SKILL.md)",
     "[external](../skills/external/example.md)",
   ].join("\n"), "utf8");
   await writeFile(join(workspacePath, "indexes", "KNOWLEDGE.md"), "[AI](../knowledge/ai/)\n", "utf8");
-  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), "[D-AI-Hub](../projects/d-ai-hub/)\n", "utf8");
+  await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+    "# Project Index",
+    "",
+    "## Active projects",
+    "",
+    "- [D-AI-Hub](../projects/d-ai-hub/)",
+    "",
+    "## Planned projects",
+    "",
+    "_None._",
+    "",
+    "## Archived projects",
+    "",
+    "_None._",
+    "",
+    "## Continuation rule",
+    "",
+    "Use progressive loading from the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md): read STATUS.md first, then the task-matching file. Read the complete project set only for close, audit, conflict, or an explicit complete-context request.",
+    "",
+  ].join("\n"), "utf8");
   await writeFile(join(workspacePath, "package.json"), `${JSON.stringify({
     name: "repository-health-fixture",
     private: true,
@@ -358,6 +390,7 @@ describe("runRepositoryHealthCheck", () => {
     await writeFile(join(workspacePath, "indexes", "SKILLS.md"), [
       "[custom one](../skills/custom/example/SKILL.md)",
       "[custom two](../skills/custom/example/SKILL.md#usage)",
+      "[project memory](../skills/custom/project-memory/SKILL.md)",
       "[compatibility](../.agents/skills/example/SKILL.md)",
       "[external](../skills/external/example.md)",
     ].join("\n"), "utf8");
@@ -408,6 +441,148 @@ describe("runRepositoryHealthCheck", () => {
     const freshnessCheck = checkWithId(report, "index-freshness");
     expect(freshnessCheck.status).toBe("failed");
     expect(freshnessCheck.observation).toContain("projects/planned-project");
+  });
+
+  it("reports a project indexed under a section that conflicts with its lifecycle", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Planned projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use progressive loading from the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md): read STATUS.md first. Read the complete project set only for close or audit.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "misclassify active project");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("lifecycle active is not indexed under active projects");
+  });
+
+  it("reports a semantically stale current pull request state", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "## Current checkpoint",
+      "- Current PR: #25 (merged)",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "conflict pull request state");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("Current PR state merged conflicts with lifecycle active");
+  });
+
+  it("reports the obsolete fixed project continuation order", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "When resuming a project, read in this order:",
+      "1. README.md",
+      "2. STATUS.md",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "restore obsolete continuation order");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
+  it("allows a numbered progressive continuation rule", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use the canonical [Project Memory Skill](../skills/custom/project-memory/SKILL.md):",
+      "1. Read STATUS.md first.",
+      "2. Read only the task-matching file.",
+      "Read the complete project set only for close or audit.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "use numbered progressive continuation");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").status).toBe("passed");
+  });
+
+  it("blocks an indexed project STATUS that resolves outside the repository", async () => {
+    const workspacePath = await createRepositoryFixture();
+    const outsideRoot = await mkdtemp(join(tmpdir(), "d-ai-project-status-outside-"));
+    temporaryRoots.splice(Math.max(0, temporaryRoots.length - 1), 0, outsideRoot);
+    await writeFile(join(outsideRoot, "STATUS.md"), [
+      "# External status",
+      "- Lifecycle: active",
+      "- Current PR: none",
+    ].join("\n"), "utf8");
+    await rename(join(workspacePath, "projects", "d-ai-hub"), join(workspacePath, "projects", "d-ai-hub-original"));
+    await symlink(outsideRoot, join(workspacePath, "projects", "d-ai-hub"), "junction");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness")).toMatchObject({
+      status: "blocked",
+      observation: expect.stringContaining("resolves outside the repository"),
+    });
+  });
+
+  it("rejects a continuation rule linked to the wrong Skill", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use [Project Memory Skill](../skills/custom/example/SKILL.md): read STATUS.md first.",
+      "Read the complete project set only for close or audit.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "link the wrong continuation Skill");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
+  it("rejects a non-numbered fixed full-project continuation order", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use [Project Memory Skill](../skills/custom/project-memory/SKILL.md).",
+      "Always read README.md, DECISIONS.md, BUGS.md, then STATUS.md.",
+      "Read the complete project set only for every continuation.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "restore a fixed full-project continuation order");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
+  });
+
+  it("rejects an unbounded continuation rule even when it mentions an allowed exception", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "indexes", "PROJECTS.md"), [
+      "# Project Index",
+      "## Active projects",
+      "- [D-AI-Hub](../projects/d-ai-hub/)",
+      "## Continuation rule",
+      "Use [Project Memory Skill](../skills/custom/project-memory/SKILL.md).",
+      "Read STATUS.md first.",
+      "Read the complete project set only for every continuation, including close.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "allow every continuation");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("continuation rule does not delegate progressive loading");
   });
 
   it("ignores untracked catalog candidates", async () => {

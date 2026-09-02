@@ -345,3 +345,17 @@ The first implementation will expose the currently unindexed planned `d-ai-hub-v
 **Revisit trigger**
 
 Revisit the target rules only if canonical ownership changes or section classification becomes machine-owned through a separately approved schema.
+
+## 2026-09-03 — Validate declared project lifecycle and index consistency
+
+**Context**
+
+The 2026-08-30 index-freshness decision kept active/planned/archived classification human-owned and required separate authorization for implementation. The user later authorized this PR to add project-index lifecycle consistency checks, including conflicts such as an archived or superseded project listed under active projects.
+
+**Decision**
+
+Humans continue to declare each project's `Lifecycle` in `STATUS.md` and its owning section in `indexes/PROJECTS.md`. The read-only health check may validate that those declared values agree, and may report structured current-PR state contradictions, but it must never edit, reclassify, or infer either value from broad free text. This authorization reconciles the implementation with the earlier ownership boundary; it does not make classification machine-owned or waive human review of lifecycle changes.
+
+**Revisit trigger**
+
+Revisit only if a separately approved schema changes who owns lifecycle or index-section declarations.
