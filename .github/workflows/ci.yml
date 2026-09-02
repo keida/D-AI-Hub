@@ -33,32 +33,8 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run typecheck
-      - name: Run ordinary tests (shard 1 of 4)
-        run: npm run test -- --shard=1/4
-      - name: Diagnose command runner - ordinary cases
-        run: npm exec -- vitest run tests/adapters/command-runner.test.ts -t "^(?!.*terminates a descendant process|.*fails closed when injected process-tree cleanup).*$"
-      - name: Diagnose command runner - normal descendant cleanup
-        run: npm exec -- vitest run tests/adapters/command-runner.test.ts -t "terminates a descendant process"
-      - name: Diagnose command runner - rejected descendant cleanup
-        run: npm exec -- vitest run tests/adapters/command-runner.test.ts -t "fails closed when injected process-tree cleanup"
-      - name: Diagnose shard 2 - Git adapter
-        run: npm exec -- vitest run tests/adapters/git.test.ts
-      - name: Diagnose shard 2 - canonical path
-        run: npm exec -- vitest run tests/domain/canonical-path.test.ts
-      - name: Diagnose shard 2 - SQLite memory store
-        run: npm exec -- vitest run tests/memory/local-sqlite-memory-store.test.ts
-      - name: Diagnose shard 2 - Skill registry
-        run: npm exec -- vitest run tests/skills/registry.test.ts
-      - name: Diagnose shard 2 - environment router
-        run: npm exec -- vitest run tests/routing/environment-router.test.ts
-      - name: Diagnose shard 2 - override parser
-        run: npm exec -- vitest run tests/routing/override-parser.test.ts
-      - name: Diagnose shard 2 - handoff service
-        run: npm exec -- vitest run tests/handoff/handoff-service.test.ts
-      - name: Run ordinary tests (shard 3 of 4)
-        run: npm run test -- --shard=3/4
-      - name: Run ordinary tests (shard 4 of 4)
-        run: npm run test -- --shard=4/4
+      - name: Run ordinary tests
+        run: npm run test
       - name: Validate repository structure
         run: npm run health-check:structural
 

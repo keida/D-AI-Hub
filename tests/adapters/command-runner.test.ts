@@ -213,7 +213,7 @@ describe("redactSensitiveText", () => {
     }
   });
 
-  it("uses one global deadline for large Windows descendant cleanup trees", async () => {
+  it.skipIf(process.platform !== "win32")("uses one global deadline for large Windows descendant cleanup trees", async () => {
     let now = 0;
     const taskkillPids: number[] = [];
     const remainingBudgets: number[] = [];
