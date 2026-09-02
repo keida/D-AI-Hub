@@ -67,7 +67,7 @@ The Git identity, required-file, Markdown-link, and working-tree checks are loca
 
 ## Runtime and verification
 
-The repository produces no distributable bundle; `typecheck` is the compile-time gate. The legacy `build` and `lint` scripts are compatibility aliases for `typecheck`, not separate build or lint stages. Supported, CI-verified runtimes are Node 22 from 22.20.0 and Node 26 from 26.7.0, with npm 11.19.x and the committed lockfile.
+The repository produces no distributable bundle; `typecheck` is the compile-time gate. The legacy `build` and `lint` scripts are compatibility aliases for `typecheck`, not separate build or lint stages. Supported, CI-verified runtimes are Node 22.20.0 and Node 26.7.0 with npm 11.19.0 and the committed lockfile.
 
 ```text
 npm ci
