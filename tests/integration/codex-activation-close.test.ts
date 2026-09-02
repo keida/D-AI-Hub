@@ -8,6 +8,7 @@ import { GitHubCliAdapter } from "../../src/adapters/github.js";
 import { pushGitRef, readRemoteRef, type GitTransport } from "../../src/adapters/git.js";
 import type { Environment, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
+import { FileHandoffPersistence } from "../../src/handoff/handoff-service.js";
 import { createConfiguredDAIRuntime } from "../../src/runtime/d-ai-runtime.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 
@@ -136,6 +137,34 @@ async function createActivationFixture(prefix: string): Promise<{
 }
 
 describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
+  it.each(["chat", "work"] as const)("fails closed before ownership transfer when default %s activation is unavailable", async (target) => {
+    const fixture = await createActivationFixture(`d-ai-codex-handoff-${target}-`);
+    try {
+      const store = new FileDurableContextStore(fixture.durableRoot);
+      await store.withTaskOwnership(fixture.state.taskId, "codex", async (lease) => {
+        await store.save({ ...fixture.state, handoffState: "none" }, lease);
+      });
+      const activate = createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }));
+
+      const result = await activate({ rawCommand: `@D-AI handoff ${target}`, taskId: fixture.state.taskId });
+
+      expect(result).toMatchObject({ taskId: fixture.state.taskId, environment: "codex", status: "blocked" });
+      expect(result.message).toMatch(/activation|connector|receive/i);
+      await expect(store.load(fixture.state.taskId)).resolves.toMatchObject({ environment: "codex", handoffState: "none" });
+      await expect(new FileHandoffPersistence(join(fixture.durableRoot, "handoffs.json")).load()).resolves.toEqual([]);
+      const freshStatus = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI status", taskId: null });
+      expect(freshStatus).toMatchObject({ taskId: fixture.state.taskId, environment: "codex", status: "accepted" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("returns NO when the configured remote reports a different SHA", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-close-mismatch-"));
     const repositoryPath = join(root, "repository");

@@ -107,7 +107,11 @@ async function makeRuntimeFixture(fixture: KnownGoodRepositoryFixture): Promise<
       evidence(request.state, "recovery", "git rev-parse HEAD + recovery-point capture", headOutput, now),
     ] };
   };
-  const adapters = { chat: new ChatEnvironmentAdapter(handoffs, executor), work: new WorkEnvironmentAdapter(handoffs, executor), codex: new CodexEnvironmentAdapter(handoffs, executor) };
+  const adapters = {
+    chat: new ChatEnvironmentAdapter(handoffs, executor, async () => {}),
+    work: new WorkEnvironmentAdapter(handoffs, executor, async () => {}),
+    codex: new CodexEnvironmentAdapter(handoffs, executor, async () => {}),
+  };
   const captureRecoveryPoint = async (state: TaskState): Promise<RecoveryPoint> => {
     const head = (await runCommand({ command: "git", arguments: ["rev-parse", "HEAD"], cwd: fixture.repositoryPath })).stdout.trim();
     const status = (await runCommand({ command: "git", arguments: ["status", "--porcelain=v1"], cwd: fixture.repositoryPath })).stdout.trim();
@@ -284,7 +288,7 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
       if (state === null) throw new Error("Expected a durable state before simulating the interrupted handoff");
 
       const envelope = await first.handoffs.create({ state, targetEnvironment: "work" });
-      await new WorkEnvironmentAdapter(first.handoffs).receive(envelope);
+      await new WorkEnvironmentAdapter(first.handoffs, undefined, async () => {}).receive(envelope);
       const pendingState: TaskState = {
         ...state,
         stage: "handoff",
@@ -347,6 +351,48 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
         handoffState: "none",
       });
       expect(restarted.handoffs.status(envelope.handoffId)).toMatchObject({ state: "rejected" });
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("rejects an acknowledged reservation and restores the source after restart", async () => {
+    const fixture = await createKnownGoodRepository();
+    try {
+      const first = await makeRuntimeFixture(fixture);
+      const intent = await first.runtime({ command: { kind: "intent", text: "implement verify repository" }, sourceEnvironment: "chat", overrides: noOverrides });
+      const continued = await first.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: "codex", overrides: noOverrides });
+      expect(continued.status).toBe("completed");
+      const state = await first.store.load(intent.taskId);
+      if (state === null) throw new Error("Expected a durable state before simulating the reserved handoff");
+
+      const envelope = await first.handoffs.create({ state, targetEnvironment: "work" });
+      await first.handoffs.reserve(envelope, new WorkEnvironmentAdapter(first.handoffs).capabilities());
+      await first.store.withTaskOwnership!(intent.taskId, state.environment, async (lease) => {
+        await first.store.save({
+          ...state,
+          stage: "handoff",
+          handoffState: "pending",
+          routingDecision: state.routingDecision === null ? null : {
+            ...state.routingDecision,
+            stage: "handoff",
+            reason: "Handoff pending acknowledgement from work",
+          },
+          durableContext: null,
+        }, lease);
+      });
+
+      const restarted = await makeRuntimeFixture(fixture);
+      const resumed = await restarted.runtime({ command: { kind: "continue", taskIdOrProject: intent.taskId }, sourceEnvironment: state.environment, overrides: noOverrides });
+
+      expect(resumed).toMatchObject({ taskId: intent.taskId, status: "accepted" });
+      await expect(restarted.store.load(intent.taskId)).resolves.toMatchObject({
+        stage: state.stage,
+        environment: state.environment,
+        handoffState: "none",
+      });
+      expect(restarted.handoffs.status(envelope.handoffId)).toMatchObject({ state: "rejected", owner: null });
+      await expect(restarted.handoffs.recordsForTask(intent.taskId)).resolves.not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ state: expect.stringMatching(/^(pending|acknowledged|active)$/u) })]),
+      );
     } finally { await fixture.cleanup(); }
   });
 });

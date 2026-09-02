@@ -195,6 +195,7 @@ function adapterWithReceiveProbe(
 ): DAIEnvironmentAdapter {
   return {
     capabilities: (): EnvironmentCapabilities => adapter.capabilities(),
+    canReceiveHandoff: (): boolean => adapter.canReceiveHandoff(),
     execute: (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> => adapter.execute(request),
     receive: async (envelope: HandoffEnvelope): Promise<void> => {
       probe(envelope);
@@ -355,9 +356,9 @@ function harness(
     return executionResult(request);
   };
   const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
-    chat: new ChatEnvironmentAdapter(handoffService, executor),
-    work: new WorkEnvironmentAdapter(handoffService, executor),
-    codex: new CodexEnvironmentAdapter(handoffService, executor),
+    chat: new ChatEnvironmentAdapter(handoffService, executor, async () => {}),
+    work: new WorkEnvironmentAdapter(handoffService, executor, async () => {}),
+    codex: new CodexEnvironmentAdapter(handoffService, executor, async () => {}),
   };
   const dependencies: DAIRuntimeDependencies = {
     store,
@@ -802,6 +803,37 @@ describe("D-AI runtime", () => {
     expect(repeated.status).toBe("blocked");
   });
 
+  it("keeps source ownership and clears target ownership when the connector throws after acknowledgement", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
+      ...runtimeHarness.dependencies.adapters,
+      work: {
+        ...runtimeHarness.dependencies.adapters.work,
+        capabilities: (): EnvironmentCapabilities => runtimeHarness.dependencies.adapters.work.capabilities(),
+        canReceiveHandoff: (): boolean => true,
+        execute: (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> =>
+          runtimeHarness.dependencies.adapters.work.execute(request),
+        receive: async (envelope: HandoffEnvelope): Promise<void> => {
+          await runtimeHarness.dependencies.adapters.work.receive(envelope);
+          throw new InvalidTaskStateError("target activation failed after acknowledgement");
+        },
+        complete: (handoffId: string): Promise<void> => runtimeHarness.dependencies.adapters.work.complete(handoffId),
+        status: (handoffId: string): HandoffStatus => runtimeHarness.dependencies.adapters.work.status(handoffId),
+      },
+    };
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, adapters });
+    const accepted = await handle(intentRequest("chat", noOverrides));
+
+    const result = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(result).toMatchObject({ taskId: accepted.taskId, environment: "codex", status: "blocked" });
+    await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ environment: "codex", handoffState: "rejected" });
+    const records = await runtimeHarness.handoffService.recordsForTask(accepted.taskId);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ owner: null, state: "rejected" });
+    expect(records.some((record) => record.state === "active")).toBe(false);
+  });
+
   it("completes the real active handoff and persists the same Work-owned task at verify", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const handle = createDAIRuntime(runtimeHarness.dependencies);
@@ -855,7 +887,7 @@ describe("D-AI runtime", () => {
       durableContext: null,
     };
     const secondEnvelope = await runtimeHarness.handoffService.create({ state: secondState, targetEnvironment: "work" });
-    await new WorkEnvironmentAdapter(runtimeHarness.handoffService).receive(secondEnvelope);
+    await new WorkEnvironmentAdapter(runtimeHarness.handoffService, undefined, async () => {}).receive(secondEnvelope);
     const beforeFirst = runtimeHarness.handoffService.status(firstId);
     const beforeSecond = runtimeHarness.handoffService.status(secondEnvelope.handoffId);
 
@@ -1064,6 +1096,7 @@ describe("D-AI runtime", () => {
       ready: () => runtimeHarness.handoffService.ready(),
       create: (input) => runtimeHarness.handoffService.create(input),
       recordsForTask: (taskId) => runtimeHarness.handoffService.recordsForTask(taskId),
+      reserve: (envelope, target) => runtimeHarness.handoffService.reserve(envelope, target),
       acknowledge: (envelope, target) => runtimeHarness.handoffService.acknowledge(envelope, target),
       complete: async () => {
         if (failCompletion) {
@@ -1122,6 +1155,7 @@ describe("D-AI runtime", () => {
       ...runtimeHarness.dependencies.adapters,
       codex: {
         capabilities: (): EnvironmentCapabilities => runtimeHarness.dependencies.adapters.codex.capabilities(),
+        canReceiveHandoff: (): boolean => runtimeHarness.dependencies.adapters.codex.canReceiveHandoff(),
         execute: async (request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> => {
           if (delayNextExecution) {
             delayNextExecution = false;
@@ -1286,6 +1320,7 @@ describe("D-AI runtime", () => {
         return runtimeHarness.handoffService.create(input);
       },
       recordsForTask: (taskId): Promise<readonly HandoffPersistenceRecord[]> => runtimeHarness.handoffService.recordsForTask(taskId),
+      reserve: (envelope, target): Promise<void> => runtimeHarness.handoffService.reserve(envelope, target),
       acknowledge: (envelope, target): Promise<void> => runtimeHarness.handoffService.acknowledge(envelope, target),
       complete: (handoffId, recipient): Promise<void> => runtimeHarness.handoffService.complete(handoffId, recipient),
       reject: (handoffId, reason): Promise<void> => runtimeHarness.handoffService.reject(handoffId, reason),
@@ -2199,9 +2234,9 @@ describe("D-AI runtime", () => {
       });
     };
     const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
-      chat: new ChatEnvironmentAdapter(runtimeHarness.handoffService, executor),
-      work: new WorkEnvironmentAdapter(runtimeHarness.handoffService, executor),
-      codex: new CodexEnvironmentAdapter(runtimeHarness.handoffService, executor),
+      chat: new ChatEnvironmentAdapter(runtimeHarness.handoffService, executor, async () => {}),
+      work: new WorkEnvironmentAdapter(runtimeHarness.handoffService, executor, async () => {}),
+      codex: new CodexEnvironmentAdapter(runtimeHarness.handoffService, executor, async () => {}),
     };
 
     const result = await createDAIRuntime({ ...runtimeHarness.dependencies, adapters })(intentRequest("chat", noOverrides));

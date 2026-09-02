@@ -90,9 +90,13 @@ export interface EnvironmentExecutionResult {
 }
 
 export type EnvironmentExecutor = (request: EnvironmentExecutionRequest) => Promise<EnvironmentExecutionResult>;
+// Connectors must prepare activation idempotently and must not assume ownership
+// until the durable handoff record advances from acknowledged to active.
+export type HandoffActivationConnector = (envelope: HandoffEnvelope) => Promise<void>;
 
 export interface DAIEnvironmentAdapter {
   capabilities(): EnvironmentCapabilities;
+  canReceiveHandoff(): boolean;
   execute(request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult>;
   receive(envelope: HandoffEnvelope): Promise<void>;
   complete(handoffId: string): Promise<void>;
@@ -1243,7 +1247,7 @@ async function reconcilePendingHandoff(
 ): Promise<PendingHandoffReconciliation> {
   const records = [...await dependencies.handoffService.recordsForTask(state.taskId)]
     .sort((left, right) => handoffRecordSequence(right) - handoffRecordSequence(left));
-  const candidate = records.find((record) => record.state === "pending" || record.state === "active" || record.state === "rejected");
+  const candidate = records.find((record) => record.state === "pending" || record.state === "acknowledged" || record.state === "active" || record.state === "rejected");
   if (candidate === undefined) {
     const blockedState = await persistState(dependencies.store, {
       ...state,
@@ -1286,7 +1290,7 @@ async function reconcilePendingHandoff(
     }, targetLease);
     return { kind: "resumed", state: resumedState, message: `Handoff ${candidate.envelope.handoffId} ownership resumed by ${candidate.owner} after runtime restart` };
   }
-  if (candidate.state === "pending") {
+  if (candidate.state === "pending" || candidate.state === "acknowledged") {
     await dependencies.handoffService.reject(candidate.envelope.handoffId, "Handoff was interrupted before target ownership became active and was safely rejected after restart");
   }
   const restoredState = await persistState(dependencies.store, {
@@ -1505,6 +1509,9 @@ async function handoffTaskExclusive(
   }
   if (state.handoffState !== "none") {
     return response(state, "blocked", `Task ${state.taskId} cannot hand off from state ${state.handoffState}`);
+  }
+  if (!dependencies.adapters[command.target].canReceiveHandoff()) {
+    return response(state, "blocked", `Handoff blocked: ${command.target} activation connector is not configured`);
   }
   const handoffTransition = transitionState(state, "handoff", state.role, state.environment);
   const pendingCandidate: TaskState = {
@@ -1987,14 +1994,6 @@ const defaultModelPolicies: readonly ModelPolicy[] = [{
   compatibleEnvironments: ["codex"],
 }];
 
-function defaultExecutionAdapter(request: EnvironmentExecutionRequest): Promise<EnvironmentExecutionResult> {
-  return Promise.resolve({
-    status: "blocked",
-    evidence: [],
-    message: `No execution connector is configured for ${request.state.environment}`,
-  });
-}
-
 function defaultRecovery(state: TaskState, reason: string): Promise<TaskState> {
   return Promise.resolve({
     ...state,
@@ -2002,6 +2001,10 @@ function defaultRecovery(state: TaskState, reason: string): Promise<TaskState> {
     role: "recovery-operator",
     contextManifest: [...state.contextManifest, `blocked-recovery:${reason}`],
   });
+}
+
+function activateLocalCodexHandoff(_envelope: HandoffEnvelope): Promise<void> {
+  return Promise.resolve();
 }
 
 export interface ConfiguredDAIRuntimeOptions {
@@ -2060,9 +2063,9 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     return prepareBootstrapTask(input, configuredStore);
   };
   const adapters: Readonly<Record<Environment, DAIEnvironmentAdapter>> = {
-    chat: new ChatEnvironmentAdapter(handoffService, defaultExecutionAdapter),
-    work: new WorkEnvironmentAdapter(handoffService, defaultExecutionAdapter),
-    codex: new CodexEnvironmentAdapter(handoffService, codexExecution),
+    chat: new ChatEnvironmentAdapter(handoffService),
+    work: new WorkEnvironmentAdapter(handoffService),
+    codex: new CodexEnvironmentAdapter(handoffService, codexExecution, activateLocalCodexHandoff),
   };
   return {
     store,

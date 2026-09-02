@@ -2,25 +2,33 @@ import type { HandoffStatus, HandoffService } from "../../handoff/handoff-servic
 import type { HandoffEnvelope } from "../../handoff/envelope.js";
 import type { EnvironmentCapabilities } from "../../routing/environment-capabilities.js";
 import { InvalidTaskStateError } from "../../domain/errors.js";
-import type { EnvironmentExecutionRequest, EnvironmentExecutionResult, EnvironmentExecutor } from "../../runtime/d-ai-runtime.js";
+import type { EnvironmentExecutionRequest, EnvironmentExecutionResult, EnvironmentExecutor, HandoffActivationConnector } from "../../runtime/d-ai-runtime.js";
 
 export class ChatEnvironmentAdapter {
   private readonly executor: EnvironmentExecutor | null;
+  private readonly activationConnector: HandoffActivationConnector | null;
 
-  public constructor(handoffService: HandoffService & { readonly status: (handoffId: string) => HandoffStatus });
-  public constructor(handoffService: HandoffService & { readonly status: (handoffId: string) => HandoffStatus }, executor: EnvironmentExecutor);
   public constructor(
     private readonly handoffService: HandoffService & { readonly status: (handoffId: string) => HandoffStatus },
     executor?: EnvironmentExecutor,
+    activationConnector?: HandoffActivationConnector,
   ) {
     this.executor = executor ?? null;
+    this.activationConnector = activationConnector ?? null;
   }
 
   public capabilities(): EnvironmentCapabilities {
     return { environment: "chat", capabilities: new Set(["approval", "status"]) };
   }
 
+  public canReceiveHandoff(): boolean {
+    return this.executor !== null && this.activationConnector !== null;
+  }
+
   public async receive(envelope: HandoffEnvelope): Promise<void> {
+    if (this.activationConnector === null) throw new InvalidTaskStateError("Chat activation connector is not configured");
+    await this.handoffService.reserve(envelope, this.capabilities());
+    await this.activationConnector(envelope);
     await this.handoffService.acknowledge(envelope, this.capabilities());
   }
 
