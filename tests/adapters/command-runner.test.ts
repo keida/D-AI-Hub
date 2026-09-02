@@ -187,7 +187,8 @@ describe("redactSensitiveText", () => {
         cwd: null,
         timeoutMs: 1_000,
         terminateProcessTree: async (child) => {
-          child.kill("SIGKILL");
+          if (process.platform === "win32" || child.pid === undefined) child.kill("SIGKILL");
+          else process.kill(-child.pid, "SIGKILL");
           return false;
         },
       })).rejects.toMatchObject({ result: expect.objectContaining({ stderr: expect.stringMatching(/cleanup|descendant|termination/i) }) });
