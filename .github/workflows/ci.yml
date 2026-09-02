@@ -34,7 +34,7 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
       - name: Run ordinary tests
-        run: npm run test
+        run: npm run test -- --pool=forks --maxWorkers=1 --no-file-parallelism
       - name: Validate repository structure
         run: npm run health-check:structural
 
