@@ -199,7 +199,7 @@ describe("runRepositoryHealthCheck", () => {
       "- Last merged delivery: PR #28",
       "- Active proposal: PR #29",
       "- Live PR status must be queried from GitHub.",
-    ].join("\n"), "utf8");
+    ].join("\r\n"), "utf8");
     await commitFixtureChanges(workspacePath, "use stable project PR fields");
 
     const report = await runRepositoryHealthCheck({ workspacePath });
@@ -209,6 +209,50 @@ describe("runRepositoryHealthCheck", () => {
       status: "passed",
       observation: "All required catalog targets are indexed exactly once",
     });
+  });
+
+  it("rejects stable delivery and proposal fields that coexist with Current PR", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: PR #29",
+      "- Current PR: #29 (open)",
+      "- Live PR status must be queried from GitHub.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "reject mixed project PR fields");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("stable PR fields cannot coexist with Current PR");
+  });
+
+  it.each([
+    ["missing boundary", []],
+    ["negated boundary", ["- Live PR status must not be queried from GitHub."]],
+    ["malformed boundary", ["- Live PR status must be queried from GitHub"]],
+    ["prose-only boundary", ["Live PR status must be queried from GitHub."]],
+    ["duplicate boundary", [
+      "- Live PR status must be queried from GitHub.",
+      "- Live PR status must be queried from GitHub.",
+    ]],
+  ] as const)("rejects a $0 in the stable project PR fields", async (_caseName, boundaryLines) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: PR #29",
+      ...boundaryLines,
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, `reject ${_caseName}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("missing live PR status boundary");
   });
 
   it.each([

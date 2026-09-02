@@ -119,6 +119,12 @@ function legacyPullRequestFindings(project: string, lifecycle: string | null, cu
   return [];
 }
 
+function hasExactlyOneLivePrStatusBoundary(status: string): boolean {
+  const phraseOccurrences = [...status.matchAll(/Live PR status must be queried from GitHub/giu)];
+  const canonicalLines = [...status.matchAll(/^- Live PR status must be queried from GitHub\.\r?$/gmu)];
+  return phraseOccurrences.length === 1 && canonicalLines.length === 1;
+}
+
 function isWithinWorkspace(workspacePath: string, candidatePath: string): boolean {
   const relativePath = relative(workspacePath, candidatePath);
   return relativePath === ""
@@ -159,10 +165,12 @@ async function projectStateFindings(
       if (activeProposal === null || !/^(?:none|PR #[1-9][0-9]*)$/u.test(activeProposal)) {
         findings.push(`${project}/STATUS.md: invalid Active proposal`);
       }
-      if (!/Live PR status must be queried from GitHub/iu.test(status)) {
+      if (!hasExactlyOneLivePrStatusBoundary(status)) {
         findings.push(`${project}/STATUS.md: missing live PR status boundary`);
       }
-      findings.push(...legacyPullRequestFindings(project, lifecycle, currentPr, false));
+      if (/^- Current PR:/mu.test(status)) {
+        findings.push(`${project}/STATUS.md: stable PR fields cannot coexist with Current PR`);
+      }
     }
   }
 

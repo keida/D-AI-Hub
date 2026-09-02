@@ -11,7 +11,7 @@ This file preserves release and verification context that no longer belongs in t
 - PR #22 completed index freshness.
 - PR #23 established knowledge/project-memory curation rules.
 - PR #24 recorded the Git line-ending reusable knowledge.
-- PR #25 merged the Skill frontmatter health check.
+- [PR #25](https://github.com/keida/D-AI-Hub/pull/25) merged the Skill-frontmatter health check as canonical merge commit `7beec52407fba58aca4e90aae06d88a1b7f335ed`.
 
 ## Historical verification records
 
