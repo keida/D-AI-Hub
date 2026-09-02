@@ -33,8 +33,14 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run typecheck
-      - name: Run ordinary tests
-        run: npm run test
+      - name: Run ordinary tests (shard 1 of 4)
+        run: npm run test -- --shard=1/4
+      - name: Run ordinary tests (shard 2 of 4)
+        run: npm run test -- --shard=2/4
+      - name: Run ordinary tests (shard 3 of 4)
+        run: npm run test -- --shard=3/4
+      - name: Run ordinary tests (shard 4 of 4)
+        run: npm run test -- --shard=4/4
       - name: Validate repository structure
         run: npm run health-check:structural
 
