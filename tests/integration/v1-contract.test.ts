@@ -14,7 +14,7 @@ import { loadSelectedSkill, type LoadedSkill } from "../../src/skills/skill-load
 import type { TaskOwnershipGuard, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { evaluateHardGates, type GateName } from "../../src/verification/gates.js";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createKnownGoodRepository, type KnownGoodRepositoryFixture } from "./fixtures/known-good-repo.js";
@@ -181,7 +181,7 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
       ]);
       expect(result.trace.loadedSkills.every((skill) => skill.instructions.includes(skill.descriptor.name))).toBe(true);
       for (const skill of result.trace.loadedSkills) {
-        expect(skill.loadedResources).toEqual([join(fixture.skillLibrary.rootPath, skill.descriptor.name, "references", "contract.md")]);
+        expect(skill.loadedResources).toEqual([await realpath(join(fixture.skillLibrary.rootPath, skill.descriptor.name, "references", "contract.md"))]);
         const expectedResource = skill.descriptor.name === "repository-execution"
           ? "Use the repository-local command fixtures for execution evidence.\n"
           : "Require a zero exit code and retain the observed output.\n";

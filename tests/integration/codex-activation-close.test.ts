@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -327,7 +327,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const executed = await activate({ rawCommand: "@D-AI verify nested workspace", taskId: null });
       expect(executed.status).toBe("completed");
       const beforeRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
-      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
 
       await writeFile(join(workspacePath, "artifact.txt"), "regression\n", "utf8");
       await git(repositoryRoot, ["add", "packages/app/artifact.txt"]);
@@ -340,7 +340,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       await expect(git(repositoryRoot, ["diff", "--name-status", recoveryHead, "HEAD"])).resolves.toBe("");
       expect(rolledBack.message).toMatch(/rollback restored/i);
       const afterRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
-      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(workspacePath);
+      expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
       expect(afterRollback?.rollbackAudit?.verification.passed).toBe(true);
       await expect(git(repositoryRoot, ["show", "HEAD:packages/app/artifact.txt"])).resolves.toBe("known good");
       await expect(git(repositoryRoot, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);

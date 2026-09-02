@@ -18,13 +18,14 @@ export function canonicalWorkspaceIdentityPath(contextManifest: readonly string[
 }
 
 export async function matchesWorkspaceIdentity(contextManifest: readonly string[], workspacePath: string): Promise<boolean> {
+  return matchesCanonicalWorkspaceIdentity(contextManifest, await canonicalPath(workspacePath));
+}
+
+export async function matchesCanonicalWorkspaceIdentity(contextManifest: readonly string[], canonicalWorkspacePath: string): Promise<boolean> {
   const storedPath = canonicalWorkspaceIdentityPath(contextManifest);
   if (storedPath === null) return false;
-  const [storedCanonicalPath, configuredCanonicalPath] = await Promise.all([
-    canonicalPath(storedPath),
-    canonicalPath(workspacePath),
-  ]);
+  const storedCanonicalPath = await canonicalPath(storedPath);
   return process.platform === "win32"
-    ? storedCanonicalPath.toLowerCase() === configuredCanonicalPath.toLowerCase()
-    : storedCanonicalPath === configuredCanonicalPath;
+    ? storedCanonicalPath.toLowerCase() === canonicalWorkspacePath.toLowerCase()
+    : storedCanonicalPath === canonicalWorkspacePath;
 }
