@@ -104,10 +104,14 @@ async function createRepositoryFixture(options: FixtureOptions = {}): Promise<st
     const outsideRoot = await mkdtemp(join(tmpdir(), "d-ai-repository-health-outside-"));
     temporaryRoots.splice(Math.max(0, temporaryRoots.length - 1), 0, outsideRoot);
     await writeFile(join(outsideRoot, "external.md"), "[external-content-must-not-be-read](missing-external-target.md)\n", "utf8");
-    await symlink(outsideRoot, join(workspacePath, "docs", "external"), "junction");
+    await symlink(
+      process.platform === "win32" ? outsideRoot : join(outsideRoot, "external.md"),
+      join(workspacePath, "docs", process.platform === "win32" ? "external" : "external.md"),
+      process.platform === "win32" ? "junction" : "file",
+    );
   }
   await git(workspacePath, fixtureOptions.sourceSymlinkOutside
-    ? ["add", ...requiredFiles, "package.json", "docs/external/external.md"]
+    ? ["add", ...requiredFiles, "package.json", process.platform === "win32" ? "docs/external/external.md" : "docs/external.md"]
     : ["add", "."]);
   await git(workspacePath, ["commit", "-m", "create health-check fixture"]);
   return workspacePath;
@@ -494,7 +498,7 @@ describe("runRepositoryHealthCheck", () => {
     expect(report.status).toBe("unhealthy");
     const markdownLinksCheck = checkWithId(report, "markdown-links");
     expect(markdownLinksCheck.status).toBe("failed");
-    expect(markdownLinksCheck.observation).toContain("docs/external/external.md");
+    expect(markdownLinksCheck.observation).toContain(process.platform === "win32" ? "docs/external/external.md" : "docs/external.md");
     expect(markdownLinksCheck.observation).not.toContain("external-content-must-not-be-read");
     expect(markdownLinksCheck.observation).not.toContain("missing-external-target.md");
     expect(checkWithId(report, "typecheck").status).toBe("passed");
