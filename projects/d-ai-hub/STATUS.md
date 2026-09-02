@@ -25,5 +25,4 @@ Re-review PR #28 against the published fix and live GitHub checks; obtain separa
 
 ## Evidence pointers
 
-- Historical implementation and release evidence: [Evidence History](EVIDENCE_HISTORY.md).
 - Durable product and architecture choices: [Decisions](DECISIONS.md); future work: [Roadmap](ROADMAP.md).
