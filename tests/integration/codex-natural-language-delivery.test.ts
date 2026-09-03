@@ -24,6 +24,14 @@ describe("natural-language delivery boundary", () => {
       expect(result.response.deliveryResult?.formatted).toContain("Linux: PENDING");
       expect(result.response.deliveryResult?.formatted).toContain("Merge performed: NO");
       expect(result.response.deliveryResult?.formatted).toContain("actual implementation must continue");
+      expect(result.response.agentExecutionDirective).toMatchObject({
+        kind: "codex-agent-delivery",
+        requestText: "那就改成 SQLite。",
+        riskLevel: 1,
+        expectedEndpoint: "local-change",
+        publicationAuthorityRequired: false,
+        mergeAllowed: false,
+      });
     } finally {
       await rm(workspacePath, { recursive: true, force: true });
     }

@@ -156,4 +156,8 @@ For a change request, the visible delivery path must have explicit publication a
 
 The raw CLI can classify the request and return an execution-required Delivery Result, but it does not simulate implementation, tests, Git, or CI. The canonical Codex Skill/agent must continue Level 1 work through an attached execution seam before any implementation or publication evidence is claimed.
 
+The response carries a structured `agentExecutionDirective` containing the original request, project/task, resume flag, risk, endpoint, publication-authority requirement, and `mergeAllowed: false`. The current Codex agent consumes it immediately under the normal gates; the user does not need to type another command.
+
+Delivery receipts keep typecheck timing separate, show observed Windows/Linux states independently, and identify the precise stage that blocked (`context-read`, `workspace-prepare`, `implementation`, `focused-test`, `typecheck`, `publication-authority`, `publication`, `ci-wait`, or `review-packet`).
+
 When a D-AI command prefix is used, the Codex Skill should invoke the runtime first and then continue the remainder of the user's request. A response that only explains the convention is not activation.

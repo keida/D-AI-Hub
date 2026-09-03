@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDeliveryOrchestrator, type DeliveryDependencies } from "../../src/automation/delivery.js";
+import { createDeliveryOrchestrator, type DeliveryDependencies, type DeliveryRequest } from "../../src/automation/delivery.js";
 
 function dependencies(events: string[]): DeliveryDependencies {
   return {
@@ -24,6 +24,7 @@ describe("createDeliveryOrchestrator", () => {
       resumeExistingTask: true,
       riskLevel: 2,
       publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
       publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
     });
 
@@ -50,6 +51,7 @@ describe("createDeliveryOrchestrator", () => {
       context_read_ms: expect.any(Number),
       workspace_prepare_ms: expect.any(Number),
       implementation_ms: expect.any(Number),
+      typecheck_ms: expect.any(Number),
       focused_test_ms: expect.any(Number),
       publication_ms: expect.any(Number),
       ci_wait_ms: expect.any(Number),
@@ -70,13 +72,37 @@ describe("createDeliveryOrchestrator", () => {
       resumeExistingTask: false,
       riskLevel: 2,
       publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
       publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
     });
 
     expect(result).toMatchObject({ status: "blocked", ci: "failed", platforms: { windows: "FAIL", linux: "PASS" } });
+    expect(result.blockedAt).toBe("ci-wait");
   });
 
-  it("blocks before any delivery stage when publication authority is absent", async () => {
+  it("preserves passing platform evidence and rejects contradictory aggregate CI", async () => {
+    const request: DeliveryRequest = {
+      taskId: "task-delivery-platforms",
+      project: "D-AI-Hub",
+      requestText: "fix the project and create a PR",
+      resumeExistingTask: false,
+      riskLevel: 2,
+      publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
+      publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
+    };
+    const passing = await createDeliveryOrchestrator(dependencies([]))(request);
+    expect(passing).toMatchObject({ status: "completed", ci: "passed", platforms: { windows: "PASS", linux: "PASS" } });
+
+    const contradictory: DeliveryDependencies = {
+      ...dependencies([]),
+      waitForCI: async () => ({ status: "passed", detail: "aggregate passed", platforms: { windows: "PASS", linux: "PENDING" } }),
+    };
+    const result = await createDeliveryOrchestrator(contradictory)(request);
+    expect(result).toMatchObject({ status: "blocked", ci: "failed", platforms: { windows: "PASS", linux: "PENDING" }, blockedAt: "ci-wait" });
+  });
+
+  it("blocks at publication authority after preserving local verification", async () => {
     const events: string[] = [];
     const result = await createDeliveryOrchestrator(dependencies(events))({
       taskId: "task-delivery-blocked",
@@ -85,6 +111,7 @@ describe("createDeliveryOrchestrator", () => {
       resumeExistingTask: false,
       riskLevel: 2,
       publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
       publicationAuthority: null,
     });
 
@@ -96,17 +123,19 @@ describe("createDeliveryOrchestrator", () => {
       typecheck: "passed",
       changes: ["src/automation/user-intent.ts"],
       publicationStatus: "PENDING",
+      blockedAt: "publication-authority",
       decisionRequired: "Explicit publication authority is required before commit, push, or PR creation",
     });
-    expect(result.timings).toEqual({
-      context_read_ms: 0,
-      workspace_prepare_ms: 0,
-      implementation_ms: 0,
-      focused_test_ms: 0,
+    expect(result.timings).toEqual(expect.objectContaining({
+      context_read_ms: expect.any(Number),
+      workspace_prepare_ms: expect.any(Number),
+      implementation_ms: expect.any(Number),
+      typecheck_ms: expect.any(Number),
+      focused_test_ms: expect.any(Number),
       publication_ms: 0,
       ci_wait_ms: 0,
-      review_packet_ms: 0,
-    });
+      review_packet_ms: expect.any(Number),
+    }));
   });
 
   it("stops before publication when focused verification fails", async () => {
@@ -123,11 +152,13 @@ describe("createDeliveryOrchestrator", () => {
       resumeExistingTask: false,
       riskLevel: 2,
       publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
       publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
     });
 
     expect(events).toEqual(["context", "workspace", "implementation", "focused-test"]);
     expect(result.status).toBe("blocked");
+    expect(result.blockedAt).toBe("focused-test");
     expect(result.timings.publication_ms).toBe(0);
     expect(result.decisionRequired).toContain("focused verification");
   });
@@ -146,6 +177,7 @@ describe("createDeliveryOrchestrator", () => {
       resumeExistingTask: false,
       riskLevel: 2,
       publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
       publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
     });
 
@@ -153,6 +185,7 @@ describe("createDeliveryOrchestrator", () => {
     expect(result).toMatchObject({
       status: "blocked",
       branch: "codex/mvp",
+      blockedAt: "workspace-prepare",
       decisionRequired: "Resolve unrelated workspace changes before implementation or publication",
       mergePerformed: "NO",
     });
@@ -167,6 +200,7 @@ describe("createDeliveryOrchestrator", () => {
       resumeExistingTask: false,
       riskLevel: 1,
       publicationRequested: false,
+      expectedEndpoint: "local-change",
       publicationAuthority: null,
     });
 
@@ -179,5 +213,32 @@ describe("createDeliveryOrchestrator", () => {
     expect(result.formatted).toContain("Total active execution:");
     expect(result.formatted).toContain("Completed/Blocked: COMPLETED");
     expect(result.formatted).toContain("Merge performed: NO");
+  });
+
+  it("returns a precise blocked stage when a dependency throws", async () => {
+    const request: DeliveryRequest = {
+      taskId: "task-delivery-error",
+      project: "D-AI-Hub",
+      requestText: "fix the project and create a PR",
+      resumeExistingTask: false,
+      riskLevel: 2,
+      publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
+      publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
+    };
+    const scenarios: Array<[string, Partial<DeliveryDependencies>, string]> = [
+      ["context", { readContext: async () => { throw new Error("context unavailable"); } }, "context-read"],
+      ["implementation", { implement: async () => { throw new Error("implementation unavailable"); } }, "implementation"],
+      ["typecheck", { runTypecheck: async () => { throw new Error("typecheck unavailable"); } }, "typecheck"],
+      ["publication", { publish: async () => { throw new Error("publication unavailable"); } }, "publication"],
+      ["ci", { waitForCI: async () => { throw new Error("CI unavailable"); } }, "ci-wait"],
+      ["review packet", { buildReviewPacket: async () => { throw new Error("review packet unavailable"); } }, "review-packet"],
+    ];
+
+    for (const [name, override, blockedAt] of scenarios) {
+      const result = await createDeliveryOrchestrator({ ...dependencies([]), ...override })(request);
+      expect(result.status, name).toBe("blocked");
+      expect(result.blockedAt, name).toBe(blockedAt);
+    }
   });
 });

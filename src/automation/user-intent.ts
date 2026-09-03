@@ -21,9 +21,11 @@ function projectFromRequest(text: string): string | null {
   if (english?.[1] !== undefined) return english[1].trim();
   const chinese = /(?:继续|接着|恢复)\s*(?:修复|修改|改成|实现)?\s*([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})/iu.exec(text);
   if (chinese?.[1] !== undefined) return chinese[1].trim();
+  const previous = /(?:继续|接着|恢复)\s*(?:上次|之前)?\s*([A-Za-z0-9][A-Za-z0-9._/-]*)(?=\s*(?:的工作|工作|并|，|,|。|$))/iu.exec(text);
+  if (previous?.[1] !== undefined) return previous[1].trim();
   const statusProject = /(?:查看|检查|查询)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})(?=\s+(?:当前|目前|状态|进展))/iu.exec(text);
   if (statusProject?.[1] !== undefined) return statusProject[1].trim();
-  const progressProject = /(?:现在|当前|目前)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})(?=\s+(?:做到哪里|到哪里|进展))/iu.exec(text);
+  const progressProject = /(?:现在|当前|目前)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})(?=\s+(?:做到哪(?:里)?|到哪(?:里)?|进展))/iu.exec(text);
   if (progressProject?.[1] !== undefined) return progressProject[1].trim();
   const labeled = /(?:项目|project|建立|初始化)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})/iu.exec(text);
   return labeled?.[1]?.trim() ?? null;
@@ -65,7 +67,7 @@ export function classifyUserIntent(input: string): UserIntent {
   const text = input.trim();
   if (text.length === 0) throw new InvalidTaskStateError("user request must not be empty");
 
-  if (/(?:做到哪里|到哪里|进展到哪|当前进展)/u.test(text)) {
+  if (/(?:做到哪(?:里)?|到哪(?:里)?|进展到哪|当前进展)/u.test(text)) {
     return makeIntent(text, "status", projectFromRequest(text), false, "status", "read-only", 0);
   }
   if (/^(?:今天)?\s*(?:先)?(?:做到这里|到这里|暂时到这里)|(?:状态保存好|保存好状态)|(?:任务)?结束了|收尾/u.test(text)) {

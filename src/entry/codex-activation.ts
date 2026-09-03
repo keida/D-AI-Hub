@@ -1,6 +1,6 @@
 import { parseDAIInvocation } from "./command-parser.js";
 import { classifyUserIntent, type UserIntent } from "../automation/user-intent.js";
-import type { DeliveryRequest, DeliveryResult, PublicationAuthority } from "../automation/delivery.js";
+import type { AgentExecutionDirective, DeliveryRequest, DeliveryResult, PublicationAuthority } from "../automation/delivery.js";
 import type { DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
 
 export interface CodexActivationInput {
@@ -16,6 +16,7 @@ export interface CodexActivationOptions {
 export interface CodexActivationResponse extends DAIResponse {
   readonly userIntent?: UserIntent;
   readonly deliveryResult?: DeliveryResult;
+  readonly agentExecutionDirective?: AgentExecutionDirective;
 }
 
 export type DAIRuntimeHandler = (request: ExternalDAIRequest) => Promise<DAIResponse>;
@@ -63,8 +64,9 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
       return { ...result, userIntent: intent };
     }
     if (intent.intent === "continue") {
-      if (intent.project === null) return naturalResponse(input, intent, "blocked", "Continue is blocked because no task or project was identified");
-      const parsed = parseDAIInvocation(`@D-AI continue ${intent.project}`);
+      const continuationTarget = intent.project ?? input.taskId;
+      if (continuationTarget === null) return naturalResponse(input, intent, "blocked", "Continue is blocked because no task or project was identified");
+      const parsed = parseDAIInvocation(`@D-AI continue ${continuationTarget}`);
       const result = await runtime({ command: parsed.command, sourceEnvironment: "codex", overrides: parsed.overrides, activeTaskId: input.taskId });
       return { ...result, userIntent: intent };
     }
@@ -84,6 +86,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         resumeExistingTask: intent.resumeExistingTask,
         riskLevel: intent.riskLevel === 2 ? 2 : 1,
         publicationRequested: intent.expectedEndpoint === "review-ready-pr",
+        expectedEndpoint: intent.expectedEndpoint === "review-ready-pr" ? "review-ready-pr" : "local-change",
         publicationAuthority: options.publicationAuthority ?? null,
       };
       const deliveryResult = await options.deliver(deliveryRequest);
@@ -96,6 +99,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         message: deliveryResult.formatted ?? deliveryResult.message,
         userIntent: intent,
         deliveryResult,
+        agentExecutionDirective: deliveryResult.agentExecutionDirective,
       };
     }
     return naturalResponse(input, intent, "blocked", `${intent.intent} is recognized but unavailable in this local MVP; it remains fail-closed`);

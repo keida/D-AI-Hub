@@ -96,6 +96,20 @@ describe("Codex D-AI activation", () => {
     expect(result).toMatchObject({ status: "accepted", userIntent: { intent: "continue", project: "D-AI-Hub" } });
   });
 
+  it("uses the existing task id when natural-language continuation has no parsed project", async () => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-fallback", stage: "execute", environment: "codex", status: "accepted", evidence: [], message: "continued" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    const result = await activate({ rawCommand: "继续上次的工作。", taskId: "task-fallback" });
+
+    expect(requests[0]?.command).toEqual({ kind: "continue", taskIdOrProject: "task-fallback" });
+    expect(result).toMatchObject({ status: "accepted", userIntent: { intent: "continue", project: null } });
+  });
+
   it("keeps an explicit status command read-only over delivery-looking surrounding text", async () => {
     const requests: ExternalDAIRequest[] = [];
     const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
@@ -116,6 +130,18 @@ describe("Codex D-AI activation", () => {
       status: "completed",
       taskId: "task-delivery",
       intent: "delivery",
+      agentExecutionDirective: {
+        kind: "codex-agent-delivery",
+        requestText: "修复健康检查并创建 PR",
+        project: null,
+        taskId: "task-delivery",
+        resumed: false,
+        riskLevel: 2,
+        expectedEndpoint: "review-ready-pr",
+        publicationAuthorityRequired: true,
+        mergeAllowed: false,
+        nextAction: "Continue through the current Codex agent",
+      },
       riskLevel: 2,
       resumed: false,
       changes: ["src/automation/user-intent.ts"],
@@ -132,15 +158,16 @@ describe("Codex D-AI activation", () => {
         context_read_ms: 1,
         workspace_prepare_ms: 2,
         implementation_ms: 3,
-        focused_test_ms: 4,
-        publication_ms: 5,
-        ci_wait_ms: 6,
-        review_packet_ms: 7,
+        typecheck_ms: 4,
+        focused_test_ms: 5,
+        publication_ms: 6,
+        ci_wait_ms: 7,
+        review_packet_ms: 8,
       },
       reviewPacket: "review-ready",
       decisionRequired: "Separate review and merge authorization are required",
       message: "Delivery completed",
-      totalActiveExecutionMs: 28,
+      totalActiveExecutionMs: 35,
       blockedAt: null,
       reason: null,
       userAction: null,
@@ -156,7 +183,7 @@ describe("Codex D-AI activation", () => {
     const result = await activate({ rawCommand: "修复健康检查并创建 PR", taskId: "task-delivery" });
 
     expect(deliveryRequests).toEqual(["task-delivery:false"]);
-    expect(result).toMatchObject({ status: "completed", deliveryResult, userIntent: { intent: "delivery", expectedEndpoint: "review-ready-pr" } });
+    expect(result).toMatchObject({ status: "completed", deliveryResult, agentExecutionDirective: deliveryResult.agentExecutionDirective, userIntent: { intent: "delivery", expectedEndpoint: "review-ready-pr" } });
   });
 
   it("keeps natural-language delivery blocked when the orchestration seam is unavailable", async () => {

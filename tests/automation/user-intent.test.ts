@@ -7,6 +7,8 @@ describe("classifyUserIntent", () => {
     ["讨论一下这个方案", "discuss", "read-only", "discussion", null, false],
     ["检查一下当前状态", "status", "read-only", "status", null, false],
     ["现在 D-AI-Hub 做到哪里了？", "status", "read-only", "status", "D-AI-Hub", false],
+    ["现在 D-AI-Hub 做到哪了？", "status", "read-only", "status", "D-AI-Hub", false],
+    ["继续上次 D-AI-Hub 的工作。", "continue", "bounded-mutation", "continuation", "D-AI-Hub", true],
     ["查看 D-AI-Hub 当前状态", "status", "read-only", "status", "D-AI-Hub", false],
     ["continue D-AI-Hub, fix the status check", "delivery", "bounded-mutation", "local-change", "D-AI-Hub", true],
     ["继续 D-AI-Hub", "continue", "bounded-mutation", "continuation", "D-AI-Hub", true],

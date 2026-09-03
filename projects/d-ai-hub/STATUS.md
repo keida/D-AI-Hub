@@ -6,7 +6,7 @@
 - Last merged delivery: PR #30
 - Active proposal: PR #29
 - Current objective: Visible natural-language automation MVP
-- Stable capability: natural-language intent classification, explicit `@D-AI` priority, and a bounded delivery seam with explicit publication authority
+- Stable capability: natural-language intent classification, explicit `@D-AI` priority, structured Codex-agent handoff, and a bounded delivery seam with explicit publication authority
 - Live PR status must be queried from GitHub.
 - Live PR/CI state: query GitHub
 - Main branch protection and remote freshness: live environment evidence only; query before release decisions
@@ -27,7 +27,7 @@
 
 ## Next concrete action
 
-Run focused tests and typecheck, then independently review the diff and live PR/CI evidence before any separately authorized merge decision.
+Independently review the current branch and live PR/CI evidence before any separately authorized merge decision; keep merge unperformed until that decision.
 
 ## Evidence pointers
 

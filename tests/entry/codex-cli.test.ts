@@ -72,6 +72,16 @@ describe("Codex D-AI CLI", () => {
         publicationStatus: "PENDING",
         mergePerformed: "NO",
       });
+      expect(result.response.agentExecutionDirective).toMatchObject({
+        kind: "codex-agent-delivery",
+        requestText: "fix the project and create a PR",
+        taskId: "unassigned",
+        resumed: false,
+        riskLevel: 2,
+        expectedEndpoint: "review-ready-pr",
+        publicationAuthorityRequired: true,
+        mergeAllowed: false,
+      });
     } finally {
       await rm(workspacePath, { recursive: true, force: true });
     }

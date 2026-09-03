@@ -1,4 +1,5 @@
 export type DeliveryCheckStatus = "PASS" | "FAIL" | "PENDING";
+export type DeliveryBlockedAt = "context-read" | "workspace-prepare" | "implementation" | "focused-test" | "typecheck" | "publication-authority" | "publication" | "ci-wait" | "review-packet";
 
 export interface PublicationAuthority {
   readonly grantedBy: string;
@@ -14,6 +15,7 @@ export interface DeliveryRequest {
   readonly resumeExistingTask: boolean;
   readonly riskLevel: 1 | 2;
   readonly publicationRequested: boolean;
+  readonly expectedEndpoint: "local-change" | "review-ready-pr";
   readonly publicationAuthority?: PublicationAuthority | null;
 }
 
@@ -46,6 +48,19 @@ export interface DeliveryCI {
   readonly platforms: DeliveryPlatforms;
 }
 
+export interface AgentExecutionDirective {
+  readonly kind: "codex-agent-delivery";
+  readonly requestText: string;
+  readonly project: string | null;
+  readonly taskId: string;
+  readonly resumed: boolean;
+  readonly riskLevel: 1 | 2;
+  readonly expectedEndpoint: "local-change" | "review-ready-pr";
+  readonly publicationAuthorityRequired: boolean;
+  readonly mergeAllowed: false;
+  readonly nextAction: string;
+}
+
 export interface DeliveryPlatforms {
   readonly windows: DeliveryCheckStatus;
   readonly linux: DeliveryCheckStatus;
@@ -55,6 +70,7 @@ export interface DeliveryTimings {
   context_read_ms: number;
   workspace_prepare_ms: number;
   implementation_ms: number;
+  typecheck_ms: number;
   focused_test_ms: number;
   publication_ms: number;
   ci_wait_ms: number;
@@ -65,6 +81,7 @@ export interface DeliveryResult {
   readonly status: "completed" | "blocked";
   readonly taskId: string;
   readonly intent: "delivery";
+  readonly agentExecutionDirective: AgentExecutionDirective;
   readonly riskLevel: 1 | 2;
   readonly resumed: boolean;
   readonly changes: readonly string[];
@@ -92,6 +109,7 @@ const emptyTimings = (): DeliveryTimings => ({
   context_read_ms: 0,
   workspace_prepare_ms: 0,
   implementation_ms: 0,
+  typecheck_ms: 0,
   focused_test_ms: 0,
   publication_ms: 0,
   ci_wait_ms: 0,
@@ -111,11 +129,31 @@ function hasPublicationAuthority(authority: PublicationAuthority | null | undefi
     && authority.allowCreatePR;
 }
 
-function baseBlockedResult(request: DeliveryRequest, message: string, decisionRequired: string, overrides: Partial<DeliveryResult> = {}): DeliveryResult {
+function hasCompletePassingPlatformEvidence(platforms: DeliveryPlatforms): boolean {
+  return platforms.windows === "PASS" && platforms.linux === "PASS";
+}
+
+function createAgentExecutionDirective(request: DeliveryRequest): AgentExecutionDirective {
+  return {
+    kind: "codex-agent-delivery",
+    requestText: request.requestText,
+    project: request.project,
+    taskId: request.taskId,
+    resumed: request.resumeExistingTask,
+    riskLevel: request.riskLevel,
+    expectedEndpoint: request.expectedEndpoint,
+    publicationAuthorityRequired: request.publicationRequested,
+    mergeAllowed: false,
+    nextAction: "Continue in the current Codex agent through the real workspace and verification seams; do not ask for another command",
+  };
+}
+
+function baseBlockedResult(request: DeliveryRequest, message: string, decisionRequired: string, blockedAt: DeliveryBlockedAt | null, overrides: Partial<DeliveryResult> = {}): DeliveryResult {
   return {
     status: "blocked",
     taskId: request.taskId,
     intent: "delivery",
+    agentExecutionDirective: createAgentExecutionDirective(request),
     riskLevel: request.riskLevel,
     resumed: request.resumeExistingTask,
     changes: [],
@@ -133,7 +171,7 @@ function baseBlockedResult(request: DeliveryRequest, message: string, decisionRe
     decisionRequired,
     message,
     totalActiveExecutionMs: 0,
-    blockedAt: "delivery",
+    blockedAt,
     reason: message,
     userAction: decisionRequired,
     ...overrides,
@@ -189,28 +227,35 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
     let changes: readonly string[] = [];
     let focusedTest: DeliveryResult["focusedTest"] = "not-run";
     let typecheck: DeliveryResult["typecheck"] = "not-run";
+    let activeStage: DeliveryBlockedAt = "context-read";
     try {
+      activeStage = "context-read";
       const context = await timed("context_read_ms", () => dependencies.readContext(request));
+      activeStage = "workspace-prepare";
       const workspace = await timed("workspace_prepare_ms", () => dependencies.prepareWorkspace(request, context));
       branch = workspace.branch;
       if (!workspace.clean) {
-        return finalize(baseBlockedResult(request, "Delivery blocked because the prepared workspace is not clean", "Resolve unrelated workspace changes before implementation or publication", { branch, timings }));
+        return finalize(baseBlockedResult(request, "Delivery blocked because the prepared workspace is not clean", "Resolve unrelated workspace changes before implementation or publication", "workspace-prepare", { branch, timings }));
       }
+      activeStage = "implementation";
       const implementation = await timed("implementation_ms", () => dependencies.implement(request, workspace));
       changes = implementation.changes;
+      activeStage = "focused-test";
       const focused = await timed("focused_test_ms", () => dependencies.runFocusedTest(request, changes));
       focusedTest = focused.status;
       if (focused.status !== "passed") {
-        return finalize(baseBlockedResult(request, `Delivery blocked after focused verification: ${focused.detail}`, "Resolve the focused verification failure before publication", { changes, branch, focusedTest, timings }));
+        return finalize(baseBlockedResult(request, `Delivery blocked after focused verification: ${focused.detail}`, "Resolve the focused verification failure before publication", "focused-test", { changes, branch, focusedTest, timings }));
       }
-      const checked = await timed("implementation_ms", () => dependencies.runTypecheck(request, changes));
+      activeStage = "typecheck";
+      const checked = await timed("typecheck_ms", () => dependencies.runTypecheck(request, changes));
       typecheck = checked.status;
       if (checked.status !== "passed") {
-        return finalize(baseBlockedResult(request, `Delivery blocked after typecheck: ${checked.detail}`, "Resolve the typecheck failure before publication", { changes, branch, focusedTest, typecheck, timings }));
+        return finalize(baseBlockedResult(request, `Delivery blocked after typecheck: ${checked.detail}`, "Resolve the typecheck failure before publication", "typecheck", { changes, branch, focusedTest, typecheck, timings }));
       }
 
       if (!request.publicationRequested) {
-        const localResult = baseBlockedResult(request, "Local reversible implementation verified; publication was not requested", "Publication remains a separate Level 2 decision", {
+        activeStage = "review-packet";
+        const localResult = baseBlockedResult(request, "Local reversible implementation verified; publication was not requested", "Publication remains a separate Level 2 decision", null, {
           status: "completed",
           changes,
           branch,
@@ -223,7 +268,8 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
       }
 
       if (!hasPublicationAuthority(request.publicationAuthority)) {
-        const pendingPublication = baseBlockedResult(request, "Local delivery verified, but publication is blocked because publication authority is not explicit", "Explicit publication authority is required before commit, push, or PR creation", {
+        activeStage = "review-packet";
+        const pendingPublication = baseBlockedResult(request, "Local delivery verified, but publication is blocked because publication authority is not explicit", "Explicit publication authority is required before commit, push, or PR creation", "publication-authority", {
           changes,
           branch,
           focusedTest,
@@ -234,10 +280,15 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
         return finalize({ ...pendingPublication, reviewPacket, timings });
       }
 
+      activeStage = "publication";
       const publication = await timed("publication_ms", () => dependencies.publish(request, workspace, changes));
+      activeStage = "ci-wait";
       const ci = await timed("ci_wait_ms", () => dependencies.waitForCI(request, publication));
-      if (ci.status !== "passed") {
-        return finalize(baseBlockedResult(request, `Delivery blocked by CI: ${ci.detail}`, "Resolve the CI result before review-ready delivery", {
+      if (ci.status !== "passed" || !hasCompletePassingPlatformEvidence(ci.platforms)) {
+        const detail = ci.status !== "passed"
+          ? ci.detail
+          : "Aggregate CI passed without PASS evidence for both Windows and Linux";
+        return finalize(baseBlockedResult(request, `Delivery blocked by CI: ${detail}`, "Resolve the CI result before review-ready delivery", "ci-wait", {
           changes,
           focusedTest,
           typecheck,
@@ -250,17 +301,19 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
           timings,
         }));
       }
+      activeStage = "review-packet";
       const completed: DeliveryResult = {
         status: "completed",
         taskId: request.taskId,
         intent: "delivery",
+        agentExecutionDirective: createAgentExecutionDirective(request),
         riskLevel: request.riskLevel,
         resumed: request.resumeExistingTask,
         changes,
         focusedTest,
         typecheck,
         ci: "passed",
-        platforms: { windows: "PASS", linux: "PASS" },
+        platforms: ci.platforms,
         publicationStatus: "PASS",
         branch: publication.branch,
         commit: publication.commit,
@@ -278,7 +331,7 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
       const reviewPacket = await timed("review_packet_ms", () => dependencies.buildReviewPacket(request, completed));
       return finalize({ ...completed, reviewPacket, timings });
     } catch (error: unknown) {
-      return finalize(baseBlockedResult(request, `Delivery blocked by dependency error: ${errorMessage(error)}`, "Resolve the reported dependency error before continuing", {
+      return finalize(baseBlockedResult(request, `Delivery blocked by dependency error: ${errorMessage(error)}`, "Resolve the reported dependency error before continuing", activeStage, {
         changes,
         branch,
         focusedTest,
@@ -294,5 +347,6 @@ export function createCodexExecutionBoundary(): (request: DeliveryRequest) => Pr
     request,
     "The CLI classified this delivery request, but actual implementation must continue in the canonical Codex agent boundary; no files, tests, commits, pushes, or PRs were performed",
     "Continue through the Codex Skill/agent execution seam for Level 1 implementation; request Level 2 publication authority separately",
+    "implementation",
   ));
 }
