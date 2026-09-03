@@ -2093,6 +2093,33 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
   });
 
+  it("does not resolve a malformed persisted repository identity", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+    const malformedState: TaskState = {
+      ...state,
+      contextManifest: state.contextManifest.map((entry) => entry.startsWith("remote-repository:")
+        ? "remote-repository:garbage/D-AI-Hub"
+        : entry),
+    };
+    await runtimeHarness.store.save(malformedState);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [malformedState],
+    });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+    expect(result.message).toBe("No active durable task found for project D-AI-Hub");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
   it("blocks an unknown project name without creating a task", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const beforeWrites = runtimeHarness.savedStates.length;

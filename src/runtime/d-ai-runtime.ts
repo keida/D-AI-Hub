@@ -361,6 +361,7 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
 
 const executionIdentityPrefixes = ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"] as const;
 const durableTaskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const remoteRepositoryIdentityPattern = /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const projectCandidateDisplayLimit = 3;
 const projectCandidateFieldMaxLength = 96;
 
@@ -378,7 +379,7 @@ function validateExecutionContextManifestEntries(entries: readonly string[] | un
       || /^remote:[A-Za-z0-9._-]+$/.test(entry)
       || (entry.startsWith("ref:") && isValidGitTargetRef(entry.slice("ref:".length)))
       || /^(?:artifact:commit:[a-f0-9]{40}|artifact:commit:[a-f0-9]{64})$/i.test(entry)
-      || /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(entry)
+      || remoteRepositoryIdentityPattern.test(entry)
       || entry === "local-state:clean-required";
     if (!approved) {
       throw new InvalidTaskStateError(`Environment execution context manifest entry is not an approved identity fact: ${entry}`);
@@ -1964,7 +1965,9 @@ async function selectDiscoveredDurableTask(
 function canonicalProjectName(state: TaskState): string | null {
   const entries = state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
   if (entries.length !== 1) return null;
-  const repository = entries[0]!.slice("remote-repository:".length);
+  const identity = entries[0]!;
+  if (!remoteRepositoryIdentityPattern.test(identity)) return null;
+  const repository = identity.slice("remote-repository:".length);
   const separator = repository.lastIndexOf("/");
   return separator < 0 || separator === repository.length - 1 ? null : repository.slice(separator + 1);
 }
