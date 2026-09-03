@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { redactSecretShapedValues } from "../domain/manifest-id.js";
 
@@ -161,6 +162,60 @@ function processIsAlive(pid: number): boolean {
   } catch (error: unknown) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+type LinuxProcessStat = {
+  readonly state: string;
+  readonly processGroupId: number;
+};
+
+function readLinuxProcessStat(pid: number): LinuxProcessStat | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    const processGroupId = Number(fields[2]);
+    if (!Number.isInteger(processGroupId)) return null;
+    return { state: fields[0] ?? "unknown", processGroupId };
+  } catch {
+    return null;
+  }
+}
+
+function linuxProcessGroupHasActiveMembers(processGroupId: number): boolean {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return true;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const stat = readLinuxProcessStat(Number(entry));
+    if (stat?.processGroupId === processGroupId && stat.state !== "Z") return true;
+  }
+  return false;
+}
+
+function processTreeHasActiveMembers(pid: number, processGroupId: number): boolean {
+  if (process.platform === "linux") return linuxProcessGroupHasActiveMembers(processGroupId);
+  return processIsAlive(pid);
+}
+
+async function waitForProcessTreeCleanup(pid: number, processGroupId: number, options: ProcessTreeCleanupOptions): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  if (timeoutMs <= 0) return false;
+  const now = options.now ?? (() => performance.now());
+  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const deadline = now() + timeoutMs;
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / 10) + 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (!processTreeHasActiveMembers(pid, processGroupId)) return true;
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) return false;
+    await sleep(Math.min(10, remainingMs));
+  }
+  return !processTreeHasActiveMembers(pid, processGroupId);
 }
 
 function runTaskkill(taskkill: string, pid: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -352,7 +407,8 @@ export async function terminateProcessTree(child: ChildProcess, options: Process
   }
   try {
     process.kill(-pid, "SIGKILL");
-    return !processIsAlive(pid);
+    const processGroupId = process.platform === "linux" ? (readLinuxProcessStat(pid)?.processGroupId ?? pid) : pid;
+    return await waitForProcessTreeCleanup(pid, processGroupId, options);
   } catch {
     return false;
   }
