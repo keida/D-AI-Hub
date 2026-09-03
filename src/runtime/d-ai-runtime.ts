@@ -21,6 +21,7 @@ import {
 } from "../domain/errors.js";
 import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
+import { isDurableTaskId } from "../domain/task-id.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
@@ -360,6 +361,9 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
 }
 
 const executionIdentityPrefixes = ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"] as const;
+const remoteRepositoryIdentityPattern = /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const projectCandidateDisplayLimit = 3;
+const projectCandidateFieldMaxLength = 96;
 
 function validateExecutionContextManifestEntries(entries: readonly string[] | undefined): readonly string[] {
   if (entries === undefined) return [];
@@ -375,7 +379,7 @@ function validateExecutionContextManifestEntries(entries: readonly string[] | un
       || /^remote:[A-Za-z0-9._-]+$/.test(entry)
       || (entry.startsWith("ref:") && isValidGitTargetRef(entry.slice("ref:".length)))
       || /^(?:artifact:commit:[a-f0-9]{40}|artifact:commit:[a-f0-9]{64})$/i.test(entry)
-      || /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(entry)
+      || remoteRepositoryIdentityPattern.test(entry)
       || entry === "local-state:clean-required";
     if (!approved) {
       throw new InvalidTaskStateError(`Environment execution context manifest entry is not an approved identity fact: ${entry}`);
@@ -1958,6 +1962,78 @@ async function selectDiscoveredDurableTask(
   return null;
 }
 
+function canonicalProjectName(state: TaskState): string | null {
+  const entries = state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
+  if (entries.length !== 1) return null;
+  const identity = entries[0]!;
+  if (!remoteRepositoryIdentityPattern.test(identity)) return null;
+  const repository = identity.slice("remote-repository:".length);
+  const separator = repository.lastIndexOf("/");
+  return separator < 0 || separator === repository.length - 1 ? null : repository.slice(separator + 1);
+}
+
+function projectCandidateDescription(state: TaskState): string {
+  const workspaceIdentity = state.contextManifest.find((entry) => entry.startsWith("identity:workspace:")) ?? "unavailable";
+  const bounded = (value: string): string => {
+    const normalized = value.replace(/[\r\n\t]/g, " ");
+    return normalized.length <= projectCandidateFieldMaxLength
+      ? normalized
+      : `${normalized.slice(0, projectCandidateFieldMaxLength - 3)}...`;
+  };
+  return `${bounded(state.taskId)} (stage=${bounded(state.stage)}, workspace=${bounded(workspaceIdentity)})`;
+}
+
+async function resolveContinueProject(
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "continue" }>,
+  dependencies: DAIRuntimeDependencies,
+): Promise<string | DAIResponse> {
+  const exact = isDurableTaskId(command.taskIdOrProject)
+    ? await dependencies.store.load(command.taskIdOrProject)
+    : null;
+  if (exact !== null) return command.taskIdOrProject;
+
+  const noMatch = (): DAIResponse => blockedWithoutState(
+    "unassigned",
+    request.sourceEnvironment,
+    `No active durable task found for project ${command.taskIdOrProject}`,
+  );
+  if (dependencies.workspacePath === null) return noMatch();
+  const discover = dependencies.discoverActiveTasks
+    ?? (dependencies.store.discoverActiveTasks === undefined
+      ? undefined
+      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
+  if (discover === undefined) return noMatch();
+  const discovered = await connectorOutcome(
+    () => discover(dependencies.workspacePath!),
+    closeConnectorFailure,
+  );
+  if (discovered.kind === "blocked") {
+    return blockedWithoutState(
+      "unassigned",
+      request.sourceEnvironment,
+      `Workspace project discovery blocked: ${discovered.message}`,
+    );
+  }
+  const candidates: TaskState[] = [];
+  for (const state of discovered.value) {
+    if (!isDurableTaskId(state.taskId) || state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
+    if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
+  }
+  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (candidates.length === 0) return noMatch();
+  if (candidates.length > 1) {
+    const displayedCandidates = candidates.slice(0, projectCandidateDisplayLimit);
+    const omittedCount = candidates.length - displayedCandidates.length;
+    return blockedWithoutState(
+      "ambiguous",
+      request.sourceEnvironment,
+      `Multiple active durable tasks found for project ${command.taskIdOrProject}; showing ${displayedCandidates.length} of ${candidates.length} candidates: ${displayedCandidates.map(projectCandidateDescription).join(", ")}; ${omittedCount} candidates omitted`,
+    );
+  }
+  return candidates[0]!.taskId;
+}
+
 export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request: ExternalDAIRequest) => Promise<DAIResponse> {
   validateDependencies(dependencies);
   const registry = createRuntimeTaskRegistry();
@@ -1974,7 +2050,14 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
       }
     }
     if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, registry);
-    if (request.command.kind === "continue") return continueTask(request, request.command, dependencies, registry);
+    if (request.command.kind === "continue") {
+      if (request.activeTaskId === undefined || request.activeTaskId === null) {
+        const selection = await resolveContinueProject(request, request.command, dependencies);
+        if (typeof selection !== "string") return selection;
+        return continueTask(request, { ...request.command, taskIdOrProject: selection }, dependencies, registry);
+      }
+      return continueTask(request, request.command, dependencies, registry);
+    }
     if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, registry);
     if (request.command.kind === "complete") return completeHandoff(request, request.command, dependencies, registry);
     if (request.command.kind === "close") return closeActiveTask(request, dependencies, registry);

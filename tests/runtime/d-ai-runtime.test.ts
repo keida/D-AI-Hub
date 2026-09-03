@@ -11,6 +11,7 @@ import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError, TaskOwnershipError } from "../../src/domain/errors.js";
 import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
+import { createCodexActivation } from "../../src/entry/codex-activation.js";
 import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../../src/handoff/envelope.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
@@ -415,6 +416,22 @@ function intentRequest(sourceEnvironment: Environment, overrides: DAIRequest["ov
     sourceEnvironment,
     overrides,
   };
+}
+
+async function seedProjectState(runtimeHarness: RuntimeHarness, projectName = "D-AI-Hub"): Promise<TaskState> {
+  const initial = createDAIRuntime({
+    ...runtimeHarness.dependencies,
+    discoverActiveTasks: async () => [],
+  });
+  const accepted = await initial(intentRequest("codex", noOverrides));
+  const state = await runtimeHarness.store.load(accepted.taskId);
+  if (state === null) throw new InvalidTaskStateError("Expected a durable task state");
+  const projectState = {
+    ...state,
+    contextManifest: [...state.contextManifest, `remote-repository:github.com/acme/${projectName}`],
+  };
+  await runtimeHarness.store.save(projectState);
+  return projectState;
 }
 
 const noOverrides: DAIRequest["overrides"] = { model: null, role: null, environment: null };
@@ -2051,6 +2068,185 @@ describe("D-AI runtime", () => {
 
     expect(result).toMatchObject({ taskId: accepted.taskId, status: "blocked" });
     expect(result.message).toMatch(/different workspace/i);
+  });
+
+  it("continues the unique active durable task selected by its exact project name", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [{
+        ...state,
+      }],
+    });
+
+    const result = await createCodexActivation(runtime)({ rawCommand: "继续 D-AI-Hub", taskId: null });
+
+    expect(result).toMatchObject({
+      taskId: state.taskId,
+      status: "accepted",
+      message: `Continuing task ${state.taskId}`,
+      userIntent: { intent: "continue", project: "D-AI-Hub" },
+    });
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("does not resolve a malformed persisted repository identity", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+    const malformedState: TaskState = {
+      ...state,
+      contextManifest: state.contextManifest.map((entry) => entry.startsWith("remote-repository:")
+        ? "remote-repository:garbage/D-AI-Hub"
+        : entry),
+    };
+    await runtimeHarness.store.save(malformedState);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [malformedState],
+    });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+    expect(result.message).toBe("No active durable task found for project D-AI-Hub");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("blocks an unknown project name without creating a task", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [],
+    });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: "Unknown-Project" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+    expect(result.message).toBe("No active durable task found for project Unknown-Project");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("blocks multiple exact project matches deterministically with bounded candidates", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const first = await seedProjectState(runtimeHarness);
+    const second: TaskState = {
+      ...first,
+      taskId: "task-project-b",
+      goal: "candidate goal must not be disclosed",
+      stage: "execute",
+    };
+    await runtimeHarness.store.save(second);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [second, first],
+    });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toContain("Multiple active durable tasks found for project D-AI-Hub");
+    expect(result.message.indexOf(`${first.taskId} (stage=${first.stage}`)).toBeLessThan(result.message.indexOf("task-project-b (stage=execute"));
+    expect(result.message).toContain("workspace=identity:workspace:");
+    expect(result.message).not.toContain(second.goal);
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("caps and bounds the displayed candidates for a large project ambiguity", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+    const candidates = Array.from({ length: 5 }, (_, index): TaskState => ({
+      ...state,
+      taskId: `task-project-${index}-${"x".repeat(100)}`,
+      stage: "execute",
+    }));
+    for (const candidate of candidates) await runtimeHarness.store.save(candidate);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [...candidates].reverse(),
+    });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toContain("showing 3 of 5 candidates");
+    expect(result.message).toContain("2 candidates omitted");
+    expect(result.message).toContain("task-project-0-");
+    expect(result.message).toContain("task-project-1-");
+    expect(result.message).toContain("task-project-2-");
+    expect(result.message).not.toContain(candidates[3]!.taskId);
+    expect(result.message).not.toContain(candidates[4]!.taskId);
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("fails closed for closed-only and wrong-workspace project candidates", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const closedHandle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [{ ...state, stage: "close" }],
+    });
+    const closed = await closedHandle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    const wrongWorkspaceHandle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      workspacePath: join(process.cwd(), "tests", "fixtures", "unrelated-workspace"),
+      discoverActiveTasks: async () => [state],
+    });
+    const wrongWorkspace = await wrongWorkspaceHandle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(closed.message).toBe("No active durable task found for project D-AI-Hub");
+    expect(wrongWorkspace.message).toBe("No active durable task found for project D-AI-Hub");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("keeps an exact task-id continue ahead of project discovery", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+    const discoverActiveTasks = vi.fn(async () => {
+      throw new Error("project discovery should not run for an exact task id");
+    });
+    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, discoverActiveTasks });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: state.taskId },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: state.taskId, status: "accepted" });
+    expect(discoverActiveTasks).not.toHaveBeenCalled();
   });
 
   it("applies continue routing overrides to the durable routing decision", async () => {
