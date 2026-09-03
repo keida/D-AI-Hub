@@ -110,7 +110,7 @@ describe("redactSensitiveText", () => {
     const maxOutputBytes = 128;
     const script = failureMode === "timeout"
       ? "process.stdout.write('stdout-diagnostic'); process.stderr.write('stderr-diagnostic'); setInterval(() => {}, 1000)"
-      : "process.stdout.write('stdout-diagnostic'); process.stderr.write('stderr-diagnostic'); process.stdout.write('x'.repeat(1000))";
+      : "process.stdout.write('stdout-diagnostic'); process.stderr.write('stderr-diagnostic'); setTimeout(() => process.stdout.write('x'.repeat(1000)), 100)";
     const runFailure = async (): Promise<{ stdout: string; stderr: string }> => {
       try {
         await runCommand({
@@ -145,7 +145,11 @@ describe("redactSensitiveText", () => {
         cwd: null,
         maxOutputBytes: 128,
         terminateProcessTree: async (child) => {
-          await new Promise<void>((resolve) => child.once("close", () => resolve()));
+          if (child.exitCode === null && child.signalCode === null) {
+            await new Promise<void>((resolve) => child.once("close", () => resolve()));
+          }
+          expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+          if (child.pid !== undefined) expect(processIsRunning(child.pid)).toBe(false);
           return terminateFixtureProcess(child);
         },
       });
