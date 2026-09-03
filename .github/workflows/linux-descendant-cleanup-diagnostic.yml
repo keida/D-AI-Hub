@@ -1,6 +1,9 @@
 name: Linux descendant cleanup diagnostic
 
 on:
+  push:
+    branches:
+      - codex/linux-descendant-cleanup-stabilization-20260903
   workflow_dispatch:
     inputs:
       iterations:
