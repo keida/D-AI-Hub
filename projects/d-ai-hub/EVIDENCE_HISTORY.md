@@ -4,13 +4,14 @@ This file preserves release and verification context that no longer belongs in t
 
 ## Canonical project milestones
 
-- PR #12 established the repository-health baseline and merged after local review and GitGuardian checks.
+- PR #12 established lightweight Skill routing and provenance.
+- PR #13 established the repository health-check baseline.
 - PR #14 merged the first local SQLite memory slice after focused diagnostics, command-runner checks, the full test suite, TypeScript validation, and GitGuardian.
 - PR #15 fixed Windows line-ending corruption of hashed memory bundle JSONL; a fresh Windows checkout with `core.autocrlf=true` preserved the recorded digest.
-- PR #22 completed the separately reviewed project-memory and curation-rule revision.
-- PR #23 merged the knowledge-curation publication and Git line-ending lesson.
-- PR #24 merged the selective knowledge/project-memory curation update.
-- [PR #25](https://github.com/keida/D-AI-Hub/pull/25) merged the tracked Skill-frontmatter health check as canonical merge commit `7beec52407fba58aca4e90aae06d88a1b7f335ed`.
+- PR #22 completed index freshness.
+- PR #23 established knowledge/project-memory curation rules.
+- PR #24 recorded the Git line-ending reusable knowledge.
+- [PR #25](https://github.com/keida/D-AI-Hub/pull/25) merged the Skill-frontmatter health check as canonical merge commit `7beec52407fba58aca4e90aae06d88a1b7f335ed`.
 
 ## Historical verification records
 

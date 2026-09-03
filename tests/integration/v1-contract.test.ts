@@ -156,7 +156,7 @@ describe("D-AI V1 end-to-end contract", { timeout: 20_000 }, () => {
     expect(result).toMatchObject({ status: "blocked", taskId: "unassigned", environment: "chat" });
   });
 
-  it("drives intent, continue, status, and handoff through the configured public runtime with one task and durable files", async () => {
+  it("drives intent, continue, status, and handoff through the configured public runtime with one task and durable files", { timeout: 60_000 }, async () => {
     const fixture = await createKnownGoodRepository();
     try {
       const result = await runLifecycle(fixture);

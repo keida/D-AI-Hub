@@ -11,7 +11,11 @@
 
 ## Current authorized follow-up
 
-- Canonical truth cleanup: keep the project checkpoint concise, archive the superseded D-AI-Hub V2 implementation plan, align project continuation with progressive loading, and extend repository health checks for project lifecycle/index consistency. Runtime handoff safety and CI remain separate PRs.
+- Canonical truth cleanup completed: the project checkpoint is concise, the superseded D-AI-Hub V2 implementation plan is archived, project continuation follows progressive loading, and repository health checks cover project lifecycle/index consistency.
+- Default handoff safety completed.
+- CI/reproducibility implemented.
+- Current stabilization: Windows Node 22 integration reliability.
+- Actor/session ADR remains Proposed/Deferred; runtime implementation is not authorized by that proposal.
 
 ## V1 product boundary
 

@@ -190,6 +190,92 @@ describe("runRepositoryHealthCheck", () => {
     expect(checkWithId(report, "test:integration").status).toBe("passed");
   });
 
+  it("accepts stable delivery and proposal fields without a mutable Current PR", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: PR #29",
+      "- Live PR status must be queried from GitHub.",
+    ].join("\r\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "use stable project PR fields");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness")).toEqual({
+      id: "index-freshness",
+      status: "passed",
+      observation: "All required catalog targets are indexed exactly once",
+    });
+  });
+
+  it("rejects stable delivery and proposal fields that coexist with Current PR", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: PR #29",
+      "- Current PR: #29 (open)",
+      "- Live PR status must be queried from GitHub.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "reject mixed project PR fields");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("stable PR fields cannot coexist with Current PR");
+  });
+
+  it.each([
+    ["missing boundary", []],
+    ["negated boundary", ["- Live PR status must not be queried from GitHub."]],
+    ["malformed boundary", ["- Live PR status must be queried from GitHub"]],
+    ["prose-only boundary", ["Live PR status must be queried from GitHub."]],
+    ["duplicate boundary", [
+      "- Live PR status must be queried from GitHub.",
+      "- Live PR status must be queried from GitHub.",
+    ]],
+  ] as const)("rejects a $0 in the stable project PR fields", async (_caseName, boundaryLines) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery: PR #28",
+      "- Active proposal: PR #29",
+      ...boundaryLines,
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, `reject ${_caseName}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain("missing live PR status boundary");
+  });
+
+  it.each([
+    ["missing last merged delivery", ["- Active proposal: none"], "invalid Last merged delivery"],
+    ["missing active proposal", ["- Last merged delivery: PR #28"], "invalid Active proposal"],
+    ["invalid last merged delivery", ["- Last merged delivery: merged #28", "- Active proposal: none"], "invalid Last merged delivery"],
+    ["invalid active proposal", ["- Last merged delivery: PR #28", "- Active proposal: #29"], "invalid Active proposal"],
+  ] as const)("rejects $0 in stable project PR fields", async (_caseName, fields, finding) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Live PR status must be queried from GitHub.",
+      ...fields,
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, `reject ${_caseName}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness").observation).toContain(finding);
+  });
+
   it("validates tracked Markdown links while skipping external, mail, and anchor links", async () => {
     const workspacePath = await createRepositoryFixture({
       markdown: [
