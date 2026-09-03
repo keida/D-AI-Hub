@@ -20,7 +20,16 @@ export interface ProcessTreeCleanupOptions {
   readonly queryProcessTree?: ((rootPid: number, remainingMs: number, signal?: AbortSignal) => Promise<readonly number[] | null>) | undefined;
   readonly sleep?: ((milliseconds: number, signal?: AbortSignal) => Promise<void>) | undefined;
   readonly processIsAlive?: ((pid: number) => boolean) | undefined;
+  readonly inspectProcessGroup?: ((processGroupId: number) => ProcessGroupInspection) | undefined;
 }
+
+export interface ProcessGroupMember {
+  readonly state: string;
+}
+
+export type ProcessGroupInspection =
+  | { readonly status: "ok"; readonly members: readonly ProcessGroupMember[] }
+  | { readonly status: "error" };
 
 export type ProcessTreeTerminator = (child: ChildProcess, options?: ProcessTreeCleanupOptions) => Promise<boolean>;
 
@@ -169,37 +178,45 @@ type LinuxProcessStat = {
   readonly processGroupId: number;
 };
 
-function readLinuxProcessStat(pid: number): LinuxProcessStat | null {
+type LinuxProcessStatRead =
+  | { readonly status: "found"; readonly value: LinuxProcessStat }
+  | { readonly status: "missing" }
+  | { readonly status: "error" };
+
+function readLinuxProcessStat(pid: number): LinuxProcessStatRead {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     const commandEnd = stat.lastIndexOf(")");
     const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
     const processGroupId = Number(fields[2]);
-    if (!Number.isInteger(processGroupId)) return null;
-    return { state: fields[0] ?? "unknown", processGroupId };
-  } catch {
-    return null;
+    if (!Number.isInteger(processGroupId)) return { status: "error" };
+    return { status: "found", value: { state: fields[0] ?? "unknown", processGroupId } };
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { status: "missing" } : { status: "error" };
   }
 }
 
-function linuxProcessGroupHasActiveMembers(processGroupId: number): boolean {
+function inspectLinuxProcessGroup(processGroupId: number): ProcessGroupInspection {
   let entries: string[];
   try {
     entries = readdirSync("/proc");
   } catch {
-    return true;
+    return { status: "error" };
   }
+  const members: ProcessGroupMember[] = [];
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue;
     const stat = readLinuxProcessStat(Number(entry));
-    if (stat?.processGroupId === processGroupId && stat.state !== "Z") return true;
+    if (stat.status === "error") return { status: "error" };
+    if (stat.status === "found" && stat.value.processGroupId === processGroupId) members.push({ state: stat.value.state });
   }
-  return false;
+  return { status: "ok", members };
 }
 
-function processTreeHasActiveMembers(pid: number, processGroupId: number): boolean {
-  if (process.platform === "linux") return linuxProcessGroupHasActiveMembers(processGroupId);
-  return processIsAlive(pid);
+function inspectProcessGroup(pid: number, processGroupId: number, options: ProcessTreeCleanupOptions): ProcessGroupInspection {
+  if (options.inspectProcessGroup !== undefined) return options.inspectProcessGroup(processGroupId);
+  if (process.platform === "linux") return inspectLinuxProcessGroup(processGroupId);
+  return processIsAlive(pid) ? { status: "ok", members: [{ state: "active" }] } : { status: "ok", members: [] };
 }
 
 async function waitForProcessTreeCleanup(pid: number, processGroupId: number, options: ProcessTreeCleanupOptions): Promise<boolean> {
@@ -210,12 +227,15 @@ async function waitForProcessTreeCleanup(pid: number, processGroupId: number, op
   const deadline = now() + timeoutMs;
   const maxAttempts = Math.max(1, Math.ceil(timeoutMs / 10) + 1);
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    if (!processTreeHasActiveMembers(pid, processGroupId)) return true;
+    const inspection = inspectProcessGroup(pid, processGroupId, options);
+    if (inspection.status === "error") return false;
+    if (!inspection.members.some((member) => member.state !== "Z")) return true;
     const remainingMs = deadline - now();
     if (remainingMs <= 0) return false;
     await sleep(Math.min(10, remainingMs));
   }
-  return !processTreeHasActiveMembers(pid, processGroupId);
+  const inspection = inspectProcessGroup(pid, processGroupId, options);
+  return inspection.status === "ok" && !inspection.members.some((member) => member.state !== "Z");
 }
 
 function runTaskkill(taskkill: string, pid: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -407,7 +427,8 @@ export async function terminateProcessTree(child: ChildProcess, options: Process
   }
   try {
     process.kill(-pid, "SIGKILL");
-    const processGroupId = process.platform === "linux" ? (readLinuxProcessStat(pid)?.processGroupId ?? pid) : pid;
+    const processStat = process.platform === "linux" ? readLinuxProcessStat(pid) : undefined;
+    const processGroupId = processStat?.status === "found" ? processStat.value.processGroupId : pid;
     return await waitForProcessTreeCleanup(pid, processGroupId, options);
   } catch {
     return false;

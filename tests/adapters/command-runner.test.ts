@@ -4,7 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { redactSensitiveText, runCommand, terminateProcessTree } from "../../src/adapters/command-runner.js";
+import { redactSensitiveText, runCommand, terminateProcessTree, type ProcessGroupInspection } from "../../src/adapters/command-runner.js";
 
 function processIsRunning(pid: number): boolean {
   try {
@@ -241,6 +241,85 @@ describe("redactSensitiveText", () => {
         // The command may have terminated before writing its child pid.
       }
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("waits for active Linux process-group members before returning success", async () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    let now = 0;
+    const sleepCalls: number[] = [];
+    const inspections: ProcessGroupInspection[] = [
+      { status: "ok", members: [{ state: "S" }] },
+      { status: "ok", members: [{ state: "R" }] },
+      { status: "ok", members: [] },
+    ];
+    try {
+      const result = await terminateProcessTree({ pid: 4321 } as ChildProcess, {
+        timeoutMs: 50,
+        now: () => now,
+        sleep: async (milliseconds) => {
+          sleepCalls.push(milliseconds);
+          now += milliseconds;
+        },
+        inspectProcessGroup: () => inspections.shift() ?? { status: "ok", members: [] },
+      });
+      expect(result).toBe(true);
+      expect(sleepCalls).toEqual([10, 10]);
+      expect(kill).toHaveBeenCalledWith(-4321, "SIGKILL");
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("returns false at the bounded Linux cleanup deadline", async () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    let now = 0;
+    const sleepCalls: number[] = [];
+    try {
+      const result = await terminateProcessTree({ pid: 4322 } as ChildProcess, {
+        timeoutMs: 25,
+        now: () => now,
+        sleep: async (milliseconds) => {
+          sleepCalls.push(milliseconds);
+          now += milliseconds;
+        },
+        inspectProcessGroup: () => ({ status: "ok", members: [{ state: "S" }] }),
+      });
+      expect(result).toBe(false);
+      expect(sleepCalls).toEqual([10, 10, 5]);
+      expect(sleepCalls.reduce((total, milliseconds) => total + milliseconds, 0)).toBe(25);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("treats Linux zombie-only process-group membership as cleaned up", async () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const sleep = vi.fn(async () => undefined);
+    try {
+      const result = await terminateProcessTree({ pid: 4323 } as ChildProcess, {
+        inspectProcessGroup: () => ({ status: "ok", members: [{ state: "Z" }] }),
+        sleep,
+      });
+      expect(result).toBe(true);
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("fails closed when Linux process-group inspection errors", async () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const sleep = vi.fn(async () => undefined);
+    try {
+      const result = await terminateProcessTree({ pid: 4324 } as ChildProcess, {
+        inspectProcessGroup: () => ({ status: "error" }),
+        sleep,
+      });
+      expect(result).toBe(false);
+      expect(sleep).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
     }
   });
 
