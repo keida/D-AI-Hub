@@ -223,19 +223,39 @@ async function waitForProcessTreeCleanup(pid: number, processGroupId: number, op
   const timeoutMs = options.timeoutMs ?? 5_000;
   if (timeoutMs <= 0) return false;
   const now = options.now ?? (() => performance.now());
-  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  const sleep = options.sleep ?? ((milliseconds: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener("abort", finish, { once: true });
+    if (signal?.aborted) finish();
+  }));
   const deadline = now() + timeoutMs;
   const maxAttempts = Math.max(1, Math.ceil(timeoutMs / 10) + 1);
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const inspection = inspectProcessGroup(pid, processGroupId, options);
     if (inspection.status === "error") return false;
+    if (now() >= deadline) return false;
     if (!inspection.members.some((member) => member.state !== "Z")) return true;
     const remainingMs = deadline - now();
     if (remainingMs <= 0) return false;
-    await sleep(Math.min(10, remainingMs));
+    const pause = await runWithinCleanupDeadline(deadline, now, (signal) => sleep(Math.min(10, remainingMs), signal));
+    if (!pause.completed) return false;
   }
   const inspection = inspectProcessGroup(pid, processGroupId, options);
-  return inspection.status === "ok" && !inspection.members.some((member) => member.state !== "Z");
+  if (inspection.status !== "ok" || now() >= deadline) return false;
+  return !inspection.members.some((member) => member.state !== "Z");
 }
 
 function runTaskkill(taskkill: string, pid: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -425,12 +445,15 @@ export async function terminateProcessTree(child: ChildProcess, options: Process
     }
     return false;
   }
+  const processStat = process.platform === "linux" ? readLinuxProcessStat(pid) : undefined;
+  const processGroupId = processStat?.status === "found" ? processStat.value.processGroupId : pid;
   try {
     process.kill(-pid, "SIGKILL");
-    const processStat = process.platform === "linux" ? readLinuxProcessStat(pid) : undefined;
-    const processGroupId = processStat?.status === "found" ? processStat.value.processGroupId : pid;
     return await waitForProcessTreeCleanup(pid, processGroupId, options);
-  } catch {
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      return await waitForProcessTreeCleanup(pid, processGroupId, options);
+    }
     return false;
   }
 }

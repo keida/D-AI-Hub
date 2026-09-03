@@ -323,6 +323,115 @@ describe("redactSensitiveText", () => {
     }
   });
 
+  it.skipIf(process.platform !== "linux")("fails closed at the Linux cleanup deadline when sleep never resolves", async () => {
+    vi.useFakeTimers();
+    let signal: AbortSignal | undefined;
+    try {
+      const cleanup = terminateProcessTree({ pid: 4325 } as ChildProcess, {
+        timeoutMs: 25,
+        inspectProcessGroup: () => ({ status: "ok", members: [{ state: "S" }] }),
+        sleep: async (_milliseconds, operationSignal) => {
+          signal = operationSignal;
+          return await new Promise<void>(() => undefined);
+        },
+      });
+      for (let turn = 0; turn < 10 && signal === undefined; turn += 1) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(cleanup).resolves.toBe(false);
+      expect(signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("consumes a late Linux cleanup sleep rejection after the deadline", async () => {
+    vi.useFakeTimers();
+    let rejectLate: ((reason?: unknown) => void) | undefined;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+    process.once("unhandledRejection", onUnhandled);
+    try {
+      const cleanup = terminateProcessTree({ pid: 4326 } as ChildProcess, {
+        timeoutMs: 25,
+        inspectProcessGroup: () => ({ status: "ok", members: [{ state: "S" }] }),
+        sleep: async () => await new Promise<void>((_resolve, reject) => {
+          rejectLate = reject;
+        }),
+      });
+      for (let turn = 0; turn < 10 && rejectLate === undefined; turn += 1) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(cleanup).resolves.toBe(false);
+      rejectLate?.(new Error("late Linux cleanup sleep failure"));
+      await vi.runOnlyPendingTimersAsync();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+      vi.useRealTimers();
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("rejects an empty Linux inspection that arrives at the deadline", async () => {
+    let now = 0;
+    let inspectionCalls = 0;
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    try {
+      const result = await terminateProcessTree({ pid: 4327 } as ChildProcess, {
+        timeoutMs: 10,
+        now: () => now,
+        inspectProcessGroup: () => {
+          inspectionCalls += 1;
+          if (inspectionCalls === 1) return { status: "ok", members: [{ state: "S" }] };
+          now = 10;
+          return { status: "ok", members: [] };
+        },
+        sleep: async () => {
+          now = 1;
+        },
+      });
+      expect(result).toBe(false);
+      expect(inspectionCalls).toBe(2);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("verifies an already-gone process group after ESRCH", async () => {
+    const error = Object.assign(new Error("process group already gone"), { code: "ESRCH" });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw error;
+    });
+    const inspectProcessGroup = vi.fn((processGroupId: number): ProcessGroupInspection => {
+      expect(processGroupId).toBe(4328);
+      return { status: "ok", members: [] };
+    });
+    try {
+      const result = await terminateProcessTree({ pid: 4328 } as ChildProcess, {
+        inspectProcessGroup,
+      });
+      expect(result).toBe(true);
+      expect(inspectProcessGroup).toHaveBeenCalledTimes(1);
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("fails closed for non-ESRCH process-group signal errors", async () => {
+    const error = Object.assign(new Error("permission denied"), { code: "EPERM" });
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw error;
+    });
+    const inspectProcessGroup = vi.fn((): ProcessGroupInspection => ({ status: "ok", members: [] }));
+    try {
+      const result = await terminateProcessTree({ pid: 4329 } as ChildProcess, {
+        inspectProcessGroup,
+      });
+      expect(result).toBe(false);
+      expect(inspectProcessGroup).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+    }
+  });
+
   it.skipIf(process.platform !== "win32")("uses one global deadline for large Windows descendant cleanup trees", async () => {
     let now = 0;
     const taskkillPids: number[] = [];
