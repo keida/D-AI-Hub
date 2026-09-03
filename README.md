@@ -1,6 +1,6 @@
 # D-AI-Hub
 
-Private, GitHub-first personal AI operating system shared across ChatGPT Web, Codex, and other compatible agents.
+GitHub-first personal AI operating system shared across ChatGPT Web, Codex, and other compatible agents, with a private-by-intent security boundary.
 
 ## What belongs here
 
@@ -56,6 +56,8 @@ Native Chat activation, native Work activation, the Work file-backed connector, 
 ## Security
 
 Never commit passwords, API keys, access tokens, private certificates, authentication cookies, secret environment files, or unauthorized employer-confidential data.
+
+Repository visibility is live GitHub state, not proof supplied by this file. Verify it before storing personal or otherwise private project context; if it is public, user action is required to make it private.
 
 ## Local repository health check
 

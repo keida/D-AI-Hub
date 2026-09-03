@@ -4,7 +4,7 @@
 
 - Title: D-AI-Hub
 - URL / repository path: `https://github.com/keida/D-AI-Hub`
-- Why it matters: canonical private source for Skills, knowledge, project memory, prompts, templates, and indexes.
+- Why it matters: canonical GitHub source for Skills, knowledge, project memory, prompts, templates, and indexes; repository visibility is live external state and must be queried before private context is stored.
 - Accessed / reviewed: 2026-08-20
 - Canonical branch: `main`.
 
