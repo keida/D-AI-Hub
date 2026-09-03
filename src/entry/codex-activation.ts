@@ -90,7 +90,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         publicationAuthority: options.publicationAuthority ?? null,
       };
       const deliveryResult = await options.deliver(deliveryRequest);
-      return {
+      const response: CodexActivationResponse = {
         taskId: deliveryResult.taskId,
         stage: "execute",
         environment: "codex",
@@ -99,8 +99,10 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         message: deliveryResult.formatted ?? deliveryResult.message,
         userIntent: intent,
         deliveryResult,
-        agentExecutionDirective: deliveryResult.agentExecutionDirective,
       };
+      return deliveryResult.agentExecutionDirective === undefined
+        ? response
+        : { ...response, agentExecutionDirective: deliveryResult.agentExecutionDirective };
     }
     return naturalResponse(input, intent, "blocked", `${intent.intent} is recognized but unavailable in this local MVP; it remains fail-closed`);
   };

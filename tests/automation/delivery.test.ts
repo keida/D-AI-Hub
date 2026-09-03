@@ -241,4 +241,29 @@ describe("createDeliveryOrchestrator", () => {
       expect(result.blockedAt, name).toBe(blockedAt);
     }
   });
+
+  it("keeps the final review-packet timing authoritative after packet construction", async () => {
+    const observed: Array<{ reviewPacketMs: number; totalActiveExecutionMs: number }> = [];
+    const result = await createDeliveryOrchestrator({
+      ...dependencies([]),
+      buildReviewPacket: async (_request, preFinalResult) => {
+        observed.push({
+          reviewPacketMs: preFinalResult.timings.review_packet_ms,
+          totalActiveExecutionMs: preFinalResult.totalActiveExecutionMs,
+        });
+        return "review-ready";
+      },
+    })({
+      taskId: "task-delivery-review-timing",
+      project: "D-AI-Hub",
+      requestText: "那就按这个方案改。",
+      resumeExistingTask: false,
+      riskLevel: 1,
+      publicationRequested: false,
+      expectedEndpoint: "local-change",
+    });
+
+    expect(observed).toEqual([{ reviewPacketMs: 0, totalActiveExecutionMs: 0 }]);
+    expect(result.formatted).toContain(`Total active execution: ${result.totalActiveExecutionMs}ms`);
+  });
 });

@@ -130,18 +130,6 @@ describe("Codex D-AI activation", () => {
       status: "completed",
       taskId: "task-delivery",
       intent: "delivery",
-      agentExecutionDirective: {
-        kind: "codex-agent-delivery",
-        requestText: "修复健康检查并创建 PR",
-        project: null,
-        taskId: "task-delivery",
-        resumed: false,
-        riskLevel: 2,
-        expectedEndpoint: "review-ready-pr",
-        publicationAuthorityRequired: true,
-        mergeAllowed: false,
-        nextAction: "Continue through the current Codex agent",
-      },
       riskLevel: 2,
       resumed: false,
       changes: ["src/automation/user-intent.ts"],
@@ -183,7 +171,9 @@ describe("Codex D-AI activation", () => {
     const result = await activate({ rawCommand: "修复健康检查并创建 PR", taskId: "task-delivery" });
 
     expect(deliveryRequests).toEqual(["task-delivery:false"]);
-    expect(result).toMatchObject({ status: "completed", deliveryResult, agentExecutionDirective: deliveryResult.agentExecutionDirective, userIntent: { intent: "delivery", expectedEndpoint: "review-ready-pr" } });
+    expect(result).toMatchObject({ status: "completed", deliveryResult, userIntent: { intent: "delivery", expectedEndpoint: "review-ready-pr" } });
+    expect(result.deliveryResult?.agentExecutionDirective).toBeUndefined();
+    expect(result.agentExecutionDirective).toBeUndefined();
   });
 
   it("keeps natural-language delivery blocked when the orchestration seam is unavailable", async () => {

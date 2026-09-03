@@ -27,6 +27,7 @@ export interface DeliveryDependencies {
   readonly runTypecheck: (request: DeliveryRequest, changes: readonly string[]) => Promise<DeliveryVerification>;
   readonly publish: (request: DeliveryRequest, workspace: { readonly branch: string; readonly clean: boolean }, changes: readonly string[]) => Promise<DeliveryPublication>;
   readonly waitForCI: (request: DeliveryRequest, publication: DeliveryPublication) => Promise<DeliveryCI>;
+  /** The result is pre-final: review_packet_ms and totalActiveExecutionMs are not authoritative until the caller returns the final result. */
   readonly buildReviewPacket: (request: DeliveryRequest, result: DeliveryResult) => Promise<string>;
   readonly now?: () => number;
 }
@@ -81,7 +82,7 @@ export interface DeliveryResult {
   readonly status: "completed" | "blocked";
   readonly taskId: string;
   readonly intent: "delivery";
-  readonly agentExecutionDirective: AgentExecutionDirective;
+  readonly agentExecutionDirective?: AgentExecutionDirective;
   readonly riskLevel: 1 | 2;
   readonly resumed: boolean;
   readonly changes: readonly string[];
@@ -306,7 +307,6 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
         status: "completed",
         taskId: request.taskId,
         intent: "delivery",
-        agentExecutionDirective: createAgentExecutionDirective(request),
         riskLevel: request.riskLevel,
         resumed: request.resumeExistingTask,
         changes,

@@ -174,7 +174,7 @@ Treat D-AI-Hub as four non-interchangeable delivery layers:
 3. Platform activation adapters translate a supported product invocation into the same raw logical `@D-AI` command and configured runtime.
 4. Chat, Work, and Codex capability connectors perform environment-specific operations and must advertise unavailable behavior as `BLOCKED`.
 
-Codex uses the user-discoverable `d-ai` Skill. Its user-facing form is `$d-ai @D-AI <command>`, with adapter-only `--task <task-id>` for explicit durable task selection in a fresh process. The `@D-AI` prefix remains a D-AI logical protocol and is not described as a Codex built-in command.
+At the time of this decision, Codex used the user-discoverable `d-ai` Skill with the user-facing form `$d-ai @D-AI <command>`, and adapter-only `--task <task-id>` for explicit durable task selection in a fresh process. That user-entry wording is partially superseded by the later natural-language-default acceptance: ordinary project language is now passed unchanged to the Skill/agent, while `@D-AI <command>` remains the force/precision override. The `@D-AI` prefix remains a D-AI logical protocol and is not described as a Codex built-in command.
 
 **Rationale**
 
