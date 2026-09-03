@@ -324,6 +324,7 @@ describe("redactSensitiveText", () => {
   });
 
   it.skipIf(process.platform !== "linux")("fails closed at the Linux cleanup deadline when sleep never resolves", async () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
     vi.useFakeTimers();
     let signal: AbortSignal | undefined;
     try {
@@ -340,11 +341,13 @@ describe("redactSensitiveText", () => {
       await expect(cleanup).resolves.toBe(false);
       expect(signal?.aborted).toBe(true);
     } finally {
+      kill.mockRestore();
       vi.useRealTimers();
     }
   });
 
   it.skipIf(process.platform !== "linux")("consumes a late Linux cleanup sleep rejection after the deadline", async () => {
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
     vi.useFakeTimers();
     let rejectLate: ((reason?: unknown) => void) | undefined;
     const unhandled: unknown[] = [];
@@ -361,11 +364,14 @@ describe("redactSensitiveText", () => {
       for (let turn = 0; turn < 10 && rejectLate === undefined; turn += 1) await Promise.resolve();
       await vi.advanceTimersByTimeAsync(25);
       await expect(cleanup).resolves.toBe(false);
-      rejectLate?.(new Error("late Linux cleanup sleep failure"));
+      expect(rejectLate).toBeDefined();
+      if (rejectLate === undefined) throw new Error("Expected to capture the late Linux cleanup rejection");
+      rejectLate(new Error("late Linux cleanup sleep failure"));
       await vi.runOnlyPendingTimersAsync();
       expect(unhandled).toEqual([]);
     } finally {
       process.removeListener("unhandledRejection", onUnhandled);
+      kill.mockRestore();
       vi.useRealTimers();
     }
   });
