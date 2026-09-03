@@ -281,6 +281,21 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
+  it("fails closed for a multi-word unknown project without throwing", async () => {
+    const fixture = await createActivationFixture("d-ai-codex-project-unknown-words-");
+    try {
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "继续 Unknown Project", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+      expect(result.message).toBe("No active durable task found for project Unknown Project");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("auto-selects the unique active workspace task before close verification", async () => {
     const fixture = await createActivationFixture("d-ai-codex-close-discovery-");
     try {

@@ -360,6 +360,9 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
 }
 
 const executionIdentityPrefixes = ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"] as const;
+const durableTaskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const projectCandidateDisplayLimit = 3;
+const projectCandidateFieldMaxLength = 96;
 
 function validateExecutionContextManifestEntries(entries: readonly string[] | undefined): readonly string[] {
   if (entries === undefined) return [];
@@ -1968,7 +1971,13 @@ function canonicalProjectName(state: TaskState): string | null {
 
 function projectCandidateDescription(state: TaskState): string {
   const workspaceIdentity = state.contextManifest.find((entry) => entry.startsWith("identity:workspace:")) ?? "unavailable";
-  return `${state.taskId} (stage=${state.stage}, workspace=${workspaceIdentity})`;
+  const bounded = (value: string): string => {
+    const normalized = value.replace(/[\r\n\t]/g, " ");
+    return normalized.length <= projectCandidateFieldMaxLength
+      ? normalized
+      : `${normalized.slice(0, projectCandidateFieldMaxLength - 3)}...`;
+  };
+  return `${bounded(state.taskId)} (stage=${bounded(state.stage)}, workspace=${bounded(workspaceIdentity)})`;
 }
 
 async function resolveContinueProject(
@@ -1976,7 +1985,9 @@ async function resolveContinueProject(
   command: Extract<DAICommand, { readonly kind: "continue" }>,
   dependencies: DAIRuntimeDependencies,
 ): Promise<string | DAIResponse> {
-  const exact = await dependencies.store.load(command.taskIdOrProject);
+  const exact = durableTaskIdPattern.test(command.taskIdOrProject)
+    ? await dependencies.store.load(command.taskIdOrProject)
+    : null;
   if (exact !== null) return command.taskIdOrProject;
 
   const noMatch = (): DAIResponse => blockedWithoutState(
@@ -2003,16 +2014,18 @@ async function resolveContinueProject(
   }
   const candidates: TaskState[] = [];
   for (const state of discovered.value) {
-    if (state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
+    if (!durableTaskIdPattern.test(state.taskId) || state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
     if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
   }
   candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
   if (candidates.length === 0) return noMatch();
   if (candidates.length > 1) {
+    const displayedCandidates = candidates.slice(0, projectCandidateDisplayLimit);
+    const omittedCount = candidates.length - displayedCandidates.length;
     return blockedWithoutState(
       "ambiguous",
       request.sourceEnvironment,
-      `Multiple active durable tasks found for project ${command.taskIdOrProject}: ${candidates.map(projectCandidateDescription).join(", ")}`,
+      `Multiple active durable tasks found for project ${command.taskIdOrProject}; showing ${displayedCandidates.length} of ${candidates.length} candidates: ${displayedCandidates.map(projectCandidateDescription).join(", ")}; ${omittedCount} candidates omitted`,
     );
   }
   return candidates[0]!.taskId;

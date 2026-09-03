@@ -2142,6 +2142,38 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
   });
 
+  it("caps and bounds the displayed candidates for a large project ambiguity", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const state = await seedProjectState(runtimeHarness);
+    const candidates = Array.from({ length: 5 }, (_, index): TaskState => ({
+      ...state,
+      taskId: `task-project-${index}-${"x".repeat(100)}`,
+      stage: "execute",
+    }));
+    for (const candidate of candidates) await runtimeHarness.store.save(candidate);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [...candidates].reverse(),
+    });
+
+    const result = await handle({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toContain("showing 3 of 5 candidates");
+    expect(result.message).toContain("2 candidates omitted");
+    expect(result.message).toContain("task-project-0-");
+    expect(result.message).toContain("task-project-1-");
+    expect(result.message).toContain("task-project-2-");
+    expect(result.message).not.toContain(candidates[3]!.taskId);
+    expect(result.message).not.toContain(candidates[4]!.taskId);
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
   it("fails closed for closed-only and wrong-workspace project candidates", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const state = await seedProjectState(runtimeHarness);
