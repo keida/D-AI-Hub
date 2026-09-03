@@ -1,6 +1,6 @@
 # Evidence History
 
-This file preserves release and verification context that no longer belongs in the replace-in-place current checkpoint. Git history and the linked pull requests remain the detailed audit source.
+This file preserves release and verification context that no longer belongs in the replace-in-place current checkpoint. Git history and the linked pull requests remain the detailed audit source. Privacy and GitHub visibility statements describe their historical evidence snapshot; current visibility is live external state and must be queried.
 
 ## Canonical project milestones
 

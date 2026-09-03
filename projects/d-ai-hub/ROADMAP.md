@@ -16,6 +16,7 @@
 - Default handoff safety completed.
 - CI/reproducibility implemented.
 - Current milestone: visible natural-language automation MVP; live PR/CI status remains a GitHub query.
+- Repository visibility, PR/CI, branch protection, and remote freshness remain live external evidence; do not copy mutable values into this roadmap.
 - Actor/session ADR remains Proposed/Deferred; runtime implementation is not authorized by that proposal.
 
 ## V1 product boundary
@@ -36,9 +37,9 @@
 - Fresh-runtime workspace-scoped durable task selection for active-state commands.
 - Canonical repository Skill source, compatibility entry, CLI, and external-workspace activation tests.
 - Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.
-- Fresh positive close-path acceptance whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
+- Fresh positive close-path acceptance at the then-private remote whose runtime close response returned `Safe-to-delete: YES`, with normal workspace-scoped discovery, durable context, recovery, private remote identity, successful push, exact remote SHA verification, and clean-worktree enforcement.
 - Lightweight engineering routing documented; selected Matt Skills remain available through native discovery, Superpowers is permanently disabled and absent from native discovery, and no independent external or general-purpose Router runtime is installed.
-- Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and accepted. Device A pushed an exact two-file bundle commit to private `main`; an isolated reader clone with a separate workspace/SQLite database and `core.autocrlf=true` verified the pulled digest, `IMPORTED`, `NOOP_DUPLICATE`, and same-ID read without writer access. Subsequent non-empty bundles must now extend the reader's sequence chain exactly; missing ranges and overlaps fail closed without records or receipts, while exact old/new replays remain `NOOP_DUPLICATE`. This isolated device-B simulation satisfies phase-one implementation acceptance; a second physical computer is optional environment validation and remains unverified. Git/GitHub transport stays manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
+- Single-writer local-memory transfer slice: local SQLite `put/get`, deterministic JSONL/manifest export, explicit `put|get|export|import` CLI, and the manual private-GitHub operator runbook are implemented and accepted. The historical Device A rehearsal pushed an exact two-file bundle commit to the then-private `main`; an isolated reader clone with a separate workspace/SQLite database and `core.autocrlf=true` verified the pulled digest, `IMPORTED`, `NOOP_DUPLICATE`, and same-ID read without writer access. Subsequent non-empty bundles must now extend the reader's sequence chain exactly; missing ranges and overlaps fail closed without records or receipts, while exact old/new replays remain `NOOP_DUPLICATE`. This isolated device-B simulation satisfies phase-one implementation acceptance; a second physical computer is optional environment validation and remains unverified. Git/GitHub transport stays manual, and automatic synchronization/merge and multi-writer behavior remain excluded.
 - Read-only repository index freshness: `runRepositoryHealthCheck` reports deterministic required catalog coverage for tracked Skills, top-level knowledge domains, and projects. Missing and duplicate targets fail, allowed extras and exclusions remain valid, enumeration errors fail closed, and the now-archived `d-ai-hub-v2` reference remains indexed. The approved boundary is recorded in `docs/specs/2026-08-30-index-freshness-design.md`.
 
 ## Future / Deferred
@@ -57,5 +58,5 @@
 
 ## Post-V1 boundary
 
-- Codex-first V1 acceptance is complete for the verified configured GitHub path; the close response returned `Safe-to-delete: YES`, while missing credentials or remote proof remains `BLOCKED`/`NO`.
+- Codex-first V1 acceptance is complete for the verified configured GitHub path; the historical close response returned `Safe-to-delete: YES`, while missing credentials, remote proof, or current privacy verification remains `BLOCKED`/`NO`.
 - Any future Chat/Work work requires a new scope decision, supported connector, capability/ownership design, and separate acceptance review.

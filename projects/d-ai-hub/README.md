@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Maintain one private, GitHub-first source of truth for personal AI Skills, durable knowledge, project memory, prompts, templates, and discovery indexes.
+Maintain one GitHub-first source of truth for personal AI Skills, durable knowledge, project memory, prompts, templates, and discovery indexes.
 
 ## Scope
 
@@ -31,6 +31,7 @@ D-AI V1 is Codex local control, GitHub-backed durable evidence, and D-AI-Hub Mar
 - Canonical branch: `main`
 - Local checkouts are working copies and may live at different paths on different machines.
 - A local checkout is current only after sync has been verified against the canonical repository. Do not preserve transient commit/tree identifiers here as durable state.
+- Privacy is product intent, not a live GitHub assertion: verify repository visibility before storing personal or otherwise private project context; changing public visibility to private requires user action.
 
 ## Bootstrap
 

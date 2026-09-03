@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-09-04 — Separate privacy intent from live GitHub visibility
+
+**Context**
+
+The product boundary intends D-AI-Hub to remain private, while GitHub visibility, pull-request state, and branch protection are external live state that can change without a Markdown edit.
+
+**Decision**
+
+Keep privacy as a product/security requirement, but do not treat README, project Markdown, or historical acceptance language as proof of current GitHub visibility. Query GitHub before storing personal or otherwise private project context and before release decisions. If the repository is public, changing it to private is a user action; this decision authorizes no visibility mutation.
+
+**Consequences**
+
+Current checkpoints must avoid mutable PR numbers, proposal labels, and live visibility claims. Historical private-repository evidence remains preserved as historical evidence and must not be presented as current state.
+
 ## 2026-08-23 — Supersede cross-environment delivery scope with Codex-first V1
 
 **Context**

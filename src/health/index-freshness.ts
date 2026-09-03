@@ -13,6 +13,11 @@ type Catalog = {
   readonly targets: readonly string[];
 };
 
+type FieldState = {
+  readonly occurrences: number;
+  readonly value: string | null;
+};
+
 type ProjectSection = "active" | "planned" | "archived";
 type CurrentPullRequestState = "open" | "draft" | "merged" | "closed";
 
@@ -95,9 +100,16 @@ function expectedProjectSection(lifecycle: string): ProjectSection | null {
   return null;
 }
 
-function oneField(markdown: string, label: string): string | null {
-  const matches = [...markdown.matchAll(new RegExp(`^- ${label}: (.+)$`, "gmu"))];
-  return matches.length === 1 ? matches[0]?.[1]?.trim() ?? null : null;
+function fieldState(markdown: string, label: string): FieldState {
+  const matches = [...markdown.matchAll(new RegExp(`^- ${label}:[ \\t]*(.*)$`, "gmu"))];
+  return {
+    occurrences: matches.length,
+    value: matches.length === 1 ? matches[0]?.[1]?.trim() ?? "" : null,
+  };
+}
+
+function fieldValue(state: FieldState): string | null {
+  return state.occurrences === 1 ? state.value : null;
 }
 
 function currentPullRequestState(value: string): CurrentPullRequestState | null {
@@ -145,7 +157,7 @@ async function projectStateFindings(
     const details = await stat(resolvedStatusPath);
     if (!details.isFile() || details.size > maxProjectStatusBytes) throw new Error(`${project}/STATUS.md is not a bounded readable file`);
     const status = await readFile(resolvedStatusPath, "utf8");
-    const lifecycle = oneField(status, "Lifecycle");
+    const lifecycle = fieldValue(fieldState(status, "Lifecycle"));
     const expected = lifecycle === null ? null : expectedProjectSection(lifecycle);
     const indexedSections = sections.get(project) ?? [];
     if (expected === null) findings.push(`${project}/STATUS.md: missing or unsupported Lifecycle`);
@@ -153,10 +165,18 @@ async function projectStateFindings(
       findings.push(`${project}: lifecycle ${lifecycle} is not indexed under ${expected} projects`);
     }
 
-    const lastMergedDelivery = oneField(status, "Last merged delivery");
-    const activeProposal = oneField(status, "Active proposal");
-    const currentPr = oneField(status, "Current PR");
-    if (lastMergedDelivery === null && activeProposal === null) {
+    const lastMergedDeliveryState = fieldState(status, "Last merged delivery");
+    const activeProposalState = fieldState(status, "Active proposal");
+    const currentPrState = fieldState(status, "Current PR");
+    const lastMergedDelivery = fieldValue(lastMergedDeliveryState);
+    const activeProposal = fieldValue(activeProposalState);
+    const currentPr = fieldValue(currentPrState);
+    const hasStablePrFields = lastMergedDeliveryState.occurrences > 0 || activeProposalState.occurrences > 0;
+    if (!hasStablePrFields && currentPrState.occurrences === 0) {
+      if (!hasExactlyOneLivePrStatusBoundary(status)) {
+        findings.push(`${project}/STATUS.md: missing live PR status boundary`);
+      }
+    } else if (!hasStablePrFields) {
       findings.push(...legacyPullRequestFindings(project, lifecycle, currentPr, true));
     } else {
       if (lastMergedDelivery === null || !/^PR #[1-9][0-9]*$/u.test(lastMergedDelivery)) {

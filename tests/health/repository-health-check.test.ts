@@ -211,6 +211,94 @@ describe("runRepositoryHealthCheck", () => {
     });
   });
 
+  it("accepts query-only project status without mutable PR snapshot fields", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Live PR status must be queried from GitHub.",
+    ].join("\r\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "accept query-only project PR state");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    expect(checkWithId(report, "index-freshness")).toEqual({
+      id: "index-freshness",
+      status: "passed",
+      observation: "All required catalog targets are indexed exactly once",
+    });
+  });
+
+  it.each([
+    ["missing boundary", []],
+    ["negated boundary", ["- Live PR status must not be queried from GitHub."]],
+    ["malformed boundary", ["- Live PR status must be queried from GitHub"]],
+    ["prose-only boundary", ["Live PR status must be queried from GitHub."]],
+    ["duplicate boundary", [
+      "- Live PR status must be queried from GitHub.",
+      "- Live PR status must be queried from GitHub.",
+    ]],
+  ] as const)("rejects a $0 in query-only project status", async (_caseName, boundaryLines) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      ...boundaryLines,
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, `reject query-only ${_caseName}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    const freshness = checkWithId(report, "index-freshness");
+    expect(freshness.status).toBe("failed");
+    expect(freshness.observation).toContain("missing live PR status boundary");
+  });
+
+  it.each([
+    ["Last merged delivery", "- Last merged delivery: PR #28", "invalid Last merged delivery"],
+    ["Active proposal", "- Active proposal: none", "invalid Active proposal"],
+    ["Current PR", "- Current PR: none", "invalid Current PR"],
+  ] as const)("rejects duplicate $0 fields in query-only project status", async (_field, fieldLine, finding) => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      fieldLine,
+      fieldLine,
+      "- Live PR status must be queried from GitHub.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, `reject duplicate ${_field}`);
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    const freshness = checkWithId(report, "index-freshness");
+    expect(freshness.status).toBe("failed");
+    expect(freshness.observation).toContain(finding);
+  });
+
+  it("rejects a legacy field split across lines", async () => {
+    const workspacePath = await createRepositoryFixture();
+    await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
+      "# Status",
+      "## State",
+      "- Lifecycle: active",
+      "- Last merged delivery:",
+      "PR #28",
+      "- Active proposal: none",
+      "- Live PR status must be queried from GitHub.",
+    ].join("\n"), "utf8");
+    await commitFixtureChanges(workspacePath, "reject split legacy PR field");
+
+    const report = await runRepositoryHealthCheck({ workspacePath });
+
+    const freshness = checkWithId(report, "index-freshness");
+    expect(freshness.status).toBe("failed");
+    expect(freshness.observation).toContain("invalid Last merged delivery");
+  });
+
   it("rejects stable delivery and proposal fields that coexist with Current PR", async () => {
     const workspacePath = await createRepositoryFixture();
     await writeFile(join(workspacePath, "projects", "d-ai-hub", "STATUS.md"), [
