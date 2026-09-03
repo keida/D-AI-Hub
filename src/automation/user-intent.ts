@@ -29,7 +29,7 @@ function projectFromRequest(text: string): string | null {
   if (progressProject?.[1] !== undefined) return progressProject[1].trim();
   const englishProgressProject = /(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9._/-]*(?:'s)?)\s+(?:status|progress)\b/iu.exec(text);
   if (englishProgressProject?.[1] !== undefined && !/^(?:current|project)$/iu.test(englishProgressProject[1])) return englishProgressProject[1].replace(/'s$/iu, "").trim();
-  const updateProject = /(?:give\s+me\s+an?\s+update\s+on|update\s+me\s+on)\s+([A-Za-z0-9][A-Za-z0-9._/-]*)\b/iu.exec(text);
+  const updateProject = /(?:give\s+me\s+an?\s+update\s+(?:on|about|regarding)|update\s+me\s+(?:on|about|regarding))\s+([A-Za-z0-9][A-Za-z0-9._/-]*)\b/iu.exec(text);
   if (updateProject?.[1] !== undefined && !/^(?:the|project)$/iu.test(updateProject[1])) return updateProject[1].trim();
   const labeled = /(?:项目|project|建立|初始化)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})/iu.exec(text);
   const labeledProject = labeled?.[1]?.trim();
@@ -43,7 +43,7 @@ function hasQuestionShape(text: string): boolean {
 function hasStatusQuestionShape(text: string): boolean {
   return /^(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?(?:(?:current|project)\s+)?(?:[A-Za-z0-9][A-Za-z0-9._/-]*(?:'s)?\s+)?(?:status|progress)\b/iu.test(text)
     || /(?:现在|当前|目前)\s*(?:[A-Za-z0-9][A-Za-z0-9._/-]*\s*)?(?:状态|进展)(?:怎么样|如何|到哪(?:里)?|到哪里)?/u.test(text)
-    || /^(?:give\s+me\s+an?\s+update\s+on|update\s+me\s+on)\b/iu.test(text);
+    || /^(?:give\s+me\s+an?\s+update\s+(?:on|about|regarding)|update\s+me\s+(?:on|about|regarding))\b/iu.test(text);
 }
 
 function hasMutationShape(text: string): boolean {
@@ -54,7 +54,7 @@ function hasMutationShape(text: string): boolean {
 }
 
 function hasPublicationShape(text: string): boolean {
-  if (/^(?:explain|describe|clarify|discuss|解释|说明|讨论)/iu.test(text)) return false;
+  if (/^\s*(?:please\s+)?(?:explain|describe|clarify|discuss|解释|说明|讨论)/iu.test(text)) return false;
   return /^\s*push\s*$/iu.test(text)
     || /^\s*pull\s+request\s*$/iu.test(text)
     || /^\s*推送分支\s*$/u.test(text)
