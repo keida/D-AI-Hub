@@ -22,6 +22,11 @@ function processIsRunning(pid: number): boolean {
   }
 }
 
+function terminateFixtureProcess(child: ChildProcess): boolean {
+  const killResult = child.kill("SIGKILL");
+  return killResult || child.pid === undefined || !processIsRunning(child.pid);
+}
+
 describe("redactSensitiveText", () => {
   it.each([
     ["password=\"quoted-secret\"", "password=[REDACTED]"],
@@ -114,7 +119,7 @@ describe("redactSensitiveText", () => {
           cwd: null,
           timeoutMs: 1_000,
           maxOutputBytes,
-          terminateProcessTree: async (child) => child.kill("SIGKILL"),
+          terminateProcessTree: async (child) => terminateFixtureProcess(child),
         });
       } catch (error: unknown) {
         return (error as { result: { stdout: string; stderr: string } }).result;
@@ -130,6 +135,27 @@ describe("redactSensitiveText", () => {
     expect(repeated).toEqual(result);
     expect(Buffer.byteLength(result?.stdout ?? "") + Buffer.byteLength(result?.stderr ?? "")).toBeLessThanOrEqual(maxOutputBytes);
   }, 15_000);
+
+  it("treats an already-exited output-limit fixture child as successfully cleaned up", async () => {
+    let thrown: unknown;
+    try {
+      await runCommand({
+        command: process.execPath,
+        arguments: ["-e", "process.stdout.write('stdout-diagnostic'); process.stderr.write('stderr-diagnostic'); process.stdout.write('x'.repeat(1000))"],
+        cwd: null,
+        maxOutputBytes: 128,
+        terminateProcessTree: async (child) => {
+          await new Promise<void>((resolve) => child.once("close", () => resolve()));
+          return terminateFixtureProcess(child);
+        },
+      });
+      throw new Error("Expected the diagnostic command to fail");
+    } catch (error: unknown) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ result: expect.objectContaining({ exitCode: null }) });
+    expect((thrown as { result: { stderr: string } }).result.stderr).not.toContain("Process tree cleanup");
+  });
 
   it("terminates a descendant process when a command times out", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-command-timeout-"));
