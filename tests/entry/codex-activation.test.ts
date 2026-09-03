@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { DeliveryResult } from "../../src/automation/delivery.js";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
 import type { DAIResponse, ExternalDAIRequest } from "../../src/runtime/d-ai-runtime.js";
 
@@ -58,5 +59,149 @@ describe("Codex D-AI activation", () => {
 
     expect(requests[0]?.overrides).toEqual({ model: "gpt-5", role: "reviewer", environment: null, stage: "verify" });
     expect(requests[0]?.command).toEqual({ kind: "continue", taskIdOrProject: "task-override" });
+  });
+
+  it("makes natural-language discussion read-only without invoking the durable runtime", async () => {
+    let runtimeCalls = 0;
+    const runtime = async (): Promise<DAIResponse> => {
+      runtimeCalls += 1;
+      throw new Error("discussion must not invoke the durable runtime");
+    };
+    const activate = createCodexActivation(runtime);
+
+    const result = await activate({ rawCommand: "这个方案是不是应该改成 SQLite？", taskId: null });
+
+    expect(runtimeCalls).toBe(0);
+    expect(result).toMatchObject({
+      taskId: "unassigned",
+      stage: "inspect",
+      environment: "codex",
+      status: "accepted",
+      userIntent: { intent: "discuss", risk: "read-only", expectedEndpoint: "discussion" },
+    });
+    expect(result.message).toMatch(/read-only discussion/i);
+  });
+
+  it("routes natural-language continuation to the existing durable runtime", async () => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-continue", stage: "execute", environment: "codex", status: "accepted", evidence: [], message: "continued" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    const result = await activate({ rawCommand: "继续 D-AI-Hub", taskId: null });
+
+    expect(requests[0]?.command).toEqual({ kind: "continue", taskIdOrProject: "D-AI-Hub" });
+    expect(result).toMatchObject({ status: "accepted", userIntent: { intent: "continue", project: "D-AI-Hub" } });
+  });
+
+  it("uses the existing task id when natural-language continuation has no parsed project", async () => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-fallback", stage: "execute", environment: "codex", status: "accepted", evidence: [], message: "continued" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    const result = await activate({ rawCommand: "继续上次的工作。", taskId: "task-fallback" });
+
+    expect(requests[0]?.command).toEqual({ kind: "continue", taskIdOrProject: "task-fallback" });
+    expect(result).toMatchObject({ status: "accepted", userIntent: { intent: "continue", project: null } });
+  });
+
+  it("keeps an explicit status command read-only over delivery-looking surrounding text", async () => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-status", stage: "verify", environment: "codex", status: "accepted", evidence: [], message: "status" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    await activate({ rawCommand: "@D-AI status, then fix and create a PR", taskId: null });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.command).toEqual({ kind: "status" });
+  });
+
+  it.each([
+    ["@D-AI status model=gpt-5", { model: "gpt-5", role: null, environment: null, stage: null }],
+    ["@D-AI status role=reviewer stage=verify", { model: null, role: "reviewer", environment: null, stage: "verify" }],
+    ["@D-AI status model=gpt-5 role=reviewer stage=verify", { model: "gpt-5", role: "reviewer", environment: null, stage: "verify" }],
+  ] as const)("preserves valid status overrides for %s", async (rawCommand, overrides) => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-status", stage: "verify", environment: "codex", status: "accepted", evidence: [], message: "status" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    await activate({ rawCommand, taskId: null });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.command).toEqual({ kind: "status" });
+    expect(requests[0]?.overrides).toEqual(overrides);
+  });
+
+  it("routes natural-language delivery to the thin orchestration seam", async () => {
+    const deliveryRequests: string[] = [];
+    const deliveryResult: DeliveryResult = {
+      status: "completed",
+      taskId: "task-delivery",
+      intent: "delivery",
+      riskLevel: 2,
+      resumed: false,
+      changes: ["src/automation/user-intent.ts"],
+      focusedTest: "passed",
+      typecheck: "passed",
+      ci: "passed",
+      platforms: { windows: "PASS", linux: "PASS" },
+      publicationStatus: "PASS",
+      branch: "codex/mvp",
+      commit: "a".repeat(40),
+      pr: "https://github.com/keida/D-AI-Hub/pull/31",
+      mergePerformed: "NO",
+      timings: {
+        context_read_ms: 1,
+        workspace_prepare_ms: 2,
+        implementation_ms: 3,
+        typecheck_ms: 4,
+        focused_test_ms: 5,
+        publication_ms: 6,
+        ci_wait_ms: 7,
+        review_packet_ms: 8,
+      },
+      reviewPacket: "review-ready",
+      decisionRequired: "Separate review and merge authorization are required",
+      message: "Delivery completed",
+      totalActiveExecutionMs: 35,
+      blockedAt: null,
+      reason: null,
+      userAction: null,
+    };
+    const runtime = async (): Promise<DAIResponse> => { throw new Error("delivery should use orchestration seam"); };
+    const activate = createCodexActivation(runtime, {
+      deliver: async (request) => {
+        deliveryRequests.push(`${request.taskId}:${request.resumeExistingTask}`);
+        return deliveryResult;
+      },
+    });
+
+    const result = await activate({ rawCommand: "修复健康检查并创建 PR", taskId: "task-delivery" });
+
+    expect(deliveryRequests).toEqual(["task-delivery:false"]);
+    expect(result).toMatchObject({ status: "completed", deliveryResult, userIntent: { intent: "delivery", expectedEndpoint: "review-ready-pr" } });
+    expect(result.deliveryResult?.agentExecutionDirective).toBeUndefined();
+    expect(result.agentExecutionDirective).toBeUndefined();
+  });
+
+  it("keeps natural-language delivery blocked when the orchestration seam is unavailable", async () => {
+    const runtime = async (): Promise<DAIResponse> => { throw new Error("delivery must not fall through to the durable runtime"); };
+    const activate = createCodexActivation(runtime);
+
+    const result = await activate({ rawCommand: "fix the project and create a PR", taskId: null });
+
+    expect(result).toMatchObject({ status: "blocked", userIntent: { intent: "delivery" } });
+    expect(result.message).toMatch(/delivery orchestration.*publication authority/i);
   });
 });

@@ -1,16 +1,31 @@
 # D-AI-Hub Short Commands
 
-D-AI V1 exposes a Codex-first logical command protocol. Commands are repository conventions, not built-in commands. Codex is the supported runtime activation surface; ChatGPT Web is for ordinary discussion and viewing only. The authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains internal when durable outcomes should be captured during a session.
+D-AI V1 exposes a Codex-first control path with natural language as its default entry and `@D-AI` as an explicit override. Commands are repository conventions, not built-in commands. Codex is the supported runtime activation surface; ChatGPT Web is for ordinary discussion and viewing only. The authoritative behavior is defined in the root `AGENTS.md`. The `@D-AI update` workflow remains internal when durable outcomes should be captured during a session.
 
-## Three layers
+## Four layers
 
-1. **Logical command** — the user-facing protocol, primarily `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`.
-2. **Codex Skill activation** — when a message begins with `@D-AI`, the `d-ai` Skill invokes the real runtime through `skills/custom/d-ai/scripts/invoke.ps1`.
-3. **CLI implementation** — the internal `npm run d-ai -- --workspace <path> --command "@D-AI status"` entry used by the Skill. Codex-only `--task <task-id>` is an explicit override.
+1. **Natural-language intent** — ordinary project requests are classified into discussion, status, continuation, delivery, close, rollback, sync, or establish.
+2. **Explicit override** — when a message begins with `@D-AI`, the named command has priority over later natural-language text.
+3. **Codex Skill activation** — the `d-ai` Skill invokes the real runtime through `skills/custom/d-ai/scripts/invoke.ps1`.
+4. **CLI implementation** — the internal `npm run d-ai -- --workspace <path> --command <text>` entry used by the Skill. Codex-only `--task <task-id>` is an explicit override.
 
 The logical prefix is a D-AI-Hub protocol, not a Codex built-in command. The Skill is the supported Codex activation surface.
 
 ## Quick reference
+
+Natural-language examples:
+
+| Request | Route | Durable mutation |
+| --- | --- | --- |
+| `这个方案是不是应该改成 SQLite？` | discussion | No |
+| `那就改成 SQLite。` | bounded delivery when configured | Only with explicit authority |
+| `查看 D-AI-Hub 当前状态` | status | No |
+| `继续 D-AI-Hub，修复并创建 PR` | continuation/delivery | Only with explicit authority |
+| `fix the project and create a PR` | bounded delivery when configured | Only with explicit authority |
+
+Questions, status requests, and ambiguous requests are read-only. No durable task is created or mutated for those paths.
+
+Risk levels: Level 0 = read-only; Level 1 = local reversible implementation; Level 2 = publication; Level 3 = irreversible/destructive action. Publication authority is required only at the Level 2 commit/push/PR boundary.
 
 | Command | Purpose |
 | --- | --- |
@@ -19,7 +34,7 @@ The logical prefix is a D-AI-Hub protocol, not a Codex built-in command. The Ski
 | `@D-AI close` | Verify durable state, GitHub evidence, and project-memory outcomes; return `YES`, `NO`, or `BLOCKED`. |
 | `@D-AI rollback` | Perform an explicitly authorized, durable, auditable rollback or fail closed. |
 
-`@D-AI establish`, `@D-AI sync`, and internal `@D-AI update` remain setup/maintenance workflows rather than the daily V1 command set. Cross-environment `handoff` remains a contract/reference command and is Future/Deferred for product delivery.
+`@D-AI establish`, `@D-AI sync`, and internal `@D-AI update` remain setup/maintenance workflows rather than the daily V1 command set. There is no new user-facing `@D-AI deliver` command. Cross-environment `handoff` remains a contract/reference command and is Future/Deferred for product delivery.
 
 For `status` and `close`, the runtime automatically selects the unique active durable task whose persisted workspace identity matches the current workspace. Zero matches, multiple matches, and ownership conflicts fail closed. Add `--task <task-id>` only when the result asks for explicit disambiguation or recovery.
 
@@ -131,10 +146,18 @@ Use `@D-AI sync` only when an explicit canonical-freshness check is needed. It i
 
 ## Request composition
 
-Ordinary project continuation can name the project and task without a D-AI command prefix. For example:
+Any ordinary project request can use natural language without a D-AI command prefix. For example:
 
 ```text
 继续 DeepSeek Harness Desktop，先读取 STATUS 和未解决 BUGS，再决定下一步。
 ```
+
+For a change request, the visible delivery path must have explicit publication authority. Without it, the request is blocked before commit, push, or PR creation. Delivery never merges or performs destructive Git actions.
+
+The raw CLI can classify the request and return an execution-required Delivery Result, but it does not simulate implementation, tests, Git, or CI. The canonical Codex Skill/agent must continue Level 1 work through an attached execution seam before any implementation or publication evidence is claimed.
+
+The response carries a structured `agentExecutionDirective` containing the original request, project/task, resume flag, risk, endpoint, publication-authority requirement, and `mergeAllowed: false`. The current Codex agent consumes it immediately under the normal gates; the user does not need to type another command.
+
+Delivery receipts keep typecheck timing separate, show observed Windows/Linux states independently, and identify the precise stage that blocked (`context-read`, `workspace-prepare`, `implementation`, `focused-test`, `typecheck`, `publication-authority`, `publication`, `ci-wait`, or `review-packet`).
 
 When a D-AI command prefix is used, the Codex Skill should invoke the runtime first and then continue the remainder of the user's request. A response that only explains the convention is not activation.

@@ -1,4 +1,6 @@
 import { parseDAIInvocation } from "./command-parser.js";
+import { classifyUserIntent, type UserIntent } from "../automation/user-intent.js";
+import type { AgentExecutionDirective, DeliveryRequest, DeliveryResult, PublicationAuthority } from "../automation/delivery.js";
 import type { DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
 
 export interface CodexActivationInput {
@@ -6,17 +8,117 @@ export interface CodexActivationInput {
   readonly taskId: string | null;
 }
 
+export interface CodexActivationOptions {
+  readonly deliver?: (request: DeliveryRequest) => Promise<DeliveryResult>;
+  readonly publicationAuthority?: PublicationAuthority | null;
+}
+
+export interface CodexActivationResponse extends DAIResponse {
+  readonly userIntent?: UserIntent;
+  readonly deliveryResult?: DeliveryResult;
+  readonly agentExecutionDirective?: AgentExecutionDirective;
+}
+
 export type DAIRuntimeHandler = (request: ExternalDAIRequest) => Promise<DAIResponse>;
 
-export function createCodexActivation(runtime: DAIRuntimeHandler): (input: CodexActivationInput) => Promise<DAIResponse> {
-  return async (input: CodexActivationInput): Promise<DAIResponse> => {
-    const parsed = parseDAIInvocation(input.rawCommand);
-    const result = await runtime({
-      command: parsed.command,
-      sourceEnvironment: "codex",
-      overrides: parsed.overrides,
-      activeTaskId: input.taskId,
-    });
-    return result;
+function defaultsForStatus(): ReturnType<typeof parseDAIInvocation> {
+  return parseDAIInvocation("@D-AI status");
+}
+
+function isExplicitStatusOverride(text: string): boolean {
+  return /^@D-AI\s+status(?:\s|[,，:：]|$)/iu.test(text.trim());
+}
+
+function parseExplicitStatusInvocation(text: string): ReturnType<typeof parseDAIInvocation> {
+  const match = /^@D-AI\s+status\b([\s\S]*)$/iu.exec(text.trim());
+  if (match === null) return parseDAIInvocation(text);
+  const trailingTokens = match[1]?.trim().split(/\s+/u).filter(Boolean) ?? [];
+  const overrideTokens = trailingTokens.filter((token) => {
+    try {
+      const parsed = parseDAIInvocation(`@D-AI status ${token}`);
+      return Object.values(parsed.overrides).some((value) => value !== null);
+    } catch {
+      return false;
+    }
+  });
+  return parseDAIInvocation(`@D-AI status${overrideTokens.length === 0 ? "" : ` ${overrideTokens.join(" ")}`}`);
+}
+
+function naturalResponse(input: CodexActivationInput, intent: UserIntent, status: DAIResponse["status"], message: string): CodexActivationResponse {
+  return {
+    taskId: input.taskId ?? "unassigned",
+    stage: intent.intent === "discuss" || intent.intent === "status" ? "inspect" : "execute",
+    environment: "codex",
+    status,
+    evidence: [],
+    message,
+    userIntent: intent,
+  };
+}
+
+export function createCodexActivation(runtime: DAIRuntimeHandler, options: CodexActivationOptions = {}): (input: CodexActivationInput) => Promise<CodexActivationResponse> {
+  return async (input: CodexActivationInput): Promise<CodexActivationResponse> => {
+    const rawText = input.rawCommand.trim();
+    if (rawText.startsWith("@D-AI")) {
+      const parsed = isExplicitStatusOverride(rawText) ? parseExplicitStatusInvocation(rawText) : parseDAIInvocation(rawText);
+      return runtime({
+        command: parsed.command,
+        sourceEnvironment: "codex",
+        overrides: parsed.overrides,
+        activeTaskId: input.taskId,
+      });
+    }
+
+    const intent = classifyUserIntent(rawText);
+    if (intent.intent === "discuss") {
+      return naturalResponse(input, intent, "accepted", "Read-only discussion; no durable task was created or mutated");
+    }
+    if (intent.intent === "status") {
+      const parsed = defaultsForStatus();
+      const result = await runtime({ command: parsed.command, sourceEnvironment: "codex", overrides: parsed.overrides, activeTaskId: input.taskId });
+      return { ...result, userIntent: intent };
+    }
+    if (intent.intent === "continue") {
+      const continuationTarget = intent.project ?? input.taskId;
+      if (continuationTarget === null) return naturalResponse(input, intent, "blocked", "Continue is blocked because no task or project was identified");
+      const parsed = parseDAIInvocation(`@D-AI continue ${continuationTarget}`);
+      const result = await runtime({ command: parsed.command, sourceEnvironment: "codex", overrides: parsed.overrides, activeTaskId: input.taskId });
+      return { ...result, userIntent: intent };
+    }
+    if (intent.intent === "close" || intent.intent === "rollback") {
+      const parsed = parseDAIInvocation(`@D-AI ${intent.intent}`);
+      const result = await runtime({ command: parsed.command, sourceEnvironment: "codex", overrides: parsed.overrides, activeTaskId: input.taskId });
+      return { ...result, userIntent: intent };
+    }
+    if (intent.intent === "delivery") {
+      if (options.deliver === undefined) {
+        return naturalResponse(input, intent, "blocked", "Delivery orchestration is unavailable; explicit publication authority is required before commit, push, or PR creation");
+      }
+      const deliveryRequest: DeliveryRequest = {
+        taskId: input.taskId ?? "unassigned",
+        project: intent.project,
+        requestText: intent.text,
+        resumeExistingTask: intent.resumeExistingTask,
+        riskLevel: intent.riskLevel === 2 ? 2 : 1,
+        publicationRequested: intent.expectedEndpoint === "review-ready-pr",
+        expectedEndpoint: intent.expectedEndpoint === "review-ready-pr" ? "review-ready-pr" : "local-change",
+        publicationAuthority: options.publicationAuthority ?? null,
+      };
+      const deliveryResult = await options.deliver(deliveryRequest);
+      const response: CodexActivationResponse = {
+        taskId: deliveryResult.taskId,
+        stage: "execute",
+        environment: "codex",
+        status: deliveryResult.status,
+        evidence: [],
+        message: deliveryResult.formatted ?? deliveryResult.message,
+        userIntent: intent,
+        deliveryResult,
+      };
+      return deliveryResult.agentExecutionDirective === undefined
+        ? response
+        : { ...response, agentExecutionDirective: deliveryResult.agentExecutionDirective };
+    }
+    return naturalResponse(input, intent, "blocked", `${intent.intent} is recognized but unavailable in this local MVP; it remains fail-closed`);
   };
 }

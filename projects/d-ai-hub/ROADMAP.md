@@ -2,6 +2,7 @@
 
 ## Now — Codex-first D-AI V1 (accepted)
 
+0. Deliver the visible automation MVP: classify ordinary natural-language requests deterministically, preserve explicit `@D-AI` command priority, keep discussion/status read-only, and expose bounded delivery only through explicit dependency and publication-authority seams.
 1. Keep the superseding Codex-first scope decision in `projects/d-ai-hub/DECISIONS.md` and retain the 2026-08-21 v2 document as a traceable historical/future architecture reference.
 2. Deliver and verify one Codex local control path through the canonical `d-ai` Skill, raw-command CLI, workspace-scoped durable task discovery, ownership fencing, verification gates, recovery, rollback, and close.
 3. Use local durable state for task identity, ownership, context, and audit manifests; use the configured GitHub adapter for push evidence and exact remote repository/ref/SHA verification.
@@ -14,7 +15,7 @@
 - Canonical truth cleanup completed: the project checkpoint is concise, the superseded D-AI-Hub V2 implementation plan is archived, project continuation follows progressive loading, and repository health checks cover project lifecycle/index consistency.
 - Default handoff safety completed.
 - CI/reproducibility implemented.
-- Current stabilization: Windows Node 22 integration reliability.
+- Current milestone: visible natural-language automation MVP; live PR/CI status remains a GitHub query.
 - Actor/session ADR remains Proposed/Deferred; runtime implementation is not authorized by that proposal.
 
 ## V1 product boundary
@@ -29,6 +30,9 @@
 
 - Ownership fencing, atomic initial persistence, handoff restart reconciliation, partial rollback audit persistence, credential/quoted-secret rejection, and URL credential redaction.
 - Raw Codex command parsing into the existing runtime.
+- Deterministic natural-language intent classification for discussion, status, continuation, delivery, close, rollback, sync, and establish, with explicit `@D-AI` priority.
+- Thin delivery orchestration seam with context/workspace/implementation/verification/publication/CI/review-packet dependencies, stage timings, explicit publication authority, and a review-ready Delivery Result that always reports merge as `NO`.
+- Read-only discussion and status paths that do not create or mutate durable task state; ambiguous natural language fails closed to read-only handling.
 - Fresh-runtime workspace-scoped durable task selection for active-state commands.
 - Canonical repository Skill source, compatibility entry, CLI, and external-workspace activation tests.
 - Negative close-path acceptance for missing task, dirty worktree, missing credentials, and remote SHA mismatch.

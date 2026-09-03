@@ -1,9 +1,10 @@
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { redactSensitiveText } from "../adapters/command-runner.js";
+import { createCodexExecutionBoundary } from "../automation/delivery.js";
 import { InvalidTaskStateError } from "../domain/errors.js";
-import { createCodexActivation } from "./codex-activation.js";
-import { createConfiguredDAIRuntime, type DAIResponse } from "../runtime/d-ai-runtime.js";
+import { createCodexActivation, type CodexActivationResponse } from "./codex-activation.js";
+import { createConfiguredDAIRuntime } from "../runtime/d-ai-runtime.js";
 
 interface ParsedCLIArguments {
   readonly workspacePath: string;
@@ -13,7 +14,7 @@ interface ParsedCLIArguments {
 
 export interface CodexCLIResult {
   readonly exitCode: 0 | 2;
-  readonly response: DAIResponse;
+  readonly response: CodexActivationResponse;
 }
 
 function parseCLIArguments(arguments_: readonly string[]): ParsedCLIArguments {
@@ -42,7 +43,9 @@ function parseCLIArguments(arguments_: readonly string[]): ParsedCLIArguments {
 
 export async function runCodexCLI(arguments_: readonly string[]): Promise<CodexCLIResult> {
   const input = parseCLIArguments(arguments_);
-  const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: input.workspacePath }));
+  const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: input.workspacePath }), {
+    deliver: createCodexExecutionBoundary(),
+  });
   const response = await activate({ rawCommand: input.rawCommand, taskId: input.taskId });
   return { exitCode: response.status === "blocked" ? 2 : 0, response };
 }

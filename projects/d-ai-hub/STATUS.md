@@ -3,34 +3,31 @@
 ## State
 
 - Lifecycle: active
-- Last merged delivery: PR #28
+- Last merged delivery: PR #30
 - Active proposal: PR #29
-- Current stabilization: Windows Node 22 integration reliability
-- PR #26: merged
-- PR #27: merged
-- PR #28: merged; its main-push CI failed only in Windows Node 22 integration run `33687769873`
-- PR #30 first published CI run `33694319752`: Windows Node 22 Integration passed, while Ubuntu Node 22 Quality failed in the unchanged command-runner descendant cleanup test; main was not restored by that run
-- PR #30 current-head CI run `33697014816`: 8/8 CI jobs and GitGuardian passed for HEAD `6f627bb6fd5b93f96317c5b1edb36abfa595473e`
-- Main branch protection: disabled/not protected
+- Current objective: Visible natural-language automation MVP
+- Stable capability: natural-language intent classification, explicit `@D-AI` priority, structured Codex-agent handoff, and a bounded delivery seam with explicit publication authority
 - Live PR status must be queried from GitHub.
-- Last verified: 2026-09-03
+- Live PR/CI state: query GitHub
+- Main branch protection and remote freshness: live environment evidence only; query before release decisions
+- Last checkpoint: 2026-09-03
 
 ## Current checkpoint
 
-- Current objective: Diagnose and minimally stabilize the Windows Node 22 integration timeout without changing runtime behavior or weakening assertions.
-- Verified state: The live main-push failure was the public-runtime lifecycle test in `tests/integration/v1-contract.test.ts`; it reached 20,024ms and hit the 20,000ms timeout, while the entire test file reported 45.06s. Exact local Node 22.20.0/npm 11.19.0 reproduction did not reproduce the failure and passed across five isolated runs.
-- Working state: The hotfix branch is based on current `origin/main`; PR #29 is untouched and deferred. Main is not claimed restored before this hotfix is merged.
+- Current objective: Make the Codex entry understand ordinary project language while keeping mutation and publication fail-closed.
+- Verified state: The deterministic classifier covers discussion, status, continuation, delivery, close, rollback, sync, and establish; focused automation and entry tests pass. Discussion is read-only and creates no durable task state.
+- Working state: Delivery is a thin dependency-injected path for context, workspace, implementation, focused verification, typecheck, publication, CI wait, and review-packet construction. The raw CLI only classifies and returns an execution-required boundary result; attached Codex agent seams are required before implementation evidence. Publication authority gates Level 2, and delivery never merges or performs destructive Git actions.
 - Proposal boundary: The actor/session ADR remains Proposed/Deferred; actor/session runtime, Chat/Work activation, automatic sync, and related redesigns are not implemented.
-- Authorized scope: Only the seven packet-authorized files in the target integration test, project-doc, and health-check paths may change; no merge or auto-merge is authorized.
+- Authorized scope: This MVP does not add Chat/Work/provider routing, memory sync, RAG, embeddings, dashboards, swarm behavior, or a second orchestrator. No merge or auto-merge is authorized.
 
 ## Current blockers
 
-- PR #30 is open with live checks recorded above; main remains unrestored until a separately authorized merge.
-- Branch-protection state is live evidence only and is currently disabled/not protected.
+- Publication authority is required before commit, push, or PR creation; absent authority blocks at the Level 2 publication boundary while permitted Level 1 local work may still return a verified result.
+- Any PR, CI, branch-protection, or remote-freshness claim must be refreshed from GitHub rather than copied into this checkpoint.
 
 ## Next concrete action
 
-PR review and checks are complete; merge only after separate explicit authorization. Main is not restored until merge and a green main-push run.
+Independently review the current branch and live PR/CI evidence before any separately authorized merge decision; keep merge unperformed until that decision.
 
 ## Evidence pointers
 

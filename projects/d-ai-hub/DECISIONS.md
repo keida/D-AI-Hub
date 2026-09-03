@@ -12,7 +12,7 @@ D-AI V1 is Codex-first: Codex local control and execution, GitHub-backed durable
 
 Keep the existing Chat and Work adapters, handoff envelope, and environment-routing contracts as reference seams. They must remain explicitly unsupported/deferred and fail closed whenever their connectors are unavailable; they must not imply product activation or allow a virtual capability to produce completion.
 
-The V1 user-facing command set is `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`. Local durable state is authoritative for task identity and ownership; GitHub is authoritative for pushed evidence and exact remote repository/ref/SHA verification; Markdown project memory records durable project decisions and checkpoints.
+The V1 user-facing entry is ordinary natural-language project requests, deterministically classified into discussion, status, continuation, bounded delivery, close, rollback, sync, or establish. An explicit `@D-AI` command remains the force/precision override and takes priority over surrounding text. Local durable state is authoritative for task identity and ownership; GitHub is authoritative for pushed evidence and exact remote repository/ref/SHA verification; Markdown project memory records durable project decisions and checkpoints.
 
 This decision supersedes the delivery scope of the cross-environment V1 sections in `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md`, not the historical design or its contract definitions. The spec now carries a traceable scope note and keeps the deferred architecture visible.
 
@@ -174,7 +174,7 @@ Treat D-AI-Hub as four non-interchangeable delivery layers:
 3. Platform activation adapters translate a supported product invocation into the same raw logical `@D-AI` command and configured runtime.
 4. Chat, Work, and Codex capability connectors perform environment-specific operations and must advertise unavailable behavior as `BLOCKED`.
 
-Codex uses the user-discoverable `d-ai` Skill. Its user-facing form is `$d-ai @D-AI <command>`, with adapter-only `--task <task-id>` for explicit durable task selection in a fresh process. The `@D-AI` prefix remains a D-AI logical protocol and is not described as a Codex built-in command.
+At the time of this decision, Codex used the user-discoverable `d-ai` Skill with the user-facing form `$d-ai @D-AI <command>`, and adapter-only `--task <task-id>` for explicit durable task selection in a fresh process. That user-entry wording is partially superseded by the later natural-language-default acceptance: ordinary project language is now passed unchanged to the Skill/agent, while `@D-AI <command>` remains the force/precision override. The `@D-AI` prefix remains a D-AI logical protocol and is not described as a Codex built-in command.
 
 **Rationale**
 
