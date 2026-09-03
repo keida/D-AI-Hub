@@ -53,8 +53,13 @@ function hasMutationShape(text: string): boolean {
     || /创建(?:一个|一份)?\s*(?:CLI\s+)?(?:helper|解析器|辅助工具)\b/iu.test(text);
 }
 
+function isExplicitDiscussionRequest(text: string): boolean {
+  return /^\s*(?:(?:please|kindly)\s+|请(?:你)?\s*|帮我\s*)?(?:explain|describe|clarify|discuss)(?=\s|$)/iu.test(text)
+    || /^\s*(?:请(?:你)?\s*|帮我\s*)?(?:解释|说明|讨论|描述)/u.test(text);
+}
+
 function hasPublicationShape(text: string): boolean {
-  if (/^\s*(?:please\s+)?(?:explain|describe|clarify|discuss|解释|说明|讨论)/iu.test(text)) return false;
+  if (isExplicitDiscussionRequest(text)) return false;
   return /^\s*push\s*$/iu.test(text)
     || /^\s*pull\s+request\s*$/iu.test(text)
     || /^\s*推送分支\s*$/u.test(text)
@@ -120,6 +125,8 @@ export function classifyUserIntent(input: string): UserIntent {
   if (/^(?:@D-AI\s+)?(?:establish|setup|initialize)/iu.test(text) || /(?:建立|初始化)/u.test(text)) {
     return makeIntent(text, "establish", projectFromRequest(text), false, "establish", "setup", 1);
   }
+
+  if (isExplicitDiscussionRequest(text)) return makeIntent(text, "discuss", null, false, "discussion", "read-only", 0);
 
   const resumeExistingTask = hasContinueSignal(text);
   const publicationRequested = hasPublicationShape(text);
