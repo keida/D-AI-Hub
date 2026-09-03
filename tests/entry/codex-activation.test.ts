@@ -124,6 +124,25 @@ describe("Codex D-AI activation", () => {
     expect(requests[0]?.command).toEqual({ kind: "status" });
   });
 
+  it.each([
+    ["@D-AI status model=gpt-5", { model: "gpt-5", role: null, environment: null, stage: null }],
+    ["@D-AI status role=reviewer stage=verify", { model: null, role: "reviewer", environment: null, stage: "verify" }],
+    ["@D-AI status model=gpt-5 role=reviewer stage=verify", { model: "gpt-5", role: "reviewer", environment: null, stage: "verify" }],
+  ] as const)("preserves valid status overrides for %s", async (rawCommand, overrides) => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "task-status", stage: "verify", environment: "codex", status: "accepted", evidence: [], message: "status" };
+    };
+    const activate = createCodexActivation(runtime);
+
+    await activate({ rawCommand, taskId: null });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.command).toEqual({ kind: "status" });
+    expect(requests[0]?.overrides).toEqual(overrides);
+  });
+
   it("routes natural-language delivery to the thin orchestration seam", async () => {
     const deliveryRequests: string[] = [];
     const deliveryResult: DeliveryResult = {

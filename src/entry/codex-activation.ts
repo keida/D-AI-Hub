@@ -29,6 +29,21 @@ function isExplicitStatusOverride(text: string): boolean {
   return /^@D-AI\s+status(?:\s|[,，:：]|$)/iu.test(text.trim());
 }
 
+function parseExplicitStatusInvocation(text: string): ReturnType<typeof parseDAIInvocation> {
+  const match = /^@D-AI\s+status\b([\s\S]*)$/iu.exec(text.trim());
+  if (match === null) return parseDAIInvocation(text);
+  const trailingTokens = match[1]?.trim().split(/\s+/u).filter(Boolean) ?? [];
+  const overrideTokens = trailingTokens.filter((token) => {
+    try {
+      const parsed = parseDAIInvocation(`@D-AI status ${token}`);
+      return Object.values(parsed.overrides).some((value) => value !== null);
+    } catch {
+      return false;
+    }
+  });
+  return parseDAIInvocation(`@D-AI status${overrideTokens.length === 0 ? "" : ` ${overrideTokens.join(" ")}`}`);
+}
+
 function naturalResponse(input: CodexActivationInput, intent: UserIntent, status: DAIResponse["status"], message: string): CodexActivationResponse {
   return {
     taskId: input.taskId ?? "unassigned",
@@ -45,7 +60,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
   return async (input: CodexActivationInput): Promise<CodexActivationResponse> => {
     const rawText = input.rawCommand.trim();
     if (rawText.startsWith("@D-AI")) {
-      const parsed = isExplicitStatusOverride(rawText) ? defaultsForStatus() : parseDAIInvocation(rawText);
+      const parsed = isExplicitStatusOverride(rawText) ? parseExplicitStatusInvocation(rawText) : parseDAIInvocation(rawText);
       return runtime({
         command: parsed.command,
         sourceEnvironment: "codex",

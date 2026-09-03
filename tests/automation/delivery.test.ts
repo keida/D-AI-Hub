@@ -82,6 +82,62 @@ describe("createDeliveryOrchestrator", () => {
     expect(result.agentExecutionDirective).toBeUndefined();
   });
 
+  it("preserves publication evidence when CI waiting throws", async () => {
+    const result = await createDeliveryOrchestrator({
+      ...dependencies([]),
+      waitForCI: async () => { throw new Error("CI wait unavailable"); },
+    })({
+      taskId: "task-delivery-ci-error",
+      project: "D-AI-Hub",
+      requestText: "publish this change",
+      resumeExistingTask: false,
+      riskLevel: 2,
+      publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
+      publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      blockedAt: "ci-wait",
+      publicationStatus: "PASS",
+      branch: "codex/mvp",
+      commit: "a".repeat(40),
+      pr: "https://github.com/keida/D-AI-Hub/pull/31",
+      ci: "not-run",
+      platforms: { windows: "PENDING", linux: "PENDING" },
+    });
+    expect(result.decisionRequired).toMatch(/do not republish/i);
+  });
+
+  it("preserves publication and CI evidence when review packet construction throws", async () => {
+    const result = await createDeliveryOrchestrator({
+      ...dependencies([]),
+      buildReviewPacket: async () => { throw new Error("review packet unavailable"); },
+    })({
+      taskId: "task-delivery-review-error",
+      project: "D-AI-Hub",
+      requestText: "publish this change",
+      resumeExistingTask: false,
+      riskLevel: 2,
+      publicationRequested: true,
+      expectedEndpoint: "review-ready-pr",
+      publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
+    });
+
+    expect(result).toMatchObject({
+      status: "blocked",
+      blockedAt: "review-packet",
+      publicationStatus: "PASS",
+      branch: "codex/mvp",
+      commit: "a".repeat(40),
+      pr: "https://github.com/keida/D-AI-Hub/pull/31",
+      ci: "passed",
+      platforms: { windows: "PASS", linux: "PASS" },
+    });
+    expect(result.decisionRequired).toMatch(/do not republish/i);
+  });
+
   it("preserves passing platform evidence and rejects contradictory aggregate CI", async () => {
     const request: DeliveryRequest = {
       taskId: "task-delivery-platforms",

@@ -4,8 +4,18 @@ import { classifyUserIntent } from "../../src/automation/user-intent.js";
 describe("classifyUserIntent", () => {
   it.each([
     ["这个方案是不是应该改成 SQLite？", "discuss", "read-only", "discussion", null, false],
+    ["这个方案怎么样？", "discuss", "read-only", "discussion", null, false],
+    ["should we change to SQLite?", "discuss", "read-only", "discussion", null, false],
+    ["what is a commit?", "discuss", "read-only", "discussion", null, false],
+    ["explain publish/subscribe architecture", "discuss", "read-only", "discussion", null, false],
+    ["explain the prefix handling", "discuss", "read-only", "discussion", null, false],
+    ["review the exchange rate", "discuss", "read-only", "discussion", null, false],
     ["讨论一下这个方案", "discuss", "read-only", "discussion", null, false],
     ["检查一下当前状态", "status", "read-only", "status", null, false],
+    ["what is the current status?", "status", "read-only", "status", null, false],
+    ["how is the project status?", "status", "read-only", "status", null, false],
+    ["what is D-AI-Hub progress?", "status", "read-only", "status", "D-AI-Hub", false],
+    ["现在 D-AI-Hub 进展怎么样？", "status", "read-only", "status", "D-AI-Hub", false],
     ["现在 D-AI-Hub 做到哪里了？", "status", "read-only", "status", "D-AI-Hub", false],
     ["现在 D-AI-Hub 做到哪了？", "status", "read-only", "status", "D-AI-Hub", false],
     ["继续上次 D-AI-Hub 的工作。", "continue", "bounded-mutation", "continuation", "D-AI-Hub", true],
@@ -27,6 +37,12 @@ describe("classifyUserIntent", () => {
     ["同步 canonical main", "sync", "external-read", "sync", null, false],
     ["在新环境建立 D-AI-Hub", "establish", "setup", "establish", "D-AI-Hub", false],
     ["please continue the lending project and fix the status check", "delivery", "bounded-mutation", "local-change", "lending project", true],
+    ["publish this change", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["push this change", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["commit this change", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["commit and push this change", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["提交并推送这个修改", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["发布这个修改并提 PR", "delivery", "bounded-mutation", "review-ready-pr", null, false],
   ] as const)("recognizes %s", (text, intent, risk, expectedEndpoint, project, resumeExistingTask) => {
     expect(classifyUserIntent(text)).toMatchObject({
       intent,

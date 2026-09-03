@@ -27,20 +27,34 @@ function projectFromRequest(text: string): string | null {
   if (statusProject?.[1] !== undefined) return statusProject[1].trim();
   const progressProject = /(?:现在|当前|目前)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})(?=\s+(?:做到哪(?:里)?|到哪(?:里)?|进展))/iu.exec(text);
   if (progressProject?.[1] !== undefined) return progressProject[1].trim();
+  const englishProgressProject = /(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9._/-]*)\s+(?:status|progress)\b/iu.exec(text);
+  if (englishProgressProject?.[1] !== undefined && !/^(?:current|project)$/iu.test(englishProgressProject[1])) return englishProgressProject[1].trim();
   const labeled = /(?:项目|project|建立|初始化)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})/iu.exec(text);
-  return labeled?.[1]?.trim() ?? null;
+  const labeledProject = labeled?.[1]?.trim();
+  return labeledProject !== undefined && !/^(?:status|progress)$/iu.test(labeledProject) ? labeledProject : null;
 }
 
 function hasQuestionShape(text: string): boolean {
   return /[?？]|\b(?:is|are|should|could|would|whether|what|why|how)\b|(?:是不是|是否|应该|能不能|怎么|为什么)/iu.test(text);
 }
 
-function hasMutationShape(text: string): boolean {
-  return /(?:fix|change|implement|build|modify|update|deliver|create|open|publish|修复|修掉|修好|修改|改成|实现|构建|更新|交付|创建|发布|按.+改)/iu.test(text);
+function hasStatusQuestionShape(text: string): boolean {
+  return /^(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?(?:(?:current|project)\s+)?(?:[A-Za-z0-9][A-Za-z0-9._/-]*\s+)?(?:status|progress)\b/iu.test(text)
+    || /(?:现在|当前|目前)\s*(?:[A-Za-z0-9][A-Za-z0-9._/-]*\s*)?(?:状态|进展)(?:怎么样|如何|到哪(?:里)?|到哪里)?/u.test(text);
 }
 
-function hasPrSignal(text: string): boolean {
-  return /(?:\bPR\b|pull\s+request|review-ready|review\s+ready|合并请求)/iu.test(text);
+function hasMutationShape(text: string): boolean {
+  return /\b(?:fix|change|implement|build|modify|update|deliver)\b/iu.test(text)
+    || /(?:修复|修掉|修好|修改|改成|实现|构建|更新|交付|按.+改)/u.test(text);
+}
+
+function hasPublicationShape(text: string): boolean {
+  return /\bcommit\s+and\s+push\b/iu.test(text)
+    || /\b(?:commit|push|publish)\s+(?:(?:and|then)\s+)?(?:this|the|that|these|it|change|changes|code|update|modification|work|branch|repo|repository)\b/iu.test(text)
+    || /\b(?:create|open)\s+(?:a\s+)?(?:PR|pull\s+request)\b/iu.test(text)
+    || /\breview[- ]ready(?:\s+PR)?\b/iu.test(text)
+    || /(?:提交|推送|发布)(?:并|和)?(?:提交|推送|发布)?(?:这个|该|此)?(?:修改|改动|变更|代码|更新)(?:并|和)?(?:提\s*(?:PR|pull\s+request)|创建(?:\s*(?:PR|pull\s+request)|合并请求))?/iu.test(text)
+    || /(?:提\s*(?:PR|pull\s+request)|创建(?:\s*(?:PR|pull\s+request)|合并请求))/iu.test(text);
 }
 
 function hasContinueSignal(text: string): boolean {
@@ -76,6 +90,9 @@ export function classifyUserIntent(input: string): UserIntent {
   if (/(?:恢复之前状态|恢复先前状态|恢复到修改前|回到之前状态)/u.test(text)) {
     return makeIntent(text, "rollback", projectFromRequest(text), false, "rollback", "destructive", 3);
   }
+  if (hasStatusQuestionShape(text)) {
+    return makeIntent(text, "status", projectFromRequest(text), false, "status", "read-only", 0);
+  }
   if (hasQuestionShape(text)) return makeIntent(text, "discuss", null, false, "discussion", "read-only", 0);
   if (/^(?:@D-AI\s+)?(?:status|state|check\s+(?:the\s+)?(?:status|state)|查看状态|检查(?:一下)?当前状态|进展)/iu.test(text)
     || /^(?:查看|检查|查询).{0,24}(?:状态|进展)/iu.test(text)
@@ -96,15 +113,16 @@ export function classifyUserIntent(input: string): UserIntent {
   }
 
   const resumeExistingTask = hasContinueSignal(text);
-  if (hasMutationShape(text)) {
+  const publicationRequested = hasPublicationShape(text);
+  if (publicationRequested || hasMutationShape(text)) {
     return makeIntent(
       text,
       "delivery",
       projectFromRequest(text),
       resumeExistingTask,
-      hasPrSignal(text) ? "review-ready-pr" : "local-change",
+      publicationRequested ? "review-ready-pr" : "local-change",
       "bounded-mutation",
-      hasPrSignal(text) ? 2 : 1,
+      publicationRequested ? 2 : 1,
     );
   }
   if (resumeExistingTask || /^(?:continue|resume)\b|^(?:继续|接着|恢复)/iu.test(text)) {

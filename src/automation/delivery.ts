@@ -227,6 +227,8 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
     let changes: readonly string[] = [];
     let focusedTest: DeliveryResult["focusedTest"] = "not-run";
     let typecheck: DeliveryResult["typecheck"] = "not-run";
+    let publicationEvidence: DeliveryPublication | null = null;
+    let ciEvidence: DeliveryCI | null = null;
     let activeStage: DeliveryBlockedAt = "context-read";
     try {
       activeStage = "context-read";
@@ -282,8 +284,10 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
 
       activeStage = "publication";
       const publication = await timed("publication_ms", () => dependencies.publish(request, workspace, changes));
+      publicationEvidence = publication;
       activeStage = "ci-wait";
       const ci = await timed("ci_wait_ms", () => dependencies.waitForCI(request, publication));
+      ciEvidence = ci;
       if (ci.status !== "passed" || !hasCompletePassingPlatformEvidence(ci.platforms)) {
         const detail = ci.status !== "passed"
           ? ci.detail
@@ -330,11 +334,20 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
       const reviewPacket = await timed("review_packet_ms", () => dependencies.buildReviewPacket(request, completed));
       return finalize({ ...completed, reviewPacket, timings });
     } catch (error: unknown) {
-      return finalize(baseBlockedResult(request, `Delivery blocked by dependency error: ${errorMessage(error)}`, "Resolve the reported dependency error before continuing", activeStage, {
+      const message = `Delivery blocked by dependency error: ${errorMessage(error)}`;
+      const decisionRequired = publicationEvidence === null
+        ? "Resolve the reported dependency error before continuing"
+        : "Inspect the existing publication and CI evidence; do not republish or create a duplicate PR";
+      return finalize(baseBlockedResult(request, message, decisionRequired, activeStage, {
         changes,
-        branch,
+        branch: publicationEvidence?.branch ?? branch,
+        commit: publicationEvidence?.commit ?? null,
+        pr: publicationEvidence?.pr ?? null,
         focusedTest,
         typecheck,
+        ci: ciEvidence === null ? "not-run" : ciEvidence.status === "passed" ? "passed" : "failed",
+        platforms: ciEvidence?.platforms ?? { windows: "PENDING", linux: "PENDING" },
+        publicationStatus: publicationEvidence === null ? "PENDING" : "PASS",
         timings,
       }));
     }
