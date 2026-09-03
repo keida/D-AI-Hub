@@ -15,6 +15,7 @@ describe("classifyUserIntent", () => {
     ["what is the current status?", "status", "read-only", "status", null, false],
     ["how is the project status?", "status", "read-only", "status", null, false],
     ["what is D-AI-Hub progress?", "status", "read-only", "status", "D-AI-Hub", false],
+    ["what is D-AI-Hub's status?", "status", "read-only", "status", "D-AI-Hub", false],
     ["现在 D-AI-Hub 进展怎么样？", "status", "read-only", "status", "D-AI-Hub", false],
     ["现在 D-AI-Hub 做到哪里了？", "status", "read-only", "status", "D-AI-Hub", false],
     ["现在 D-AI-Hub 做到哪了？", "status", "read-only", "status", "D-AI-Hub", false],
@@ -43,6 +44,14 @@ describe("classifyUserIntent", () => {
     ["commit and push this change", "delivery", "bounded-mutation", "review-ready-pr", null, false],
     ["提交并推送这个修改", "delivery", "bounded-mutation", "review-ready-pr", null, false],
     ["发布这个修改并提 PR", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["give me an update on D-AI-Hub", "status", "read-only", "status", "D-AI-Hub", false],
+    ["update me on the project", "status", "read-only", "status", null, false],
+    ["create a local parser", "delivery", "bounded-mutation", "local-change", null, false],
+    ["创建一个 CLI helper", "delivery", "bounded-mutation", "local-change", null, false],
+    ["explain commit and push semantics", "discuss", "read-only", "discussion", null, false],
+    ["push", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["pull request", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["推送分支", "delivery", "bounded-mutation", "review-ready-pr", null, false],
   ] as const)("recognizes %s", (text, intent, risk, expectedEndpoint, project, resumeExistingTask) => {
     expect(classifyUserIntent(text)).toMatchObject({
       intent,

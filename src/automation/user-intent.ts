@@ -27,8 +27,10 @@ function projectFromRequest(text: string): string | null {
   if (statusProject?.[1] !== undefined) return statusProject[1].trim();
   const progressProject = /(?:现在|当前|目前)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})(?=\s+(?:做到哪(?:里)?|到哪(?:里)?|进展))/iu.exec(text);
   if (progressProject?.[1] !== undefined) return progressProject[1].trim();
-  const englishProgressProject = /(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9._/-]*)\s+(?:status|progress)\b/iu.exec(text);
-  if (englishProgressProject?.[1] !== undefined && !/^(?:current|project)$/iu.test(englishProgressProject[1])) return englishProgressProject[1].trim();
+  const englishProgressProject = /(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9._/-]*(?:'s)?)\s+(?:status|progress)\b/iu.exec(text);
+  if (englishProgressProject?.[1] !== undefined && !/^(?:current|project)$/iu.test(englishProgressProject[1])) return englishProgressProject[1].replace(/'s$/iu, "").trim();
+  const updateProject = /(?:give\s+me\s+an?\s+update\s+on|update\s+me\s+on)\s+([A-Za-z0-9][A-Za-z0-9._/-]*)\b/iu.exec(text);
+  if (updateProject?.[1] !== undefined && !/^(?:the|project)$/iu.test(updateProject[1])) return updateProject[1].trim();
   const labeled = /(?:项目|project|建立|初始化)\s+([A-Za-z0-9][A-Za-z0-9._/-]*(?:\s+[A-Za-z0-9][A-Za-z0-9._/-]*){0,5})/iu.exec(text);
   const labeledProject = labeled?.[1]?.trim();
   return labeledProject !== undefined && !/^(?:status|progress)$/iu.test(labeledProject) ? labeledProject : null;
@@ -39,17 +41,24 @@ function hasQuestionShape(text: string): boolean {
 }
 
 function hasStatusQuestionShape(text: string): boolean {
-  return /^(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?(?:(?:current|project)\s+)?(?:[A-Za-z0-9][A-Za-z0-9._/-]*\s+)?(?:status|progress)\b/iu.test(text)
-    || /(?:现在|当前|目前)\s*(?:[A-Za-z0-9][A-Za-z0-9._/-]*\s*)?(?:状态|进展)(?:怎么样|如何|到哪(?:里)?|到哪里)?/u.test(text);
+  return /^(?:what(?:'s| is)|how(?:'s| is))\s+(?:the\s+)?(?:(?:current|project)\s+)?(?:[A-Za-z0-9][A-Za-z0-9._/-]*(?:'s)?\s+)?(?:status|progress)\b/iu.test(text)
+    || /(?:现在|当前|目前)\s*(?:[A-Za-z0-9][A-Za-z0-9._/-]*\s*)?(?:状态|进展)(?:怎么样|如何|到哪(?:里)?|到哪里)?/u.test(text)
+    || /^(?:give\s+me\s+an?\s+update\s+on|update\s+me\s+on)\b/iu.test(text);
 }
 
 function hasMutationShape(text: string): boolean {
   return /\b(?:fix|change|implement|build|modify|update|deliver)\b/iu.test(text)
-    || /(?:修复|修掉|修好|修改|改成|实现|构建|更新|交付|按.+改)/u.test(text);
+    || /(?:修复|修掉|修好|修改|改成|实现|构建|更新|交付|按.+改)/u.test(text)
+    || /\bcreate\s+(?:a|an)\s+(?:local\s+)?(?:parser|helper)\b/iu.test(text)
+    || /创建(?:一个|一份)?\s*(?:CLI\s+)?(?:helper|解析器|辅助工具)\b/iu.test(text);
 }
 
 function hasPublicationShape(text: string): boolean {
-  return /\bcommit\s+and\s+push\b/iu.test(text)
+  if (/^(?:explain|describe|clarify|discuss|解释|说明|讨论)/iu.test(text)) return false;
+  return /^\s*push\s*$/iu.test(text)
+    || /^\s*pull\s+request\s*$/iu.test(text)
+    || /^\s*推送分支\s*$/u.test(text)
+    || /\bcommit\s+and\s+push\b/iu.test(text)
     || /\b(?:commit|push|publish)\s+(?:(?:and|then)\s+)?(?:this|the|that|these|it|change|changes|code|update|modification|work|branch|repo|repository)\b/iu.test(text)
     || /\b(?:create|open)\s+(?:a\s+)?(?:PR|pull\s+request)\b/iu.test(text)
     || /\breview[- ]ready(?:\s+PR)?\b/iu.test(text)
