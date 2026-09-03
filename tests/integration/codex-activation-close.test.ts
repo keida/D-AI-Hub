@@ -262,6 +262,25 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
+  it("continues the unique active durable task from a natural-language project name", async () => {
+    const fixture = await createActivationFixture("d-ai-codex-project-continue-");
+    try {
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "继续 d-ai", taskId: null });
+
+      expect(result).toMatchObject({
+        taskId: fixture.state.taskId,
+        status: "accepted",
+        message: `Continuing task ${fixture.state.taskId}`,
+        userIntent: { intent: "continue", project: "d-ai" },
+      });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("auto-selects the unique active workspace task before close verification", async () => {
     const fixture = await createActivationFixture("d-ai-codex-close-discovery-");
     try {

@@ -1958,6 +1958,66 @@ async function selectDiscoveredDurableTask(
   return null;
 }
 
+function canonicalProjectName(state: TaskState): string | null {
+  const entries = state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
+  if (entries.length !== 1) return null;
+  const repository = entries[0]!.slice("remote-repository:".length);
+  const separator = repository.lastIndexOf("/");
+  return separator < 0 || separator === repository.length - 1 ? null : repository.slice(separator + 1);
+}
+
+function projectCandidateDescription(state: TaskState): string {
+  const workspaceIdentity = state.contextManifest.find((entry) => entry.startsWith("identity:workspace:")) ?? "unavailable";
+  return `${state.taskId} (stage=${state.stage}, workspace=${workspaceIdentity})`;
+}
+
+async function resolveContinueProject(
+  request: DAIRequest,
+  command: Extract<DAICommand, { readonly kind: "continue" }>,
+  dependencies: DAIRuntimeDependencies,
+): Promise<string | DAIResponse> {
+  const exact = await dependencies.store.load(command.taskIdOrProject);
+  if (exact !== null) return command.taskIdOrProject;
+
+  const noMatch = (): DAIResponse => blockedWithoutState(
+    "unassigned",
+    request.sourceEnvironment,
+    `No active durable task found for project ${command.taskIdOrProject}`,
+  );
+  if (dependencies.workspacePath === null) return noMatch();
+  const discover = dependencies.discoverActiveTasks
+    ?? (dependencies.store.discoverActiveTasks === undefined
+      ? undefined
+      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
+  if (discover === undefined) return noMatch();
+  const discovered = await connectorOutcome(
+    () => discover(dependencies.workspacePath!),
+    closeConnectorFailure,
+  );
+  if (discovered.kind === "blocked") {
+    return blockedWithoutState(
+      "unassigned",
+      request.sourceEnvironment,
+      `Workspace project discovery blocked: ${discovered.message}`,
+    );
+  }
+  const candidates: TaskState[] = [];
+  for (const state of discovered.value) {
+    if (state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
+    if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
+  }
+  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (candidates.length === 0) return noMatch();
+  if (candidates.length > 1) {
+    return blockedWithoutState(
+      "ambiguous",
+      request.sourceEnvironment,
+      `Multiple active durable tasks found for project ${command.taskIdOrProject}: ${candidates.map(projectCandidateDescription).join(", ")}`,
+    );
+  }
+  return candidates[0]!.taskId;
+}
+
 export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request: ExternalDAIRequest) => Promise<DAIResponse> {
   validateDependencies(dependencies);
   const registry = createRuntimeTaskRegistry();
@@ -1974,7 +2034,14 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
       }
     }
     if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, registry);
-    if (request.command.kind === "continue") return continueTask(request, request.command, dependencies, registry);
+    if (request.command.kind === "continue") {
+      if (request.activeTaskId === undefined || request.activeTaskId === null) {
+        const selection = await resolveContinueProject(request, request.command, dependencies);
+        if (typeof selection !== "string") return selection;
+        return continueTask(request, { ...request.command, taskIdOrProject: selection }, dependencies, registry);
+      }
+      return continueTask(request, request.command, dependencies, registry);
+    }
     if (request.command.kind === "handoff") return handoffTask(request, request.command, dependencies, registry);
     if (request.command.kind === "complete") return completeHandoff(request, request.command, dependencies, registry);
     if (request.command.kind === "close") return closeActiveTask(request, dependencies, registry);
