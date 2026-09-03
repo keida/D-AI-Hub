@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { redactSecretShapedValues } from "../domain/manifest-id.js";
 
@@ -19,7 +20,16 @@ export interface ProcessTreeCleanupOptions {
   readonly queryProcessTree?: ((rootPid: number, remainingMs: number, signal?: AbortSignal) => Promise<readonly number[] | null>) | undefined;
   readonly sleep?: ((milliseconds: number, signal?: AbortSignal) => Promise<void>) | undefined;
   readonly processIsAlive?: ((pid: number) => boolean) | undefined;
+  readonly inspectProcessGroup?: ((processGroupId: number) => ProcessGroupInspection) | undefined;
 }
+
+export interface ProcessGroupMember {
+  readonly state: string;
+}
+
+export type ProcessGroupInspection =
+  | { readonly status: "ok"; readonly members: readonly ProcessGroupMember[] }
+  | { readonly status: "error" };
 
 export type ProcessTreeTerminator = (child: ChildProcess, options?: ProcessTreeCleanupOptions) => Promise<boolean>;
 
@@ -161,6 +171,91 @@ function processIsAlive(pid: number): boolean {
   } catch (error: unknown) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+type LinuxProcessStat = {
+  readonly state: string;
+  readonly processGroupId: number;
+};
+
+type LinuxProcessStatRead =
+  | { readonly status: "found"; readonly value: LinuxProcessStat }
+  | { readonly status: "missing" }
+  | { readonly status: "error" };
+
+function readLinuxProcessStat(pid: number): LinuxProcessStatRead {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
+    const processGroupId = Number(fields[2]);
+    if (!Number.isInteger(processGroupId)) return { status: "error" };
+    return { status: "found", value: { state: fields[0] ?? "unknown", processGroupId } };
+  } catch (error: unknown) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? { status: "missing" } : { status: "error" };
+  }
+}
+
+function inspectLinuxProcessGroup(processGroupId: number): ProcessGroupInspection {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return { status: "error" };
+  }
+  const members: ProcessGroupMember[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const stat = readLinuxProcessStat(Number(entry));
+    if (stat.status === "error") return { status: "error" };
+    if (stat.status === "found" && stat.value.processGroupId === processGroupId) members.push({ state: stat.value.state });
+  }
+  return { status: "ok", members };
+}
+
+function inspectProcessGroup(pid: number, processGroupId: number, options: ProcessTreeCleanupOptions): ProcessGroupInspection {
+  if (options.inspectProcessGroup !== undefined) return options.inspectProcessGroup(processGroupId);
+  if (process.platform === "linux") return inspectLinuxProcessGroup(processGroupId);
+  return processIsAlive(pid) ? { status: "ok", members: [{ state: "active" }] } : { status: "ok", members: [] };
+}
+
+async function waitForProcessTreeCleanup(pid: number, processGroupId: number, options: ProcessTreeCleanupOptions): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  if (timeoutMs <= 0) return false;
+  const now = options.now ?? (() => performance.now());
+  const sleep = options.sleep ?? ((milliseconds: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener("abort", finish, { once: true });
+    if (signal?.aborted) finish();
+  }));
+  const deadline = now() + timeoutMs;
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / 10) + 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const inspection = inspectProcessGroup(pid, processGroupId, options);
+    if (inspection.status === "error") return false;
+    if (now() >= deadline) return false;
+    if (!inspection.members.some((member) => member.state !== "Z")) return true;
+    const remainingMs = deadline - now();
+    if (remainingMs <= 0) return false;
+    const pause = await runWithinCleanupDeadline(deadline, now, (signal) => sleep(Math.min(10, remainingMs), signal));
+    if (!pause.completed) return false;
+  }
+  const inspection = inspectProcessGroup(pid, processGroupId, options);
+  if (inspection.status !== "ok" || now() >= deadline) return false;
+  return !inspection.members.some((member) => member.state !== "Z");
 }
 
 function runTaskkill(taskkill: string, pid: number, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -350,10 +445,15 @@ export async function terminateProcessTree(child: ChildProcess, options: Process
     }
     return false;
   }
+  const processStat = process.platform === "linux" ? readLinuxProcessStat(pid) : undefined;
+  const processGroupId = processStat?.status === "found" ? processStat.value.processGroupId : pid;
   try {
     process.kill(-pid, "SIGKILL");
-    return !processIsAlive(pid);
-  } catch {
+    return await waitForProcessTreeCleanup(pid, processGroupId, options);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      return await waitForProcessTreeCleanup(pid, processGroupId, options);
+    }
     return false;
   }
 }
