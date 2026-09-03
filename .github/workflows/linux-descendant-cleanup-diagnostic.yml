@@ -34,7 +34,7 @@ jobs:
       - name: Run tagged diagnostic
         env:
           DAI_LINUX_DESCENDANT_DIAGNOSTIC: "1"
-          DAI_LINUX_DESCENDANT_ITERATIONS: ${{ inputs.iterations }}
+          DAI_LINUX_DESCENDANT_ITERATIONS: ${{ inputs.iterations || '30' }}
           DAI_LINUX_DESCENDANT_OUTPUT: diagnostic-output.jsonl
         run: npx vitest run tests/adapters/command-runner-linux-diagnostic.test.ts --reporter=verbose
       - name: Upload diagnostic evidence
