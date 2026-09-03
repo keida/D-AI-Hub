@@ -106,6 +106,8 @@ describe.skipIf(process.platform !== "linux" || process.env.DAI_LINUX_DESCENDANT
       const completedAt = performance.now();
       const rootPid = descriptor.rootPid;
       const descendantPid = descriptor.descendantPid;
+      const rootAtReturn = readProcSnapshot(rootPid);
+      const descendantAtReturn = readProcSnapshot(descendantPid);
       const samples: Record<string, ProcSnapshot> = {};
       const returnAt = performance.now();
       for (const delay of [5, 10, 25, 50, 100, 250, 500, 1000]) {
@@ -122,8 +124,8 @@ describe.skipIf(process.platform !== "linux" || process.env.DAI_LINUX_DESCENDANT
         rootBeforeKill: descriptor.rootBeforeKill,
         descendantBeforeKill: descriptor.descendantBeforeKill,
         resultMarker,
-        rootAtReturn: readProcSnapshot(rootPid),
-        descendantAtReturn: readProcSnapshot(descendantPid),
+        rootAtReturn,
+        descendantAtReturn,
         samples,
         descendantActiveAtFinal: isActive(finalSnapshot),
       });

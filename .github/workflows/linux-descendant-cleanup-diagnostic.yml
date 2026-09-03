@@ -39,6 +39,7 @@ jobs:
           DAI_LINUX_DESCENDANT_OUTPUT: diagnostic-output.jsonl
         run: npx vitest run tests/adapters/command-runner-linux-diagnostic.test.ts --reporter=verbose
       - name: Upload diagnostic evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-descendant-cleanup-diagnostic-${{ github.run_id }}
