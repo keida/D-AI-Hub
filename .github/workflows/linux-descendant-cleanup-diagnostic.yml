@@ -23,7 +23,7 @@ jobs:
       - name: Install from lockfile
         run: npm ci
       - name: Run 30-run diagnostic
-        run: npx vitest run diagnostics/linux-descendant-cleanup-diagnostic.ts --reporter=verbose
+        run: npx vitest run --config diagnostics/vitest.config.ts --reporter=verbose
       - name: Upload diagnostic artifact
         if: always()
         uses: actions/upload-artifact@v4
