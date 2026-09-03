@@ -20,7 +20,7 @@ Route deterministically:
 
 - questions and status requests are read-only discussion/status paths;
 - continue/resume requests use the durable-task continuation path;
-- fix/change/build/deliver requests use the bounded delivery path only when its explicit dependencies and publication authority are configured;
+- fix/change/build/deliver requests use the bounded delivery path; Level 1 may produce a local verified result, while Level 2 publication requires explicit publication authority;
 - close, rollback, sync, and establish retain their named runtime paths or fail closed when unavailable;
 - ambiguous language is read-only and must not create or mutate durable state.
 
@@ -47,3 +47,5 @@ User-facing explicit syntax:
 `--task <task-id>` is an explicit Codex option for ambiguity resolution or recovery, not the normal user-facing command. Unconfigured Chat, Work, Codex, recovery, Git, or GitHub capabilities remain `BLOCKED`.
 
 Delivery is a thin visible orchestration seam. It may read context, prepare a workspace, implement, run focused verification, typecheck, publish, wait for CI, and build a review packet. It must receive explicit publication authority before commit, push, or PR creation; it never merges, auto-merges, force-pushes, deletes, resets, cleans, or performs destructive rollback. The delivery result must report stage timings and keep review/merge as a separate decision.
+
+The raw CLI is a real classification and execution-boundary check, not an implementation simulator. If no Codex agent execution seam is attached, it returns a formatted `BLOCKED` result with `execution required` and leaves files, tests, Git, CI, and durable task state unchanged. The Skill/agent continues Level 1 work through the actual Codex workspace; injected delivery dependencies are the only route to claim implementation or publication evidence.

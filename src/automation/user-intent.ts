@@ -34,7 +34,7 @@ function hasQuestionShape(text: string): boolean {
 }
 
 function hasMutationShape(text: string): boolean {
-  return /(?:fix|change|implement|build|modify|update|deliver|create|open|publish|修复|修改|改成|实现|构建|更新|交付|创建|发布)/iu.test(text);
+  return /(?:fix|change|implement|build|modify|update|deliver|create|open|publish|修复|修掉|修好|修改|改成|实现|构建|更新|交付|创建|发布|按.+改)/iu.test(text);
 }
 
 function hasPrSignal(text: string): boolean {
@@ -71,7 +71,7 @@ export function classifyUserIntent(input: string): UserIntent {
   if (/^(?:今天)?\s*(?:先)?(?:做到这里|到这里|暂时到这里)|(?:状态保存好|保存好状态)|(?:任务)?结束了|收尾/u.test(text)) {
     return makeIntent(text, "close", projectFromRequest(text), false, "close", "bounded-mutation", 1);
   }
-  if (/(?:恢复之前状态|恢复先前状态|回到之前状态)/u.test(text)) {
+  if (/(?:恢复之前状态|恢复先前状态|恢复到修改前|回到之前状态)/u.test(text)) {
     return makeIntent(text, "rollback", projectFromRequest(text), false, "rollback", "destructive", 3);
   }
   if (hasQuestionShape(text)) return makeIntent(text, "discuss", null, false, "discussion", "read-only", 0);

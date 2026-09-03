@@ -43,6 +43,7 @@ export interface DeliveryPublication {
 export interface DeliveryCI {
   readonly status: "passed" | "failed";
   readonly detail: string;
+  readonly platforms: DeliveryPlatforms;
 }
 
 export interface DeliveryPlatforms {
@@ -80,6 +81,10 @@ export interface DeliveryResult {
   readonly reviewPacket: string;
   readonly decisionRequired: string | null;
   readonly message: string;
+  readonly totalActiveExecutionMs: number;
+  readonly blockedAt: string | null;
+  readonly reason: string | null;
+  readonly userAction: string | null;
   readonly formatted?: string;
 }
 
@@ -127,25 +132,41 @@ function baseBlockedResult(request: DeliveryRequest, message: string, decisionRe
     reviewPacket: "",
     decisionRequired,
     message,
+    totalActiveExecutionMs: 0,
+    blockedAt: "delivery",
+    reason: message,
+    userAction: decisionRequired,
     ...overrides,
   };
 }
 
 function finalize(result: DeliveryResult): DeliveryResult {
-  return { ...result, formatted: formatDeliveryResult(result) };
+  const totalActiveExecutionMs = Object.values(result.timings).reduce((total, value) => total + value, 0);
+  return { ...result, totalActiveExecutionMs, formatted: formatDeliveryResult({ ...result, totalActiveExecutionMs }) };
 }
 
 export function formatDeliveryResult(result: DeliveryResult): string {
   const changes = result.changes.length === 0 ? "none" : result.changes.join(", ");
   const timing = Object.entries(result.timings).map(([key, value]) => `${key}=${value}ms`).join(", ");
   return [
+    "D-AI Delivery Result",
     `Task: ${result.taskId}`,
-    `Intent: ${result.intent} (Level ${result.riskLevel})${result.resumed ? " [resumed]" : ""}`,
+    `Intent: ${result.intent} (Level ${result.riskLevel})`,
+    `resumed: ${result.resumed ? "YES" : "NO"}`,
     `Changes: ${changes}`,
-    `Verification: focused=${result.focusedTest.toUpperCase()}, typecheck=${result.typecheck.toUpperCase()}, Windows=${result.platforms.windows}, Linux=${result.platforms.linux}`,
+    `Focused test: ${result.focusedTest.toUpperCase()}`,
+    `Typecheck: ${result.typecheck.toUpperCase()}`,
+    `CI: ${result.ci.toUpperCase()}`,
+    `Windows: ${result.platforms.windows}`,
+    `Linux: ${result.platforms.linux}`,
     `Publication: ${result.publicationStatus}${result.branch === null ? "" : `, branch=${result.branch}`}${result.commit === null ? "" : `, commit=${result.commit}`}${result.pr === null ? "" : `, PR=${result.pr}`}`,
     `Timing: ${timing}`,
+    `Total active execution: ${result.totalActiveExecutionMs}ms`,
     `Decision: ${result.decisionRequired ?? "none"}`,
+    `Completed/Blocked: ${result.status === "completed" ? "COMPLETED" : "BLOCKED"}`,
+    `Blocked at: ${result.blockedAt ?? "none"}`,
+    `Reason: ${result.reason ?? "none"}`,
+    `User action: ${result.userAction ?? "none"}`,
     "Merge performed: NO",
     `Status: ${result.status.toUpperCase()} — ${result.message}`,
   ].join("\n");
@@ -221,7 +242,7 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
           focusedTest,
           typecheck,
           ci: "failed",
-          platforms: { windows: "FAIL", linux: "FAIL" },
+          platforms: ci.platforms,
           publicationStatus: "PASS",
           branch: publication.branch,
           commit: publication.commit,
@@ -249,6 +270,10 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
         reviewPacket: "",
         decisionRequired: "Separate review and merge authorization are required",
         message: "Delivery completed through publication and CI; merge was not performed",
+        totalActiveExecutionMs: 0,
+        blockedAt: null,
+        reason: null,
+        userAction: null,
       };
       const reviewPacket = await timed("review_packet_ms", () => dependencies.buildReviewPacket(request, completed));
       return finalize({ ...completed, reviewPacket, timings });
@@ -264,16 +289,10 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
   };
 }
 
-export function createLocalPlanDelivery(workspacePath: string): (request: DeliveryRequest) => Promise<DeliveryResult> {
-  const orchestrate = createDeliveryOrchestrator({
-    readContext: async () => ({ summary: `local workspace plan for ${workspacePath}` }),
-    prepareWorkspace: async () => ({ branch: "local-plan", clean: true }),
-    implement: async () => ({ changes: [] }),
-    runFocusedTest: async () => ({ status: "passed", detail: "plan-only path makes no file changes" }),
-    runTypecheck: async () => ({ status: "passed", detail: "plan-only path has no generated code to typecheck" }),
-    publish: async () => { throw new Error("publication adapter is not configured for the local plan path"); },
-    waitForCI: async () => ({ status: "failed", detail: "CI adapter is not configured for the local plan path" }),
-    buildReviewPacket: async (_request, result) => formatDeliveryResult(result),
-  });
-  return async (request) => orchestrate(request);
+export function createCodexExecutionBoundary(): (request: DeliveryRequest) => Promise<DeliveryResult> {
+  return async (request) => finalize(baseBlockedResult(
+    request,
+    "The CLI classified this delivery request, but actual implementation must continue in the canonical Codex agent boundary; no files, tests, commits, pushes, or PRs were performed",
+    "Continue through the Codex Skill/agent execution seam for Level 1 implementation; request Level 2 publication authority separately",
+  ));
 }

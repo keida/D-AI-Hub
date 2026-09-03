@@ -67,8 +67,8 @@ describe("Codex D-AI CLI", () => {
       expect(result.response.message).toMatch(/publication authority/i);
       expect(result.response.deliveryResult).toMatchObject({
         status: "blocked",
-        focusedTest: "passed",
-        typecheck: "passed",
+        focusedTest: "not-run",
+        typecheck: "not-run",
         publicationStatus: "PENDING",
         mergePerformed: "NO",
       });
@@ -77,7 +77,7 @@ describe("Codex D-AI CLI", () => {
     }
   });
 
-  it("runs the natural-language Level 1 path end-to-end as a local bounded receipt", async () => {
+  it("runs the natural-language delivery boundary end-to-end and reports execution is required", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-natural-local-plan-"));
     try {
       const result = await runCodexCLI([
@@ -87,20 +87,23 @@ describe("Codex D-AI CLI", () => {
         "那就改成 SQLite。",
       ]);
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode).toBe(2);
       expect(result.response).toMatchObject({
-        status: "completed",
+        status: "blocked",
         userIntent: { intent: "delivery", riskLevel: 1 },
         deliveryResult: {
-          status: "completed",
+          status: "blocked",
           riskLevel: 1,
           changes: [],
+          focusedTest: "not-run",
+          typecheck: "not-run",
           publicationStatus: "PENDING",
           platforms: { windows: "PENDING", linux: "PENDING" },
           mergePerformed: "NO",
         },
       });
       expect(result.response.message).toContain("Task: unassigned");
+      expect(result.response.message).toContain("actual implementation must continue");
       expect(result.response.message).toContain("Merge performed: NO");
     } finally {
       await rm(workspacePath, { recursive: true, force: true });

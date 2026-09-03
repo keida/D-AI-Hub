@@ -12,7 +12,7 @@ D-AI V1 is Codex-first: Codex local control and execution, GitHub-backed durable
 
 Keep the existing Chat and Work adapters, handoff envelope, and environment-routing contracts as reference seams. They must remain explicitly unsupported/deferred and fail closed whenever their connectors are unavailable; they must not imply product activation or allow a virtual capability to produce completion.
 
-The V1 user-facing command set is `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`. Local durable state is authoritative for task identity and ownership; GitHub is authoritative for pushed evidence and exact remote repository/ref/SHA verification; Markdown project memory records durable project decisions and checkpoints.
+The V1 user-facing entry is ordinary natural-language project requests, deterministically classified into discussion, status, continuation, bounded delivery, close, rollback, sync, or establish. An explicit `@D-AI` command remains the force/precision override and takes priority over surrounding text. Local durable state is authoritative for task identity and ownership; GitHub is authoritative for pushed evidence and exact remote repository/ref/SHA verification; Markdown project memory records durable project decisions and checkpoints.
 
 This decision supersedes the delivery scope of the cross-environment V1 sections in `docs/specs/2026-08-21-d-ai-orchestrator-v2-design.md`, not the historical design or its contract definitions. The spec now carries a traceable scope note and keeps the deferred architecture visible.
 

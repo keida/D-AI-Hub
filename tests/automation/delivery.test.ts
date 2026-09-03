@@ -9,7 +9,7 @@ function dependencies(events: string[]): DeliveryDependencies {
     runFocusedTest: async () => { events.push("focused-test"); return { status: "passed", detail: "14/14 passed" }; },
     runTypecheck: async () => { events.push("typecheck"); return { status: "passed", detail: "tsc --noEmit passed" }; },
     publish: async () => { events.push("publication"); return { branch: "codex/mvp", commit: "a".repeat(40), pr: "https://github.com/keida/D-AI-Hub/pull/31" }; },
-    waitForCI: async () => { events.push("ci"); return { status: "passed", detail: "8/8 CI jobs passed" }; },
+    waitForCI: async () => { events.push("ci"); return { status: "passed", detail: "8/8 CI jobs passed", platforms: { windows: "PASS", linux: "PASS" } }; },
     buildReviewPacket: async () => { events.push("review-packet"); return "review-ready"; },
   };
 }
@@ -55,6 +55,25 @@ describe("createDeliveryOrchestrator", () => {
       ci_wait_ms: expect.any(Number),
       review_packet_ms: expect.any(Number),
     }));
+  });
+
+  it("preserves asymmetric Windows and Linux CI observations", async () => {
+    const events: string[] = [];
+    const asymmetric: DeliveryDependencies = {
+      ...dependencies(events),
+      waitForCI: async () => { events.push("ci"); return { status: "failed", detail: "Windows failed; Linux passed", platforms: { windows: "FAIL", linux: "PASS" } }; },
+    };
+    const result = await createDeliveryOrchestrator(asymmetric)({
+      taskId: "task-delivery-asymmetric",
+      project: "D-AI-Hub",
+      requestText: "fix the project and create a PR",
+      resumeExistingTask: false,
+      riskLevel: 2,
+      publicationRequested: true,
+      publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true, allowCreatePR: true },
+    });
+
+    expect(result).toMatchObject({ status: "blocked", ci: "failed", platforms: { windows: "FAIL", linux: "PASS" } });
   });
 
   it("blocks before any delivery stage when publication authority is absent", async () => {
@@ -153,9 +172,12 @@ describe("createDeliveryOrchestrator", () => {
 
     expect(events).toEqual(["context", "workspace", "implementation", "focused-test", "typecheck", "review-packet"]);
     expect(result).toMatchObject({ status: "completed", riskLevel: 1, publicationStatus: "PENDING", pr: null, mergePerformed: "NO" });
-    expect(result.formatted).toContain("Verification:");
-    expect(result.formatted).toContain("Windows=PENDING");
-    expect(result.formatted).toContain("Linux=PENDING");
+    expect(result.formatted).toContain("D-AI Delivery Result");
+    expect(result.formatted).toContain("Focused test: PASSED");
+    expect(result.formatted).toContain("Windows: PENDING");
+    expect(result.formatted).toContain("Linux: PENDING");
+    expect(result.formatted).toContain("Total active execution:");
+    expect(result.formatted).toContain("Completed/Blocked: COMPLETED");
     expect(result.formatted).toContain("Merge performed: NO");
   });
 });

@@ -11,13 +11,17 @@ describe("classifyUserIntent", () => {
     ["continue D-AI-Hub, fix the status check", "delivery", "bounded-mutation", "local-change", "D-AI-Hub", true],
     ["继续 D-AI-Hub", "continue", "bounded-mutation", "continuation", "D-AI-Hub", true],
     ["继续修复 D-AI-Hub 并创建 PR", "delivery", "bounded-mutation", "review-ready-pr", "D-AI-Hub", true],
+    ["继续 D-AI-Hub，把这个小 bug 修好，测试以后提 PR。", "delivery", "bounded-mutation", "review-ready-pr", "D-AI-Hub", true],
     ["修复健康检查并创建 pull request", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["帮我把 memory export 的错误处理修掉，测试好以后提 PR。", "delivery", "bounded-mutation", "review-ready-pr", null, false],
     ["那就改成 SQLite。", "delivery", "bounded-mutation", "local-change", null, false],
+    ["那就按这个方案改。", "delivery", "bounded-mutation", "local-change", null, false],
     ["关闭当前任务", "close", "bounded-mutation", "close", null, false],
     ["今天先做到这里，把状态保存好。", "close", "bounded-mutation", "close", null, false],
     ["这个任务结束了，帮我收尾。", "close", "bounded-mutation", "close", null, false],
     ["回滚刚才的变更", "rollback", "destructive", "rollback", null, false],
     ["恢复之前状态", "rollback", "destructive", "rollback", null, false],
+    ["刚才这次改动有问题，恢复到修改前。", "rollback", "destructive", "rollback", null, false],
     ["同步 canonical main", "sync", "external-read", "sync", null, false],
     ["在新环境建立 D-AI-Hub", "establish", "setup", "establish", "D-AI-Hub", false],
     ["please continue the lending project and fix the status check", "delivery", "bounded-mutation", "local-change", "lending project", true],
@@ -37,6 +41,13 @@ describe("classifyUserIntent", () => {
       risk: "read-only",
       expectedEndpoint: "discussion",
     });
+  });
+
+  it("maps the four explicit risk levels", () => {
+    expect(classifyUserIntent("这个方案是不是应该改成 SQLite？").riskLevel).toBe(0);
+    expect(classifyUserIntent("那就按这个方案改。").riskLevel).toBe(1);
+    expect(classifyUserIntent("修复健康检查并创建 PR").riskLevel).toBe(2);
+    expect(classifyUserIntent("恢复之前状态").riskLevel).toBe(3);
   });
 
   it("rejects non-string input", () => {

@@ -16,13 +16,13 @@
 
 - Current objective: Make the Codex entry understand ordinary project language while keeping mutation and publication fail-closed.
 - Verified state: The deterministic classifier covers discussion, status, continuation, delivery, close, rollback, sync, and establish; focused automation and entry tests pass. Discussion is read-only and creates no durable task state.
-- Working state: Delivery is a thin dependency-injected path for context, workspace, implementation, focused verification, typecheck, publication, CI wait, and review-packet construction. It reports stage timings, requires explicit publication authority, and never merges or performs destructive Git actions.
+- Working state: Delivery is a thin dependency-injected path for context, workspace, implementation, focused verification, typecheck, publication, CI wait, and review-packet construction. The raw CLI only classifies and returns an execution-required boundary result; attached Codex agent seams are required before implementation evidence. Publication authority gates Level 2, and delivery never merges or performs destructive Git actions.
 - Proposal boundary: The actor/session ADR remains Proposed/Deferred; actor/session runtime, Chat/Work activation, automatic sync, and related redesigns are not implemented.
 - Authorized scope: This MVP does not add Chat/Work/provider routing, memory sync, RAG, embeddings, dashboards, swarm behavior, or a second orchestrator. No merge or auto-merge is authorized.
 
 ## Current blockers
 
-- Publication authority is required before commit, push, or PR creation; absent authority blocks before mutation.
+- Publication authority is required before commit, push, or PR creation; absent authority blocks at the Level 2 publication boundary while permitted Level 1 local work may still return a verified result.
 - Any PR, CI, branch-protection, or remote-freshness claim must be refreshed from GitHub rather than copied into this checkpoint.
 
 ## Next concrete action

@@ -140,6 +140,10 @@ describe("Codex D-AI activation", () => {
       reviewPacket: "review-ready",
       decisionRequired: "Separate review and merge authorization are required",
       message: "Delivery completed",
+      totalActiveExecutionMs: 28,
+      blockedAt: null,
+      reason: null,
+      userAction: null,
     };
     const runtime = async (): Promise<DAIResponse> => { throw new Error("delivery should use orchestration seam"); };
     const activate = createCodexActivation(runtime, {

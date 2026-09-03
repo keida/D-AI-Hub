@@ -4,7 +4,7 @@ This repository is the canonical source of truth for D-AI-Hub across ChatGPT Web
 
 ## D-AI Command Protocol
 
-The following are D-AI-Hub natural-language workflows for Codex and compatible agents. They are not built-in commands. For current Codex-first V1, the primary daily commands are `@D-AI continue`, `@D-AI status`, `@D-AI close`, and `@D-AI rollback`; `@D-AI establish` and `@D-AI sync` are setup/freshness workflows, and `@D-AI update` remains an internal workflow for recording durable outcomes during a session. ChatGPT Web may discuss or view repository-hosted content but is not a D-AI runtime. When a supported agent message begins with one of these exact prefixes, interpret it as the workflow below and then continue with any task text that follows the command.
+The following are D-AI-Hub natural-language workflows for Codex and compatible agents. They are not built-in commands. For current Codex-first V1, ordinary project language is the default entry; explicit `@D-AI` commands override it. The daily intents are discussion, status, continuation, bounded delivery, close, and rollback; `@D-AI establish` and `@D-AI sync` are setup/freshness workflows, and `@D-AI update` remains an internal workflow for recording durable outcomes during a session. ChatGPT Web may discuss or view repository-hosted content but is not a D-AI runtime. When a supported agent message begins with an explicit `@D-AI` prefix, interpret that command first and then continue with any task text that follows it.
 
 The detailed V1 command reference is [`docs/commands.md`](docs/commands.md). Native Chat/Work activation and automatic cross-environment routing remain Future/Deferred; unavailable capabilities must fail closed.
 

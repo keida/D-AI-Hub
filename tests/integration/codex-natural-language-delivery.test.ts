@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { runCodexCLI } from "../../src/entry/codex-cli.js";
 
 describe("natural-language delivery boundary", () => {
-  it("executes the Level 1 local bounded-plan path through the real CLI entry", async () => {
+  it("executes the natural-language delivery boundary through the real CLI entry", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-natural-integration-"));
     try {
       const result = await runCodexCLI([
@@ -15,13 +15,15 @@ describe("natural-language delivery boundary", () => {
         "那就改成 SQLite。",
       ]);
 
-      expect(result.exitCode).toBe(0);
-      expect(result.response.deliveryResult?.status).toBe("completed");
+      expect(result.exitCode).toBe(2);
+      expect(result.response.deliveryResult?.status).toBe("blocked");
       expect(result.response.deliveryResult?.publicationStatus).toBe("PENDING");
-      expect(result.response.deliveryResult?.formatted).toContain("Verification:");
-      expect(result.response.deliveryResult?.formatted).toContain("Windows=PENDING");
-      expect(result.response.deliveryResult?.formatted).toContain("Linux=PENDING");
+      expect(result.response.deliveryResult?.focusedTest).toBe("not-run");
+      expect(result.response.deliveryResult?.formatted).toContain("D-AI Delivery Result");
+      expect(result.response.deliveryResult?.formatted).toContain("Windows: PENDING");
+      expect(result.response.deliveryResult?.formatted).toContain("Linux: PENDING");
       expect(result.response.deliveryResult?.formatted).toContain("Merge performed: NO");
+      expect(result.response.deliveryResult?.formatted).toContain("actual implementation must continue");
     } finally {
       await rm(workspacePath, { recursive: true, force: true });
     }

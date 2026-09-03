@@ -154,4 +154,6 @@ Any ordinary project request can use natural language without a D-AI command pre
 
 For a change request, the visible delivery path must have explicit publication authority. Without it, the request is blocked before commit, push, or PR creation. Delivery never merges or performs destructive Git actions.
 
+The raw CLI can classify the request and return an execution-required Delivery Result, but it does not simulate implementation, tests, Git, or CI. The canonical Codex Skill/agent must continue Level 1 work through an attached execution seam before any implementation or publication evidence is claimed.
+
 When a D-AI command prefix is used, the Codex Skill should invoke the runtime first and then continue the remainder of the user's request. A response that only explains the convention is not activation.
