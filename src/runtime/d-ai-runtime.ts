@@ -21,6 +21,7 @@ import {
 } from "../domain/errors.js";
 import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
+import { isDurableTaskId } from "../domain/task-id.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
@@ -360,7 +361,6 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
 }
 
 const executionIdentityPrefixes = ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"] as const;
-const durableTaskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const remoteRepositoryIdentityPattern = /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const projectCandidateDisplayLimit = 3;
 const projectCandidateFieldMaxLength = 96;
@@ -1988,7 +1988,7 @@ async function resolveContinueProject(
   command: Extract<DAICommand, { readonly kind: "continue" }>,
   dependencies: DAIRuntimeDependencies,
 ): Promise<string | DAIResponse> {
-  const exact = durableTaskIdPattern.test(command.taskIdOrProject)
+  const exact = isDurableTaskId(command.taskIdOrProject)
     ? await dependencies.store.load(command.taskIdOrProject)
     : null;
   if (exact !== null) return command.taskIdOrProject;
@@ -2017,7 +2017,7 @@ async function resolveContinueProject(
   }
   const candidates: TaskState[] = [];
   for (const state of discovered.value) {
-    if (!durableTaskIdPattern.test(state.taskId) || state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
+    if (!isDurableTaskId(state.taskId) || state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
     if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
   }
   candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));

@@ -5,6 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
+import { isDurableTaskId } from "../domain/task-id.js";
 import type { CloseCandidate, DebugSession, DurableContextManifest, Environment, TaskState } from "../domain/types.js";
 import type {
   DurableContextStore,
@@ -17,7 +18,6 @@ import type {
 } from "./durable-context-store.js";
 import { matchesCanonicalWorkspaceIdentity } from "./workspace-identity.js";
 
-const taskIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const credentialFieldPattern = /(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credential|cookie|password|private[_-]?key|secret|session[_-]?token)/i;
 export const FILE_DURABLE_CONTEXT_LEASE_MS = 30_000;
 const ownershipDirectoryName = "ownership";
@@ -256,7 +256,7 @@ function serialize(value: object): string {
 }
 
 function assertTaskId(taskId: string): void {
-  if (!taskIdPattern.test(taskId)) {
+  if (!isDurableTaskId(taskId)) {
     throw new InvalidTaskStateError(`Invalid task id: ${taskId}`);
   }
 }
@@ -588,7 +588,7 @@ export class FileDurableContextStore implements DurableContextStore {
 
     const candidates: TaskState[] = [];
     for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-      if (!entry.isDirectory() || !taskIdPattern.test(entry.name)) continue;
+      if (!entry.isDirectory() || !isDurableTaskId(entry.name)) continue;
       const state = await this.load(entry.name);
       if (state === null || state.stage === "close") continue;
       if (await matchesCanonicalWorkspaceIdentity(state.contextManifest, canonicalWorkspacePath)) {
