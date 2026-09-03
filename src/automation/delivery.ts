@@ -154,7 +154,6 @@ function baseBlockedResult(request: DeliveryRequest, message: string, decisionRe
     status: "blocked",
     taskId: request.taskId,
     intent: "delivery",
-    agentExecutionDirective: createAgentExecutionDirective(request),
     riskLevel: request.riskLevel,
     resumed: request.resumeExistingTask,
     changes: [],
@@ -343,10 +342,13 @@ export function createDeliveryOrchestrator(dependencies: DeliveryDependencies): 
 }
 
 export function createCodexExecutionBoundary(): (request: DeliveryRequest) => Promise<DeliveryResult> {
-  return async (request) => finalize(baseBlockedResult(
-    request,
-    "The CLI classified this delivery request, but actual implementation must continue in the canonical Codex agent boundary; no files, tests, commits, pushes, or PRs were performed",
-    "Continue through the Codex Skill/agent execution seam for Level 1 implementation; request Level 2 publication authority separately",
-    "implementation",
-  ));
+  return async (request) => finalize({
+    ...baseBlockedResult(
+      request,
+      "The CLI classified this delivery request, but actual implementation must continue in the canonical Codex agent boundary; no files, tests, commits, pushes, or PRs were performed",
+      "Continue through the Codex Skill/agent execution seam for Level 1 implementation; request Level 2 publication authority separately",
+      "implementation",
+    ),
+    agentExecutionDirective: createAgentExecutionDirective(request),
+  });
 }

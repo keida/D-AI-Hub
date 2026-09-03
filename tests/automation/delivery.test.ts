@@ -47,6 +47,7 @@ describe("createDeliveryOrchestrator", () => {
       mergePerformed: "NO",
       reviewPacket: "review-ready",
     });
+    expect(result.agentExecutionDirective).toBeUndefined();
     expect(result.timings).toEqual(expect.objectContaining({
       context_read_ms: expect.any(Number),
       workspace_prepare_ms: expect.any(Number),
@@ -78,6 +79,7 @@ describe("createDeliveryOrchestrator", () => {
 
     expect(result).toMatchObject({ status: "blocked", ci: "failed", platforms: { windows: "FAIL", linux: "PASS" } });
     expect(result.blockedAt).toBe("ci-wait");
+    expect(result.agentExecutionDirective).toBeUndefined();
   });
 
   it("preserves passing platform evidence and rejects contradictory aggregate CI", async () => {
@@ -100,6 +102,7 @@ describe("createDeliveryOrchestrator", () => {
     };
     const result = await createDeliveryOrchestrator(contradictory)(request);
     expect(result).toMatchObject({ status: "blocked", ci: "failed", platforms: { windows: "PASS", linux: "PENDING" }, blockedAt: "ci-wait" });
+    expect(result.agentExecutionDirective).toBeUndefined();
   });
 
   it("blocks at publication authority after preserving local verification", async () => {
@@ -126,6 +129,7 @@ describe("createDeliveryOrchestrator", () => {
       blockedAt: "publication-authority",
       decisionRequired: "Explicit publication authority is required before commit, push, or PR creation",
     });
+    expect(result.agentExecutionDirective).toBeUndefined();
     expect(result.timings).toEqual(expect.objectContaining({
       context_read_ms: expect.any(Number),
       workspace_prepare_ms: expect.any(Number),
@@ -161,6 +165,7 @@ describe("createDeliveryOrchestrator", () => {
     expect(result.blockedAt).toBe("focused-test");
     expect(result.timings.publication_ms).toBe(0);
     expect(result.decisionRequired).toContain("focused verification");
+    expect(result.agentExecutionDirective).toBeUndefined();
   });
 
   it("stops before implementation when workspace preparation is not clean", async () => {
@@ -189,6 +194,7 @@ describe("createDeliveryOrchestrator", () => {
       decisionRequired: "Resolve unrelated workspace changes before implementation or publication",
       mergePerformed: "NO",
     });
+    expect(result.agentExecutionDirective).toBeUndefined();
   });
 
   it("completes a Level 1 local delivery without publication authority", async () => {
