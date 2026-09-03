@@ -78,7 +78,7 @@ describe.skipIf(process.platform !== "linux" || process.env.DAI_LINUX_DESCENDANT
         command: process.execPath,
         arguments: ["-e", script, descriptorPath],
         cwd: null,
-        timeoutMs: 250,
+        timeoutMs: Number(process.env.DAI_LINUX_DESCENDANT_TIMEOUT_MS ?? "1000"),
       });
       let descriptor: ProcessDescriptor | undefined;
       for (let attempt = 0; attempt < 100 && descriptor === undefined; attempt += 1) {
