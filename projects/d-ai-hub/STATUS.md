@@ -3,31 +3,31 @@
 ## State
 
 - Lifecycle: active
-- Privacy intent: keep the repository private; GitHub visibility is live external state and is not a mutable checkpoint field.
-- Current objective: Visible natural-language automation MVP
-- Stable capability: natural-language intent classification, explicit `@D-AI` priority, structured Codex-agent handoff, and a bounded delivery seam with explicit publication authority
+- Privacy intent: PUBLIC is the accepted intentional state; do not store real private Memory, credentials, or confidential durable context while PUBLIC.
+- Current objective: Configured Codex repository preflight guarantee
+- Stable capability: natural-language intent classification, explicit `@D-AI` priority, structured Codex-agent handoff, bounded delivery, and fail-closed configured Codex repository identity preflight
 - Live PR status must be queried from GitHub.
 - Live GitHub CI, branch-protection, visibility, and remote-freshness state must be queried before release or privacy decisions.
 - Last checkpoint: 2026-09-04
 
 ## Current checkpoint
 
-- Current objective: Make the Codex entry understand ordinary project language while keeping mutation and publication fail-closed.
-- Verified state: The deterministic classifier covers discussion, status, continuation, delivery, close, rollback, sync, and establish; focused automation and entry tests pass. Discussion is read-only and creates no durable task state.
+- Stabilization: CLOSED. Legacy migration: ALREADY SATISFIED. Real natural-language and explicit task-ID DOGFOOD PASS.
+- Verified state: The future-task repository guarantee is IMPLEMENTED/VERIFIED after the required focused tests, integration suite, typecheck, and structural health checks passed: configured Codex Git root, origin, and canonical GitHub identity failures return `unassigned`/`bootstrap`/`BLOCKED` before durable task creation; a healthy disposable repository persists exactly one `remote-repository:<host>/<owner>/<repo>` in its earliest generation. Existing continuation and public Skill contracts remain covered.
 - Audit boundary: live GitHub state was queried for this review; PR numbers and mutable remote status are not canonical checkpoint fields.
-- Working state: Delivery is a thin dependency-injected path for context, workspace, implementation, focused verification, typecheck, publication, CI wait, and review-packet construction. The raw CLI only classifies and returns an execution-required boundary result; attached Codex agent seams are required before implementation evidence. Publication authority gates Level 2, and delivery never merges or performs destructive Git actions.
+- Working state: The candidate changes only the configured runtime preflight, strictly affected integration assertions/tests, and this checkpoint. Publication authority gates Level 2, and delivery never merges or performs destructive Git actions.
 - Proposal boundary: The actor/session ADR remains Proposed/Deferred; actor/session runtime, Chat/Work activation, automatic sync, and related redesigns are not implemented.
 - Authorized scope: This MVP does not add Chat/Work/provider routing, memory sync, RAG, embeddings, dashboards, swarm behavior, or a second orchestrator. No merge or auto-merge is authorized.
 
 ## Current blockers
 
-- Publication authority is required before commit, push, or PR creation; absent authority blocks at the Level 2 publication boundary while permitted Level 1 local work may still return a verified result.
+- Publication authority is required before commit, push, or PR creation; this candidate remains local and uncommitted. The full unit suite has one unrelated Windows line-ending byte assertion failure; targeted runtime/typecheck and all integration suites pass.
 - Any PR, CI, branch-protection, or remote-freshness claim must be refreshed from GitHub rather than copied into this checkpoint.
 - Repository privacy must be verified from live GitHub before private context is stored; changing public visibility to private requires user action.
 
 ## Next concrete action
 
-Independently review the current branch and live PR/CI evidence before any separately authorized merge decision; keep merge unperformed until that decision.
+Boss decides whether to publish this local uncommitted candidate; keep commit, push, PR, and merge unperformed until separately authorized.
 
 ## Evidence pointers
 

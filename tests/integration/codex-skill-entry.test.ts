@@ -61,7 +61,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("returns BLOCKED when the routed Codex execution connector is unconfigured", async () => {
+  it("returns BLOCKED when the configured Codex workspace is not a Git repository", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-connector-"));
     const discoveryRoot = join(root, "user-skills");
     const workspacePath = join(root, "unrelated-workspace");
@@ -79,8 +79,8 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
 
       expect(result.exitCode, result.stderr).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
-      expect(response).toMatchObject({ environment: "codex", status: "blocked", stage: "recover" });
-      expect(response.message).toMatch(/No safe bounded Codex verification operation is configured/i);
+      expect(response).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
+      expect(response.message).toMatch(/Configured Codex.*Git repository root/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -148,8 +148,8 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
 
       expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
-      expect(response).toMatchObject({ environment: "codex", status: "blocked", stage: "recover" });
-      expect(response.message).toMatch(/GitHub remote identity|github\.com|remote/i);
+      expect(response).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
+      expect(response.message).toMatch(/Configured Codex.*GitHub.*identity|origin/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
