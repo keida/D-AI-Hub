@@ -470,6 +470,17 @@ function blockedWithoutState(taskId: string, environment: Environment, message: 
   return { taskId, stage: "bootstrap", environment, status: "blocked", evidence: [], message: redactSensitiveText(message) };
 }
 
+class ConfiguredBootstrapPreflightError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = "ConfiguredBootstrapPreflightError";
+  }
+}
+
+function isBootstrapIdentityInspectionFailure(error: unknown): boolean {
+  return error instanceof InvalidTaskStateError && /^Unable to inspect (?:workspace|repository) identity at /u.test(error.message);
+}
+
 function connectorOutcome<T>(operation: () => Promise<T>, failureMessage: ConnectorFailureMessage): Promise<ConnectorOutcome<T>> {
   return Promise.resolve().then(operation).then(
     (value): ConnectorSuccess<T> => ({ kind: "success", value }),
@@ -1129,13 +1140,21 @@ async function executeIntent(
   registry: RuntimeTaskRegistry,
 ): Promise<DAIResponse> {
   const prepare = dependencies.prepareBootstrapTask ?? prepareBootstrapTask;
-  const bootstrapped = await prepare({
-    taskId: null,
-    goal: command.text,
-    environment: request.sourceEnvironment,
-    workspacePath: dependencies.workspacePath,
-    repositoryPath: dependencies.repositoryPath,
-  }, dependencies.store);
+  let bootstrapped: TaskState;
+  try {
+    bootstrapped = await prepare({
+      taskId: null,
+      goal: command.text,
+      environment: request.sourceEnvironment,
+      workspacePath: dependencies.workspacePath,
+      repositoryPath: dependencies.repositoryPath,
+    }, dependencies.store);
+  } catch (error: unknown) {
+    if (error instanceof ConfiguredBootstrapPreflightError) {
+      return blockedWithoutState("unassigned", request.sourceEnvironment, error.message);
+    }
+    throw error;
+  }
   return registry.serializeMutation(
     bootstrapped.taskId,
     () => withDurableTaskOwnership(
@@ -2119,20 +2138,32 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
       try {
         repositoryPath = await resolveGitRepositoryRoot(input.workspacePath);
       } catch {
-        return prepareBootstrapTask(input, configuredStore);
+        let existing: TaskState;
+        try {
+          existing = await prepareBootstrapTask(input, configuredStore);
+        } catch (error: unknown) {
+          if (isBootstrapIdentityInspectionFailure(error)) {
+            throw new ConfiguredBootstrapPreflightError("Configured Codex Git repository root could not be resolved");
+          }
+          throw error;
+        }
+        if (existing.durableContext !== null) return existing;
+        throw new ConfiguredBootstrapPreflightError("Configured Codex Git repository root could not be resolved");
       }
       const prepared = await prepareBootstrapTask({ ...input, repositoryPath }, configuredStore);
       let local;
       try {
         local = await inspectCurrentGitState(input.workspacePath, "origin");
       } catch {
-        return prepared;
+        if (prepared.durableContext !== null) return prepared;
+        throw new ConfiguredBootstrapPreflightError("Configured Codex origin remote could not be inspected");
       }
       let remoteRepository: string;
       try {
         remoteRepository = resolveGitHubRepository(local.remoteUrl, enterpriseHost).repository;
       } catch {
-        return prepared;
+        if (prepared.durableContext !== null) return prepared;
+        throw new ConfiguredBootstrapPreflightError("Configured Codex GitHub repository identity could not be resolved from origin");
       }
       const remoteEntries = prepared.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
       if (remoteEntries.length > 1 || (remoteEntries.length === 1 && remoteEntries[0] !== `remote-repository:${remoteRepository}`)) {

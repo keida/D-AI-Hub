@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -134,6 +134,26 @@ async function createActivationFixture(prefix: string): Promise<{
   await git(repositoryPath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
   const { state } = await seedCloseReadyTask(durableRoot, repositoryPath, commitSha, new Date().toISOString());
   return { root, repositoryPath, durableRoot, state };
+}
+
+async function createConfiguredBootstrapFixture(prefix: string, remoteUrl: string | null): Promise<{
+  readonly root: string;
+  readonly repositoryPath: string;
+  readonly durableRoot: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const repositoryPath = join(root, "repository");
+  const durableRoot = join(root, "durable");
+  await mkdir(repositoryPath);
+  await mkdir(join(repositoryPath, ".agents", "skills"), { recursive: true });
+  await git(null, ["init", "--initial-branch=main", repositoryPath]);
+  await git(repositoryPath, ["config", "user.email", "d-ai@example.test"]);
+  await git(repositoryPath, ["config", "user.name", "D-AI Test"]);
+  await writeFile(join(repositoryPath, "artifact.txt"), "verified artifact\n", "utf8");
+  await git(repositoryPath, ["add", "artifact.txt"]);
+  await git(repositoryPath, ["commit", "-m", "verified artifact"]);
+  if (remoteUrl !== null) await git(repositoryPath, ["remote", "add", "origin", remoteUrl]);
+  return { root, repositoryPath, durableRoot };
 }
 
 describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
@@ -276,6 +296,149 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         message: `Continuing task ${fixture.state.taskId}`,
         userIntent: { intent: "continue", project: "d-ai" },
       });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a configured Codex new task when Git root resolution fails without durable writes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-configured-bootstrap-no-git-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      await mkdir(workspacePath);
+      await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
+      const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({
+        rawCommand: "@D-AI establish repository guarantee",
+        taskId: null,
+      });
+
+      expect(result).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
+      expect(result.message).toMatch(/configured Codex|Git repository|repository root/i);
+      await expect(readdir(durableRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a configured Codex new task when the workspace cannot be inspected without durable writes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-configured-bootstrap-missing-workspace-"));
+    const workspacePath = join(root, "missing-workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({
+        rawCommand: "@D-AI establish repository guarantee",
+        taskId: null,
+      });
+
+      expect(result).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
+      expect(result.message).toMatch(/configured Codex|Git repository|repository root/i);
+      await expect(readdir(durableRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a configured Codex new task when origin inspection fails without durable writes", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-no-origin-", null);
+    try {
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
+      expect(result.message).toMatch(/configured Codex|origin|inspect/i);
+      await expect(readdir(fixture.durableRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a configured Codex new task when origin is not a canonical GitHub remote without durable writes", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-noncanonical-", "https://example.com/acme/d-ai.git");
+    try {
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
+      expect(result.message).toMatch(/configured Codex|GitHub|identity|origin/i);
+      await expect(readdir(fixture.durableRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("persists a healthy configured Codex new task with exactly one canonical remote identity", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-healthy-", "https://github.com/acme/d-ai.git");
+    try {
+      const store = new FileDurableContextStore(fixture.durableRoot);
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+
+      expect(result.taskId).toMatch(/^task-/);
+      expect(result.status).toBe("blocked");
+      const state = await store.load(result.taskId);
+      expect(state).not.toBeNull();
+      expect(state!.contextManifest.filter((entry) => entry.startsWith("remote-repository:"))).toEqual(["remote-repository:github.com/acme/d-ai"]);
+      const taskEntries = await readdir(join(fixture.durableRoot, result.taskId, "generations"));
+      const generationRecords = await Promise.all(taskEntries
+        .filter((entry) => !entry.startsWith("."))
+        .map(async (manifestId) => ({ manifestId, manifest: JSON.parse(await readFile(join(fixture.durableRoot, result.taskId, "generations", manifestId, "manifest.json"), "utf8")) as { readonly recordedAt: string }, state: JSON.parse(await readFile(join(fixture.durableRoot, result.taskId, "generations", manifestId, "state.json"), "utf8")) as TaskState })));
+      const orderedGenerations = [...generationRecords].sort((left, right) => left.manifest.recordedAt.localeCompare(right.manifest.recordedAt));
+      expect(orderedGenerations).toHaveLength(7);
+      expect(orderedGenerations.map((generation) => generation.state.stage)).toEqual(["bootstrap", "route", "plan", "execute", "execute", "debug", "recover"]);
+      expect(orderedGenerations[0]?.state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"))).toEqual(["remote-repository:github.com/acme/d-ai"]);
+      expect(orderedGenerations.every((generation) => generation.state.contextManifest.filter((entry) => entry.startsWith("remote-repository:")).length === 1)).toBe(true);
+      expect(orderedGenerations.every((generation) => generation.state.contextManifest.includes("remote-repository:github.com/acme/d-ai"))).toBe(true);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["Git root", async (repositoryPath: string) => { await rename(join(repositoryPath, ".git"), join(repositoryPath, "..", "git-hidden")); await mkdir(join(repositoryPath, ".git")); }],
+    ["origin", async (repositoryPath: string) => { await git(repositoryPath, ["remote", "remove", "origin"]); }],
+    ["canonical remote identity", async (repositoryPath: string) => { await git(repositoryPath, ["remote", "set-url", "origin", "https://example.com/acme/d-ai.git"]); }],
+  ] as const)("preserves an existing configured Codex task when %s preflight becomes unavailable", async (_label, invalidateRepository) => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-existing-preflight-", "https://github.com/acme/d-ai.git");
+    try {
+      const first = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+      expect(first.taskId).toMatch(/^task-/);
+      const store = new FileDurableContextStore(fixture.durableRoot);
+      const persisted = await store.load(first.taskId);
+      if (persisted === null) throw new Error("Expected the initial configured task to persist");
+      await store.withTaskOwnership(first.taskId, "codex", async (lease) => {
+        await store.save({
+          ...persisted,
+          stage: "bootstrap",
+          role: "analyst",
+          routingDecision: null,
+          selectedCapabilities: [],
+          verificationEvidence: [],
+          recoveryPoint: null,
+          recoverySnapshot: null,
+          handoffState: "none",
+          approvalState: "not-required",
+          criticalUnsavedContext: [],
+        }, lease);
+      });
+      await invalidateRepository(fixture.repositoryPath);
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+
+      expect(result).toMatchObject({ taskId: first.taskId, environment: "codex", status: "blocked" });
+      await expect(store.load(first.taskId)).resolves.toMatchObject({ taskId: first.taskId, stage: "recover" });
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
