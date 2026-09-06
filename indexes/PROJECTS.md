@@ -5,6 +5,7 @@ Canonical project state lives under `projects/`.
 ## Active projects
 
 - [D-AI-Hub](../projects/d-ai-hub/)
+- [Quote Float](../projects/quote-float/) — native Windows quota widget; WPF R1 accepted through QF-WPF-006, with QF-WPF-007 next.
 
 ## Planned projects
 
