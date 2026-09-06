@@ -33,6 +33,7 @@ An explicit `@D-AI` command overrides the natural-language default. In particula
    - `--task <task-id>` selects a durable task in a fresh Codex process.
    - `--workspace <path>` selects the target workspace; otherwise use the current workspace.
 3. Run this Skill's `scripts/invoke.ps1` with `-CommandText`, `-WorkspacePath`, and optional `-TaskId`; natural-language text is passed unchanged when it is the default entry.
+   The installed Skill root must contain a machine-local `.runtime-root` file pointing to a validated D-AI-Hub runtime checkout. Establish or switch that binding with `scripts/set-runtime-binding.ps1 -SkillRoot <installed-skill-root> -RuntimeRoot <d-ai-hub-checkout>`; a missing or invalid binding fails closed.
 4. Report the returned status, message, and evidence without converting `BLOCKED` or `NO` into completion.
 
 For `@D-AI status` and `@D-AI close`, omit `--task` on the normal path. The runtime discovers the unique active durable task for the current workspace. If there are zero matches, multiple matches, or an ownership/workspace conflict, keep the result `BLOCKED` and follow the returned retry guidance.
