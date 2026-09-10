@@ -5,6 +5,7 @@ import { parseRoutingOverrides, type RoutingOverrides } from "../routing/overrid
 export type DAICommand =
   | { readonly kind: "intent"; readonly text: string }
   | { readonly kind: "continue"; readonly taskIdOrProject: string }
+  | { readonly kind: "sync"; readonly project: string | null }
   | { readonly kind: "status" }
   | { readonly kind: "handoff"; readonly target: Environment }
   | { readonly kind: "complete"; readonly handoffId: string }
@@ -18,7 +19,7 @@ export interface ParsedDAIInvocation {
 
 const commandPrefix = "@D-AI";
 const environments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
-const reservedCommands: ReadonlySet<string> = new Set(["continue", "status", "handoff", "complete", "close", "rollback"]);
+const reservedCommands: ReadonlySet<string> = new Set(["continue", "sync", "status", "handoff", "complete", "close", "rollback"]);
 const routingOverrideKeys: ReadonlySet<string> = new Set(["model", "role", "environment", "stage"]);
 
 function normalizedTokens(input: string): readonly string[] {
@@ -57,6 +58,9 @@ function parseCommandTokens(tokens: readonly string[]): DAICommand {
       throw new InvalidTaskStateError("continue requires a task or project name");
     }
     return { kind: "continue", taskIdOrProject: arguments_.join(" ") };
+  }
+  if (command === "sync") {
+    return { kind: "sync", project: arguments_.length === 0 ? null : arguments_.join(" ") };
   }
   if (command === "status") {
     assertArgumentCount(command, arguments_, 0);

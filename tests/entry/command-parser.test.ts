@@ -8,6 +8,8 @@ describe("parseDAICommand", () => {
     ["  @D-AI   implement   the runtime  ", { kind: "intent", text: "implement the runtime" }],
     ["@D-AI continue task-123", { kind: "continue", taskIdOrProject: "task-123" }],
     ["@D-AI continue DeepSeek Harness", { kind: "continue", taskIdOrProject: "DeepSeek Harness" }],
+    ["@D-AI sync codex-quota-float", { kind: "sync", project: "codex-quota-float" }],
+    ["@D-AI sync", { kind: "sync", project: null }],
     ["@D-AI status", { kind: "status" }],
     ["@D-AI handoff chat", { kind: "handoff", target: "chat" }],
     ["@D-AI handoff work", { kind: "handoff", target: "work" }],
