@@ -151,6 +151,7 @@ const stageSchema = z.enum(["bootstrap", "route", "plan", "execute", "inspect", 
 const commandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("intent"), text: z.string().trim().min(1) }).strict(),
   z.object({ kind: z.literal("continue"), taskIdOrProject: z.string().trim().min(1) }).strict(),
+  z.object({ kind: z.literal("sync"), project: z.string().trim().min(1).nullable() }).strict(),
   z.object({ kind: z.literal("status") }).strict(),
   z.object({ kind: z.literal("handoff"), target: environmentSchema }).strict(),
   z.object({ kind: z.literal("complete"), handoffId: z.string().trim().min(1) }).strict(),
@@ -2058,6 +2059,13 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
   const registry = createRuntimeTaskRegistry();
   return async (externalRequest: ExternalDAIRequest): Promise<DAIResponse> => {
     const request = validateRequest(externalRequest);
+    if (request.command.kind === "sync") {
+      return blockedWithoutState(
+        request.activeTaskId ?? "unassigned",
+        request.sourceEnvironment,
+        `Sync${request.command.project === null ? "" : ` for project ${request.command.project}`} is recognized but unsupported in this runtime; no durable task was created or mutated`,
+      );
+    }
     if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
       const selection = await selectExplicitDurableTask(request.activeTaskId, request, dependencies, registry);
       if (selection !== null) return selection;
