@@ -131,6 +131,27 @@ describe("unsupported sync preflight", { timeout: 20_000 }, () => {
     }
   });
 
+  it("blocks punctuation-attached explicit sync before creating any durable task", async () => {
+    const fixture = await createRepositoryFixture("d-ai-unsupported-sync-punctuation-");
+    try {
+      await mkdir(join(fixture.repositoryPath, ".agents", "skills"), { recursive: true });
+      const before = await snapshotFiles(fixture.durableRoot);
+      const activate = createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }));
+
+      const result = await activate({ rawCommand: "@D-AI sync，然后核实 codex-quota-float", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", stage: "bootstrap", environment: "codex", status: "blocked" });
+      expect(result.message).toMatch(/sync.*unsupported|unsupported.*sync|not supported/i);
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
+      expect(await pathExists(fixture.durableRoot)).toBe(false);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it("does not mutate an existing durable task when explicit sync is unsupported", async () => {
     const fixture = await createRepositoryFixture("d-ai-unsupported-sync-existing-");
     try {

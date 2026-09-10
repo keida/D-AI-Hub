@@ -62,6 +62,13 @@ function parseCommandTokens(tokens: readonly string[]): DAICommand {
   if (command === "sync") {
     return { kind: "sync", project: arguments_.length === 0 ? null : arguments_.join(" ") };
   }
+  const punctuationAttachedSync = command.match(/^sync([,，:：])(.*)$/u);
+  if (punctuationAttachedSync !== null) {
+    const projectArguments = punctuationAttachedSync[2]!.length === 0
+      ? arguments_
+      : [punctuationAttachedSync[2]!, ...arguments_];
+    return { kind: "sync", project: projectArguments.length === 0 ? null : projectArguments.join(" ") };
+  }
   if (command === "status") {
     assertArgumentCount(command, arguments_, 0);
     return { kind: "status" };
