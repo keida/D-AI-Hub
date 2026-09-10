@@ -185,7 +185,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("returns NO when the configured remote reports a different SHA", async () => {
+  it("retains the GitHub gate for an explicit publication close", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-close-mismatch-"));
     const repositoryPath = join(root, "repository");
     const durableRoot = join(root, "durable");
@@ -215,9 +215,14 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         durableRoot,
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
       });
-      const activate = createCodexActivation(runtime);
-
-      const result = await activate({ rawCommand: "@D-AI close", taskId: state.taskId });
+      const result = await runtime({
+        command: { kind: "close" },
+        sourceEnvironment: "codex",
+        overrides: { model: null, role: null, environment: null, stage: null },
+        activeTaskId: state.taskId,
+        publicationRequested: true,
+        publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true },
+      });
 
       expect(result.status).toBe("blocked");
       expect(result.message).toMatch(/Close verdict NO.*Remote SHA does not match/i);
@@ -226,30 +231,39 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("returns NO for a dirty worktree without calling the push transport", async () => {
+  it("blocks local close without calling GitHub for a dirty worktree", async () => {
     const fixture = await createActivationFixture("d-ai-codex-close-dirty-");
     try {
       await writeFile(join(fixture.repositoryPath, "dirty.txt"), "unsaved work\n", "utf8");
       const transport: GitTransport = {
-        pushRef: async () => { throw new Error("Dirty close must not push"); },
-        readRef: async () => { throw new Error("Dirty close must not verify a remote"); },
+        pushRef: async () => { throw new Error("Local close must not push"); },
+        readRef: async () => { throw new Error("Local close must not verify a remote"); },
+      };
+      let pushCalls = 0;
+      let remoteCalls = 0;
+      const countingTransport: GitTransport = {
+        pushRef: async (...args) => { pushCalls += 1; return transport.pushRef(...args); },
+        readRef: async (...args) => { remoteCalls += 1; return transport.readRef(...args); },
       };
       const activate = createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,
         durableRoot: fixture.durableRoot,
-        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, countingTransport),
       }));
 
       const result = await activate({ rawCommand: "@D-AI close", taskId: fixture.state.taskId });
 
       expect(result.status).toBe("blocked");
-      expect(result.message).toMatch(/Close verdict NO.*worktree is not clean/i);
+      expect(result.message).toMatch(/Close verdict BLOCKED.*worktree/i);
+      expect(result.message).not.toMatch(/Safe-to-delete: YES/i);
+      expect(pushCalls).toBe(0);
+      expect(remoteCalls).toBe(0);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
   });
 
-  it("returns BLOCKED when GitHub credentials are not configured", async () => {
+  it("completes local close when GitHub credentials are not configured", async () => {
     const fixture = await createActivationFixture("d-ai-codex-close-unconfigured-");
     try {
       const activate = createCodexActivation(createConfiguredDAIRuntime({
@@ -260,8 +274,8 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
 
       const result = await activate({ rawCommand: "@D-AI close", taskId: fixture.state.taskId });
 
-      expect(result.status).toBe("blocked");
-      expect(result.message).toMatch(/Close verdict BLOCKED.*credentials.*configuration/i);
+      expect(result.status).toBe("completed");
+      expect(result.message).toMatch(/Local close completed/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -469,7 +483,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       }))({ rawCommand: "@D-AI close", taskId: null });
 
       expect(result.taskId).toBe(fixture.state.taskId);
-      expect(result.message).toMatch(/Close verdict BLOCKED.*credentials/i);
+      expect(result.message).toMatch(/Local close completed.*Safe-to-delete: YES/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -509,9 +523,9 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
 
       const closed = await createCodexActivation(freshRuntime)({ rawCommand: "@D-AI close", taskId: null });
       expect(closed).toMatchObject({ taskId: fixture.state.taskId, status: "completed", stage: "close" });
-      expect(closed.message).toMatch(/YES/i);
-      expect(pushCalls).toBe(1);
-      expect(readCalls).toBe(1);
+      expect(closed.message).toMatch(/Local close completed/i);
+      expect(pushCalls).toBe(0);
+      expect(readCalls).toBe(0);
       const afterClose = await new FileDurableContextStore(fixture.durableRoot).load(fixture.state.taskId);
       if (afterClose === null) throw new Error("Expected the durable task after close");
       for (const prefix of ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"]) {
@@ -524,8 +538,8 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
       });
       await expect(createCodexActivation(finalRuntime)({ rawCommand: "@D-AI close", taskId: null })).resolves.toMatchObject({ taskId: "unassigned", status: "blocked" });
-      expect(pushCalls).toBe(1);
-      expect(readCalls).toBe(1);
+      expect(pushCalls).toBe(0);
+      expect(readCalls).toBe(0);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -778,7 +792,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("honors an explicit Enterprise GitHub host through Codex bootstrap, execution, recovery, and close", async () => {
+  it("honors an explicit Enterprise GitHub host through Codex bootstrap, execution, recovery, and publication close", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-enterprise-host-"));
     const workspacePath = join(root, "workspace");
     const durableRoot = join(workspacePath, ".d-ai");
@@ -816,7 +830,14 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       expect(task?.contextManifest).toContain("remote-repository:git.example.test/acme/d-ai");
       expect(task?.recoveryPoint).not.toBeNull();
 
-      const closed = await activate({ rawCommand: "@D-AI close", taskId: verified.taskId });
+      const closed = await runtime({
+        command: { kind: "close" },
+        sourceEnvironment: "codex",
+        overrides: { model: null, role: null, environment: null, stage: null },
+        activeTaskId: verified.taskId,
+        publicationRequested: true,
+        publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true },
+      });
       expect(closed).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "completed", stage: "close" });
       expect(closed.message).toMatch(/YES/i);
       await expect(git(bareRemotePath, ["rev-parse", "refs/heads/main"])).resolves.toMatch(/^[a-f0-9]{40}$/);

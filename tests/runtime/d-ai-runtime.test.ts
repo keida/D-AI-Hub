@@ -2053,7 +2053,7 @@ describe("D-AI runtime", () => {
     expect(response.status).toBe(expectedStatus);
     expect(runtimeHarness.executed).toHaveLength(executionsBeforeClose);
     await expect(readFile(sentinelPath, "utf8")).resolves.toBe(sentinelBefore);
-    expect(response.message).toMatch(verdict === "YES" ? /yes/i : new RegExp(verdict, "i"));
+    expect(response.message).toMatch(verdict === "YES" ? /local close completed/i : new RegExp(verdict, "i"));
     expect(runtimeHarness.closedStates.at(-1)?.stage).toBe("verify");
   });
 
@@ -2351,8 +2351,27 @@ describe("D-AI runtime", () => {
       stage: "close",
       environment: "codex",
       status: "completed",
-      message: "Safe-to-delete: YES",
+      message: "Local close completed; Safe-to-delete: YES; GitHub publication was not requested",
     });
+  });
+
+  it("blocks publication close without explicit commit and push authority", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const seedingRuntime = createDAIRuntime(runtimeHarness.dependencies);
+    const accepted = await seedingRuntime(intentRequest("codex", noOverrides));
+    const freshRuntime = createDAIRuntime(runtimeHarness.dependencies);
+
+    const result = await freshRuntime({
+      command: { kind: "close" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      activeTaskId: accepted.taskId,
+      publicationRequested: true,
+    });
+
+    expect(result).toMatchObject({ taskId: accepted.taskId, stage: "verify", status: "blocked" });
+    expect(result.message).toMatch(/explicit commit and push authority/i);
+    expect(runtimeHarness.closedStates).toHaveLength(0);
   });
 
   it("keeps a NO close retryable in verify before the real close evaluator runs", async () => {

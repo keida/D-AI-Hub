@@ -20,11 +20,11 @@ Route deterministically:
 
 - questions and status requests are read-only discussion/status paths;
 - continue/resume requests use the durable-task continuation path;
-- fix/change/build/deliver requests use the bounded delivery path; Level 1 may produce a local verified result, while Level 2 publication requires explicit publication authority;
+- fix/change/build/deliver requests use the bounded delivery path; local implementation and verification remain local by default, while milestone publication requires explicit publication authority;
 - close, rollback, sync, and establish retain their named runtime paths or fail closed when unavailable;
 - ambiguous language is read-only and must not create or mutate durable state.
 
-Risk levels are explicit: Level 0 is read-only discussion/status, Level 1 is local reversible implementation, Level 2 is publication (commit/push/PR), and Level 3 is irreversible or destructive action. Publication authority gates only Level 2 publication; it does not block a permitted Level 0 read or Level 1 local result.
+Risk levels are explicit: Level 0 is read-only discussion/status, Level 1 is local reversible implementation, Level 2 is publication, and Level 3 is irreversible or destructive action. Verification tiers are separate: Tier 1 is ordinary local checking, Tier 2 is critical local verification, and Tier 3 is publication/remote evidence. Local Level 1 work and Tier 1/2 verification do not publish by default. Publication authority gates commit/push/PR/CI publication; it does not block a permitted local result.
 
 An explicit `@D-AI` command overrides the natural-language default. In particular, an explicit status command remains status even if later text asks for a change. There is no new user-facing `@D-AI deliver` command.
 
@@ -36,7 +36,7 @@ An explicit `@D-AI` command overrides the natural-language default. In particula
    The installed Skill root must contain a machine-local `.runtime-root` file pointing to a validated D-AI-Hub runtime checkout. Establish or switch that binding with `scripts/set-runtime-binding.ps1 -SkillRoot <installed-skill-root> -RuntimeRoot <d-ai-hub-checkout>`; a missing or invalid binding fails closed.
 4. Report the returned status, message, and evidence without converting `BLOCKED` or `NO` into completion.
 
-For `@D-AI status` and `@D-AI close`, omit `--task` on the normal path. The runtime discovers the unique active durable task for the current workspace. If there are zero matches, multiple matches, or an ownership/workspace conflict, keep the result `BLOCKED` and follow the returned retry guidance.
+For `@D-AI status` and `@D-AI close`, omit `--task` on the normal path. The runtime discovers the unique active durable task for the current workspace. Close is local by default; an explicit publication close must provide publication intent and authority. If there are zero matches, multiple matches, or an ownership/workspace conflict, keep the result `BLOCKED` and follow the returned retry guidance.
 
 User-facing explicit syntax:
 
@@ -47,7 +47,7 @@ User-facing explicit syntax:
 
 `--task <task-id>` is an explicit Codex option for ambiguity resolution or recovery, not the normal user-facing command. Unconfigured Chat, Work, Codex, recovery, Git, or GitHub capabilities remain `BLOCKED`.
 
-Delivery is a thin visible orchestration seam. It may read context, prepare a workspace, implement, run focused verification, typecheck, publish, wait for CI, and build a review packet. It must receive explicit publication authority before commit, push, or PR creation; it never merges, auto-merges, force-pushes, deletes, resets, cleans, or performs destructive rollback. The delivery result must report stage timings and keep review/merge as a separate decision.
+Delivery is a thin visible orchestration seam. It may read context, prepare a workspace, implement, run focused verification, typecheck, and build a local review packet. Publication, CI, and release steps occur only for an explicit milestone/publication request with authority; commit, push, and PR creation never receive implicit authorization. It never merges, auto-merges, force-pushes, deletes, resets, cleans, or performs destructive rollback. The delivery result must report stage timings and keep review/merge as a separate decision.
 
 The raw CLI is a real classification and execution-boundary check, not an implementation simulator. If no Codex agent execution seam is attached, it returns a formatted `BLOCKED` result with `execution required` and leaves files, tests, Git, CI, and durable task state unchanged. The Skill/agent continues Level 1 work through the actual Codex workspace; injected delivery dependencies are the only route to claim implementation or publication evidence.
 

@@ -3,7 +3,7 @@ import { GitRemoteBlockedError } from "../../src/adapters/github.js";
 import { closeTask } from "../../src/close/close-service.js";
 import type { DurableContextStore, TaskOwnershipGuard, TaskOwnershipLease } from "../../src/state/durable-context-store.js";
 import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../../src/adapters/github.js";
-import type { GitFailureCategory } from "../../src/adapters/git.js";
+import type { GitFailureCategory, LocalGitState } from "../../src/adapters/git.js";
 import type { CloseCandidate, DurableContextManifest, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 
 const gateNames = [
@@ -99,6 +99,19 @@ function closeReadyState(now: string): TaskState {
     approvalState: "approved",
     criticalUnsavedContext: [],
     durableContext,
+  };
+}
+
+function cleanLocalGitState(): LocalGitState {
+  return {
+    repositoryPath: "C:\\repo",
+    branch: "main",
+    head: "e".repeat(40),
+    worktreeStatus: "",
+    remote: "origin",
+    remoteUrl: "https://github.com/acme/d-ai.git",
+    pushUrl: "https://github.com/acme/d-ai.git",
+    ref: "refs/heads/main",
   };
 }
 
@@ -200,6 +213,50 @@ function unexpectedGitHub(): GitHubAdapter {
 }
 
 describe("closeTask", () => {
+  it("completes local close without calling GitHub", async () => {
+    const state = closeReadyState(new Date().toISOString());
+    let pushCalls = 0;
+    let remoteCalls = 0;
+
+    const verdict = await closeTask(state, {
+      store: storeFor(state),
+      gitHub: {
+        pushExpectedCommit: async (): Promise<GitPushEvidence> => {
+          pushCalls += 1;
+          return successfulPush();
+        },
+        verifyRemoteState: async (): Promise<RemoteState> => {
+          remoteCalls += 1;
+          return matchingRemoteState("e".repeat(40));
+        },
+      },
+      inspectLocalGitState: async (): Promise<LocalGitState> => cleanLocalGitState(),
+    }, ...validCloseOwnership(), "local");
+
+    expect(verdict.status).toBe("YES");
+    expect(verdict.closeCandidate).not.toBeNull();
+    expect(pushCalls).toBe(0);
+    expect(remoteCalls).toBe(0);
+  });
+
+  it.each([
+    { label: "dirty worktree", mutate: (local: LocalGitState): LocalGitState => ({ ...local, worktreeStatus: "?? unsaved.txt" }), reason: /worktree/i },
+    { label: "branch identity", mutate: (local: LocalGitState): LocalGitState => ({ ...local, branch: "other" }), reason: /branch|ref/i },
+    { label: "HEAD identity", mutate: (local: LocalGitState): LocalGitState => ({ ...local, head: "f".repeat(40) }), reason: /HEAD|commit/i },
+    { label: "repository identity", mutate: (local: LocalGitState): LocalGitState => ({ ...local, repositoryPath: "C:/other-repo" }), reason: /repository identity/i },
+    { label: "remote repository identity", mutate: (local: LocalGitState): LocalGitState => ({ ...local, remoteUrl: "https://github.com/other/repo.git" }), reason: /remote repository identity/i },
+  ])("blocks local close when live $label does not match", async ({ mutate, reason }) => {
+    const state = closeReadyState(new Date().toISOString());
+    const verdict = await closeTask(state, {
+      store: storeFor(state),
+      gitHub: unexpectedGitHub(),
+      inspectLocalGitState: async (): Promise<LocalGitState> => mutate(cleanLocalGitState()),
+    }, ...validCloseOwnership(), "local");
+
+    expect(verdict.status).toBe("BLOCKED");
+    expect(verdict.reasons.join(" ")).toMatch(reason);
+  });
+
   it("returns YES only after persisted state, fresh gates, a successful push, and an exact remote SHA match", async () => {
     const now = new Date().toISOString();
     const state = closeReadyState(now);
@@ -458,7 +515,7 @@ describe("closeTask", () => {
 
   it("returns NO when critical unsaved context remains", async () => {
     const state = { ...closeReadyState(new Date().toISOString()), criticalUnsavedContext: ["unrecorded approval"] };
-    const verdict = await closeTask(state, { store: storeFor(state), gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))) });
+    const verdict = await closeTask(state, { store: storeFor(state), gitHub: unexpectedGitHub() }, ...validCloseOwnership(), "local");
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/unsaved/i);
@@ -573,8 +630,8 @@ describe("closeTask", () => {
 
     const verdict = await closeTask(mismatchedState, {
       store: storeFor(mismatchedState),
-      gitHub: gitHubFor(successfulPush(), matchingRemoteState("e".repeat(40))),
-    });
+      gitHub: unexpectedGitHub(),
+    }, ...validCloseOwnership(), "local");
 
     expect(verdict.status).toBe("NO");
     expect(verdict.reasons.join(" ")).toMatch(/artifact correspondence/i);

@@ -5,9 +5,9 @@ description: Curate and retrieve reusable knowledge or stable cross-project memo
 
 # Knowledge Manager
 
-Keep useful, evidence-backed information in `D-AI-Hub`. A capture may correctly produce no write.
+Keep useful, evidence-backed, public-safe information in `D-AI-Hub` locally by default. A capture may correctly produce no write and never implies GitHub publication.
 
-This Skill governs Markdown in `knowledge/` and Hub `memory/`; it does not write Codex's generated memory store or automatically capture conversations into SQLite. Apply the repository Write Gate before modifying files. A request to curate information does not authorize installing hooks, changing workflow rules, deleting existing records, or publishing Git changes.
+This Skill governs Markdown in `knowledge/` and Hub `memory/`; it does not write Codex's generated memory store or automatically capture conversations into SQLite. Private memory belongs in OS-local SQLite/private state; repository content is public-safe promoted context only. Apply the repository Write Gate before modifying files. A request to curate information does not authorize installing hooks, changing workflow rules, deleting existing records, or publishing Git changes.
 
 ## Admission by information type
 
@@ -56,7 +56,7 @@ When retrieving knowledge or stable context:
 
 Report the actual files added or updated, the useful outcome and evidence, and a brief grouped reason for NOOP/DEFER/REJECT where relevant. Never echo rejected secret values. If nothing qualifies, say so without creating a receipt file or an empty note.
 
-State local-only versus published state. Markdown persistence is not proof of SQLite insertion, Codex Memory injection, successful future retrieval, or cross-device synchronization.
+State local-only versus published state. Markdown persistence is not proof of SQLite insertion, Codex Memory injection, successful future retrieval, or cross-device synchronization. Publication requires explicit review and authority for public-safe content.
 
 ## Storage rules
 

@@ -1,5 +1,23 @@
 # Decisions
 
+## 2026-09-11 — LOCAL FIRST, GITHUB ON MILESTONE
+
+**Context**
+
+The earlier GitHub-first model made repository publication and remote evidence feel like the normal completion path, while daily fixes, curation, continuation, tests, and critical local verification should remain reversible and private by default.
+
+**Decision**
+
+Treat the local runtime, working tree, durable task state, SQLite private memory, and project checkpoints as active working truth. Keep daily Tier 1 work and critical Tier 2 runtime/durable-state verification local-only. Use GitHub as the last explicitly published public-safe framework/source milestone, release, backup, and cross-device transport. Tier 3 publication requires a separate explicit milestone decision and authority for commit, push, PR, CI, and any merge/post-merge action.
+
+Keep repository `memory/` public-safe promoted context only; private memory stays in OS-local state. `@D-AI close` is local by default. An explicit publication close may use the existing GitHub push and exact remote-SHA gates only when publication intent and authority are supplied. Explicit `@D-AI sync` remains the current fail-closed freshness flow and is never reinterpreted as push. The overloaded word “同步” requires clarification.
+
+Older project summaries, specifications, and reference descriptions that describe GitHub-first completion remain historical/superseded context; they do not override the current root workflow, runtime contract, or canonical Skill policy.
+
+**Consequences**
+
+Local completion is not publication-incomplete. No implicit commit authority is granted. Existing durable state, ownership, recovery, task selection, and public repository visibility contracts remain unchanged. The historical GitHub-first decision below is preserved as superseded history.
+
 ## 2026-09-04 — Separate privacy intent from live GitHub visibility
 
 **Context**

@@ -5,10 +5,10 @@ import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { createCodexExecutionAdapter, createCodexRecoveryPointCapture } from "../adapters/codex-local.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
-import { inspectCurrentGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
+import { inspectCurrentGitState, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
 import { GitHubCliAdapter, resolveGitHubRepository, type GitHubAdapter } from "../adapters/github.js";
 import { bootstrapTask, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
-import { closeTask } from "../close/close-service.js";
+import { closeTask, type CloseMode } from "../close/close-service.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
   CapabilityMismatchError,
@@ -53,6 +53,14 @@ export interface DAIRequest {
   readonly sourceEnvironment: Environment;
   readonly overrides: RoutingOverrides;
   readonly activeTaskId?: string | null;
+  readonly publicationRequested?: boolean;
+  readonly publicationAuthority?: PublicationCloseAuthority | null;
+}
+
+export interface PublicationCloseAuthority {
+  readonly grantedBy: string;
+  readonly allowCommit: boolean;
+  readonly allowPush: boolean;
 }
 
 export interface DAIResponse {
@@ -76,6 +84,8 @@ export interface ExternalDAIRequest {
   readonly sourceEnvironment: string;
   readonly overrides: ExternalRoutingOverrides;
   readonly activeTaskId?: string | null;
+  readonly publicationRequested?: boolean;
+  readonly publicationAuthority?: PublicationCloseAuthority | null;
 }
 
 export interface EnvironmentExecutionRequest {
@@ -140,7 +150,7 @@ export interface DAIRuntimeDependencies {
   readonly recover: Recover;
   readonly rollbackTask?: RollbackTask | undefined;
   readonly rerunOriginalCheck?: RerunOriginalCheck | undefined;
-  readonly closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<CloseVerdict>;
+  readonly closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard, mode?: CloseMode) => Promise<CloseVerdict>;
   readonly maximumEvidenceAgeMs: number;
   readonly now: () => Date;
 }
@@ -148,6 +158,11 @@ export interface DAIRuntimeDependencies {
 const environmentSchema = z.enum(["chat", "work", "codex"]);
 const roleSchema = z.enum(["analyst", "planner", "implementer", "evidence-collector", "reviewer", "debugger", "recovery-operator"]);
 const stageSchema = z.enum(["bootstrap", "route", "plan", "execute", "inspect", "verify", "debug", "recover", "handoff", "close"]);
+const publicationCloseAuthoritySchema = z.object({
+  grantedBy: z.string().trim().min(1),
+  allowCommit: z.boolean(),
+  allowPush: z.boolean(),
+}).strict();
 const commandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("intent"), text: z.string().trim().min(1) }).strict(),
   z.object({ kind: z.literal("continue"), taskIdOrProject: z.string().trim().min(1) }).strict(),
@@ -169,6 +184,8 @@ const requestSchema = z.object({
   sourceEnvironment: environmentSchema,
   overrides: overridesSchema,
   activeTaskId: z.string().trim().min(1).nullable().optional(),
+  publicationRequested: z.boolean().optional(),
+  publicationAuthority: publicationCloseAuthoritySchema.nullable().optional(),
 }).strict();
 const evidenceSchema = z.object({
   evidenceId: z.string().trim().min(1),
@@ -317,7 +334,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
-  const { activeTaskId, ...validated } = result.data;
+  const { activeTaskId, publicationRequested, publicationAuthority, ...validated } = result.data;
   return {
     ...validated,
     overrides: {
@@ -325,6 +342,8 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
       stage: result.data.overrides.stage ?? null,
     },
     ...(activeTaskId === undefined ? {} : { activeTaskId }),
+    ...(publicationRequested === undefined ? {} : { publicationRequested }),
+    ...(publicationAuthority === undefined ? {} : { publicationAuthority }),
   };
 }
 
@@ -465,6 +484,14 @@ function response(state: TaskState, status: DAIResponse["status"], message: stri
     evidence: state.verificationEvidence.map(redactEvidence),
     message: redactSensitiveText(message),
   };
+}
+
+function hasPublicationCloseAuthority(authority: PublicationCloseAuthority | null | undefined): authority is PublicationCloseAuthority {
+  return authority !== null
+    && authority !== undefined
+    && authority.grantedBy.trim().length > 0
+    && authority.allowCommit
+    && authority.allowPush;
 }
 
 function blockedWithoutState(taskId: string, environment: Environment, message: string): DAIResponse {
@@ -1801,6 +1828,10 @@ async function closeActiveTaskExclusive(
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
   }
+  const publicationRequested = request.publicationRequested === true;
+  if (publicationRequested && !hasPublicationCloseAuthority(request.publicationAuthority)) {
+    return response(state, "blocked", "Publication close is blocked because explicit commit and push authority was not provided");
+  }
   const closeReadyState = state.verificationEvidence.some((item) => item.evidenceId === "gate:handoff")
     || (state.handoffState !== "none" && state.handoffState !== "completed")
     ? state
@@ -1823,7 +1854,10 @@ async function closeActiveTaskExclusive(
     }, lease);
   state = closeReadyState;
   await assertOwnership();
-  const closeOutcome = await connectorOutcome(() => dependencies.closeTask(closeReadyState, lease, assertOwnership), closeConnectorFailure);
+  const closeOutcome = await connectorOutcome(
+    () => dependencies.closeTask(closeReadyState, lease, assertOwnership, publicationRequested ? "publication" : "local"),
+    closeConnectorFailure,
+  );
   if (closeOutcome.kind === "blocked") {
     return response(state, "blocked", `Close connector blocked: ${closeOutcome.message}`);
   }
@@ -1870,7 +1904,9 @@ async function closeActiveTaskExclusive(
     return response(state, "blocked", `Close persistence blocked after successful close verification: ${closeState.message}`);
   }
   const status: DAIResponse["status"] = "completed";
-  const message = "Safe-to-delete: YES";
+  const message = publicationRequested
+    ? "Safe-to-delete: YES"
+    : "Local close completed; Safe-to-delete: YES; GitHub publication was not requested";
   return {
     taskId: closeState.value.taskId,
     stage: closeState.value.stage,
@@ -2217,7 +2253,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
       if (execution.status !== "completed") throw new InvalidTaskStateError(execution.message);
       return execution.evidence;
     },
-    closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard): Promise<CloseVerdict> => closeTask(state, { store, gitHub }, lease, assertOwnership),
+    closeTask: (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard, mode: CloseMode = "local"): Promise<CloseVerdict> => closeTask(state, { store, gitHub, inspectLocalGitState }, lease, assertOwnership, mode),
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),
     discoverActiveTasks: (workspacePath: string): Promise<readonly TaskState[]> => store.discoverActiveTasks(workspacePath),
