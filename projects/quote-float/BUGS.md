@@ -2,16 +2,6 @@
 
 ## Open
 
-### GOV-001 — Historical ticket labels conflict with later acceptance evidence
-
-- Severity: low
-- Status: deferred documentation correction
-- First observed: 2026-09-06
-- Expected: ticket metadata reflects the latest accepted dependency chain.
-- Actual: `TICKET-MAP.md` still labels QF-WPF-001 through QF-WPF-004 as READY/BLOCKED, and `QF-WPF-007.md` still says BLOCKED while the map says NOT STARTED.
-- Evidence: the QF-WPF-004A, QF-WPF-005, and QF-WPF-006 ticket/evidence chain supersedes the earlier dependency labels; QF-WPF-006 has direct Boss acceptance evidence.
-- Disposition: canonicalize the current state here; defer edits to the source repository metadata because this task is restricted to D-AI-Hub bootstrap.
-
 ### GOV-002 — Human-facing project name is not a D-AI runtime continuation alias
 
 - Severity: medium
@@ -25,13 +15,18 @@
 ### GOV-003 — Global installed entry cannot resolve the canonical runtime root
 
 - Severity: medium
-- Status: open
+- Status: resolved
 - First observed: 2026-09-06
 - Expected: the self-contained installed D-AI Skill executes the current canonical D-AI runtime.
-- Actual: the installed source is canonical and has no worktree dependency, but its launcher cannot resolve the npm project root from the global installation location; the direct global invocation returns no structured runtime result and exit code `-4058`. Repository-local activation succeeds separately.
-- Evidence: installed source blobs match the accepted canonical Skill files; direct repository-local status/continuation checks select the unique durable task; direct global invocation remains blocked.
-- Disposition: do not alter the canonical Skill, add aliases, guess a repository, or restore a worktree dependency. Resolve through a separately authorized supported installation/runtime bridge or retain this as an onboarding blocker.
+- Actual: resolved. The installed self-contained entry now binds through `.runtime-root` to the canonical runtime checkout and returns the unique Quote Float durable task from the real source workspace.
+- Evidence: fresh installed-entry `@D-AI status` and `@D-AI continue codex-quota-float` both selected `task-937dc8b8c2a683764bc3eb62` on 2026-09-07.
+- Disposition: retain the canonical runtime binding and fail-closed exact repository identity; do not restore a worktree dependency.
 
 ## Resolved
 
-None recorded by this bootstrap.
+- GOV-001 — historical QF-WPF-001–004 and QF-WPF-007–008 ticket labels were normalized to `BOSS PASS` during WPF R1 freeze on 2026-09-08; final matrix is recorded in `codex-quota-float::docs/wpf-r1/WPF-R1-FREEZE.md`.
+- GOV-003 — installed entry canonical runtime-root binding verified 2026-09-07.
+- UI-001 — Settings Refresh interval typography corrected and independently accepted 2026-09-07. Input remains Segoe UI; label/unit retain Microsoft YaHei UI with Segoe UI fallback; ZH -> EN -> ZH keeps fixed geometry and one 520 x 520 Settings window. Evidence: `codex-quota-float::output/wpf-r1/QF-WPF-SETTINGS-TYPOGRAPHY-001-BOSS-REVIEW/boss-acceptance.txt`.
+- UI-002 — Settings 420 x 296 manual header drag and control isolation passed the final human matrix; released in v1.1.0.
+- UI-003 — authoritative `WidgetWindowController.ApplyState()` ownership, edge-to-Orb, 300 ms temporary Full, exact Orb restore, and multi-monitor anchoring passed the final Plus/Pro human matrices; released in v1.1.0.
+- UI-004 — DWM `ROUNDSMALL` native corner ownership with no HRGN/SetWindowRgn product clipping passed physical-screen white-background review; the remaining Default-mode capture anomaly was classified capture-only for the tested environment; released in v1.1.0.
