@@ -128,9 +128,11 @@ type Recover = (state: TaskState, reason: string) => Promise<TaskState>;
 type RollbackTask = (state: TaskState, lease: TaskOwnershipLease, assertOwnership: TaskOwnershipGuard) => Promise<RollbackResult>;
 type RerunOriginalCheck = (state: TaskState) => Promise<readonly VerificationEvidence[]>;
 type DiscoverActiveTasks = (workspacePath: string) => Promise<readonly TaskState[]>;
+type ResolveRepositoryIdentity = () => Promise<string>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
   readonly discoverActiveTasks?: DiscoverActiveTasks | undefined;
+  readonly resolveRepositoryIdentity?: ResolveRepositoryIdentity | undefined;
   readonly workspacePath: string | null;
   readonly repositoryPath: string | null;
   readonly skillRoots: readonly string[];
@@ -1202,6 +1204,78 @@ async function executeIntent(
   );
 }
 
+function isExplicitNewTaskIntent(text: string): boolean {
+  return /^(?:establish|setup|initialize|new[- ]task)\b/iu.test(text.trim());
+}
+
+function remoteRepositoryIdentity(state: TaskState): string | null {
+  const entries = state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
+  if (entries.length !== 1) return null;
+  const identity = entries[0]!;
+  return remoteRepositoryIdentityPattern.test(identity)
+    ? identity.slice("remote-repository:".length)
+    : null;
+}
+
+type GenericIntentSelection =
+  | { readonly kind: "blocked"; readonly response: DAIResponse };
+
+async function selectGenericIntentTask(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+): Promise<GenericIntentSelection | null> {
+  if (request.sourceEnvironment !== "codex"
+    || dependencies.repositoryPath === null
+    || (dependencies.discoverActiveTasks === undefined && dependencies.store.discoverActiveTasks === undefined)
+    || dependencies.resolveRepositoryIdentity === undefined
+    || isExplicitNewTaskIntent(request.command.kind === "intent" ? request.command.text : "")) return null;
+  if (dependencies.workspacePath === null) {
+    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, "Workspace identity is unavailable; generic intent remains read-only") };
+  }
+  const discover = dependencies.discoverActiveTasks
+    ?? (dependencies.store.discoverActiveTasks === undefined
+      ? undefined
+      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
+  if (discover === undefined) {
+    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, "Configured Codex task discovery is unavailable; generic intent remains read-only") };
+  }
+  let repository: string;
+  try {
+    repository = await dependencies.resolveRepositoryIdentity();
+  } catch {
+    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, "Configured Codex repository identity could not be resolved; generic intent remains read-only") };
+  }
+  const discovered = await connectorOutcome(
+    () => discover(dependencies.workspacePath!),
+    closeConnectorFailure,
+  );
+  if (discovered.kind === "blocked") {
+    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, `Workspace task discovery blocked: ${discovered.message}`) };
+  }
+  const candidates: TaskState[] = [];
+  for (const state of discovered.value) {
+    if (state.stage === "close" || state.environment !== request.sourceEnvironment || remoteRepositoryIdentity(state) !== repository) continue;
+    if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
+  }
+  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (candidates.length === 0) {
+    return {
+      kind: "blocked",
+      response: blockedWithoutState("unassigned", request.sourceEnvironment, "No active D-AI task matches this canonical workspace and repository. Use @D-AI establish for explicit new-task authority"),
+    };
+  }
+  if (candidates.length > 1) {
+    return {
+      kind: "blocked",
+      response: blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this canonical workspace and repository: ${candidates.map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> or use @D-AI continue <task-id>`),
+    };
+  }
+  return {
+    kind: "blocked",
+    response: response(candidates[0]!, "blocked", `Generic intent matched active task ${candidates[0]!.taskId}, but no configured safe operation is available; no durable task was created or mutated`),
+  };
+}
+
 async function continueTaskExclusive(
   request: DAIRequest,
   command: Extract<DAICommand, { readonly kind: "continue" }>,
@@ -2112,7 +2186,11 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
         if (selection !== null) return selection;
       }
     }
-    if (request.command.kind === "intent") return executeIntent(request, request.command, dependencies, registry);
+    if (request.command.kind === "intent") {
+      const selection = await selectGenericIntentTask(request, dependencies);
+      if (selection?.kind === "blocked") return selection.response;
+      return executeIntent(request, request.command, dependencies, registry);
+    }
     if (request.command.kind === "continue") {
       if (request.activeTaskId === undefined || request.activeTaskId === null) {
         const selection = await resolveContinueProject(request, request.command, dependencies);
@@ -2229,6 +2307,10 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     store,
     workspacePath: root,
     repositoryPath: root,
+    resolveRepositoryIdentity: async (): Promise<string> => {
+      const local = await inspectCurrentGitState(root, "origin");
+      return resolveGitHubRepository(local.remoteUrl, enterpriseHost).repository;
+    },
     skillRoots: [join(root, ".agents", "skills")],
     modelPolicies: defaultModelPolicies,
     adapters,

@@ -18,6 +18,14 @@
 
 ## Resolved
 
+### BUG-006 — Generic explicit intent could create an unauthorized duplicate durable task
+
+- Severity: high
+- Status: resolved locally on 2026-09-11; not published or installed.
+- Resolution: Configured Codex generic explicit intents now require exact canonical workspace and repository matching. Zero matches and multiple matches fail closed without durable writes; one match returns a task-bound blocked response when no safe generic operation is configured. Explicit establish/new-task creation remains available.
+- Evidence: Isolated FileDurableContextStore regressions covered the dogfood-style `@D-AI 整理进我的知识库` request, zero/one/multiple matches, different workspace, different canonical remote, Enterprise identity, and explicit establish creation. Relevant integration verification passed 40 tests with 1 platform skip; runtime/parser focus passed 133 tests; typecheck and diff check passed.
+- Limitation: Existing Quote Float duplicates `task-d568bcbd45a8d2e139bcfe66` and `task-cb9212276ba3e1bc76d04638` were not repaired, deleted, merged, replayed, or closed; any destructive cleanup requires a separate decision.
+
 ### BUG-005 — Incremental memory bundles could skip an unseen sequence range
 
 - Severity: high
