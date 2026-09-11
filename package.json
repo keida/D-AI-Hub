@@ -15,12 +15,14 @@
     "health-check:structural": "tsx src/health/health-check-cli.ts --workspace . --structural-only",
     "lint": "npm run typecheck",
     "memory": "tsx src/memory/memory-cli.ts",
+    "mcp": "tsx src/mcp/stdio-server.ts",
     "test": "vitest run --exclude \"tests/integration/**\"",
     "test:integration": "vitest run tests/integration --pool=forks --maxWorkers=1 --no-file-parallelism",
     "typecheck": "tsc --noEmit",
     "verify": "npm run typecheck && npm run test && npm run test:integration && npm run health-check:structural"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "yaml": "^2.8.1",
     "zod": "^4.0.0"
   },

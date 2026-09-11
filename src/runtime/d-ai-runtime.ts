@@ -2522,6 +2522,44 @@ export function createConfiguredDAIRuntime(options: ConfiguredDAIRuntimeOptions)
   return createDAIRuntime(createDefaultDependencies(options));
 }
 
+export function createConfiguredCurationHandler(options: ConfiguredDAIRuntimeOptions): (candidates: readonly CurationCandidate[], projectHint: string | null) => Promise<CurationResult> {
+  const dependencies = createDefaultDependencies(options);
+  return async (candidates, projectHint): Promise<CurationResult> => {
+    validateCurationCandidates(candidates);
+    const request: DAIRequest = {
+      command: { kind: "curate" },
+      sourceEnvironment: "codex",
+      overrides: { model: null, role: null, environment: null, stage: null },
+      activeTaskId: projectHint,
+      curationCandidates: candidates,
+    };
+    const taskIdentity = await resolveCurationTaskIdentity(request, dependencies);
+    if (taskIdentity.kind === "blocked") {
+      return {
+        status: "blocked",
+        counts: { added: 0, updated: 0, noOp: 0, deferred: 1, rejected: 0 },
+        records: [],
+        locallyStored: false,
+        readBackVerified: false,
+        safeToDeleteOriginalChat: "NO",
+        message: taskIdentity.message,
+      };
+    }
+    if (dependencies.curateCurrentContext === undefined) {
+      return {
+        status: "blocked",
+        counts: { added: 0, updated: 0, noOp: 0, deferred: 1, rejected: 0 },
+        records: [],
+        locallyStored: false,
+        readBackVerified: false,
+        safeToDeleteOriginalChat: "NO",
+        message: "Local curation handler is unavailable",
+      };
+    }
+    return dependencies.curateCurrentContext(candidates, { knownProjectTaskId: taskIdentity.knownProjectTaskId });
+  };
+}
+
 const defaultRuntime = createConfiguredDAIRuntime({ workspacePath: process.cwd() });
 
 export async function handleDAIRequest(request: DAIRequest): Promise<DAIResponse> {
