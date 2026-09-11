@@ -7,6 +7,13 @@ import { resolveDefaultMemoryDatabasePath, resolveLocalMemoryScopeId } from "../
 import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 
 describe("Codex D-AI CLI", () => {
+  it.skipIf(process.platform !== "win32")("resolves the canonical Windows memory workflow path used by curation defaults", () => {
+    const localAppData = "C:\\Users\\Canonical\\AppData\\Local";
+    const expectedCanonicalPath = "C:\\Users\\Canonical\\AppData\\Local\\D-AI-Hub\\memory\\memory.sqlite";
+
+    expect(resolveDefaultMemoryDatabasePath({ LOCALAPPDATA: localAppData }, "C:\\Users\\Canonical")).toBe(expectedCanonicalPath);
+  });
+
   it("fails closed with task-selection instructions in a fresh unrelated workspace", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-codex-entry-"));
     try {

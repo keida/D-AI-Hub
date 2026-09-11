@@ -16,7 +16,7 @@ export function resolveDefaultMemoryDatabasePath(environment: NodeJS.ProcessEnv 
   const baseDirectory = configuredDirectory !== undefined && isAbsolute(configuredDirectory)
     ? configuredDirectory
     : fallbackDirectory;
-  return resolve(join(baseDirectory, "D-AI-Hub", "memory.sqlite"));
+  return resolve(join(baseDirectory, "D-AI-Hub", "memory", "memory.sqlite"));
 }
 
 export function resolveLocalMemoryScopeId(memoryDatabasePath: string): string {
