@@ -2,7 +2,7 @@
 name: d-ai
 description: Activate the D-AI control plane in Codex for ordinary natural-language project requests and explicit @D-AI commands, with deterministic intent routing and fail-closed delivery boundaries.
 metadata:
-  triggers: '["d-ai","continue","status","fix","change","deliver","close","rollback","sync","establish"]'
+  triggers: '["d-ai","continue","status","fix","change","deliver","curate","整理","close","rollback","sync","establish"]'
   compatibleEnvironments: '["codex"]'
   compatibleStages: '["bootstrap","inspect","recover","handoff","close"]'
   requiredResources: '[]'
@@ -32,9 +32,19 @@ An explicit `@D-AI` command overrides the natural-language default. In particula
 2. Extract Codex-only options from the invocation:
    - `--task <task-id>` selects a durable task in a fresh Codex process.
    - `--workspace <path>` selects the target workspace; otherwise use the current workspace.
-3. Run this Skill's `scripts/invoke.ps1` with `-CommandText`, `-WorkspacePath`, and optional `-TaskId`; natural-language text is passed unchanged when it is the default entry.
+3. For exact curation forms, pass only a deliberately selected structured JSON payload with `-CurationPayloadPath`; the payload is not a transcript and must contain `{ "version": 1, "candidates": [...] }` current-context facts. Optionally pass an absolute `-MemoryDatabasePath` in a separate private directory outside the target workspace/repository for an isolated test database; when omitted, persistence uses the deterministic OS-local D-AI-Hub memory path outside the workspace. Run this Skill's `scripts/invoke.ps1` with `-CommandText`, `-WorkspacePath`, and optional `-TaskId`, `-CurationPayloadPath`, and `-MemoryDatabasePath`; natural-language text is passed unchanged when it is the default entry.
    The installed Skill root must contain a machine-local `.runtime-root` file pointing to a validated D-AI-Hub runtime checkout. Establish or switch that binding with `scripts/set-runtime-binding.ps1 -SkillRoot <installed-skill-root> -RuntimeRoot <d-ai-hub-checkout>`; a missing or invalid binding fails closed.
 4. Report the returned status, message, and evidence without converting `BLOCKED` or `NO` into completion.
+
+The supported exact curation forms, with or without the `@D-AI` prefix, are `整理`, `整理一下`, `整理当前内容`, `整理进我的知识库`, `curate`, and `curate this`. Without a supplied structured curation payload, each returns SAFE NO and does not capture chat history or create durable task state. Missing, unreadable, malformed, relative, or secret-shaped payload values fail closed before any memory or durable write.
+
+To create a payload, select only facts already present in the current visible context, write them to an absolute temporary JSON file, and pass that file to the Skill. For example:
+
+```json
+{"version":1,"candidates":[{"candidateId":"release-gate","memoryId":"release-gate","fact":"Local release checks require a clean worktree.","category":"knowledge","source":"current-context","privacyRisk":"local-private"}]}
+```
+
+Do not place a transcript, chat export, credentials, workplace-confidential material, or unverified project-memory claim in the payload. The runtime discovers one exact active task for the current workspace and canonical repository when available; project-memory is deferred when no exact task exists, and curation is blocked when discovery is ambiguous.
 
 For `@D-AI status` and `@D-AI close`, omit `--task` on the normal path. The runtime discovers the unique active durable task for the current workspace. Close is local by default; an explicit publication close must provide publication intent and authority. If there are zero matches, multiple matches, or an ownership/workspace conflict, keep the result `BLOCKED` and follow the returned retry guidance.
 

@@ -136,7 +136,7 @@ Continue <project>
 → local focused verification and @D-AI close when durable work is ready
 ```
 
-Use a separate milestone/publication decision before commit, push, PR, CI, or publication close. Future `整理` is a policy-only local/private curation concept in this task; it is not implemented here and does not imply current project-memory/knowledge-manager writes or GitHub publication.
+Use a separate milestone/publication decision before commit, push, PR, CI, or publication close. `@D-AI 整理` is implemented as a local-only curation seam: the handling agent may pass a selected versioned current-context JSON payload to the Codex Skill, which validates and stores only eligible facts in the OS-local SQLite memory path (or an explicit absolute test override). It never crawls chat history, creates durable tasks, or publishes to GitHub; missing or ambiguous project identity keeps project-memory curation fail-closed.
 
 An internal close request may set `publicationRequested: true` and provide `publicationAuthority: { grantedBy, allowCommit: true, allowPush: true }`. The default omitted flag is local close. This request flag is not implicit commit authority.
 

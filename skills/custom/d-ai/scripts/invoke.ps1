@@ -7,7 +7,13 @@ param(
   [string]$TaskId,
 
   [Parameter(Mandatory = $false)]
-  [string]$WorkspacePath = (Get-Location).Path
+  [string]$WorkspacePath = (Get-Location).Path,
+
+  [Parameter(Mandatory = $false)]
+  [string]$CurationPayloadPath,
+
+  [Parameter(Mandatory = $false)]
+  [string]$MemoryDatabasePath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,6 +45,19 @@ function Resolve-Directory([string]$Path, [string]$Label) {
     throw "$Label is not a directory: $Path"
   }
   return $resolved.Path
+}
+
+function Assert-CurationInputs {
+  if (-not [string]::IsNullOrWhiteSpace($CurationPayloadPath)) {
+    Assert-FullyQualifiedPath $CurationPayloadPath 'Curation payload path'
+    if (-not (Test-Path -LiteralPath $CurationPayloadPath -PathType Leaf)) {
+      throw 'Curation payload is not readable'
+    }
+    Get-Content -LiteralPath $CurationPayloadPath -Raw -ErrorAction Stop | Out-Null
+  }
+  if (-not [string]::IsNullOrWhiteSpace($MemoryDatabasePath)) {
+    Assert-FullyQualifiedPath $MemoryDatabasePath 'Memory database path'
+  }
 }
 
 function Assert-InstalledSkillRoot([string]$Candidate) {
@@ -81,6 +100,7 @@ function Test-RuntimeRoot([string]$Candidate, [ref]$FailureReason) {
 $skillRoot = Split-Path -Parent $PSScriptRoot
 $repositoryRoot = $null
 try {
+  Assert-CurationInputs
   Assert-InstalledSkillRoot $skillRoot
   $bindingPath = Join-Path $skillRoot '.runtime-root'
   if (-not (Test-Path -LiteralPath $bindingPath -PathType Leaf)) {
@@ -112,6 +132,12 @@ $arguments = @(
 )
 if (-not [string]::IsNullOrWhiteSpace($TaskId)) {
   $arguments += @('--task', $TaskId)
+}
+if (-not [string]::IsNullOrWhiteSpace($CurationPayloadPath)) {
+  $arguments += @('--curation-payload', $CurationPayloadPath)
+}
+if (-not [string]::IsNullOrWhiteSpace($MemoryDatabasePath)) {
+  $arguments += @('--memory-database', $MemoryDatabasePath)
 }
 
 & $npm @arguments

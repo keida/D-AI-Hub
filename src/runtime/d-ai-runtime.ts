@@ -1,4 +1,5 @@
-import { join, resolve } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { CommandExecutionError, redactSensitiveText } from "../adapters/command-runner.js";
 import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js";
@@ -9,6 +10,7 @@ import { inspectCurrentGitState, inspectLocalGitState, isValidGitBranchName, isV
 import { GitHubCliAdapter, resolveGitHubRepository, type GitHubAdapter } from "../adapters/github.js";
 import { bootstrapTask, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
 import { closeTask, type CloseMode } from "../close/close-service.js";
+import { curateCurrentContext, validateCurationCandidates, type CurationCandidate, type CurationRecordResult, type CurationResult } from "../curation/local-curation.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
   CapabilityMismatchError,
@@ -45,6 +47,8 @@ import type {
   TaskStateWriteAuthorization,
 } from "../state/durable-context-store.js";
 import { FileDurableContextStore } from "../state/file-durable-context-store.js";
+import { LocalSqliteMemoryStore } from "../memory/local-sqlite-memory-store.js";
+import { resolveDefaultMemoryDatabasePath, resolveLocalMemoryScopeId } from "../memory/local-memory-path.js";
 import { matchesWorkspaceIdentity } from "../state/workspace-identity.js";
 import { evaluateHardGates, type GateEvidence, type GateResult, type HardGateInput } from "../verification/gates.js";
 
@@ -55,6 +59,7 @@ export interface DAIRequest {
   readonly activeTaskId?: string | null;
   readonly publicationRequested?: boolean;
   readonly publicationAuthority?: PublicationCloseAuthority | null;
+  readonly curationCandidates?: readonly CurationCandidate[];
 }
 
 export interface PublicationCloseAuthority {
@@ -70,6 +75,7 @@ export interface DAIResponse {
   readonly status: "accepted" | "blocked" | "completed";
   readonly evidence: readonly VerificationEvidence[];
   readonly message: string;
+  readonly curationRecords?: readonly Pick<CurationRecordResult, "memoryId" | "category" | "decision">[];
 }
 
 export interface ExternalRoutingOverrides {
@@ -86,6 +92,7 @@ export interface ExternalDAIRequest {
   readonly activeTaskId?: string | null;
   readonly publicationRequested?: boolean;
   readonly publicationAuthority?: PublicationCloseAuthority | null;
+  readonly curationCandidates?: readonly CurationCandidate[];
 }
 
 export interface EnvironmentExecutionRequest {
@@ -132,6 +139,7 @@ type ResolveRepositoryIdentity = () => Promise<string>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
   readonly discoverActiveTasks?: DiscoverActiveTasks | undefined;
+  readonly curateCurrentContext?: (candidates: readonly CurationCandidate[], options: { readonly knownProjectTaskId: string | null }) => Promise<CurationResult>;
   readonly resolveRepositoryIdentity?: ResolveRepositoryIdentity | undefined;
   readonly workspacePath: string | null;
   readonly repositoryPath: string | null;
@@ -167,6 +175,7 @@ const publicationCloseAuthoritySchema = z.object({
 }).strict();
 const commandSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("intent"), text: z.string().trim().min(1) }).strict(),
+  z.object({ kind: z.literal("curate") }).strict(),
   z.object({ kind: z.literal("continue"), taskIdOrProject: z.string().trim().min(1) }).strict(),
   z.object({ kind: z.literal("sync"), project: z.string().trim().min(1).nullable() }).strict(),
   z.object({ kind: z.literal("status") }).strict(),
@@ -188,6 +197,7 @@ const requestSchema = z.object({
   activeTaskId: z.string().trim().min(1).nullable().optional(),
   publicationRequested: z.boolean().optional(),
   publicationAuthority: publicationCloseAuthoritySchema.nullable().optional(),
+  curationCandidates: z.array(z.unknown()).optional(),
 }).strict();
 const evidenceSchema = z.object({
   evidenceId: z.string().trim().min(1),
@@ -336,7 +346,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
-  const { activeTaskId, publicationRequested, publicationAuthority, ...validated } = result.data;
+  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, ...validated } = result.data;
   return {
     ...validated,
     overrides: {
@@ -346,6 +356,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
     ...(activeTaskId === undefined ? {} : { activeTaskId }),
     ...(publicationRequested === undefined ? {} : { publicationRequested }),
     ...(publicationAuthority === undefined ? {} : { publicationAuthority }),
+    ...(curationCandidates === undefined ? {} : { curationCandidates: curationCandidates as readonly CurationCandidate[] }),
   };
 }
 
@@ -498,6 +509,28 @@ function hasPublicationCloseAuthority(authority: PublicationCloseAuthority | nul
 
 function blockedWithoutState(taskId: string, environment: Environment, message: string): DAIResponse {
   return { taskId, stage: "bootstrap", environment, status: "blocked", evidence: [], message: redactSensitiveText(message) };
+}
+
+function curationResponse(
+  request: DAIRequest,
+  result: CurationResult,
+): DAIResponse {
+  const { added, updated, noOp, deferred, rejected } = result.counts;
+  const recordSummary = result.records.length === 0
+    ? "none"
+    : result.records.map((record) => `${record.memoryId}:${record.decision}`).join(", ");
+  const safeMessage = result.safeToDeleteOriginalChat === "YES"
+    ? "SAFE TO DELETE ORIGINAL CHAT: YES (selected curated facts only; not the source chat or transcript)"
+    : "SAFE TO DELETE ORIGINAL CHAT: NO (selected curated facts were not fully verified; the source chat or transcript remains untouched)";
+  return {
+    taskId: request.activeTaskId ?? "unassigned",
+    stage: "inspect",
+    environment: request.sourceEnvironment,
+    status: result.status === "completed" ? "completed" : "blocked",
+    evidence: [],
+    curationRecords: result.records.map(({ memoryId, category, decision }) => ({ memoryId, category, decision })),
+    message: redactSensitiveText(`${result.message}; Records=${recordSummary}; Added=${added}, Updated=${updated}, No-op=${noOp}, Deferred=${deferred}, Rejected=${rejected}; locally stored=${result.locallyStored ? "YES" : "NO"}; read-back=${result.readBackVerified ? "PASS" : "NO"}; ${safeMessage}`),
+  };
 }
 
 class ConfiguredBootstrapPreflightError extends Error {
@@ -1217,6 +1250,97 @@ function remoteRepositoryIdentity(state: TaskState): string | null {
     : null;
 }
 
+type CanonicalWorkspaceTaskDiscovery =
+  | { readonly kind: "unavailable"; readonly message: string }
+  | { readonly kind: "available"; readonly repository: string; readonly candidates: readonly TaskState[] };
+
+async function discoverCanonicalWorkspaceTasks(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+): Promise<CanonicalWorkspaceTaskDiscovery> {
+  if (dependencies.workspacePath === null) return { kind: "unavailable", message: "Workspace identity is unavailable" };
+  if (dependencies.repositoryPath === null) return { kind: "unavailable", message: "Repository identity is unavailable" };
+  const discover = dependencies.discoverActiveTasks
+    ?? (dependencies.store.discoverActiveTasks === undefined
+      ? undefined
+      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
+  if (discover === undefined) return { kind: "unavailable", message: "Configured Codex task discovery is unavailable" };
+  if (dependencies.resolveRepositoryIdentity === undefined) return { kind: "unavailable", message: "Configured Codex repository identity is unavailable" };
+  let repository: string;
+  try {
+    repository = await dependencies.resolveRepositoryIdentity();
+  } catch {
+    return { kind: "unavailable", message: "Configured Codex repository identity could not be resolved" };
+  }
+  const discovered = await connectorOutcome(
+    () => discover(dependencies.workspacePath!),
+    closeConnectorFailure,
+  );
+  if (discovered.kind === "blocked") return { kind: "unavailable", message: `Workspace task discovery blocked: ${discovered.message}` };
+  const candidates: TaskState[] = [];
+  for (const state of discovered.value) {
+    if (state.stage === "close" || state.environment !== request.sourceEnvironment || remoteRepositoryIdentity(state) !== repository) continue;
+    if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
+  }
+  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
+  return { kind: "available", repository, candidates };
+}
+
+type CurationTaskIdentity =
+  | { readonly kind: "resolved"; readonly knownProjectTaskId: string | null }
+  | { readonly kind: "blocked"; readonly taskId: string; readonly message: string };
+
+async function resolveCurationTaskIdentity(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+): Promise<CurationTaskIdentity> {
+  const candidates = request.curationCandidates ?? [];
+  if (candidates.length === 0) return { kind: "resolved", knownProjectTaskId: null };
+  const hasProjectMemory = candidates.some((candidate) => candidate.category === "project-memory");
+  if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
+    const loaded = await connectorOutcome(() => dependencies.store.load(request.activeTaskId!), closeConnectorFailure);
+    if (loaded.kind === "blocked") {
+      return { kind: "blocked", taskId: request.activeTaskId, message: `Curation task validation blocked: ${loaded.message}` };
+    }
+    const state = loaded.value;
+    if (state === null) return { kind: "blocked", taskId: request.activeTaskId, message: "Curation task validation failed: task was not found" };
+    if (state.stage === "close" || state.environment !== request.sourceEnvironment) {
+      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: task is not an active Codex task" };
+    }
+    if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
+      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: task does not belong to the current workspace" };
+    }
+    if (dependencies.resolveRepositoryIdentity === undefined || dependencies.repositoryPath === null) {
+      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: canonical repository identity is unavailable" };
+    }
+    let repository: string;
+    try {
+      repository = await dependencies.resolveRepositoryIdentity();
+    } catch {
+      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: canonical repository identity could not be resolved" };
+    }
+    if (remoteRepositoryIdentity(state) !== repository) {
+      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: task does not belong to the current canonical repository" };
+    }
+    return { kind: "resolved", knownProjectTaskId: state.taskId };
+  }
+
+  const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+  if (discovery.kind === "unavailable") {
+    return hasProjectMemory
+      ? { kind: "blocked", taskId: "unassigned", message: `${discovery.message}; project-memory curation remains blocked` }
+      : { kind: "resolved", knownProjectTaskId: null };
+  }
+  if (discovery.candidates.length > 1) {
+    return {
+      kind: "blocked",
+      taskId: "unassigned",
+      message: `Multiple active D-AI tasks match this canonical workspace and repository: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}; curation is blocked without writes`,
+    };
+  }
+  return { kind: "resolved", knownProjectTaskId: discovery.candidates[0]?.taskId ?? null };
+}
+
 type GenericIntentSelection =
   | { readonly kind: "blocked"; readonly response: DAIResponse };
 
@@ -1229,50 +1353,29 @@ async function selectGenericIntentTask(
     || (dependencies.discoverActiveTasks === undefined && dependencies.store.discoverActiveTasks === undefined)
     || dependencies.resolveRepositoryIdentity === undefined
     || isExplicitNewTaskIntent(request.command.kind === "intent" ? request.command.text : "")) return null;
-  if (dependencies.workspacePath === null) {
-    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, "Workspace identity is unavailable; generic intent remains read-only") };
+  const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+  if (discovery.kind === "unavailable") {
+    const message = discovery.message.includes("repository identity")
+      ? "Configured Codex Git repository root or GitHub repository identity could not be resolved"
+      : discovery.message;
+    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, `${message}; generic intent remains read-only`) };
   }
-  const discover = dependencies.discoverActiveTasks
-    ?? (dependencies.store.discoverActiveTasks === undefined
-      ? undefined
-      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
-  if (discover === undefined) {
-    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, "Configured Codex task discovery is unavailable; generic intent remains read-only") };
-  }
-  let repository: string;
-  try {
-    repository = await dependencies.resolveRepositoryIdentity();
-  } catch {
-    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, "Configured Codex repository identity could not be resolved; generic intent remains read-only") };
-  }
-  const discovered = await connectorOutcome(
-    () => discover(dependencies.workspacePath!),
-    closeConnectorFailure,
-  );
-  if (discovered.kind === "blocked") {
-    return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, `Workspace task discovery blocked: ${discovered.message}`) };
-  }
-  const candidates: TaskState[] = [];
-  for (const state of discovered.value) {
-    if (state.stage === "close" || state.environment !== request.sourceEnvironment || remoteRepositoryIdentity(state) !== repository) continue;
-    if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
-  }
-  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
-  if (candidates.length === 0) {
+  if (discovery.candidates.length === 0) {
     return {
       kind: "blocked",
       response: blockedWithoutState("unassigned", request.sourceEnvironment, "No active D-AI task matches this canonical workspace and repository. Use @D-AI establish for explicit new-task authority"),
     };
   }
-  if (candidates.length > 1) {
+  if (discovery.candidates.length > 1) {
     return {
       kind: "blocked",
-      response: blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this canonical workspace and repository: ${candidates.map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> or use @D-AI continue <task-id>`),
+      response: blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this canonical workspace and repository: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> or use @D-AI continue <task-id>`),
     };
   }
+  const candidate = discovery.candidates[0]!;
   return {
     kind: "blocked",
-    response: response(candidates[0]!, "blocked", `Generic intent matched active task ${candidates[0]!.taskId}, but no configured safe operation is available; no durable task was created or mutated`),
+    response: response(candidate, "blocked", `Generic intent matched active task ${candidate.taskId}, but no configured safe operation is available; no durable task was created or mutated`),
   };
 }
 
@@ -2169,6 +2272,49 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
   const registry = createRuntimeTaskRegistry();
   return async (externalRequest: ExternalDAIRequest): Promise<DAIResponse> => {
     const request = validateRequest(externalRequest);
+    if (request.command.kind === "curate") {
+      if (dependencies.curateCurrentContext === undefined) {
+        return curationResponse(request, {
+          status: "blocked",
+          counts: { added: 0, updated: 0, noOp: 0, deferred: 1, rejected: 0 },
+          records: [],
+          locallyStored: false,
+          readBackVerified: false,
+          safeToDeleteOriginalChat: "NO",
+          message: "Local curation handler is unavailable; no chat history was captured",
+        });
+      }
+      try {
+        validateCurationCandidates(request.curationCandidates ?? []);
+        const taskIdentity = await resolveCurationTaskIdentity(request, dependencies);
+        if (taskIdentity.kind === "blocked") {
+          return curationResponse({ ...request, activeTaskId: taskIdentity.taskId }, {
+            status: "blocked",
+            counts: { added: 0, updated: 0, noOp: 0, deferred: 0, rejected: 0 },
+            records: [],
+            locallyStored: false,
+            readBackVerified: false,
+            safeToDeleteOriginalChat: "NO",
+            message: taskIdentity.message,
+          });
+        }
+        const responseRequest = { ...request, activeTaskId: taskIdentity.knownProjectTaskId ?? request.activeTaskId ?? null };
+        const result = await dependencies.curateCurrentContext(request.curationCandidates ?? [], {
+          knownProjectTaskId: taskIdentity.knownProjectTaskId,
+        });
+        return curationResponse(responseRequest, result);
+      } catch (error: unknown) {
+        return curationResponse(request, {
+          status: "blocked",
+          counts: { added: 0, updated: 0, noOp: 0, deferred: 1, rejected: 0 },
+          records: [],
+          locallyStored: false,
+          readBackVerified: false,
+          safeToDeleteOriginalChat: "NO",
+          message: `Local curation failed closed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    }
     if (request.command.kind === "sync") {
       return blockedWithoutState(
         request.activeTaskId ?? "unassigned",
@@ -2234,6 +2380,7 @@ function activateLocalCodexHandoff(_envelope: HandoffEnvelope): Promise<void> {
 export interface ConfiguredDAIRuntimeOptions {
   readonly workspacePath: string;
   readonly durableRoot?: string;
+  readonly memoryDatabasePath?: string;
   readonly gitHub?: GitHubAdapter;
   readonly githubCredentialsConfigured?: boolean;
   readonly githubEnterpriseHost?: string | null;
@@ -2246,6 +2393,18 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     ? options.githubEnterpriseHost
     : process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST ?? null;
   const store = new FileDurableContextStore(durableRoot);
+  if (options.memoryDatabasePath !== undefined && !isAbsolute(options.memoryDatabasePath)) {
+    throw new InvalidTaskStateError("Memory database path must be absolute");
+  }
+  const memoryDatabasePath = resolve(options.memoryDatabasePath ?? resolveDefaultMemoryDatabasePath());
+  if (options.memoryDatabasePath !== undefined) {
+    const relativePath = relative(root, memoryDatabasePath);
+    if (relativePath.length === 0 || (!relativePath.startsWith("..") && !isAbsolute(relativePath))) {
+      throw new InvalidTaskStateError("Memory database path must be outside the configured workspace");
+    }
+  }
+  const memoryRoot = dirname(memoryDatabasePath);
+  const memoryScopeId = resolveLocalMemoryScopeId(memoryDatabasePath);
   const handoffService = new PersistentHandoffService(new FileHandoffPersistence(join(durableRoot, "handoffs.json")));
   const gitHub = options.gitHub ?? GitHubCliAdapter.create({
     mode: "external",
@@ -2339,6 +2498,23 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),
     discoverActiveTasks: (workspacePath: string): Promise<readonly TaskState[]> => store.discoverActiveTasks(workspacePath),
+    curateCurrentContext: async (candidates: readonly CurationCandidate[], curationOptions: { readonly knownProjectTaskId: string | null }): Promise<CurationResult> => {
+        if (candidates.length === 0) return curateCurrentContext(null, candidates, curationOptions);
+        validateCurationCandidates(candidates);
+        await mkdir(dirname(memoryDatabasePath), { recursive: true });
+        const memoryStore = new LocalSqliteMemoryStore({
+          databasePath: memoryDatabasePath,
+          workspacePath: memoryRoot,
+          mode: "writer",
+          scopeId: memoryScopeId,
+          writerId: "primary-device",
+        });
+        try {
+          return await curateCurrentContext(memoryStore, candidates, curationOptions);
+        } finally {
+          memoryStore.close();
+        }
+      },
   };
 }
 

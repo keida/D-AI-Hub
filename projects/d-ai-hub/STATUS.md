@@ -3,7 +3,7 @@
 ## State
 
 - Lifecycle: active
-- Current objective: Dogfood Mode — use D-AI-Hub to manage real projects and observe actual failures instead of continuing preventive architecture expansion.
+- Current objective: Dogfood Mode — activate and dogfood Local Curation V1 with deliberately selected local-private facts, without publishing or ingesting a full chat transcript.
 - Privacy boundary: repository `knowledge/`, `memory/`, and `projects/` contain public-safe promoted context only; private Memory remains in OS-local SQLite/private state. Live GitHub visibility must be verified separately.
 - Stable capability: natural-language intent classification, explicit `@D-AI` priority, structured Codex-agent handoff, bounded delivery, workspace fencing, and fail-closed configured Codex repository identity preflight.
 - Live PR status must be queried from GitHub.
@@ -19,22 +19,23 @@
 - Existing workspace fencing and fail-closed behavior remain accepted.
 - LOCAL FIRST, GITHUB ON MILESTONE is implemented for this checkpoint: local runtime, live local Git state, durable state, private SQLite memory, and project checkpoints are active working truth; GitHub is the last explicitly published public-safe milestone and transport.
 - Default `@D-AI close` completes locally only after live local Git identity, clean-worktree, durable, ownership, recovery, and critical-unsaved-context gates. A late dirty or untracked worktree, identity mismatch, inspection failure, or recovery mismatch returns `BLOCKED`/`NO` without GitHub calls. Explicit publication close requires `publicationRequested: true` and authority allowing commit and push; the existing exact remote-SHA GitHub gates remain in that lane.
-- Working state: accepted local-first baseline is active at `30153cb806bdee8360215e45a00d0c965971a293`; the task-reuse fix is locally reviewed and captured in this local checkpoint. No push, PR, CI, or GitHub publication was performed.
-- Local validation: task-reuse relevant integration tests passed 40 with 1 platform skip; runtime/parser focused tests passed 133; typecheck and diff check passed; added-line secret-like scan had 0 hits. Structural health passed repository identity, required files, index freshness, Skill frontmatter, and Markdown links, with only intentional dirty-working-tree checks failing.
-- Real Quote Float cleanup condition remains unresolved and untouched: active durable tasks `task-937dc8b8c2a683764bc3eb62`, `task-d568bcbd45a8d2e139bcfe66`, and `task-cb9212276ba3e1bc76d04638` remain under the real workspace. No cleanup, replay, close, merge, or deletion was performed.
+- Working state: Local Curation V1 is implemented and locally verified on the local-first branch. Exact curation forms route before generic task bootstrap, persist only selected structured facts to the OS-local SQLite memory store, and return deterministic `ADD`, `UPDATE`, `NOOP`, `DEFER`, or `REJECT` outcomes with post-transaction read-back evidence. No push, PR, GitHub Actions, or GitHub publication was performed.
+- Local Curation V1 safety contract: repository `knowledge/`, `memory/`, and `projects/` receive zero automatic curation writes; workplace-risk content fails conservatively; project-memory requires an exact active workspace/repository task; and `SAFE TO DELETE ORIGINAL CHAT: YES` covers only the selected verified facts, not a transcript or every sentence.
+- Local validation: focused curation, parser, runtime, CLI, memory, rollback, and installed-Skill tests pass; relevant close/task-reuse integration tests remain green; typecheck and diff checks pass; privacy review found no content disclosure in serialized curation results.
+- Quote Float durable cleanup is CLOSED by Boss acceptance. The real workspace has one active canonical task, `task-937dc8b8c2a683764bc3eb62`; this implementation used only synthetic isolated stores and did not access or mutate that real durable state.
 - Dogfood freeze: absent new real evidence, do not implement Actor/Session V2, Memory redesign, RAG, embeddings, a vector database, fuzzy or semantic resolution, cross-workspace resume, a Router, swarm behavior, a second orchestrator, Chat/Work runtime, Runtime V2, automatic sync, or multi-writer support.
 - PR #29 remains Deferred and untouched.
 
 ## Current blockers
 
-- No current V1 product blocker; the next evidence must come from real dogfood.
+- No current product blocker in the locally verified implementation; activation and real-user curation still require a separate controlled dogfood acceptance.
 - Keep public-safe boundaries intact in `knowledge/`, `memory/`, and `projects/`; do not store private Memory, credentials, or confidential durable context there.
 - Any PR, CI, branch-protection, or remote-freshness claim must be refreshed from GitHub rather than copied into this checkpoint.
 - Merge and destructive Git operations still require separate explicit authorization.
 
 ## Next concrete action
 
-Recommended next action: activate and verify the new local runtime baseline, then obtain a distinct destructive cleanup decision for the three untouched Quote Float tasks. Do not publish to GitHub in that step.
+Recommended next action: activate the new local runtime baseline, then run a separately approved real-user Local Curation dogfood with a small reviewed fact set and verify SQLite read-back. Do not ingest the full chat or publish to GitHub.
 
 ## Evidence pointers
 

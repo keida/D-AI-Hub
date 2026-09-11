@@ -445,7 +445,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       if (existing === null) throw new Error("Expected the explicit establish task to persist");
       const before = await snapshotFiles(fixture.durableRoot);
 
-      const result = await activate({ rawCommand: "@D-AI 整理进我的知识库", taskId: null });
+      const result = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
 
       expect(result).toMatchObject({
         taskId: existing.taskId,
@@ -468,7 +468,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const result = await createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,
         durableRoot: fixture.durableRoot,
-      }))({ rawCommand: "@D-AI 整理进我的知识库", taskId: null });
+      }))({ rawCommand: "@D-AI inspect current context", taskId: null });
 
       expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
       expect(result.message).toMatch(/No active D-AI task matches this canonical workspace and repository/i);
@@ -489,7 +489,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const second = await activate({ rawCommand: "@D-AI establish second task", taskId: null });
       const before = await snapshotFiles(fixture.durableRoot);
 
-      const result = await activate({ rawCommand: "@D-AI 整理进我的知识库", taskId: null });
+      const result = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
 
       expect(result).toMatchObject({ taskId: "ambiguous", status: "blocked" });
       expect(result.message).toContain(first.taskId);
@@ -521,7 +521,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const result = await createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: otherWorkspace,
         durableRoot: fixture.durableRoot,
-      }))({ rawCommand: "@D-AI 整理进我的知识库", taskId: null });
+      }))({ rawCommand: "@D-AI inspect current context", taskId: null });
 
       expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
       expect(result.message).toMatch(/No active D-AI task matches this canonical workspace and repository/i);
@@ -545,7 +545,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       const result = await createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,
         durableRoot: fixture.durableRoot,
-      }))({ rawCommand: "@D-AI 整理进我的知识库", taskId: null });
+      }))({ rawCommand: "@D-AI inspect current context", taskId: null });
 
       expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
       expect(result.message).toMatch(/No active D-AI task matches this canonical workspace and repository/i);
@@ -972,7 +972,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       expect(task?.contextManifest).toContain("remote-repository:git.example.test/acme/d-ai");
       expect(task?.recoveryPoint).not.toBeNull();
       const beforeGeneric = await snapshotFiles(durableRoot);
-      const generic = await activate({ rawCommand: "@D-AI 整理进我的知识库", taskId: null });
+      const generic = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
       expect(generic).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "blocked" });
       expect(generic.message).toMatch(/matched active task|no configured safe operation/i);
       expect(await snapshotFiles(durableRoot)).toEqual(beforeGeneric);

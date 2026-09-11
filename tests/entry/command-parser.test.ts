@@ -21,6 +21,10 @@ describe("parseDAICommand", () => {
     ["@D-AI complete handoff-task-1", { kind: "complete", handoffId: "handoff-task-1" }],
     ["@D-AI close", { kind: "close" }],
     ["@D-AI rollback", { kind: "rollback" }],
+    ["@D-AI 整理", { kind: "curate" }],
+    ["@D-AI 整理进我的知识库", { kind: "curate" }],
+    ["@D-AI curate this", { kind: "curate" }],
+    ["@D-AI 整理一下这个", { kind: "intent", text: "整理一下这个" }],
   ] as const)("normalizes %s", (input, expected) => {
     expect(parseDAICommand(input)).toEqual(expected);
   });

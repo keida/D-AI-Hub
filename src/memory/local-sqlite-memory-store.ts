@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
-import type { LocalSqliteMemoryStoreOptions, MemoryRecord, MemoryStoreMode, MemoryValue, PutMemoryInput } from "./types.js";
+import type { LocalSqliteMemoryStoreOptions, MemoryMutation, MemoryRecord, MemoryStoreMode, MemoryValue, PutMemoryInput } from "./types.js";
 
 interface MemoryRow {
   readonly memory_id: string;
@@ -767,6 +767,73 @@ export class LocalSqliteMemoryStore {
       };
     } catch (error) {
       this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  public async applyMutations(mutations: readonly MemoryMutation[]): Promise<readonly MemoryRecord[]> {
+    if (this.options.mode !== "writer") {
+      throw new InvalidTaskStateError("Memory mutations are blocked in reader mode");
+    }
+    const prepared = mutations.map((mutation) => ({
+      operation: mutation.operation,
+      memoryId: assertIdentifier(mutation.memoryId, "Memory memoryId"),
+      value: snapshotMemoryValue(mutation.value),
+      recordedAt: assertRecordedAt(mutation.recordedAt),
+    }));
+    const seenIds = new Set<string>();
+    for (const mutation of prepared) {
+      if (seenIds.has(mutation.memoryId)) throw new InvalidTaskStateError(`Memory mutation contains duplicate ID ${mutation.memoryId}`);
+      seenIds.add(mutation.memoryId);
+      assertNoSecretShapedValue(mutation.value);
+    }
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      let sequence = (this.database
+        .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM memory_records WHERE scope_id = ? AND writer_id = ?")
+        .get(this.options.scopeId, this.options.writerId) as { readonly sequence: number }).sequence;
+      const records: MemoryRecord[] = [];
+      for (const mutation of prepared) {
+        const existing = this.database
+          .prepare("SELECT memory_id FROM memory_records WHERE scope_id = ? AND memory_id = ?")
+          .get(this.options.scopeId, mutation.memoryId) as { readonly memory_id: string } | undefined;
+        if (mutation.operation === "add" && existing !== undefined) {
+          throw new InvalidTaskStateError(`Memory ${mutation.memoryId} already exists in scope ${this.options.scopeId}`);
+        }
+        if (mutation.operation === "update" && existing === undefined) {
+          throw new InvalidTaskStateError(`Memory ${mutation.memoryId} does not exist in scope ${this.options.scopeId}`);
+        }
+        sequence += 1;
+        const valueJson = canonicalJson(mutation.value);
+        const valueSha256 = createHash("sha256").update(valueJson, "utf8").digest("hex");
+        if (mutation.operation === "add") {
+          this.database
+            .prepare("INSERT INTO memory_records (scope_id, memory_id, writer_id, sequence, value_json, value_sha256, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .run(this.options.scopeId, mutation.memoryId, this.options.writerId, sequence, valueJson, valueSha256, mutation.recordedAt);
+        } else {
+          this.database
+            .prepare("UPDATE memory_records SET writer_id = ?, sequence = ?, value_json = ?, value_sha256 = ?, recorded_at = ? WHERE scope_id = ? AND memory_id = ?")
+            .run(this.options.writerId, sequence, valueJson, valueSha256, mutation.recordedAt, this.options.scopeId, mutation.memoryId);
+        }
+        const row = this.database
+          .prepare("SELECT memory_id, scope_id, writer_id, sequence, value_json, value_sha256, recorded_at FROM memory_records WHERE scope_id = ? AND memory_id = ?")
+          .get(this.options.scopeId, mutation.memoryId) as MemoryRow | undefined;
+        if (row === undefined) throw new InvalidTaskStateError(`Memory read-back failed for ${mutation.memoryId}`);
+        const record = toRecord(row);
+        if (record.valueSha256 !== valueSha256 || record.sequence !== sequence) {
+          throw new InvalidTaskStateError(`Memory read-back integrity failed for ${mutation.memoryId}`);
+        }
+        records.push(record);
+      }
+      this.database.exec("COMMIT");
+      return records;
+    } catch (error) {
+      try {
+        this.database.exec("ROLLBACK");
+      } catch {
+        // Preserve the original transaction failure.
+      }
       throw error;
     }
   }

@@ -1,9 +1,30 @@
 import { describe, expect, it } from "vitest";
 import type { DeliveryResult } from "../../src/automation/delivery.js";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
+import type { CurationCandidate } from "../../src/curation/local-curation.js";
 import type { DAIResponse, ExternalDAIRequest } from "../../src/runtime/d-ai-runtime.js";
 
 describe("Codex D-AI activation", () => {
+  it("routes explicit curation with supplied context without changing it into a generic intent", async () => {
+    const requests: ExternalDAIRequest[] = [];
+    const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
+      requests.push(request);
+      return { taskId: "unassigned", stage: "inspect", environment: "codex", status: "completed", evidence: [], message: "curated" };
+    };
+    const candidate: CurationCandidate = {
+      candidateId: "fact-1",
+      memoryId: "fact-1",
+      fact: "A supplied fact",
+      category: "knowledge",
+      source: "current-context",
+      privacyRisk: "local-private",
+    };
+    const activate = createCodexActivation(runtime);
+
+    await activate({ rawCommand: "@D-AI 整理", taskId: null, currentContext: [candidate] });
+
+    expect(requests).toEqual([expect.objectContaining({ command: { kind: "curate" }, curationCandidates: [candidate] })]);
+  });
   it("parses a raw logical close command and selects the explicit durable task", async () => {
     const requests: ExternalDAIRequest[] = [];
     const runtime = async (request: ExternalDAIRequest): Promise<DAIResponse> => {
