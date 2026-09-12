@@ -25,3 +25,7 @@ export interface PutMemoryInput {
   readonly value: MemoryValue;
   readonly recordedAt: string;
 }
+
+export type MemoryMutation =
+  | { readonly operation: "add"; readonly memoryId: string; readonly value: MemoryValue; readonly recordedAt: string }
+  | { readonly operation: "update"; readonly memoryId: string; readonly value: MemoryValue; readonly recordedAt: string };

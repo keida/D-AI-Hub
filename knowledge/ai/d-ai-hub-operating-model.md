@@ -2,19 +2,19 @@
 
 - Domain: ai
 - Status: verified
-- Last reviewed: 2026-08-20
+- Last reviewed: 2026-09-11
 - Source: repository README, design specification, indexes, custom Skills, and authenticated GitHub main snapshot
 
 ## Summary
 
-D-AI-Hub is a private, GitHub-first personal AI operating system shared across ChatGPT Web, Codex, and other compatible agents. GitHub is the canonical source of truth; local checkouts are working copies used for repository maintenance and local Skill discovery.
+D-AI-Hub is a local-first personal AI operating system shared across ChatGPT Web, Codex, and other compatible agents. Local runtime/source/worktree/durable state and private SQLite memory are active working truth; GitHub is the last explicitly published public-safe framework/source milestone and transport for backup, release, and cross-device transfer.
 
 ## Key points
 
 - Skills define how agents should work. `.agents/skills/` contains Agent Skills-compatible entry points; the canonical user-authored Skill files live under `skills/custom/`.
 - Durable subject knowledge belongs under the narrowest domain in `knowledge/` and is discovered through `indexes/KNOWLEDGE.md`.
 - Project state belongs under `projects/<project>/` and is resumed from `README.md`, `STATUS.md`, `DECISIONS.md`, `BUGS.md`, `ROADMAP.md`, then `REFERENCES.md`.
-- Cross-project durable context belongs under `memory/`; reusable instructions belong under Skills or `prompts/`.
+- Cross-project durable context belongs under `memory/` only after explicit public-safe promotion; private cross-project context belongs in OS-local state. Reusable instructions belong under Skills or `prompts/`.
 - Third-party Skills are registered under `skills/external/` rather than copied into the hub by default.
 - V1 is intentionally Markdown-first and excludes vector databases, embeddings, RAG infrastructure, background ingestion, and automatic sync services.
 - Never store passwords, API keys, access tokens, certificates, cookies, secret environment files, or unauthorized confidential material.

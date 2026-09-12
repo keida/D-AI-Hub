@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCommand } from "../../src/adapters/command-runner.js";
+import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
+import { resolveLocalMemoryScopeId } from "../../src/memory/local-memory-path.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { describe, expect, it } from "vitest";
 
@@ -226,7 +228,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("completes a bounded verify intent through the public Skill and persists a recovery point", async () => {
+  it("blocks a generic explicit verify intent through the public Skill when no active task exists", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-real-execution-"));
     const workspacePath = join(root, "workspace");
     const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
@@ -245,20 +247,11 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       const entryPath = join(await createBoundInstalledSkill(root), "scripts", "invoke.ps1");
       const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace");
 
-      expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(0);
+      expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
-      expect(response).toMatchObject({ environment: "codex", status: "completed", stage: "verify" });
-      expect(response.message).toMatch(/verification/i);
-      expect(Array.isArray(response.evidence)).toBe(true);
-      expect((response.evidence as unknown[]).length).toBe(8);
-      const state = await new FileDurableContextStore(join(workspacePath, ".d-ai")).load(String(response.taskId));
-      expect(state).not.toBeNull();
-      expect(state?.stage).toBe("verify");
-      expect(state?.recoveryPoint).not.toBeNull();
-      expect(state?.criticalUnsavedContext).toHaveLength(0);
-      expect(state?.contextManifest).toContain("ref:refs/heads/verify/review");
-      expect(state?.contextManifest).toContain("local-state:clean-required");
-      expect(state?.verificationEvidence.map((item) => item.evidenceId)).toEqual(expect.arrayContaining(["gate:recovery"]));
+      expect(response).toMatchObject({ environment: "codex", status: "blocked", stage: "bootstrap", taskId: "unassigned" });
+      expect(response.message).toMatch(/No active D-AI task matches this canonical workspace and repository.*establish/i);
+      expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -288,6 +281,56 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
       expect(response).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
       expect(response.message).toMatch(/Configured Codex.*GitHub.*identity|origin/i);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the actual installed Skill curation seam with an isolated database and SAFE NO without a payload", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-curation-"));
+    const workspacePath = join(root, "workspace");
+    const payloadPath = join(root, "curation.json");
+    const databasePath = join(root, "memory.sqlite");
+    try {
+      await mkdir(workspacePath);
+      const installedEntry = join(await createBoundInstalledSkill(root), "scripts", "invoke.ps1");
+      await writeFile(payloadPath, JSON.stringify({
+        version: 1,
+        candidates: [{
+          candidateId: "installed-skill-fact",
+          memoryId: "installed-skill-fact",
+          fact: "The installed Skill passes selected facts through an isolated local seam.",
+          category: "knowledge",
+          source: "current-context",
+          privacyRisk: "local-private",
+        }],
+      }), "utf8");
+      const stored = await runPowerShellArguments(installedEntry, workspacePath, [
+        "-WorkspacePath", workspacePath,
+        "-CommandText", "整理一下",
+        "-CurationPayloadPath", payloadPath,
+        "-MemoryDatabasePath", databasePath,
+      ]);
+      expect(stored.exitCode, `${stored.stderr}\n${stored.stdout}`).toBe(0);
+      expect(JSON.parse(stored.stdout)).toMatchObject({ status: "completed" });
+      expect(stored.stdout).toMatch(/Added=1|locally stored=YES/i);
+
+      const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: dirname(databasePath), mode: "reader", scopeId: resolveLocalMemoryScopeId(databasePath), writerId: "primary-device" });
+      try {
+        await expect(reader.get("installed-skill-fact")).resolves.not.toBeNull();
+      } finally {
+        reader.close();
+      }
+      expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
+
+      const safeNo = await runPowerShellArguments(installedEntry, workspacePath, [
+        "-WorkspacePath", workspacePath,
+        "-CommandText", "@D-AI 整理",
+      ]);
+      expect(safeNo.exitCode, `${safeNo.stderr}\n${safeNo.stdout}`).toBe(2);
+      expect(JSON.parse(safeNo.stdout)).toMatchObject({ status: "blocked" });
+      expect(safeNo.stdout).toMatch(/SAFE TO DELETE ORIGINAL CHAT: NO|not captured/i);
+      expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

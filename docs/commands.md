@@ -25,18 +25,18 @@ Natural-language examples:
 
 Questions, status requests, and ambiguous requests are read-only. No durable task is created or mutated for those paths.
 
-Risk levels: Level 0 = read-only; Level 1 = local reversible implementation; Level 2 = publication; Level 3 = irreversible/destructive action. Publication authority is required only at the Level 2 commit/push/PR boundary.
+Risk levels: Level 0 = read-only; Level 1 = local reversible implementation; Level 2 = publication; Level 3 = irreversible/destructive action. Verification tiers are a separate axis: Tier 1 covers ordinary local checks, Tier 2 covers critical local verification, and Tier 3 covers publication/remote evidence. Tier 1 and Tier 2 work do not publish by default. Publication authority is required at the commit/push/PR/CI boundary.
 
 | Command | Purpose |
 | --- | --- |
 | `@D-AI continue <task-or-project>` | Resume the active Codex task after workspace and ownership checks. |
 | `@D-AI status` | Show the uniquely discovered active task for the current workspace, or fail closed. |
-| `@D-AI close` | Verify durable state, GitHub evidence, and project-memory outcomes; return `YES`, `NO`, or `BLOCKED`. |
+| `@D-AI close` | Verify local durable state, ownership, recovery, and project-memory outcomes; complete a local close by default and return `YES`, `NO`, or `BLOCKED`. |
 | `@D-AI rollback` | Perform an explicitly authorized, durable, auditable rollback or fail closed. |
 
 `@D-AI establish`, `@D-AI sync`, and internal `@D-AI update` remain setup/maintenance workflows rather than the daily V1 command set. There is no new user-facing `@D-AI deliver` command. Cross-environment `handoff` remains a contract/reference command and is Future/Deferred for product delivery.
 
-For `status` and `close`, the runtime automatically selects the unique active durable task whose persisted workspace identity matches the current workspace. Zero matches, multiple matches, and ownership conflicts fail closed. Add `--task <task-id>` only when the result asks for explicit disambiguation or recovery.
+For `status` and `close`, the runtime automatically selects the unique active durable task whose persisted workspace identity matches the current workspace. Zero matches, multiple matches, and ownership conflicts fail closed. Close is local by default; an explicit publication close requires publication intent and authority. Add `--task <task-id>` only when the result asks for explicit disambiguation or recovery.
 
 ## `@D-AI establish`
 
@@ -116,8 +116,8 @@ Use when meaningful work is finished for the session.
 
 Expected outcome:
 - local durable task state and the touched project's Markdown memory reflect verified reality and the next action;
-- GitHub push success and exact remote repository/ref/SHA evidence are checked when the close gate applies;
-- missing credentials, remote evidence, ownership, or durable context return `NO`/`BLOCKED`;
+- GitHub push success and exact remote repository/ref/SHA evidence are checked only for an explicit publication close;
+- missing ownership, recovery, or durable context can return `NO`/`BLOCKED`; missing credentials or remote evidence blocks only an explicit publication close;
 - no files, processes, repositories, or unrelated user changes are deleted or hidden.
 
 Example:
@@ -133,14 +133,20 @@ Continue <project>
 → Fast Read
 → Write Gate before the first modification
 → do the work
-→ Release Gate and @D-AI close when durable work is ready
+→ local focused verification and @D-AI close when durable work is ready
 ```
+
+Use a separate milestone/publication decision before commit, push, PR, CI, or publication close. `@D-AI 整理` is implemented as a local-only curation seam: the handling agent may pass a selected versioned current-context JSON payload to the Codex Skill, which validates and stores only eligible facts in the OS-local SQLite memory path (or an explicit absolute test override). The quality gate records stable subject/provenance metadata, detects duplicate/stale/competing facts, validates durable repository or HTTPS references, and returns a structured `PASS`, `HOLD`, or `NO` report. It never crawls chat history, creates durable tasks, or publishes to GitHub; missing or ambiguous project identity keeps project-memory curation fail-closed.
+
+Fresh `@D-AI status` and `@D-AI continue` responses include a bounded, redacted task-scoped `memorySnapshot` when the existing private SQLite database can be read. A missing database returns explicit no-memory; status and continue never create a memory database or durable task merely to inspect it. `SAFE TO DELETE ORIGINAL CHAT: YES` is emitted only when selected facts pass quality checks, persist/read back, and are recovered through a fresh reader; any deferred/rejected fact, contradiction, failed asset/reference, cross-project binding, or failed recovery keeps it `NO` or `HOLD`.
+
+An internal close request may set `publicationRequested: true` and provide `publicationAuthority: { grantedBy, allowCommit: true, allowPush: true }`. The default omitted flag is local close. This request flag is not implicit commit authority.
 
 When a durable outcome is worth capturing before the session ends, run the internal `@D-AI update` workflow before continuing.
 
 Within one uninterrupted session, continue from the already loaded state instead of rereading unchanged project files. Refresh the project's current checkpoint only after meaningful change.
 
-Use `@D-AI sync` only when an explicit canonical-freshness check is needed. It is not required merely to make the agent read local project context.
+Use `@D-AI sync` only when an explicit canonical-freshness check is needed. It remains unsupported/fail-closed with zero durable writes in the current runtime and is not a publication command. The overloaded word `同步` must be clarified before any GitHub action.
 
 `@D-AI establish` is normally not part of the daily loop once an environment has been successfully established.
 

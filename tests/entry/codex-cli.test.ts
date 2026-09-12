@@ -1,10 +1,19 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCodexCLI } from "../../src/entry/codex-cli.js";
+import { resolveDefaultMemoryDatabasePath, resolveLocalMemoryScopeId } from "../../src/memory/local-memory-path.js";
+import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 
 describe("Codex D-AI CLI", () => {
+  it.skipIf(process.platform !== "win32")("resolves the canonical Windows memory workflow path used by curation defaults", () => {
+    const localAppData = "C:\\Users\\Canonical\\AppData\\Local";
+    const expectedCanonicalPath = "C:\\Users\\Canonical\\AppData\\Local\\D-AI-Hub\\memory\\memory.sqlite";
+
+    expect(resolveDefaultMemoryDatabasePath({ LOCALAPPDATA: localAppData }, "C:\\Users\\Canonical")).toBe(expectedCanonicalPath);
+  });
+
   it("fails closed with task-selection instructions in a fresh unrelated workspace", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-codex-entry-"));
     try {
@@ -117,6 +126,171 @@ describe("Codex D-AI CLI", () => {
       expect(result.response.message).toContain("Merge performed: NO");
     } finally {
       await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a validated curation payload through the CLI and reads back into an isolated SQLite override", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-curation-cli-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-curation-db-"));
+    const payloadPath = join(workspacePath, "curation.json");
+    const databasePath = join(databaseRoot, "isolated-memory.sqlite");
+    try {
+      await writeFile(payloadPath, JSON.stringify({
+        version: 1,
+        candidates: [{
+          candidateId: "cli-fact",
+          memoryId: "cli-fact",
+          fact: "CLI supplied facts use a local SQLite seam.",
+          category: "knowledge",
+          source: "current-context",
+          privacyRisk: "local-private",
+        }],
+      }), "utf8");
+
+      const result = await runCodexCLI([
+        "--workspace", workspacePath,
+        "--command", "@D-AI 整理",
+        "--curation-payload", payloadPath,
+        "--memory-database", databasePath,
+      ]);
+
+      expect(result.exitCode).toBe(0);
+      expect(result.response).toMatchObject({ status: "completed", message: expect.stringMatching(/Added=1|locally stored=YES/i) });
+      expect(result.response.curationRecords).toMatchObject([{ memoryId: "cli-fact", decision: "ADD" }]);
+      expect(result.response.message).toContain("Records=cli-fact:ADD");
+      const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: dirname(databasePath), mode: "reader", scopeId: resolveLocalMemoryScopeId(databasePath), writerId: "primary-device" });
+      try {
+        await expect(reader.get("cli-fact")).resolves.toMatchObject({ value: { fact: "CLI supplied facts use a local SQLite seam." } });
+      } finally {
+        reader.close();
+      }
+      await expect(access(join(workspacePath, ".d-ai"))).rejects.toThrow();
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+      await rm(databaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not serialize confidential fact content in public curation records", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-curation-cli-privacy-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-curation-db-privacy-"));
+    const payloadPath = join(workspacePath, "curation.json");
+    const confidentialFact = "WORKPLACE-CONFIDENTIAL-FACT-MUST-NOT-APPEAR-IN-RESPONSE";
+    try {
+      await writeFile(payloadPath, JSON.stringify({
+        version: 1,
+        candidates: [{
+          candidateId: "confidential-fact",
+          memoryId: "confidential-fact",
+          fact: confidentialFact,
+          category: "knowledge",
+          source: "current-context",
+          privacyRisk: "workplace-confidential",
+        }],
+      }), "utf8");
+
+      const result = await runCodexCLI([
+        "--workspace", workspacePath,
+        "--command", "@D-AI 整理",
+        "--curation-payload", payloadPath,
+        "--memory-database", join(databaseRoot, "memory.sqlite"),
+      ]);
+
+      const serialized = JSON.stringify(result.response);
+      expect(result.response).toMatchObject({ status: "completed", curationRecords: [{ memoryId: "confidential-fact", category: "knowledge", decision: "REJECT" }] });
+      expect(result.response.message).toMatch(/Rejected=1|confidential-fact:REJECT/i);
+      expect(serialized).not.toContain(confidentialFact);
+      expect(serialized).not.toContain("summary");
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+      await rm(databaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("returns SAFE NO with zero writes when curation has no supplied payload", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-curation-cli-empty-"));
+    try {
+      const result = await runCodexCLI(["--workspace", workspacePath, "--command", "@D-AI 整理"]);
+
+      expect(result.exitCode).toBe(2);
+      expect(result.response.message).toMatch(/SAFE TO DELETE ORIGINAL CHAT: NO|not captured/i);
+      await expect(access(join(workspacePath, ".d-ai"))).rejects.toThrow();
+      expect(resolveDefaultMemoryDatabasePath().toLowerCase()).not.toContain(workspacePath.toLowerCase());
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an explicit memory database inside the configured workspace", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-curation-cli-local-db-"));
+    try {
+      await expect(runCodexCLI([
+        "--workspace", workspacePath,
+        "--command", "@D-AI 整理",
+        "--memory-database", join(workspacePath, "memory.sqlite"),
+      ])).rejects.toThrow(/outside the configured workspace/i);
+      await expect(access(join(workspacePath, ".d-ai"))).rejects.toThrow();
+      await expect(access(join(workspacePath, "memory.sqlite"))).rejects.toThrow();
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a missing curation payload before any durable or memory write", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-curation-cli-invalid-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-curation-db-invalid-"));
+    const databasePath = join(databaseRoot, "isolated-memory.sqlite");
+    try {
+      const result = await runCodexCLI([
+        "--workspace", workspacePath,
+        "--command", "@D-AI 整理",
+        "--curation-payload", join(workspacePath, "missing.json"),
+        "--memory-database", databasePath,
+      ]);
+
+      expect(result.exitCode).toBe(2);
+      expect(result.response.message).toMatch(/payload|readable|blocked/i);
+      await expect(access(databasePath)).rejects.toThrow();
+      await expect(access(join(workspacePath, ".d-ai"))).rejects.toThrow();
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+      await rm(databaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects secret-shaped persisted identifiers before creating the memory database", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "d-ai-curation-cli-secret-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-curation-db-secret-"));
+    const payloadPath = join(workspacePath, "secret.json");
+    const databasePath = join(databaseRoot, "isolated-memory.sqlite");
+    try {
+      await writeFile(payloadPath, JSON.stringify({
+        version: 1,
+        candidates: [{
+          candidateId: "-----BEGIN PRIVATE KEY-----",
+          memoryId: "safe-memory-id",
+          fact: "A harmless-looking fact.",
+          category: "knowledge",
+          source: "current-context",
+          privacyRisk: "local-private",
+        }],
+      }), "utf8");
+
+      const result = await runCodexCLI([
+        "--workspace", workspacePath,
+        "--command", "@D-AI 整理",
+        "--curation-payload", payloadPath,
+        "--memory-database", databasePath,
+      ]);
+
+      expect(result.exitCode).toBe(2);
+      expect(result.response.message).toMatch(/candidate|safe|secret/i);
+      await expect(access(databasePath)).rejects.toThrow();
+      await expect(access(join(workspacePath, ".d-ai"))).rejects.toThrow();
+      expect(result.response.message).not.toContain("api-key-candidate");
+    } finally {
+      await rm(workspacePath, { recursive: true, force: true });
+      await rm(databaseRoot, { recursive: true, force: true });
     }
   });
 });

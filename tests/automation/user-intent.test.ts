@@ -60,6 +60,12 @@ describe("classifyUserIntent", () => {
     ["push", "delivery", "bounded-mutation", "review-ready-pr", null, false],
     ["pull request", "delivery", "bounded-mutation", "review-ready-pr", null, false],
     ["推送分支", "delivery", "bounded-mutation", "review-ready-pr", null, false],
+    ["整理", "curate", "bounded-mutation", "curate", null, false],
+    ["整理一下", "curate", "bounded-mutation", "curate", null, false],
+    ["整理当前内容", "curate", "bounded-mutation", "curate", null, false],
+    ["整理进我的知识库", "curate", "bounded-mutation", "curate", null, false],
+    ["curate", "curate", "bounded-mutation", "curate", null, false],
+    ["curate this", "curate", "bounded-mutation", "curate", null, false],
   ] as const)("recognizes %s", (text, intent, risk, expectedEndpoint, project, resumeExistingTask) => {
     expect(classifyUserIntent(text)).toMatchObject({
       intent,
@@ -72,6 +78,11 @@ describe("classifyUserIntent", () => {
 
   it("fails ambiguous requests into read-only discussion", () => {
     expect(classifyUserIntent("帮我看看这个方案")).toMatchObject({
+      intent: "discuss",
+      risk: "read-only",
+      expectedEndpoint: "discussion",
+    });
+    expect(classifyUserIntent("整理一下这个")).toMatchObject({
       intent: "discuss",
       risk: "read-only",
       expectedEndpoint: "discussion",

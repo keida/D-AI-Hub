@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { GitHubCliAdapter } from "../../src/adapters/github.js";
@@ -156,6 +156,23 @@ async function createConfiguredBootstrapFixture(prefix: string, remoteUrl: strin
   return { root, repositoryPath, durableRoot };
 }
 
+async function snapshotFiles(root: string): Promise<readonly [string, string][]> {
+  const files: [string, string][] = [];
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else files.push([relative(root, path).replaceAll("\\", "/"), await readFile(path, "utf8")]);
+    }
+  };
+  try {
+    await visit(root);
+  } catch (error: unknown) {
+    if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+  }
+  return files.sort(([left], [right]) => left.localeCompare(right));
+}
+
 describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
   it.each(["chat", "work"] as const)("fails closed before ownership transfer when default %s activation is unavailable", async (target) => {
     const fixture = await createActivationFixture(`d-ai-codex-handoff-${target}-`);
@@ -185,7 +202,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("returns NO when the configured remote reports a different SHA", async () => {
+  it("retains the GitHub gate for an explicit publication close", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-close-mismatch-"));
     const repositoryPath = join(root, "repository");
     const durableRoot = join(root, "durable");
@@ -215,9 +232,14 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         durableRoot,
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
       });
-      const activate = createCodexActivation(runtime);
-
-      const result = await activate({ rawCommand: "@D-AI close", taskId: state.taskId });
+      const result = await runtime({
+        command: { kind: "close" },
+        sourceEnvironment: "codex",
+        overrides: { model: null, role: null, environment: null, stage: null },
+        activeTaskId: state.taskId,
+        publicationRequested: true,
+        publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true },
+      });
 
       expect(result.status).toBe("blocked");
       expect(result.message).toMatch(/Close verdict NO.*Remote SHA does not match/i);
@@ -226,30 +248,39 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("returns NO for a dirty worktree without calling the push transport", async () => {
+  it("blocks local close without calling GitHub for a dirty worktree", async () => {
     const fixture = await createActivationFixture("d-ai-codex-close-dirty-");
     try {
       await writeFile(join(fixture.repositoryPath, "dirty.txt"), "unsaved work\n", "utf8");
       const transport: GitTransport = {
-        pushRef: async () => { throw new Error("Dirty close must not push"); },
-        readRef: async () => { throw new Error("Dirty close must not verify a remote"); },
+        pushRef: async () => { throw new Error("Local close must not push"); },
+        readRef: async () => { throw new Error("Local close must not verify a remote"); },
+      };
+      let pushCalls = 0;
+      let remoteCalls = 0;
+      const countingTransport: GitTransport = {
+        pushRef: async (...args) => { pushCalls += 1; return transport.pushRef(...args); },
+        readRef: async (...args) => { remoteCalls += 1; return transport.readRef(...args); },
       };
       const activate = createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,
         durableRoot: fixture.durableRoot,
-        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
+        gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, countingTransport),
       }));
 
       const result = await activate({ rawCommand: "@D-AI close", taskId: fixture.state.taskId });
 
       expect(result.status).toBe("blocked");
-      expect(result.message).toMatch(/Close verdict NO.*worktree is not clean/i);
+      expect(result.message).toMatch(/Close verdict BLOCKED.*worktree/i);
+      expect(result.message).not.toMatch(/Safe-to-delete: YES/i);
+      expect(pushCalls).toBe(0);
+      expect(remoteCalls).toBe(0);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
   });
 
-  it("returns BLOCKED when GitHub credentials are not configured", async () => {
+  it("completes local close when GitHub credentials are not configured", async () => {
     const fixture = await createActivationFixture("d-ai-codex-close-unconfigured-");
     try {
       const activate = createCodexActivation(createConfiguredDAIRuntime({
@@ -260,8 +291,8 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
 
       const result = await activate({ rawCommand: "@D-AI close", taskId: fixture.state.taskId });
 
-      expect(result.status).toBe("blocked");
-      expect(result.message).toMatch(/Close verdict BLOCKED.*credentials.*configuration/i);
+      expect(result.status).toBe("completed");
+      expect(result.message).toMatch(/Local close completed/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -400,6 +431,131 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
+  it("reuses the unique configured Codex task for a generic explicit intent", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-generic-reuse-", "https://github.com/acme/d-ai.git");
+    try {
+      const store = new FileDurableContextStore(fixture.durableRoot);
+      const activate = createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }));
+      const established = await activate({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+      expect(established.taskId).toMatch(/^task-/);
+      const existing = await store.load(established.taskId);
+      if (existing === null) throw new Error("Expected the explicit establish task to persist");
+      const before = await snapshotFiles(fixture.durableRoot);
+
+      const result = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
+
+      expect(result).toMatchObject({
+        taskId: existing.taskId,
+        stage: existing.stage,
+        environment: existing.environment,
+        status: "blocked",
+      });
+      expect(result.evidence).toEqual(existing.verificationEvidence);
+      expect(result.message).toMatch(/matched active task|no configured safe operation/i);
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a generic explicit intent without a matching task and writes nothing", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-generic-zero-", "https://github.com/acme/d-ai.git");
+    try {
+      const before = await snapshotFiles(fixture.durableRoot);
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI inspect current context", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+      expect(result.message).toMatch(/No active D-AI task matches this canonical workspace and repository/i);
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks a generic explicit intent with multiple matching tasks without mutation", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-generic-multiple-", "https://github.com/acme/d-ai.git");
+    try {
+      const activate = createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }));
+      const first = await activate({ rawCommand: "@D-AI establish first task", taskId: null });
+      const second = await activate({ rawCommand: "@D-AI establish second task", taskId: null });
+      const before = await snapshotFiles(fixture.durableRoot);
+
+      const result = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "ambiguous", status: "blocked" });
+      expect(result.message).toContain(first.taskId);
+      expect(result.message).toContain(second.taskId);
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reuse a task from another workspace", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-generic-workspace-", "https://github.com/acme/d-ai.git");
+    const otherWorkspace = join(fixture.root, "other-workspace");
+    try {
+      await mkdir(otherWorkspace);
+      await git(null, ["init", "--initial-branch=main", otherWorkspace]);
+      await git(otherWorkspace, ["config", "user.email", "d-ai@example.test"]);
+      await git(otherWorkspace, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(otherWorkspace, "artifact.txt"), "other workspace\n", "utf8");
+      await git(otherWorkspace, ["add", "artifact.txt"]);
+      await git(otherWorkspace, ["commit", "-m", "other workspace"]);
+      await git(otherWorkspace, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      const seeded = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+      const before = await snapshotFiles(fixture.durableRoot);
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: otherWorkspace,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI inspect current context", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+      expect(result.message).toMatch(/No active D-AI task matches this canonical workspace and repository/i);
+      expect(result.taskId).not.toBe(seeded.taskId);
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reuse a task with a different canonical remote identity", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-generic-repository-", "https://github.com/acme/other.git");
+    try {
+      const seeded = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+      await git(fixture.repositoryPath, ["remote", "set-url", "origin", "https://github.com/acme/d-ai.git"]);
+      const before = await snapshotFiles(fixture.durableRoot);
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI inspect current context", taskId: null });
+
+      expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
+      expect(result.message).toMatch(/No active D-AI task matches this canonical workspace and repository/i);
+      expect(result.taskId).not.toBe(seeded.taskId);
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ["Git root", async (repositoryPath: string) => { await rename(join(repositoryPath, ".git"), join(repositoryPath, "..", "git-hidden")); await mkdir(join(repositoryPath, ".git")); }],
     ["origin", async (repositoryPath: string) => { await git(repositoryPath, ["remote", "remove", "origin"]); }],
@@ -469,7 +625,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       }))({ rawCommand: "@D-AI close", taskId: null });
 
       expect(result.taskId).toBe(fixture.state.taskId);
-      expect(result.message).toMatch(/Close verdict BLOCKED.*credentials/i);
+      expect(result.message).toMatch(/Local close completed.*Safe-to-delete: YES/i);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -509,9 +665,9 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
 
       const closed = await createCodexActivation(freshRuntime)({ rawCommand: "@D-AI close", taskId: null });
       expect(closed).toMatchObject({ taskId: fixture.state.taskId, status: "completed", stage: "close" });
-      expect(closed.message).toMatch(/YES/i);
-      expect(pushCalls).toBe(1);
-      expect(readCalls).toBe(1);
+      expect(closed.message).toMatch(/Local close completed/i);
+      expect(pushCalls).toBe(0);
+      expect(readCalls).toBe(0);
       const afterClose = await new FileDurableContextStore(fixture.durableRoot).load(fixture.state.taskId);
       if (afterClose === null) throw new Error("Expected the durable task after close");
       for (const prefix of ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"]) {
@@ -524,8 +680,8 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: null }, transport),
       });
       await expect(createCodexActivation(finalRuntime)({ rawCommand: "@D-AI close", taskId: null })).resolves.toMatchObject({ taskId: "unassigned", status: "blocked" });
-      expect(pushCalls).toBe(1);
-      expect(readCalls).toBe(1);
+      expect(pushCalls).toBe(0);
+      expect(readCalls).toBe(0);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -550,7 +706,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
 
       const runtime = createConfiguredDAIRuntime({ workspacePath });
       const activate = createCodexActivation(runtime);
-      const executed = await activate({ rawCommand: "@D-AI verify nested workspace", taskId: null });
+      const executed = await activate({ rawCommand: "@D-AI establish verify nested workspace", taskId: null });
       expect(executed.status).toBe("completed");
       const beforeRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
       expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
@@ -778,7 +934,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("honors an explicit Enterprise GitHub host through Codex bootstrap, execution, recovery, and close", async () => {
+  it("honors an explicit Enterprise GitHub host through Codex bootstrap, execution, recovery, and publication close", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-enterprise-host-"));
     const workspacePath = join(root, "workspace");
     const durableRoot = join(workspacePath, ".d-ai");
@@ -809,14 +965,26 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       });
       const activate = createCodexActivation(runtime);
 
-      const verified = await activate({ rawCommand: "@D-AI verify Enterprise workspace", taskId: null });
+      const verified = await activate({ rawCommand: "@D-AI establish verify Enterprise workspace", taskId: null });
       expect(verified).toMatchObject({ environment: "codex", status: "completed", stage: "verify" });
       expect(verified.message).toMatch(/verification/i);
       const task = await new FileDurableContextStore(durableRoot).load(verified.taskId);
       expect(task?.contextManifest).toContain("remote-repository:git.example.test/acme/d-ai");
       expect(task?.recoveryPoint).not.toBeNull();
+      const beforeGeneric = await snapshotFiles(durableRoot);
+      const generic = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
+      expect(generic).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "blocked" });
+      expect(generic.message).toMatch(/matched active task|no configured safe operation/i);
+      expect(await snapshotFiles(durableRoot)).toEqual(beforeGeneric);
 
-      const closed = await activate({ rawCommand: "@D-AI close", taskId: verified.taskId });
+      const closed = await runtime({
+        command: { kind: "close" },
+        sourceEnvironment: "codex",
+        overrides: { model: null, role: null, environment: null, stage: null },
+        activeTaskId: verified.taskId,
+        publicationRequested: true,
+        publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true },
+      });
       expect(closed).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "completed", stage: "close" });
       expect(closed.message).toMatch(/YES/i);
       await expect(git(bareRemotePath, ["rev-parse", "refs/heads/main"])).resolves.toMatch(/^[a-f0-9]{40}$/);

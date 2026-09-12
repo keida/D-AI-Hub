@@ -1,10 +1,10 @@
 # D-AI-Hub Agent Bootstrap
 
-This repository is the canonical source of truth for D-AI-Hub across ChatGPT Web, Codex, and compatible agents.
+This repository is the published public framework/source for D-AI-Hub across ChatGPT Web, Codex, and compatible agents. Local runtime, durable state, and daily project work remain authoritative until explicitly published.
 
 ## D-AI Command Protocol
 
-The following are D-AI-Hub natural-language workflows for Codex and compatible agents. They are not built-in commands. For current Codex-first V1, ordinary project language is the default entry; explicit `@D-AI` commands override it. The daily intents are discussion, status, continuation, bounded delivery, close, and rollback; `@D-AI establish` and `@D-AI sync` are setup/freshness workflows, and `@D-AI update` remains an internal workflow for recording durable outcomes during a session. ChatGPT Web may discuss or view repository-hosted content but is not a D-AI runtime. When a supported agent message begins with an explicit `@D-AI` prefix, interpret that command first and then continue with any task text that follows it.
+The following are D-AI-Hub natural-language workflows for Codex and compatible agents. They are not built-in commands. For current Codex-first V1, ordinary project language is the default entry; explicit `@D-AI` commands override it. The daily intents are discussion, status, continuation, bounded delivery, close, and rollback; `@D-AI establish` and `@D-AI sync` are setup/freshness workflows, and `@D-AI update` remains an internal workflow for recording durable outcomes during a session. The local working state is authoritative for daily work; GitHub `main` is the published public framework/source milestone and transport. ChatGPT Web may discuss or view repository-hosted content but is not a D-AI runtime. When a supported agent message begins with an explicit `@D-AI` prefix, interpret that command first and then continue with any task text that follows it.
 
 The detailed V1 command reference is [`docs/commands.md`](docs/commands.md). Native Chat/Work activation and automatic cross-environment routing remain Future/Deferred; unavailable capabilities must fail closed.
 
@@ -45,11 +45,11 @@ Use to persist worthwhile information from the current session without ending th
    - workflow instructions -> `skills/custom/`
    - reusable subject knowledge -> `knowledge/`
    - project-specific state/decisions/bugs/roadmap/references -> `projects/<project>/`
-   - stable cross-project context -> `memory/`
+   - stable cross-project context -> repository `memory/` only after explicit public-safe promotion; private context remains OS-local
    - reusable standalone prompt -> `prompts/`
 6. Update relevant indexes when discovery state changes.
 7. Verify the resulting content is internally consistent and source-aware.
-8. Commit/push small durable updates only when explicitly authorized; otherwise report exactly what remains local/unsynced.
+8. Keep daily durable updates local by default. Commit/push only for an explicitly authorized milestone or publication decision; otherwise report exactly what remains local/unsynced.
 
 ### `@D-AI close`
 
@@ -61,7 +61,7 @@ Use at the end of meaningful work.
 4. Promote reusable knowledge out of project notes into the appropriate `knowledge/` domain only when it is genuinely reusable; link rather than duplicate.
 5. Remove or generalize stale machine-specific paths, transient SHAs/snapshot hashes, and one-session diagnostics unless still operationally relevant.
 6. Verify no secrets or unauthorized confidential material were added.
-7. Commit/push durable changes when possible and report the final sync state plus the next action. If push fails, do not claim the close is fully synced.
+7. Keep close local by default and report the local result separately from publication. Commit/push durable changes only after an explicit milestone/publication decision and authority; if publication fails, do not claim the close is fully synchronized.
 
 Detailed command examples and behavior notes live in `docs/commands.md`; cross-client safety and Git decision rules live in `docs/workflow.md`.
 
@@ -71,7 +71,7 @@ Use the smallest gate that matches the action:
 
 - **Fast Read** — for read-only questions and ordinary project continuation: locate the real checkout, inspect branch/status, and read `STATUS.md` plus relevant open bugs. Do not run network sync, full-repository audits, or release checks unless the task needs them.
 - **Write Gate** — before the first file modification: confirm the authorized file scope, preserve existing dirty changes, load the narrowest required Skill, and verify canonical freshness when stale remote state could affect the write.
-- **Release Gate** — before commit, push, merge, PR, or `@D-AI close`: inspect the complete intended diff, run relevant tests and targeted validation, check staged files and secret-like additions, then verify the actual remote result after push.
+- **Release Gate** — before commit, push, merge, PR, or an explicit publication close: inspect the complete intended diff, run relevant tests and targeted validation, check staged files and secret-like additions, then verify the actual remote result after push.
 
 Do not run Release Gate checks repeatedly during read-only work. A lower gate never authorizes an action that requires a higher gate.
 
@@ -116,7 +116,7 @@ For ordinary read-only continuation, apply Fast Read. Before the first durable w
 - Agent discovery entry points -> `.agents/skills/`
 - Durable reusable subject knowledge -> `knowledge/`
 - Project-specific state and decisions -> `projects/<project>/`
-- Stable cross-project context -> `memory/`
+- Stable cross-project context -> repository `memory/` only after explicit public-safe promotion; private context remains OS-local.
 - Reusable standalone prompts -> `prompts/`
 - Reusable content structures -> `templates/`
 - Discovery only -> `indexes/`
@@ -149,7 +149,7 @@ Machine-specific paths, transient commit SHAs, local snapshot hashes, and tempor
 
 ## Branch policy
 
-- Small knowledge, index, status, and documentation updates may commit directly to `main`.
+- Small knowledge, index, status, and documentation updates remain local by default; direct-to-`main` publication requires an explicit milestone decision and authority.
 - Larger structural, automation, or code changes should use at most one working branch per task.
 - Do not create speculative branches.
 
@@ -162,7 +162,7 @@ Before ending meaningful work:
 3. Promote reusable knowledge to the appropriate `knowledge/` domain and update indexes when needed.
 4. Remove or generalize stale machine-specific paths, transient SHAs, temporary snapshots, and one-session diagnostics unless they are still operationally relevant.
 5. Verify that no secrets or unauthorized confidential material were added.
-6. Commit/push durable changes when the environment permits it; otherwise state exactly what remains unsynced.
+6. Leave durable changes local unless an explicit milestone/publication decision authorizes commit/push; state exactly what remains unpublished.
 
 ## D-AI-Hub project continuation
 

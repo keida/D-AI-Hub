@@ -1,9 +1,9 @@
 import { InvalidTaskStateError } from "../domain/errors.js";
 
-export type UserIntentName = "discuss" | "status" | "continue" | "delivery" | "close" | "rollback" | "sync" | "establish";
+export type UserIntentName = "discuss" | "status" | "continue" | "delivery" | "curate" | "close" | "rollback" | "sync" | "establish";
 export type UserIntentRisk = "read-only" | "bounded-mutation" | "destructive" | "external-read" | "setup";
 export type UserIntentRiskLevel = 0 | 1 | 2 | 3;
-export type UserIntentEndpoint = "discussion" | "status" | "continuation" | "review-ready-pr" | "local-change" | "close" | "rollback" | "sync" | "establish";
+export type UserIntentEndpoint = "discussion" | "status" | "continuation" | "review-ready-pr" | "local-change" | "curate" | "close" | "rollback" | "sync" | "establish";
 
 export interface UserIntent {
   readonly text: string;
@@ -58,6 +58,10 @@ function isExplicitDiscussionRequest(text: string): boolean {
     || /^\s*(?:请(?:你)?\s*|帮我\s*)?(?:解释|说明|讨论|描述)/u.test(text);
 }
 
+function isExplicitCurationRequest(text: string): boolean {
+  return /^(?:整理|整理一下|整理当前内容|整理进我的知识库|curate(?: this)?)$/iu.test(text.trim());
+}
+
 function hasPublicationShape(text: string): boolean {
   if (isExplicitDiscussionRequest(text)) return false;
   return /^\s*push\s*$/iu.test(text)
@@ -94,6 +98,10 @@ export function classifyUserIntent(input: string): UserIntent {
   if (typeof input !== "string") throw new InvalidTaskStateError("user request must be a string");
   const text = input.trim();
   if (text.length === 0) throw new InvalidTaskStateError("user request must not be empty");
+
+  if (isExplicitCurationRequest(text)) {
+    return makeIntent(text, "curate", null, false, "curate", "bounded-mutation", 1);
+  }
 
   if (/(?:做到哪(?:里)?|到哪(?:里)?|进展到哪|当前进展)/u.test(text)) {
     return makeIntent(text, "status", projectFromRequest(text), false, "status", "read-only", 0);
