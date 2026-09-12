@@ -1,5 +1,6 @@
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
 import type { MemoryMutation, MemoryRecord, MemoryValue } from "../memory/types.js";
+import type { CurationQualityReport, MemoryRecoverySnapshot } from "./knowledge-quality-loop.js";
 
 export type CurationCategory = "knowledge" | "project-memory" | "cross-project-memory";
 export type CurationPrivacyRisk = "local-private" | "possible-workplace" | "workplace-confidential";
@@ -14,6 +15,11 @@ export interface CurationCandidate {
   readonly privacyRisk: CurationPrivacyRisk;
   readonly revision?: number;
   readonly projectTaskId?: string;
+  readonly subjectKey?: string;
+  readonly observedAt?: string;
+  readonly supersedesMemoryIds?: readonly string[];
+  readonly evidenceRefs?: readonly string[];
+  readonly assetRefs?: readonly string[];
 }
 
 export interface CurationStore {
@@ -24,6 +30,7 @@ export interface CurationStore {
 export interface CurationOptions {
   readonly recordedAt?: string;
   readonly knownProjectTaskId?: string | null;
+  readonly taskScopeId?: string | null;
 }
 
 export interface CurationRecordResult {
@@ -47,6 +54,8 @@ export interface CurationResult {
   readonly readBackVerified: boolean;
   readonly safeToDeleteOriginalChat: "YES" | "NO";
   readonly message: string;
+  readonly qualityReport?: CurationQualityReport;
+  readonly memorySnapshot?: MemoryRecoverySnapshot;
 }
 
 interface PreparedCandidate {
@@ -75,6 +84,13 @@ function isCategory(value: unknown): value is CurationCategory {
 
 function isPrivacyRisk(value: unknown): value is CurationPrivacyRisk {
   return value === "local-private" || value === "possible-workplace" || value === "workplace-confidential";
+}
+
+function assertReferenceList(value: readonly string[] | undefined, label: string): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.some((reference) => typeof reference !== "string" || reference.trim() !== reference || reference.length === 0 || reference.length > 512 || containsSecretShapedValue(reference))) {
+    throw new Error(`Curation candidate ${label} must contain bounded non-secret references`);
+  }
 }
 
 export function assertCurationCandidate(candidate: CurationCandidate): void {
@@ -107,6 +123,19 @@ export function assertCurationCandidate(candidate: CurationCandidate): void {
   if (candidate.projectTaskId !== undefined && containsSecretShapedValue(candidate.projectTaskId)) {
     throw new Error("Curation candidate projectTaskId is not a safe local identifier");
   }
+  if (candidate.subjectKey !== undefined && (candidate.subjectKey.trim() !== candidate.subjectKey
+    || candidate.subjectKey.length === 0 || candidate.subjectKey.length > 128
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(candidate.subjectKey)
+    || containsSecretShapedValue(candidate.subjectKey))) {
+    throw new Error("Curation candidate subjectKey is not a safe local identifier");
+  }
+  if (candidate.observedAt !== undefined && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(candidate.observedAt)
+    || Number.isNaN(Date.parse(candidate.observedAt)) || new Date(candidate.observedAt).toISOString() !== candidate.observedAt)) {
+    throw new Error("Curation candidate observedAt must be an ISO timestamp");
+  }
+  assertReferenceList(candidate.supersedesMemoryIds, "supersedesMemoryIds");
+  assertReferenceList(candidate.evidenceRefs, "evidenceRefs");
+  assertReferenceList(candidate.assetRefs, "assetRefs");
 }
 
 export function validateCurationCandidates(candidates: readonly CurationCandidate[]): void {
@@ -147,7 +176,7 @@ function projectTaskBindingMatches(candidate: CurationCandidate, existing: Memor
   return stored !== null && (stored.projectTaskId ?? null) === (candidate.projectTaskId ?? null);
 }
 
-function valueFor(candidate: CurationCandidate): MemoryValue {
+function valueFor(candidate: CurationCandidate, options: CurationOptions): MemoryValue {
   return {
     kind: "curated-fact",
     candidateId: candidate.candidateId,
@@ -157,6 +186,12 @@ function valueFor(candidate: CurationCandidate): MemoryValue {
     privacyRisk: candidate.privacyRisk,
     revision: candidate.revision ?? 1,
     projectTaskId: candidate.projectTaskId ?? null,
+    subjectKey: candidate.subjectKey ?? candidate.memoryId,
+    observedAt: candidate.observedAt ?? null,
+    supersedesMemoryIds: candidate.supersedesMemoryIds === undefined ? [] : [...candidate.supersedesMemoryIds],
+    evidenceRefs: candidate.evidenceRefs === undefined ? [] : [...candidate.evidenceRefs],
+    assetRefs: candidate.assetRefs === undefined ? [] : [...candidate.assetRefs],
+    taskScopeId: options.taskScopeId ?? null,
   };
 }
 
@@ -255,7 +290,7 @@ export async function curateCurrentContext(
     .map(({ candidate, decision }) => ({
       operation: decision === "ADD" ? "add" : "update",
       memoryId: candidate.memoryId,
-      value: valueFor(candidate),
+      value: valueFor(candidate, options),
       recordedAt: options.recordedAt ?? new Date().toISOString(),
     }));
   let applied: readonly MemoryRecord[] = [];

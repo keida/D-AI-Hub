@@ -50,6 +50,72 @@ afterEach(async () => {
 });
 
 describe("configured curation runtime", () => {
+  it("reports explicit no-memory on read-only status without creating a database or durable task", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-status-no-memory-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-status-no-memory-db-"));
+    temporaryRoots.push(root, databaseRoot);
+    const databasePath = join(databaseRoot, "memory.sqlite");
+    const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: root, memoryDatabasePath: databasePath }));
+
+    const result = await activate({ rawCommand: "@D-AI status", taskId: null });
+
+    expect(result).toMatchObject({ status: "blocked", memorySnapshot: { status: "empty", taskId: null, records: [] } });
+    await expect(access(databasePath)).rejects.toThrow();
+    await expect(access(join(root, ".d-ai"))).rejects.toThrow();
+  });
+
+  it("blocks status recovery when the existing task-scoped database contains conflicting current facts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-status-conflict-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-status-conflict-db-"));
+    temporaryRoots.push(root, databaseRoot);
+    await prepareGitWorkspace(root);
+    const taskId = "task-status-conflict";
+    const databasePath = join(databaseRoot, "memory.sqlite");
+    const memoryStore = new LocalSqliteMemoryStore({ databasePath, workspacePath: databaseRoot, mode: "writer", scopeId: resolveLocalMemoryScopeId(databasePath), writerId: "primary-device" });
+    await memoryStore.applyMutations([
+      { operation: "add", memoryId: "conflict-a", value: { kind: "curated-fact", fact: "Current fact A.", category: "knowledge", subjectKey: "conflicting-subject", revision: 2, observedAt: "2026-09-12T00:00:00.000Z", projectTaskId: taskId, taskScopeId: taskId }, recordedAt: "2026-09-12T00:00:00.000Z" },
+      { operation: "add", memoryId: "conflict-b", value: { kind: "curated-fact", fact: "Current fact B.", category: "knowledge", subjectKey: "conflicting-subject", revision: 2, observedAt: "2026-09-12T00:00:00.000Z", projectTaskId: taskId, taskScopeId: taskId }, recordedAt: "2026-09-12T00:00:01.000Z" },
+    ]);
+    memoryStore.close();
+    const durableStore = new FileDurableContextStore(join(root, ".d-ai"));
+    await durableStore.createIfAbsent(seededTask(root, taskId));
+    const before = await durableStore.load(taskId);
+    const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: root, memoryDatabasePath: databasePath }));
+
+    const result = await activate({ rawCommand: "@D-AI status", taskId });
+
+    expect(result.memorySnapshot).toMatchObject({ status: "blocked", taskId, records: [], findings: [{ code: "CONTRADICTORY_CURRENT_FACTS" }] });
+    expect(await durableStore.load(taskId)).toEqual(before);
+    const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: databaseRoot, mode: "reader", scopeId: resolveLocalMemoryScopeId(databasePath), writerId: "primary-device" });
+    try {
+      await expect(reader.listAll()).resolves.toHaveLength(2);
+    } finally {
+      reader.close();
+    }
+  });
+
+  it("does not surface global memory for a not-found continue target", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-continue-not-found-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-continue-not-found-db-"));
+    temporaryRoots.push(root, databaseRoot);
+    const databasePath = join(databaseRoot, "memory.sqlite");
+    const memoryStore = new LocalSqliteMemoryStore({ databasePath, workspacePath: databaseRoot, mode: "writer", scopeId: resolveLocalMemoryScopeId(databasePath), writerId: "primary-device" });
+    await memoryStore.applyMutations([{ operation: "add", memoryId: "global-fact", value: { kind: "curated-fact", fact: "Unrelated global fact.", category: "knowledge", subjectKey: "global-fact", revision: 1, projectTaskId: null, taskScopeId: null }, recordedAt: "2026-09-12T00:00:00.000Z" }]);
+    memoryStore.close();
+    const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: root, memoryDatabasePath: databasePath }));
+
+    const result = await activate({ rawCommand: "@D-AI continue missing-task", taskId: null });
+
+    expect(result).toMatchObject({ status: "blocked", memorySnapshot: { status: "empty", taskId: null, records: [] } });
+    const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: databaseRoot, mode: "reader", scopeId: resolveLocalMemoryScopeId(databasePath), writerId: "primary-device" });
+    try {
+      await expect(reader.listAll()).resolves.toHaveLength(1);
+    } finally {
+      reader.close();
+    }
+    await expect(access(join(root, ".d-ai"))).rejects.toThrow();
+  });
+
   it("defers without context and does not create a durable task", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-curation-runtime-"));
     temporaryRoots.push(root);
@@ -212,5 +278,40 @@ describe("configured curation runtime", () => {
     }
     await expect(access(join(workspaceA, ".d-ai"))).rejects.toThrow();
     await expect(access(join(workspaceB, ".d-ai"))).rejects.toThrow();
+  });
+
+  it("surfaces a fresh task-scoped snapshot from status and continue without mutating durable task state", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-curation-runtime-recovery-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-curation-runtime-recovery-db-"));
+    temporaryRoots.push(root, databaseRoot);
+    await prepareGitWorkspace(root);
+    const taskId = "task-quality-loop";
+    const durableStore = new FileDurableContextStore(join(root, ".d-ai"));
+    await durableStore.createIfAbsent(seededTask(root, taskId));
+    const before = await durableStore.load(taskId);
+    const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: root, memoryDatabasePath: join(databaseRoot, "memory.sqlite") }));
+
+    const curation = await activate({
+      rawCommand: "@D-AI 整理",
+      taskId,
+      currentContext: [{
+        candidateId: "task-fact",
+        memoryId: "task-fact",
+        fact: "Fresh status must surface the selected task fact.",
+        category: "knowledge",
+        source: "current-context",
+        privacyRisk: "local-private",
+      }],
+    });
+    expect(curation).toMatchObject({ status: "completed", curationQuality: { verdict: "PASS", safeToDeleteOriginalChat: "YES" } });
+    expect(curation.message).toMatch(/fresh-recovery=PASS|SAFE TO DELETE ORIGINAL CHAT: YES/i);
+
+    const status = await activate({ rawCommand: "@D-AI status", taskId });
+    expect(status.memorySnapshot).toMatchObject({ status: "available", taskId, records: [{ memoryId: "task-fact" }] });
+    expect(await durableStore.load(taskId)).toEqual(before);
+
+    const continued = await activate({ rawCommand: `@D-AI continue ${taskId}`, taskId });
+    expect(continued.memorySnapshot).toMatchObject({ status: "available", taskId, records: [{ memoryId: "task-fact" }] });
+    expect(await durableStore.load(taskId)).toEqual(before);
   });
 });

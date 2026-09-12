@@ -1,4 +1,5 @@
 import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { CommandExecutionError, redactSensitiveText } from "../adapters/command-runner.js";
@@ -11,6 +12,7 @@ import { GitHubCliAdapter, resolveGitHubRepository, type GitHubAdapter } from ".
 import { bootstrapTask, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
 import { closeTask, type CloseMode } from "../close/close-service.js";
 import { curateCurrentContext, validateCurationCandidates, type CurationCandidate, type CurationRecordResult, type CurationResult } from "../curation/local-curation.js";
+import { createKnowledgeQualityLoop, type CurationQualityReport, type MemoryRecoverySnapshot } from "../curation/knowledge-quality-loop.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
   CapabilityMismatchError,
@@ -76,6 +78,8 @@ export interface DAIResponse {
   readonly evidence: readonly VerificationEvidence[];
   readonly message: string;
   readonly curationRecords?: readonly Pick<CurationRecordResult, "memoryId" | "category" | "decision">[];
+  readonly curationQuality?: CurationQualityReport;
+  readonly memorySnapshot?: MemoryRecoverySnapshot;
 }
 
 export interface ExternalRoutingOverrides {
@@ -139,7 +143,8 @@ type ResolveRepositoryIdentity = () => Promise<string>;
 export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
   readonly discoverActiveTasks?: DiscoverActiveTasks | undefined;
-  readonly curateCurrentContext?: (candidates: readonly CurationCandidate[], options: { readonly knownProjectTaskId: string | null }) => Promise<CurationResult>;
+  readonly curateCurrentContext?: (candidates: readonly CurationCandidate[], options: { readonly knownProjectTaskId: string | null; readonly taskScopeId?: string | null }) => Promise<CurationResult>;
+  readonly recoverKnowledgeSnapshot?: (taskId: string | null) => Promise<MemoryRecoverySnapshot>;
   readonly resolveRepositoryIdentity?: ResolveRepositoryIdentity | undefined;
   readonly workspacePath: string | null;
   readonly repositoryPath: string | null;
@@ -529,8 +534,55 @@ function curationResponse(
     status: result.status === "completed" ? "completed" : "blocked",
     evidence: [],
     curationRecords: result.records.map(({ memoryId, category, decision }) => ({ memoryId, category, decision })),
+    ...(result.qualityReport === undefined ? {} : { curationQuality: result.qualityReport }),
+    ...(result.memorySnapshot === undefined ? {} : { memorySnapshot: result.memorySnapshot }),
     message: redactSensitiveText(`${result.message}; Records=${recordSummary}; Added=${added}, Updated=${updated}, No-op=${noOp}, Deferred=${deferred}, Rejected=${rejected}; locally stored=${result.locallyStored ? "YES" : "NO"}; read-back=${result.readBackVerified ? "PASS" : "NO"}; ${safeMessage}`),
   };
+}
+
+async function withKnowledgeSnapshot(
+  result: DAIResponse,
+  taskId: string | null,
+  dependencies: DAIRuntimeDependencies,
+): Promise<DAIResponse> {
+  if (taskId === null) {
+    return {
+      ...result,
+      memorySnapshot: {
+        status: "empty",
+        taskId: null,
+        records: [],
+        truncated: false,
+        reason: "No active durable task is bound for memory recovery",
+      },
+    };
+  }
+  if (dependencies.recoverKnowledgeSnapshot === undefined) {
+    return {
+      ...result,
+      memorySnapshot: {
+        status: "blocked",
+        taskId,
+        records: [],
+        truncated: false,
+        reason: "Local memory recovery is unavailable",
+      },
+    };
+  }
+  try {
+    return { ...result, memorySnapshot: await dependencies.recoverKnowledgeSnapshot(taskId) };
+  } catch {
+    return {
+      ...result,
+      memorySnapshot: {
+        status: "blocked",
+        taskId,
+        records: [],
+        truncated: false,
+        reason: "Local memory recovery failed closed",
+      },
+    };
+  }
 }
 
 class ConfiguredBootstrapPreflightError extends Error {
@@ -1538,9 +1590,13 @@ async function continueTask(
 ): Promise<DAIResponse> {
   const state = await dependencies.store.load(command.taskIdOrProject);
   if (state === null) {
-    return blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`);
+    return withKnowledgeSnapshot(
+      blockedWithoutState(command.taskIdOrProject, request.sourceEnvironment, `Task or project was not found: ${command.taskIdOrProject}`),
+      null,
+      dependencies,
+    );
   }
-  return registry.serializeMutation(
+  const result = await registry.serializeMutation(
     state.taskId,
     () => withDurableTaskOwnership(
       state.taskId,
@@ -1549,6 +1605,7 @@ async function continueTask(
       async (lease, transfer) => continueTaskExclusive(request, command, dependencies, registry, lease, transfer),
     ),
   );
+  return withKnowledgeSnapshot(result, state.taskId, dependencies);
 }
 
 async function rollbackActiveTaskExclusive(
@@ -2301,6 +2358,7 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
         const responseRequest = { ...request, activeTaskId: taskIdentity.knownProjectTaskId ?? request.activeTaskId ?? null };
         const result = await dependencies.curateCurrentContext(request.curationCandidates ?? [], {
           knownProjectTaskId: taskIdentity.knownProjectTaskId,
+          taskScopeId: taskIdentity.knownProjectTaskId,
         });
         return curationResponse(responseRequest, result);
       } catch (error: unknown) {
@@ -2324,12 +2382,20 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
     }
     if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
       const selection = await selectExplicitDurableTask(request.activeTaskId, request, dependencies, registry);
-      if (selection !== null) return selection;
+      if (selection !== null) {
+        return request.command.kind === "status" || request.command.kind === "continue"
+          ? withKnowledgeSnapshot(selection, null, dependencies)
+          : selection;
+      }
     }
     if (request.activeTaskId === undefined || request.activeTaskId === null) {
       if (request.command.kind === "status" || request.command.kind === "close") {
         const selection = await selectDiscoveredDurableTask(request, dependencies, registry);
-        if (selection !== null) return selection;
+        if (selection !== null) {
+          return request.command.kind === "status"
+            ? withKnowledgeSnapshot(selection, null, dependencies)
+            : selection;
+        }
       }
     }
     if (request.command.kind === "intent") {
@@ -2340,7 +2406,7 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
     if (request.command.kind === "continue") {
       if (request.activeTaskId === undefined || request.activeTaskId === null) {
         const selection = await resolveContinueProject(request, request.command, dependencies);
-        if (typeof selection !== "string") return selection;
+        if (typeof selection !== "string") return withKnowledgeSnapshot(selection, null, dependencies);
         return continueTask(request, { ...request.command, taskIdOrProject: selection }, dependencies, registry);
       }
       return continueTask(request, request.command, dependencies, registry);
@@ -2350,9 +2416,13 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
     if (request.command.kind === "close") return closeActiveTask(request, dependencies, registry);
     if (request.command.kind === "rollback") return rollbackActiveTask(request, dependencies, registry);
     const state = await requireActiveState(request.sourceEnvironment, registry, dependencies.store);
-    return state === null
-      ? blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for status")
-      : response(state, "accepted", `Task ${state.taskId} is ${state.stage} in ${state.environment}`);
+    return withKnowledgeSnapshot(
+      state === null
+        ? blockedWithoutState("unassigned", request.sourceEnvironment, "No active task is available for status")
+        : response(state, "accepted", `Task ${state.taskId} is ${state.stage} in ${state.environment}`),
+      state?.taskId ?? null,
+      dependencies,
+    );
   };
 }
 
@@ -2384,6 +2454,37 @@ export interface ConfiguredDAIRuntimeOptions {
   readonly gitHub?: GitHubAdapter;
   readonly githubCredentialsConfigured?: boolean;
   readonly githubEnterpriseHost?: string | null;
+}
+
+async function recoverConfiguredKnowledgeSnapshot(
+  databasePath: string,
+  memoryRoot: string,
+  memoryScopeId: string,
+  repositoryPath: string,
+  taskId: string | null,
+): Promise<MemoryRecoverySnapshot> {
+  if (!existsSync(databasePath)) {
+    return { status: "empty", taskId, records: [], truncated: false, reason: "No local memory database is available" };
+  }
+  let memoryStore: LocalSqliteMemoryStore | undefined;
+  try {
+    memoryStore = new LocalSqliteMemoryStore({
+      databasePath,
+      workspacePath: memoryRoot,
+      mode: "reader",
+      scopeId: memoryScopeId,
+      writerId: "primary-device",
+    });
+    return await createKnowledgeQualityLoop({
+      store: memoryStore,
+      workspacePath: memoryRoot,
+      repositoryPath,
+    }).recover(taskId);
+  } catch {
+    return { status: "blocked", taskId, records: [], truncated: false, reason: "Local memory database could not be read" };
+  } finally {
+    memoryStore?.close();
+  }
 }
 
 function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRuntimeDependencies {
@@ -2498,7 +2599,8 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     maximumEvidenceAgeMs: 300_000,
     now: (): Date => new Date(),
     discoverActiveTasks: (workspacePath: string): Promise<readonly TaskState[]> => store.discoverActiveTasks(workspacePath),
-    curateCurrentContext: async (candidates: readonly CurationCandidate[], curationOptions: { readonly knownProjectTaskId: string | null }): Promise<CurationResult> => {
+    recoverKnowledgeSnapshot: (taskId: string | null): Promise<MemoryRecoverySnapshot> => recoverConfiguredKnowledgeSnapshot(memoryDatabasePath, memoryRoot, memoryScopeId, root, taskId),
+    curateCurrentContext: async (candidates: readonly CurationCandidate[], curationOptions: { readonly knownProjectTaskId: string | null; readonly taskScopeId?: string | null }): Promise<CurationResult> => {
         if (candidates.length === 0) return curateCurrentContext(null, candidates, curationOptions);
         validateCurationCandidates(candidates);
         await mkdir(dirname(memoryDatabasePath), { recursive: true });
@@ -2510,9 +2612,48 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
           writerId: "primary-device",
         });
         try {
-          return await curateCurrentContext(memoryStore, candidates, curationOptions);
-        } finally {
+          const result = await createKnowledgeQualityLoop({
+            store: memoryStore,
+            workspacePath: memoryRoot,
+            repositoryPath: root,
+          }).curate(candidates, {
+            ...curationOptions,
+            taskScopeId: curationOptions.taskScopeId ?? curationOptions.knownProjectTaskId,
+          });
           memoryStore.close();
+          const snapshot = await recoverConfiguredKnowledgeSnapshot(
+            memoryDatabasePath,
+            memoryRoot,
+            memoryScopeId,
+            root,
+            curationOptions.taskScopeId ?? curationOptions.knownProjectTaskId,
+          );
+          const selectedIds = new Set(result.records
+            .filter((record) => record.decision === "ADD" || record.decision === "UPDATE" || record.decision === "NOOP")
+            .map((record) => record.memoryId));
+          const recoveredIds = new Set(snapshot.records.map((record) => record.memoryId));
+          const recoveredSelectedFacts = snapshot.status === "available" && [...selectedIds].every((memoryId) => recoveredIds.has(memoryId));
+          const qualityReport = result.qualityReport === undefined
+            ? undefined
+            : {
+              ...result.qualityReport,
+              recoveredCount: snapshot.records.length,
+              verdict: result.qualityReport.verdict === "PASS" && !recoveredSelectedFacts ? "HOLD" as const : result.qualityReport.verdict,
+              safeToDeleteOriginalChat: result.qualityReport.safeToDeleteOriginalChat === "YES" && recoveredSelectedFacts ? "YES" as const : "NO" as const,
+            };
+          return {
+            ...result,
+            memorySnapshot: snapshot,
+            ...(qualityReport === undefined ? {} : { qualityReport }),
+            safeToDeleteOriginalChat: qualityReport?.safeToDeleteOriginalChat ?? result.safeToDeleteOriginalChat,
+            message: `${result.message}; fresh-recovery=${recoveredSelectedFacts ? "PASS" : "NO"}`,
+          };
+        } finally {
+          try {
+            memoryStore.close();
+          } catch {
+            // Preserve the curation result; the fresh reader remains the recovery authority.
+          }
         }
       },
   };

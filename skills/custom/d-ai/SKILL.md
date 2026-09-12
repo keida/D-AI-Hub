@@ -36,7 +36,7 @@ An explicit `@D-AI` command overrides the natural-language default. In particula
    The installed Skill root must contain a machine-local `.runtime-root` file pointing to a validated D-AI-Hub runtime checkout. Establish or switch that binding with `scripts/set-runtime-binding.ps1 -SkillRoot <installed-skill-root> -RuntimeRoot <d-ai-hub-checkout>`; a missing or invalid binding fails closed.
 4. Report the returned status, message, and evidence without converting `BLOCKED` or `NO` into completion.
 
-The supported exact curation forms, with or without the `@D-AI` prefix, are `整理`, `整理一下`, `整理当前内容`, `整理进我的知识库`, `curate`, and `curate this`. Without a supplied structured curation payload, each returns SAFE NO and does not capture chat history or create durable task state. Missing, unreadable, malformed, relative, or secret-shaped payload values fail closed before any memory or durable write.
+The supported exact curation forms, with or without the `@D-AI` prefix, are `整理`, `整理一下`, `整理当前内容`, `整理进我的知识库`, `curate`, and `curate this`. Without a supplied structured curation payload, each returns SAFE NO and does not capture chat history or create durable task state. Missing, unreadable, malformed, relative, or secret-shaped payload values fail closed before any memory or durable write. Selected facts pass a local quality gate for stable subject identity, observation/provenance, supersession, contradiction/duplicate detection, and durable repository or HTTPS evidence/assets; the gate returns structured `PASS`, `HOLD`, or `NO` findings and does not auto-edit its own rules.
 
 To create a payload, select only facts already present in the current visible context, write them to an absolute temporary JSON file, and pass that file to the Skill. For example:
 
@@ -47,6 +47,8 @@ To create a payload, select only facts already present in the current visible co
 Do not place a transcript, chat export, credentials, workplace-confidential material, or unverified project-memory claim in the payload. The runtime discovers one exact active task for the current workspace and canonical repository when available; project-memory is deferred when no exact task exists, and curation is blocked when discovery is ambiguous.
 
 For `@D-AI status` and `@D-AI close`, omit `--task` on the normal path. The runtime discovers the unique active durable task for the current workspace. Close is local by default; an explicit publication close must provide publication intent and authority. If there are zero matches, multiple matches, or an ownership/workspace conflict, keep the result `BLOCKED` and follow the returned retry guidance.
+
+Fresh `@D-AI status` and `@D-AI continue` also return a bounded redacted task-scoped `memorySnapshot` from an existing private SQLite database. A missing database is reported as no-memory without creating it; this read-only recovery path never crawls chat history, crosses project-task bindings, or mutates durable task state. SAFE TO DELETE remains YES only after selected facts pass the quality gate, persist/read back, and are recovered by a fresh reader.
 
 User-facing explicit syntax:
 

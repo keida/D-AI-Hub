@@ -561,6 +561,13 @@ export class LocalSqliteMemoryStore {
     return rows.map(toRecord);
   }
 
+  public async listAll(): Promise<MemoryRecord[]> {
+    const rows = this.database
+      .prepare("SELECT memory_id, scope_id, writer_id, sequence, value_json, value_sha256, recorded_at FROM memory_records WHERE scope_id = ? AND writer_id = ? ORDER BY sequence ASC")
+      .all(this.options.scopeId, this.options.writerId) as unknown as MemoryRow[];
+    return rows.map(toRecord);
+  }
+
   public getAppliedBundleReceipt(bundleId: string): AppliedMemoryBundleReceipt | null {
     const normalizedBundleId = assertIdentifier(bundleId, "Memory bundleId");
     let row: { readonly bundle_id: string; readonly records_sha256: string; readonly applied_at: string } | undefined;
