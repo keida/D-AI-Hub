@@ -4,6 +4,7 @@ import { parseRoutingOverrides, type RoutingOverrides } from "../routing/overrid
 
 export type DAICommand =
   | { readonly kind: "intent"; readonly text: string }
+  | { readonly kind: "curate" }
   | { readonly kind: "continue"; readonly taskIdOrProject: string }
   | { readonly kind: "sync"; readonly project: string | null }
   | { readonly kind: "status" }
@@ -21,6 +22,10 @@ const commandPrefix = "@D-AI";
 const environments: ReadonlySet<string> = new Set(["chat", "work", "codex"]);
 const reservedCommands: ReadonlySet<string> = new Set(["continue", "sync", "status", "handoff", "complete", "close", "rollback"]);
 const routingOverrideKeys: ReadonlySet<string> = new Set(["model", "role", "environment", "stage"]);
+
+function isExplicitCurationCommand(value: string): boolean {
+  return /^(?:整理|整理一下|整理当前内容|整理进我的知识库|curate(?: this)?)$/iu.test(value.trim());
+}
 
 function normalizedTokens(input: string): readonly string[] {
   if (typeof input !== "string") {
@@ -52,6 +57,10 @@ function parseCommandTokens(tokens: readonly string[]): DAICommand {
     throw new InvalidTaskStateError("D-AI command or intent is missing");
   }
   const arguments_ = tokens.slice(2);
+
+  if (isExplicitCurationCommand(tokens.slice(1).join(" "))) {
+    return { kind: "curate" };
+  }
 
   if (command === "continue") {
     if (arguments_.length === 0) {

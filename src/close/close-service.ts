@@ -1,8 +1,9 @@
 import { redactSensitiveText } from "../adapters/command-runner.js";
-import type { GitHubAdapter, GitPushEvidence, RemoteState } from "../adapters/github.js";
-import { isValidGitBranchName, isValidGitTargetRef, type GitFailureCategory } from "../adapters/git.js";
+import { resolveGitHubRepository, type GitHubAdapter, type GitPushEvidence, type RemoteState } from "../adapters/github.js";
+import { inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, type GitFailureCategory, type LocalGitState } from "../adapters/git.js";
 import { CloseBlockedError } from "../domain/errors.js";
 import type { CloseCandidate, CloseVerdict, DurableContextManifest, TaskState, VerificationEvidence } from "../domain/types.js";
+import { canonicalPath } from "../domain/canonical-path.js";
 import { isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import type { DurableContextStore, TaskOwnershipGuard, TaskOwnershipLease } from "../state/durable-context-store.js";
@@ -35,6 +36,10 @@ interface PreflightResult {
   readonly reasons: readonly string[];
   readonly configuration: CloseConfiguration | null;
 }
+
+type LocalGitStateInspector = typeof inspectLocalGitState;
+
+export type CloseMode = "local" | "publication";
 
 function selectedModel(state: TaskState): string {
   return state.routingDecision?.selectedModel.trim() || "unrecorded-model";
@@ -239,6 +244,76 @@ function closeCandidateFailure(candidate: CloseCandidate | null, state: TaskStat
   return null;
 }
 
+async function localGitStateFailure(
+  state: TaskState,
+  configuration: CloseConfiguration,
+  inspector: LocalGitStateInspector | undefined,
+): Promise<string | null> {
+  if (inspector === undefined) {
+    return failure("Live local Git state inspection is unavailable", "run close through the configured local runtime");
+  }
+  let observed: LocalGitState;
+  try {
+    observed = await inspector(configuration.repositoryPath, configuration.remote, configuration.ref, configuration.workspacePath);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return failure(`Live local Git state could not be inspected: ${redactSensitiveText(message)}`, "restore the local repository and rerun close");
+  }
+  let expectedRepositoryPath: string;
+  let expectedWorkspacePath: string;
+  try {
+    [expectedRepositoryPath, expectedWorkspacePath] = await Promise.all([
+      canonicalPath(configuration.repositoryPath),
+      canonicalPath(configuration.workspacePath),
+    ]);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return failure(`Configured local identity could not be resolved: ${redactSensitiveText(message)}`, "run close from the recorded workspace and repository");
+  }
+  if (observed.repositoryPath !== expectedRepositoryPath) {
+    return failure("Live Git repository identity does not match the durable close configuration", "run close against the recorded repository root");
+  }
+  const storedWorkspacePath = canonicalWorkspaceIdentityPath(state.contextManifest);
+  if (storedWorkspacePath !== null) {
+    try {
+      if (await canonicalPath(storedWorkspacePath) !== expectedWorkspacePath) {
+        return failure("Live workspace identity does not match the durable close configuration", "run close from the recorded workspace");
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return failure(`Durable workspace identity could not be resolved: ${redactSensitiveText(message)}`, "restore the recorded workspace identity and rerun close");
+    }
+  }
+  if (observed.worktreeStatus.trim().length > 0) {
+    return failure("Live local Git worktree is not clean", "restore the recovery-point worktree state and rerun close");
+  }
+  const expectedBranch = configuration.ref.slice("refs/heads/".length);
+  if (observed.branch !== expectedBranch || observed.ref !== configuration.ref) {
+    return failure("Live Git branch or target ref does not match the durable close configuration", "restore the recorded branch and target ref before close");
+  }
+  if (observed.head.toLowerCase() !== configuration.commitSha.toLowerCase()) {
+    return failure("Live Git HEAD does not match the durable commit artifact", "restore the recorded commit without rewriting history and rerun close");
+  }
+  if (observed.remote !== configuration.remote) {
+    return failure("Live Git remote name does not match the durable close configuration", "restore the recorded remote name and rerun close");
+  }
+  const expectedRepositoryParts = configuration.expectedRepository.split("/");
+  const expectedHost = expectedRepositoryParts[0];
+  if (expectedHost === undefined) {
+    return failure("Durable remote repository identity is malformed", "restore the recorded remote repository identity and rerun close");
+  }
+  try {
+    const observedRepository = resolveGitHubRepository(observed.remoteUrl, expectedHost === "github.com" ? null : expectedHost).repository;
+    if (observedRepository.toLowerCase() !== configuration.expectedRepository.toLowerCase()) {
+      return failure("Live Git remote repository identity does not match the durable close configuration", "restore the recorded remote URL and rerun close");
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return failure(`Live Git remote repository identity could not be verified: ${redactSensitiveText(message)}`, "restore the recorded GitHub remote and rerun close");
+  }
+  return null;
+}
+
 async function loadCloseState(store: DurableContextStore, taskId: string): Promise<TaskState | null> {
   try {
     return await store.load(taskId);
@@ -366,9 +441,10 @@ function blockedReason(error: Error, nextCheck: string): string {
 
 export async function closeTask(
   state: TaskState,
-  dependencies: { readonly store: DurableContextStore; readonly gitHub: GitHubAdapter },
+  dependencies: { readonly store: DurableContextStore; readonly gitHub: GitHubAdapter; readonly inspectLocalGitState?: LocalGitStateInspector },
   lease?: TaskOwnershipLease,
   assertOwnership?: TaskOwnershipGuard,
+  mode: CloseMode = "publication",
 ): Promise<CloseVerdict> {
   const now = new Date();
   const persistedState = await dependencies.store.load(state.taskId).then(
@@ -430,11 +506,12 @@ export async function closeTask(
     return createVerdict(state, "BLOCKED", [failure("Durable close candidate persistence is unavailable", "use the real durable context store before close")], state.verificationEvidence);
   }
   const candidate = createCloseCandidate(state, configuration, now.toISOString());
+  let persistedCandidate: CloseCandidate | null = null;
   try {
     await assertOwnership();
     await dependencies.store.saveCloseCandidate(candidate, lease);
     await assertOwnership();
-    const persistedCandidate = await loadCloseCandidate(dependencies.store, state.taskId);
+    persistedCandidate = await loadCloseCandidate(dependencies.store, state.taskId);
     const candidateFailure = closeCandidateFailure(persistedCandidate, state, configuration);
     if (candidateFailure !== null) {
       return createVerdict(state, "NO", [failure(candidateFailure, "restore the exact durable close candidate and rerun close")], state.verificationEvidence);
@@ -442,6 +519,19 @@ export async function closeTask(
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return createVerdict(state, "BLOCKED", [failure(`Durable close candidate could not be persisted or verified: ${redactSensitiveText(message)}`, "restore durable candidate storage and rerun close")], state.verificationEvidence);
+  }
+  if (mode === "local") {
+    const localStateFailure = await localGitStateFailure(state, configuration, dependencies.inspectLocalGitState);
+    if (localStateFailure !== null) {
+      return createVerdict(state, "BLOCKED", [localStateFailure], state.verificationEvidence);
+    }
+    if (persistedCandidate === null) {
+      return createVerdict(state, "BLOCKED", [failure("Durable close candidate is missing after local close verification", "restore the exact durable close candidate and rerun close")], state.verificationEvidence);
+    }
+    return {
+      ...createVerdict(state, "YES", [], state.verificationEvidence),
+      closeCandidate: persistedCandidate,
+    };
   }
   try {
     await assertOwnership();
