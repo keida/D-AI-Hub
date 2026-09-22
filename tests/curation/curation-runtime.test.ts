@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
+import { buildCurationBoundarySha256 } from "../../src/curation/current-view-pipeline.js";
 import { createConfiguredDAIRuntime } from "../../src/runtime/d-ai-runtime.js";
 import type { TaskState } from "../../src/domain/types.js";
 import { runCommand } from "../../src/adapters/command-runner.js";
@@ -313,5 +314,37 @@ describe("configured curation runtime", () => {
     const continued = await activate({ rawCommand: `@D-AI continue ${taskId}`, taskId });
     expect(continued.memorySnapshot).toMatchObject({ status: "available", taskId, records: [{ memoryId: "task-fact" }] });
     expect(await durableStore.load(taskId)).toEqual(before);
+  });
+
+  it("routes a supplied bounded source window and exposes verified finalization evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-curation-runtime-pipeline-"));
+    const databaseRoot = await mkdtemp(join(tmpdir(), "d-ai-curation-runtime-pipeline-db-"));
+    temporaryRoots.push(root, databaseRoot);
+    await prepareGitWorkspace(root);
+    const taskId = "task-pipeline-runtime";
+    const durableStore = new FileDurableContextStore(join(root, ".d-ai"));
+    await durableStore.createIfAbsent(seededTask(root, taskId));
+    const databasePath = join(databaseRoot, "memory.sqlite");
+    const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath: root, memoryDatabasePath: databasePath }));
+    const sourceWindow = {
+      sourceType: "conversation" as const,
+      sourceKey: "runtime-source-chat",
+      projectTaskId: taskId,
+      messages: [{ marker: "m-001", text: "Approved runtime pipeline decision.", observedAt: "2026-09-13T00:00:00.000Z", memoryId: "runtime-pipeline-fact", subjectKey: "runtime:pipeline", critical: true }],
+      previousCoveredThroughMarker: null,
+      previousBoundarySha256: null,
+      sourceStartAttested: true,
+      coveredThroughMarker: "m-001",
+      boundarySha256: buildCurationBoundarySha256(null, null, [{ marker: "m-001", text: "Approved runtime pipeline decision.", observedAt: "2026-09-13T00:00:00.000Z", memoryId: "runtime-pipeline-fact", subjectKey: "runtime:pipeline", critical: true }]),
+      coverageConfidence: "complete" as const,
+      finalWindow: true,
+      trigger: "source-delete-check" as const,
+    };
+
+    const result = await activate({ rawCommand: "@D-AI 整理", taskId, curationSourceWindow: sourceWindow });
+
+    expect(result, JSON.stringify(result)).toMatchObject({ status: "completed", taskId, curationPipeline: { status: "completed", checkpointAdvanced: true, safeToDeleteSuppliedContent: "YES", safeToDeleteSourceChat: "YES", finalization: { chainComplete: true, currentViewFresh: true, freshRecovery: true, safeToDeleteSourceChat: "YES", reason: "Fresh whole-source coverage verified" } } });
+    expect(result.curationPipeline?.currentView?.relevantMemoryIds).toContain("runtime-pipeline-fact");
+    await expect(access(databasePath)).resolves.toBeUndefined();
   });
 });

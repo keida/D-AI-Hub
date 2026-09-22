@@ -13,6 +13,7 @@ import { bootstrapTask, prepareBootstrapTask, type BootstrapInput } from "../boo
 import { closeTask, type CloseMode } from "../close/close-service.js";
 import { curateCurrentContext, validateCurationCandidates, type CurationCandidate, type CurationRecordResult, type CurationResult } from "../curation/local-curation.js";
 import { createKnowledgeQualityLoop, type CurationQualityReport, type MemoryRecoverySnapshot } from "../curation/knowledge-quality-loop.js";
+import { createCurationPipeline, type CurationFinalizationEvidence, type CurationPipelineInput, type CurationPipelineResult } from "../curation/current-view-pipeline.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
   CapabilityMismatchError,
@@ -28,6 +29,7 @@ import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { isDurableTaskId } from "../domain/task-id.js";
 import { assertStageTransition } from "../domain/transitions.js";
 import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
+import type { CurationCoverage } from "../memory/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
 import { FileHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
 import type { HandoffEnvelope } from "../handoff/envelope.js";
@@ -62,6 +64,7 @@ export interface DAIRequest {
   readonly publicationRequested?: boolean;
   readonly publicationAuthority?: PublicationCloseAuthority | null;
   readonly curationCandidates?: readonly CurationCandidate[];
+  readonly curationSourceWindow?: CurationPipelineInput;
 }
 
 export interface PublicationCloseAuthority {
@@ -80,6 +83,36 @@ export interface DAIResponse {
   readonly curationRecords?: readonly Pick<CurationRecordResult, "memoryId" | "category" | "decision">[];
   readonly curationQuality?: CurationQualityReport;
   readonly memorySnapshot?: MemoryRecoverySnapshot;
+  readonly curationPipeline?: CurationPipelinePublicMetadata;
+}
+
+export interface CurationPipelinePublicMetadata {
+  readonly status: CurationPipelineResult["status"];
+  readonly mode: CurationPipelineResult["mode"];
+  readonly checkpointAdvanced: boolean;
+  readonly checkpointRecorded: boolean;
+  readonly coverageAdvanced: boolean;
+  readonly consolidated: boolean;
+  readonly relatedMemoryCount: number;
+  readonly checkpoint: {
+    readonly coverageConfidence: CurationCoverage;
+    readonly currentViewVersion: number;
+    readonly unresolvedCriticalCount: number;
+    readonly relevantMemoryCount: number;
+  } | null;
+  readonly currentView: {
+    readonly verificationStatus: "verified" | "stale" | "unverified";
+    readonly relevantMemoryIds: readonly string[];
+  } | null;
+  readonly curation: {
+    readonly counts: CurationResult["counts"];
+    readonly locallyStored: boolean;
+    readonly readBackVerified: boolean;
+    readonly safeToDeleteOriginalChat: "YES" | "NO";
+  } | null;
+  readonly safeToDeleteSuppliedContent: "YES" | "NO";
+  readonly safeToDeleteSourceChat: "YES" | "NO";
+  readonly finalization: CurationFinalizationEvidence;
 }
 
 export interface ExternalRoutingOverrides {
@@ -97,6 +130,7 @@ export interface ExternalDAIRequest {
   readonly publicationRequested?: boolean;
   readonly publicationAuthority?: PublicationCloseAuthority | null;
   readonly curationCandidates?: readonly CurationCandidate[];
+  readonly curationSourceWindow?: CurationPipelineInput;
 }
 
 export interface EnvironmentExecutionRequest {
@@ -144,6 +178,7 @@ export interface DAIRuntimeDependencies {
   readonly store: DurableContextStore;
   readonly discoverActiveTasks?: DiscoverActiveTasks | undefined;
   readonly curateCurrentContext?: (candidates: readonly CurationCandidate[], options: { readonly knownProjectTaskId: string | null; readonly taskScopeId?: string | null }) => Promise<CurationResult>;
+  readonly curateSourceWindow?: (input: CurationPipelineInput) => Promise<CurationPipelineResult>;
   readonly recoverKnowledgeSnapshot?: (taskId: string | null) => Promise<MemoryRecoverySnapshot>;
   readonly resolveRepositoryIdentity?: ResolveRepositoryIdentity | undefined;
   readonly workspacePath: string | null;
@@ -195,6 +230,31 @@ const overridesSchema = z.object({
   environment: environmentSchema.nullable(),
   stage: stageSchema.nullable().optional(),
 }).strict();
+const curationSourceMessageSchema = z.object({
+  marker: z.string().trim().min(1).max(256),
+  text: z.string().max(16_384),
+  observedAt: z.string().datetime(),
+  memoryId: z.string().trim().min(1).max(128).optional(),
+  subjectKey: z.string().trim().min(1).max(128).optional(),
+  revision: z.number().int().positive().optional(),
+  supersedesMemoryIds: z.array(z.string().trim().min(1).max(128)).optional(),
+  projectTaskId: z.string().trim().min(1).max(128).optional(),
+  critical: z.boolean().optional(),
+}).strict();
+const curationSourceWindowSchema = z.object({
+  sourceType: z.literal("conversation"),
+  sourceKey: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  projectTaskId: z.string().trim().min(1).max(128),
+  messages: z.array(curationSourceMessageSchema).min(1).max(64),
+  previousCoveredThroughMarker: z.string().trim().min(1).max(256).nullable(),
+  previousBoundarySha256: z.string().regex(/^[a-f0-9]{64}$/i).nullable(),
+  sourceStartAttested: z.boolean(),
+  coveredThroughMarker: z.string().trim().min(1).max(256),
+  boundarySha256: z.string().regex(/^[a-f0-9]{64}$/i),
+  coverageConfidence: z.enum(["complete", "partial", "unknown"]),
+  finalWindow: z.boolean().optional(),
+  trigger: z.enum(["window", "milestone", "explicit-consolidation", "source-delete-check"]).optional(),
+}).strict();
 const requestSchema = z.object({
   command: commandSchema,
   sourceEnvironment: environmentSchema,
@@ -203,6 +263,7 @@ const requestSchema = z.object({
   publicationRequested: z.boolean().optional(),
   publicationAuthority: publicationCloseAuthoritySchema.nullable().optional(),
   curationCandidates: z.array(z.unknown()).optional(),
+  curationSourceWindow: curationSourceWindowSchema.optional(),
 }).strict();
 const evidenceSchema = z.object({
   evidenceId: z.string().trim().min(1),
@@ -351,7 +412,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
-  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, ...validated } = result.data;
+  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, curationSourceWindow, ...validated } = result.data;
   return {
     ...validated,
     overrides: {
@@ -362,6 +423,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
     ...(publicationRequested === undefined ? {} : { publicationRequested }),
     ...(publicationAuthority === undefined ? {} : { publicationAuthority }),
     ...(curationCandidates === undefined ? {} : { curationCandidates: curationCandidates as readonly CurationCandidate[] }),
+    ...(curationSourceWindow === undefined ? {} : { curationSourceWindow: curationSourceWindow as CurationPipelineInput }),
   };
 }
 
@@ -537,6 +599,93 @@ function curationResponse(
     ...(result.qualityReport === undefined ? {} : { curationQuality: result.qualityReport }),
     ...(result.memorySnapshot === undefined ? {} : { memorySnapshot: result.memorySnapshot }),
     message: redactSensitiveText(`${result.message}; Records=${recordSummary}; Added=${added}, Updated=${updated}, No-op=${noOp}, Deferred=${deferred}, Rejected=${rejected}; locally stored=${result.locallyStored ? "YES" : "NO"}; read-back=${result.readBackVerified ? "PASS" : "NO"}; ${safeMessage}`),
+  };
+}
+
+function safePublicMemoryIds(ids: readonly string[]): readonly string[] {
+  return ids.filter((id) => /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(id)).slice(0, 32);
+}
+
+function safePublicMarker(marker: string): string { return containsSecretShapedValue(marker) ? "[REDACTED]" : marker; }
+
+function blockedFinalization(reason: string): CurationFinalizationEvidence {
+  return { earliestTrustedAnchor: null, latestCheckpoint: null, chainComplete: false, uncuratedTailCount: 0, unresolvedCriticalCount: 0, currentViewFresh: false, freshRecovery: false, safeToDeleteSourceChat: "NO", reason };
+}
+
+function safePublicFinalizationReason(reason: string): string {
+  const safeReasons = new Set([
+    "Source-chat finalization was not requested",
+    "Earliest trusted source boundary is unknown",
+    "Trusted source coverage chain is incomplete",
+    "Trusted source coverage is incomplete",
+    "Uncurated source tail remains",
+    "Unresolved critical curation items remain",
+    "Current-state view is stale or unverified",
+    "Fresh current-state recovery failed",
+    "Fresh whole-source coverage verified",
+  ]);
+  return safeReasons.has(reason) ? reason : "Source-chat finalization is blocked; source chat deletion remains NO";
+}
+
+function curationPipelinePublicMetadata(result: CurationPipelineResult): CurationPipelinePublicMetadata {
+  const checkpoint = result.checkpoint === null
+    ? null
+    : {
+      coverageConfidence: result.checkpoint.coverageConfidence,
+      currentViewVersion: result.checkpoint.currentViewVersion,
+      unresolvedCriticalCount: result.checkpoint.unresolvedCriticalIds.length,
+      relevantMemoryCount: result.checkpoint.relevantMemoryIds.length,
+    };
+  const currentView = result.currentView === null
+    ? null
+    : {
+      verificationStatus: result.currentView.verificationStatus,
+      relevantMemoryIds: safePublicMemoryIds(result.currentView.relevantMemoryIds),
+    };
+  const curation = result.status === "completed" && result.curation !== null
+    ? {
+      counts: result.curation.counts,
+      locallyStored: result.curation.locallyStored,
+      readBackVerified: result.curation.readBackVerified,
+      safeToDeleteOriginalChat: result.curation.safeToDeleteOriginalChat,
+    }
+    : null;
+  const finalization = result.finalization;
+  return {
+    status: result.status,
+    mode: result.mode,
+    checkpointAdvanced: result.checkpointAdvanced,
+    checkpointRecorded: result.checkpointRecorded,
+    coverageAdvanced: result.coverageAdvanced,
+    consolidated: result.consolidated,
+    relatedMemoryCount: result.relatedMemoryIds.length,
+    checkpoint,
+    currentView,
+    curation,
+    safeToDeleteSuppliedContent: result.safeToDeleteSuppliedContent,
+    safeToDeleteSourceChat: result.safeToDeleteSourceChat,
+    finalization: {
+      ...finalization,
+      earliestTrustedAnchor: finalization.earliestTrustedAnchor === null ? null : { ...finalization.earliestTrustedAnchor, marker: safePublicMarker(finalization.earliestTrustedAnchor.marker) },
+      latestCheckpoint: finalization.latestCheckpoint === null ? null : { ...finalization.latestCheckpoint, coveredThroughMarker: safePublicMarker(finalization.latestCheckpoint.coveredThroughMarker) },
+      reason: safePublicFinalizationReason(redactSensitiveText(finalization.reason)),
+    },
+  };
+}
+
+function curationPipelineResponse(request: DAIRequest, result: CurationPipelineResult): DAIResponse {
+  const status = result.status;
+  const message = status === "completed"
+    ? `Local curation pipeline completed; SAFE TO DELETE SUPPLIED CONTENT: ${result.safeToDeleteSuppliedContent}; SAFE TO DELETE SOURCE CHAT: ${result.safeToDeleteSourceChat}`
+    : "Local curation pipeline blocked; no source chat deletion is permitted";
+  return {
+    taskId: request.activeTaskId ?? "unassigned",
+    stage: "inspect",
+    environment: request.sourceEnvironment,
+    status,
+    evidence: [],
+    curationPipeline: curationPipelinePublicMetadata(result),
+    message: redactSensitiveText(message),
   };
 }
 
@@ -1347,8 +1496,9 @@ async function resolveCurationTaskIdentity(
   dependencies: DAIRuntimeDependencies,
 ): Promise<CurationTaskIdentity> {
   const candidates = request.curationCandidates ?? [];
-  if (candidates.length === 0) return { kind: "resolved", knownProjectTaskId: null };
-  const hasProjectMemory = candidates.some((candidate) => candidate.category === "project-memory");
+  const sourceTaskId = request.curationSourceWindow?.projectTaskId;
+  if (candidates.length === 0 && sourceTaskId === undefined) return { kind: "resolved", knownProjectTaskId: null };
+  const hasProjectMemory = sourceTaskId !== undefined || candidates.some((candidate) => candidate.category === "project-memory");
   if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
     const loaded = await connectorOutcome(() => dependencies.store.load(request.activeTaskId!), closeConnectorFailure);
     if (loaded.kind === "blocked") {
@@ -2330,6 +2480,77 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
   return async (externalRequest: ExternalDAIRequest): Promise<DAIResponse> => {
     const request = validateRequest(externalRequest);
     if (request.command.kind === "curate") {
+      if (request.curationSourceWindow !== undefined) {
+        if (dependencies.curateSourceWindow === undefined) return curationPipelineResponse(request, {
+          status: "blocked",
+          mode: "bounded-fallback",
+          curation: null,
+          checkpoint: null,
+          currentView: null,
+          checkpointAdvanced: false,
+          checkpointRecorded: false,
+          coverageAdvanced: false,
+          consolidated: false,
+          relatedMemoryIds: [],
+          safeToDeleteSuppliedContent: "NO",
+          safeToDeleteSourceChat: "NO",
+          finalization: blockedFinalization("Local curation pipeline is unavailable; no source chat deletion is permitted"),
+          message: "Local curation pipeline is unavailable; no source chat deletion is permitted",
+        });
+        try {
+          const taskIdentity = await resolveCurationTaskIdentity(request, dependencies);
+          if (taskIdentity.kind === "blocked") return curationPipelineResponse({ ...request, activeTaskId: taskIdentity.taskId }, {
+            status: "blocked",
+            mode: "bounded-fallback",
+            curation: null,
+            checkpoint: null,
+            currentView: null,
+            checkpointAdvanced: false,
+            checkpointRecorded: false,
+            coverageAdvanced: false,
+            consolidated: false,
+            relatedMemoryIds: [],
+            safeToDeleteSuppliedContent: "NO",
+            safeToDeleteSourceChat: "NO",
+            finalization: blockedFinalization(taskIdentity.message),
+            message: taskIdentity.message,
+          });
+          if (taskIdentity.knownProjectTaskId !== request.curationSourceWindow.projectTaskId) return curationPipelineResponse(request, {
+            status: "blocked",
+            mode: "bounded-fallback",
+            curation: null,
+            checkpoint: null,
+            currentView: null,
+            checkpointAdvanced: false,
+            checkpointRecorded: false,
+            coverageAdvanced: false,
+            consolidated: false,
+            relatedMemoryIds: [],
+            safeToDeleteSuppliedContent: "NO",
+            safeToDeleteSourceChat: "NO",
+            finalization: blockedFinalization("Curation source window project task does not match the exact active task; no source chat deletion is permitted"),
+            message: "Curation source window project task does not match the exact active task; no source chat deletion is permitted",
+          });
+          return curationPipelineResponse({ ...request, activeTaskId: taskIdentity.knownProjectTaskId }, await dependencies.curateSourceWindow(request.curationSourceWindow));
+        } catch (error: unknown) {
+          return curationPipelineResponse(request, {
+            status: "blocked",
+            mode: "bounded-fallback",
+            curation: null,
+            checkpoint: null,
+            currentView: null,
+            checkpointAdvanced: false,
+            checkpointRecorded: false,
+            coverageAdvanced: false,
+            consolidated: false,
+            relatedMemoryIds: [],
+            safeToDeleteSuppliedContent: "NO",
+            safeToDeleteSourceChat: "NO",
+            finalization: blockedFinalization("Local curation pipeline failed closed"),
+            message: `Local curation pipeline failed closed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+      }
       if (dependencies.curateCurrentContext === undefined) {
         return curationResponse(request, {
           status: "blocked",
@@ -2656,6 +2877,21 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
           }
         }
       },
+    curateSourceWindow: async (input: CurationPipelineInput): Promise<CurationPipelineResult> => {
+      await mkdir(dirname(memoryDatabasePath), { recursive: true });
+      const memoryStore = new LocalSqliteMemoryStore({
+        databasePath: memoryDatabasePath,
+        workspacePath: memoryRoot,
+        mode: "writer",
+        scopeId: memoryScopeId,
+        writerId: "primary-device",
+      });
+      try {
+        return await createCurationPipeline({ store: memoryStore, workspacePath: memoryRoot, repositoryPath: root }).run(input);
+      } finally {
+        memoryStore.close();
+      }
+    },
   };
 }
 

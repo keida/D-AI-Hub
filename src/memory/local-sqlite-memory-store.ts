@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
-import type { LocalSqliteMemoryStoreOptions, MemoryMutation, MemoryRecord, MemoryStoreMode, MemoryValue, PutMemoryInput } from "./types.js";
+import type { CurationCheckpoint, CurationCoverage, CurrentStateView, LocalSqliteMemoryStoreOptions, MemoryMutation, MemoryRecord, MemoryStoreMode, MemoryValue, PutMemoryInput, RelatedMemoryQuery } from "./types.js";
 
 interface MemoryRow {
   readonly memory_id: string;
@@ -16,6 +16,33 @@ interface MemoryRow {
   readonly value_sha256: string;
   readonly recorded_at: string;
 }
+
+interface CurationCheckpointRow {
+  readonly checkpoint_id: string;
+  readonly scope_id: string;
+  readonly source_type: string;
+  readonly source_key_sha256: string;
+  readonly covered_through_marker: string;
+  readonly boundary_sha256: string;
+  readonly last_curated_at: string;
+  readonly last_candidate_ids_json: string;
+  readonly unresolved_critical_ids_json: string;
+  readonly relevant_memory_ids_json: string;
+  readonly project_task_id: string;
+  readonly coverage_confidence: CurationCoverage;
+  readonly last_committed_memory_sequence: number;
+  readonly current_view_version: number;
+  readonly new_retained_since_consolidation: number;
+  readonly current_view_json: string;
+  readonly current_view_sha256: string;
+  readonly checkpoint_sha256: string;
+  readonly earliest_trusted_marker?: string | null;
+  readonly earliest_trusted_boundary_sha256?: string | null;
+  readonly coverage_chain_complete?: number | null;
+}
+
+const legacyCurationCheckpointColumns = "checkpoint_id, scope_id, source_type, source_key_sha256, covered_through_marker, boundary_sha256, last_curated_at, last_candidate_ids_json, unresolved_critical_ids_json, relevant_memory_ids_json, project_task_id, coverage_confidence, last_committed_memory_sequence, current_view_version, new_retained_since_consolidation, current_view_json, current_view_sha256, checkpoint_sha256";
+const curationCheckpointColumns = `${legacyCurationCheckpointColumns}, earliest_trusted_marker, earliest_trusted_boundary_sha256, coverage_chain_complete`;
 
 export interface AppliedMemoryBundleReceipt {
   readonly bundleId: string;
@@ -62,6 +89,29 @@ const memorySchema = `
     scope_id TEXT PRIMARY KEY,
     writer_id TEXT NOT NULL,
     workspace_path TEXT NOT NULL
+  ) STRICT;
+  CREATE TABLE IF NOT EXISTS curation_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_key_sha256 TEXT NOT NULL,
+    covered_through_marker TEXT NOT NULL,
+    boundary_sha256 TEXT NOT NULL,
+    last_curated_at TEXT NOT NULL,
+    last_candidate_ids_json TEXT NOT NULL,
+    unresolved_critical_ids_json TEXT NOT NULL,
+    relevant_memory_ids_json TEXT NOT NULL,
+    project_task_id TEXT NOT NULL,
+    coverage_confidence TEXT NOT NULL,
+    last_committed_memory_sequence INTEGER NOT NULL,
+    current_view_version INTEGER NOT NULL,
+    new_retained_since_consolidation INTEGER NOT NULL,
+    current_view_json TEXT NOT NULL,
+    current_view_sha256 TEXT NOT NULL,
+    checkpoint_sha256 TEXT NOT NULL,
+    earliest_trusted_marker TEXT,
+    earliest_trusted_boundary_sha256 TEXT,
+    coverage_chain_complete INTEGER
   ) STRICT;
 `;
 
@@ -114,6 +164,124 @@ function assertMemorySchema(database: DatabaseSync): void {
   const uniqueIndexes = database.prepare("PRAGMA index_list(memory_records)").all() as Array<{ readonly name: string; readonly unique: number }>;
   const uniqueRecordIndex = uniqueIndexes.find((index) => index.unique === 1 && database.prepare(`PRAGMA index_info(\"${index.name.replaceAll('"', '""')}\")`).all().map((column) => (column as { readonly name: string }).name).join(",") === "scope_id,writer_id,sequence");
   if (uniqueRecordIndex === undefined) throw new InvalidTaskStateError("Memory database sequence constraint is invalid");
+}
+
+function migrateCurationCheckpointSchema(database: DatabaseSync): void {
+  const observed = database.prepare("PRAGMA table_info(curation_checkpoints)").all() as Array<{ readonly name: string }>;
+  const names = new Set(observed.map(({ name }) => name));
+  const missing = ["earliest_trusted_marker", "earliest_trusted_boundary_sha256", "coverage_chain_complete"].filter((name) => !names.has(name));
+  if (missing.length === 0) return;
+  if (missing.length !== 3) throw new InvalidTaskStateError("Curation checkpoint finalization schema is partially initialized");
+  database.exec("ALTER TABLE curation_checkpoints ADD COLUMN earliest_trusted_marker TEXT");
+  database.exec("ALTER TABLE curation_checkpoints ADD COLUMN earliest_trusted_boundary_sha256 TEXT");
+  database.exec("ALTER TABLE curation_checkpoints ADD COLUMN coverage_chain_complete INTEGER");
+}
+
+function assertCurationCheckpointSchema(database: DatabaseSync): boolean {
+  const table = (database.prepare("PRAGMA table_list").all() as Array<{ readonly schema: string; readonly name: string; readonly type: string; readonly strict: number }>).find((candidate) => candidate.schema === "main" && candidate.name === "curation_checkpoints");
+  if (table?.type !== "table" || table.strict !== 1) throw new InvalidTaskStateError("Curation checkpoint schema is not initialized or STRICT");
+  const legacyExpected = [
+    "checkpoint_id", "scope_id", "source_type", "source_key_sha256", "covered_through_marker", "boundary_sha256",
+    "last_curated_at", "last_candidate_ids_json", "unresolved_critical_ids_json", "relevant_memory_ids_json",
+    "project_task_id", "coverage_confidence", "last_committed_memory_sequence", "current_view_version", "new_retained_since_consolidation",
+    "current_view_json", "current_view_sha256", "checkpoint_sha256",
+  ];
+  const expected = [...legacyExpected, "earliest_trusted_marker", "earliest_trusted_boundary_sha256", "coverage_chain_complete"];
+  const observed = database.prepare("PRAGMA table_info(curation_checkpoints)").all() as Array<{ readonly name: string; readonly type: string; readonly notnull: number }>;
+  const valid = (names: readonly string[], nullableFinalization = false): boolean => observed.length === names.length && observed.every((column, index) => column.name === names[index] && column.type === (column.name.endsWith("_version") || column.name.endsWith("_sequence") || column.name === "new_retained_since_consolidation" || column.name === "coverage_chain_complete" ? "INTEGER" : "TEXT") && column.notnull === (nullableFinalization && index >= legacyExpected.length ? 0 : 1));
+  if (valid(expected, true)) return true;
+  if (valid(legacyExpected)) return false;
+  throw new InvalidTaskStateError("Curation checkpoint schema columns are invalid");
+}
+
+function curationCheckpointSelectColumns(hasFinalizationColumns: boolean): string { return hasFinalizationColumns ? curationCheckpointColumns : `${legacyCurationCheckpointColumns}, NULL AS earliest_trusted_marker, NULL AS earliest_trusted_boundary_sha256, NULL AS coverage_chain_complete`; }
+
+function canonicalJsonValue(value: unknown): string {
+  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJsonValue).join(",")}]`;
+  if (typeof value !== "object") throw new InvalidTaskStateError("Curation checkpoint contains unsupported data");
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJsonValue((value as Record<string, unknown>)[key])}`).join(",")}}`;
+}
+
+function sha256(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
+
+function assertStringList(value: readonly string[], label: string): void {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() !== item || item.length === 0 || item.length > 256 || containsSecretShapedValue(item))) throw new InvalidTaskStateError(`${label} must be a bounded non-secret string list`);
+}
+
+function assertBoundedText(value: unknown, label: string, maximum = 256): asserts value is string {
+  if (typeof value !== "string" || value.trim() !== value || value.length === 0 || value.length > maximum || containsSecretShapedValue(value)) throw new InvalidTaskStateError(`${label} must be bounded non-secret text`);
+}
+
+function assertCheckpoint(checkpoint: CurationCheckpoint, validateView = true): void {
+  assertIdentifier(checkpoint.checkpointId, "Curation checkpointId");
+  assertIdentifier(checkpoint.scopeId, "Curation scopeId");
+  assertIdentifier(checkpoint.sourceType, "Curation sourceType");
+  assertSha256(checkpoint.sourceKeySha256, "Curation sourceKeySha256");
+  if (checkpoint.coveredThroughMarker.trim() !== checkpoint.coveredThroughMarker || checkpoint.coveredThroughMarker.length === 0 || checkpoint.coveredThroughMarker.length > 256) throw new InvalidTaskStateError("Curation coveredThroughMarker is invalid");
+  assertSha256(checkpoint.boundarySha256, "Curation boundarySha256");
+  assertRecordedAt(checkpoint.lastCuratedAt);
+  assertStringList(checkpoint.lastCandidateIds, "Curation lastCandidateIds");
+  assertStringList(checkpoint.unresolvedCriticalIds, "Curation unresolvedCriticalIds");
+  assertStringList(checkpoint.relevantMemoryIds, "Curation relevantMemoryIds");
+  assertIdentifier(checkpoint.projectTaskId, "Curation projectTaskId");
+  if (checkpoint.coverageConfidence !== "complete" && checkpoint.coverageConfidence !== "partial" && checkpoint.coverageConfidence !== "unknown") throw new InvalidTaskStateError("Curation coverageConfidence is invalid");
+  if (!Number.isSafeInteger(checkpoint.lastCommittedMemorySequence) || checkpoint.lastCommittedMemorySequence < 0 || !Number.isSafeInteger(checkpoint.currentViewVersion) || checkpoint.currentViewVersion < 0 || !Number.isSafeInteger(checkpoint.newRetainedSinceConsolidation) || checkpoint.newRetainedSinceConsolidation < 0) throw new InvalidTaskStateError("Curation checkpoint counters are invalid");
+  if ((checkpoint.earliestTrustedMarker === null) !== (checkpoint.earliestTrustedBoundarySha256 === null)) throw new InvalidTaskStateError("Curation earliest trusted checkpoint anchor is incomplete");
+  if (checkpoint.earliestTrustedMarker !== null && (checkpoint.earliestTrustedMarker.trim() !== checkpoint.earliestTrustedMarker || checkpoint.earliestTrustedMarker.length === 0 || checkpoint.earliestTrustedMarker.length > 256 || containsSecretShapedValue(checkpoint.earliestTrustedMarker))) throw new InvalidTaskStateError("Curation earliest trusted marker is invalid");
+  if (checkpoint.earliestTrustedBoundarySha256 !== null) assertSha256(checkpoint.earliestTrustedBoundarySha256, "Curation earliest trusted boundarySha256");
+  if (checkpoint.coverageChainComplete !== null && typeof checkpoint.coverageChainComplete !== "boolean") throw new InvalidTaskStateError("Curation coverage chain flag is invalid");
+  if (checkpoint.coverageChainComplete === true && checkpoint.earliestTrustedMarker === null) throw new InvalidTaskStateError("Curation complete coverage chain requires a trusted anchor");
+  if (validateView) {
+    if (typeof checkpoint.currentView !== "object" || checkpoint.currentView === null) throw new InvalidTaskStateError("Curation current view is required");
+    assertIdentifier(checkpoint.currentView.identity, "Curation view identity");
+    assertBoundedText(checkpoint.currentView.phase, "Curation view phase");
+    if (checkpoint.currentView.nextAction !== null) assertBoundedText(checkpoint.currentView.nextAction, "Curation view nextAction");
+    assertIdentifier(checkpoint.currentView.checkpointReference, "Curation view checkpointReference");
+    assertStringList(checkpoint.currentView.milestones, "Curation view milestones");
+    assertStringList(checkpoint.currentView.currentWork, "Curation view currentWork");
+    assertStringList(checkpoint.currentView.confirmedDecisions, "Curation view confirmedDecisions");
+    assertStringList(checkpoint.currentView.blockers, "Curation view blockers");
+    assertStringList(checkpoint.currentView.limitations, "Curation view limitations");
+    assertStringList(checkpoint.currentView.relevantMemoryIds, "Curation view relevantMemoryIds");
+    if (checkpoint.currentView.verificationStatus !== "verified" && checkpoint.currentView.verificationStatus !== "stale" && checkpoint.currentView.verificationStatus !== "unverified") throw new InvalidTaskStateError("Curation view verification status is invalid");
+  }
+  assertSha256(checkpoint.currentViewSha256, "Curation currentViewSha256");
+  assertSha256(checkpoint.checkpointSha256, "Curation checkpointSha256");
+}
+
+function checkpointDigest(checkpoint: CurationCheckpoint): string {
+  const { checkpointSha256: _ignored, currentView: _view, currentViewSha256: _viewHash, ...payload } = checkpoint;
+  return sha256(canonicalJsonValue(payload));
+}
+
+function legacyCheckpointDigest(checkpoint: CurationCheckpoint): string {
+  const { checkpointSha256: _ignored, currentView: _view, currentViewSha256: _viewHash, earliestTrustedMarker: _marker, earliestTrustedBoundarySha256: _boundary, coverageChainComplete: _chain, ...payload } = checkpoint;
+  return sha256(canonicalJsonValue(payload));
+}
+
+function checkpointFromRow(row: CurationCheckpointRow, verifyIntegrity = true, validateView = true): CurationCheckpoint {
+  let lastCandidateIds: unknown;
+  let unresolvedCriticalIds: unknown;
+  let relevantMemoryIds: unknown;
+  let currentView: unknown;
+  try {
+    lastCandidateIds = JSON.parse(row.last_candidate_ids_json) as unknown;
+    unresolvedCriticalIds = JSON.parse(row.unresolved_critical_ids_json) as unknown;
+    relevantMemoryIds = JSON.parse(row.relevant_memory_ids_json) as unknown;
+    currentView = JSON.parse(row.current_view_json) as unknown;
+  } catch {
+    throw new InvalidTaskStateError("Curation checkpoint JSON is corrupt");
+  }
+  if (row.coverage_chain_complete !== undefined && row.coverage_chain_complete !== null && row.coverage_chain_complete !== 0 && row.coverage_chain_complete !== 1) throw new InvalidTaskStateError("Curation coverage chain flag is invalid");
+  const checkpoint = { checkpointId: row.checkpoint_id, scopeId: row.scope_id, sourceType: row.source_type, sourceKeySha256: row.source_key_sha256, coveredThroughMarker: row.covered_through_marker, boundarySha256: row.boundary_sha256, lastCuratedAt: row.last_curated_at, lastCandidateIds: lastCandidateIds as readonly string[], unresolvedCriticalIds: unresolvedCriticalIds as readonly string[], relevantMemoryIds: relevantMemoryIds as readonly string[], projectTaskId: row.project_task_id, coverageConfidence: row.coverage_confidence, lastCommittedMemorySequence: row.last_committed_memory_sequence, currentViewVersion: row.current_view_version, newRetainedSinceConsolidation: row.new_retained_since_consolidation, currentView: currentView as CurrentStateView, currentViewSha256: row.current_view_sha256, checkpointSha256: row.checkpoint_sha256, earliestTrustedMarker: row.earliest_trusted_marker ?? null, earliestTrustedBoundarySha256: row.earliest_trusted_boundary_sha256 ?? null, coverageChainComplete: row.coverage_chain_complete === undefined || row.coverage_chain_complete === null ? null : row.coverage_chain_complete === 1 } satisfies CurationCheckpoint;
+  assertCheckpoint(checkpoint, validateView);
+  if (verifyIntegrity) {
+    const viewDigest = sha256(canonicalJsonValue(checkpoint.currentView));
+    const digest = checkpoint.coverageChainComplete === null ? legacyCheckpointDigest : checkpointDigest;
+    if ((validateView && viewDigest !== checkpoint.currentViewSha256) || digest({ ...checkpoint, checkpointSha256: "" }) !== checkpoint.checkpointSha256) throw new InvalidTaskStateError("Curation checkpoint hash verification failed");
+  }
+  return checkpoint;
 }
 
 function assertIdentifier(value: string, label: string): string {
@@ -399,6 +567,7 @@ function toRecord(row: MemoryRow): MemoryRecord {
 export class LocalSqliteMemoryStore {
   private readonly database: DatabaseSync;
   private readonly options: LocalSqliteMemoryStoreOptions;
+  private transactionDepth = 0;
 
   public constructor(options: LocalSqliteMemoryStoreOptions) {
     assertStoreMode(options.mode);
@@ -462,6 +631,8 @@ export class LocalSqliteMemoryStore {
       transactionStarted = true;
       database.exec(memorySchema);
       assertMemorySchema(database);
+      migrateCurationCheckpointSchema(database);
+      assertCurationCheckpointSchema(database);
       LocalSqliteMemoryStore.assertScopeBindingOnDatabase(database, options, true);
       database.exec("COMMIT");
       transactionStarted = false;
@@ -497,6 +668,8 @@ export class LocalSqliteMemoryStore {
       transactionStarted = true;
       this.database.exec(memorySchema);
       assertMemorySchema(this.database);
+      migrateCurationCheckpointSchema(this.database);
+      assertCurationCheckpointSchema(this.database);
       this.assertScopeBinding(true);
       this.database.exec("COMMIT");
     } catch (error) {
@@ -795,7 +968,11 @@ export class LocalSqliteMemoryStore {
       assertNoSecretShapedValue(mutation.value);
     }
 
-    this.database.exec("BEGIN IMMEDIATE");
+    const ownsTransaction = this.transactionDepth === 0;
+    if (ownsTransaction) {
+      this.database.exec("BEGIN IMMEDIATE");
+      this.transactionDepth = 1;
+    }
     try {
       let sequence = (this.database
         .prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM memory_records WHERE scope_id = ? AND writer_id = ?")
@@ -833,14 +1010,93 @@ export class LocalSqliteMemoryStore {
         }
         records.push(record);
       }
-      this.database.exec("COMMIT");
+      if (ownsTransaction) {
+        this.database.exec("COMMIT");
+        this.transactionDepth = 0;
+      }
       return records;
+    } catch (error) {
+      if (ownsTransaction) {
+        try {
+          this.database.exec("ROLLBACK");
+        } catch {
+          // Preserve the original transaction failure.
+        }
+        this.transactionDepth = 0;
+      }
+      throw error;
+    }
+  }
+
+  public async getLatestCurationCheckpoint(sourceType: string, projectTaskId: string, sourceKeySha256: string, verifyIntegrity = true): Promise<CurationCheckpoint | null> {
+    const hasFinalizationColumns = assertCurationCheckpointSchema(this.database);
+    const normalizedSourceType = assertIdentifier(sourceType, "Curation sourceType");
+    const normalizedProjectTaskId = assertIdentifier(projectTaskId, "Curation projectTaskId");
+    assertSha256(sourceKeySha256, "Curation sourceKeySha256");
+    const row = this.database.prepare(`SELECT ${curationCheckpointSelectColumns(hasFinalizationColumns)} FROM curation_checkpoints WHERE scope_id = ? AND source_type = ? AND source_key_sha256 = ? AND project_task_id = ? ORDER BY last_curated_at DESC, checkpoint_id DESC LIMIT 1`).get(this.options.scopeId, normalizedSourceType, sourceKeySha256, normalizedProjectTaskId) as CurationCheckpointRow | undefined;
+    return row === undefined ? null : checkpointFromRow(row, verifyIntegrity);
+  }
+
+  public async getCurationCheckpointForViewRefresh(sourceType: string, projectTaskId: string, sourceKeySha256: string): Promise<CurationCheckpoint | null> {
+    const hasFinalizationColumns = assertCurationCheckpointSchema(this.database);
+    const normalizedSourceType = assertIdentifier(sourceType, "Curation sourceType");
+    const normalizedProjectTaskId = assertIdentifier(projectTaskId, "Curation projectTaskId");
+    assertSha256(sourceKeySha256, "Curation sourceKeySha256");
+    const row = this.database.prepare(`SELECT ${curationCheckpointSelectColumns(hasFinalizationColumns)} FROM curation_checkpoints WHERE scope_id = ? AND source_type = ? AND source_key_sha256 = ? AND project_task_id = ? ORDER BY last_curated_at DESC, checkpoint_id DESC LIMIT 1`).get(this.options.scopeId, normalizedSourceType, sourceKeySha256, normalizedProjectTaskId) as CurationCheckpointRow | undefined;
+    const checkpoint = row === undefined ? null : checkpointFromRow(row, false, false);
+    if (checkpoint !== null && (checkpoint.coverageChainComplete === null ? legacyCheckpointDigest(checkpoint) : checkpointDigest(checkpoint)) !== checkpoint.checkpointSha256) throw new InvalidTaskStateError("Curation checkpoint metadata integrity failed; view refresh is blocked");
+    return checkpoint;
+  }
+
+  public async retrieveRelatedMemories(query: RelatedMemoryQuery): Promise<readonly MemoryRecord[]> {
+    const limit = query.limit ?? 8;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 16) throw new InvalidTaskStateError("Related-memory retrieval limit must be between 1 and 16");
+    const memoryId = query.memoryId === null ? null : assertIdentifier(query.memoryId, "Related memoryId");
+    if (query.subjectKey.trim() !== query.subjectKey || query.subjectKey.length === 0 || query.subjectKey.length > 128 || containsSecretShapedValue(query.subjectKey)) throw new InvalidTaskStateError("Related subjectKey is invalid");
+    if (query.projectTaskId.trim() !== query.projectTaskId || query.projectTaskId.length === 0 || containsSecretShapedValue(query.projectTaskId)) throw new InvalidTaskStateError("Related projectTaskId is invalid");
+    if (query.category.trim() !== query.category || query.category.length === 0 || query.category.length > 64 || containsSecretShapedValue(query.category)) throw new InvalidTaskStateError("Related category is invalid");
+    const rows = this.database.prepare("SELECT memory_id, scope_id, writer_id, sequence, value_json, value_sha256, recorded_at FROM memory_records WHERE scope_id = ? AND writer_id = ? AND (json_extract(value_json, '$.taskScopeId') = ? OR json_extract(value_json, '$.projectTaskId') = ?) AND (memory_id = ? OR json_extract(value_json, '$.subjectKey') = ? OR json_extract(value_json, '$.projectTaskId') = ? OR json_extract(value_json, '$.category') = ?) ORDER BY CASE WHEN memory_id = ? THEN 0 WHEN json_extract(value_json, '$.subjectKey') = ? THEN 1 WHEN json_extract(value_json, '$.projectTaskId') = ? THEN 2 WHEN json_extract(value_json, '$.category') = ? THEN 3 ELSE 4 END, COALESCE(json_extract(value_json, '$.observedAt'), '') DESC, sequence DESC, memory_id ASC LIMIT ?").all(this.options.scopeId, this.options.writerId, query.projectTaskId, query.projectTaskId, memoryId, query.subjectKey, query.projectTaskId, query.category, memoryId, query.subjectKey, query.projectTaskId, query.category, limit) as unknown as MemoryRow[];
+    return rows.map(toRecord);
+  }
+
+  public async withCurationCheckpoint<T>(checkpoint: CurationCheckpoint | (() => CurationCheckpoint), operation: () => Promise<T>): Promise<{ readonly result: T; readonly checkpoint: CurationCheckpoint }> {
+    if (this.options.mode !== "writer") throw new InvalidTaskStateError("Curation checkpoint writes are blocked in reader mode");
+    assertCurationCheckpointSchema(this.database);
+    if (this.transactionDepth !== 0) throw new InvalidTaskStateError("Curation checkpoint transaction is already active");
+    const initialCheckpoint = typeof checkpoint === "function" ? null : checkpoint;
+    if (initialCheckpoint !== null && initialCheckpoint.scopeId !== this.options.scopeId) throw new InvalidTaskStateError("Curation checkpoint scope does not match the configured store");
+    this.database.exec("BEGIN IMMEDIATE");
+    this.transactionDepth = 1;
+    try {
+      const result = await operation();
+      const pendingCheckpoint = typeof checkpoint === "function" ? checkpoint() : checkpoint;
+      if (pendingCheckpoint.scopeId !== this.options.scopeId) throw new InvalidTaskStateError("Curation checkpoint scope does not match the configured store");
+      const existing = this.database.prepare("SELECT earliest_trusted_marker, earliest_trusted_boundary_sha256, coverage_chain_complete FROM curation_checkpoints WHERE checkpoint_id = ?").get(pendingCheckpoint.checkpointId) as { readonly earliest_trusted_marker?: string | null; readonly earliest_trusted_boundary_sha256?: string | null; readonly coverage_chain_complete?: number | null } | undefined;
+      const committedBase = existing === undefined ? pendingCheckpoint : {
+        ...pendingCheckpoint,
+        earliestTrustedMarker: existing.earliest_trusted_marker ?? null,
+        earliestTrustedBoundarySha256: existing.earliest_trusted_boundary_sha256 ?? null,
+        coverageChainComplete: existing.coverage_chain_complete === undefined || existing.coverage_chain_complete === null ? null : existing.coverage_chain_complete === 1,
+      };
+      const currentViewSha256 = sha256(canonicalJsonValue(committedBase.currentView));
+      const withoutDigest = { ...committedBase, currentViewSha256, checkpointSha256: "" };
+      const committed = { ...committedBase, currentViewSha256, checkpointSha256: committedBase.coverageChainComplete === null ? legacyCheckpointDigest(withoutDigest) : checkpointDigest(withoutDigest) };
+      assertCheckpoint(committed);
+      this.database.prepare("INSERT INTO curation_checkpoints (checkpoint_id, scope_id, source_type, source_key_sha256, covered_through_marker, boundary_sha256, last_curated_at, last_candidate_ids_json, unresolved_critical_ids_json, relevant_memory_ids_json, project_task_id, coverage_confidence, last_committed_memory_sequence, current_view_version, new_retained_since_consolidation, current_view_json, current_view_sha256, checkpoint_sha256, earliest_trusted_marker, earliest_trusted_boundary_sha256, coverage_chain_complete) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(checkpoint_id) DO UPDATE SET scope_id = excluded.scope_id, source_type = excluded.source_type, source_key_sha256 = excluded.source_key_sha256, covered_through_marker = excluded.covered_through_marker, boundary_sha256 = excluded.boundary_sha256, last_curated_at = excluded.last_curated_at, last_candidate_ids_json = excluded.last_candidate_ids_json, unresolved_critical_ids_json = excluded.unresolved_critical_ids_json, relevant_memory_ids_json = excluded.relevant_memory_ids_json, project_task_id = excluded.project_task_id, coverage_confidence = excluded.coverage_confidence, last_committed_memory_sequence = excluded.last_committed_memory_sequence, current_view_version = excluded.current_view_version, new_retained_since_consolidation = excluded.new_retained_since_consolidation, current_view_json = excluded.current_view_json, current_view_sha256 = excluded.current_view_sha256, checkpoint_sha256 = excluded.checkpoint_sha256, earliest_trusted_marker = curation_checkpoints.earliest_trusted_marker, earliest_trusted_boundary_sha256 = curation_checkpoints.earliest_trusted_boundary_sha256, coverage_chain_complete = curation_checkpoints.coverage_chain_complete")
+        .run(committed.checkpointId, committed.scopeId, committed.sourceType, committed.sourceKeySha256, committed.coveredThroughMarker, committed.boundarySha256, committed.lastCuratedAt, canonicalJsonValue(committed.lastCandidateIds), canonicalJsonValue(committed.unresolvedCriticalIds), canonicalJsonValue(committed.relevantMemoryIds), committed.projectTaskId, committed.coverageConfidence, committed.lastCommittedMemorySequence, committed.currentViewVersion, committed.newRetainedSinceConsolidation, canonicalJsonValue(committed.currentView), committed.currentViewSha256, committed.checkpointSha256, committed.earliestTrustedMarker, committed.earliestTrustedBoundarySha256, committed.coverageChainComplete === null ? null : committed.coverageChainComplete ? 1 : 0);
+      const row = this.database.prepare(`SELECT ${curationCheckpointColumns} FROM curation_checkpoints WHERE checkpoint_id = ?`).get(committed.checkpointId) as CurationCheckpointRow | undefined;
+      const committedCheckpoint = row === undefined ? null : checkpointFromRow(row);
+      if (committedCheckpoint === null || committedCheckpoint.checkpointSha256 !== committed.checkpointSha256) throw new InvalidTaskStateError("Curation checkpoint read-back failed");
+      this.database.exec("COMMIT");
+      this.transactionDepth = 0;
+      return { result, checkpoint: committedCheckpoint };
     } catch (error) {
       try {
         this.database.exec("ROLLBACK");
       } catch {
-        // Preserve the original transaction failure.
+        // Preserve the original atomic-operation failure.
       }
+      this.transactionDepth = 0;
       throw error;
     }
   }

@@ -1,6 +1,7 @@
 import { parseDAIInvocation } from "./command-parser.js";
 import { classifyUserIntent, type UserIntent } from "../automation/user-intent.js";
 import type { CurationCandidate } from "../curation/local-curation.js";
+import type { CurationPipelineInput } from "../curation/current-view-pipeline.js";
 import type { AgentExecutionDirective, DeliveryRequest, DeliveryResult, PublicationAuthority } from "../automation/delivery.js";
 import type { DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
 
@@ -8,6 +9,7 @@ export interface CodexActivationInput {
   readonly rawCommand: string;
   readonly taskId: string | null;
   readonly currentContext?: readonly CurationCandidate[];
+  readonly curationSourceWindow?: CurationPipelineInput;
 }
 
 export interface CodexActivationOptions {
@@ -69,6 +71,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         overrides: parsed.overrides,
         activeTaskId: input.taskId,
         ...(input.currentContext === undefined ? {} : { curationCandidates: input.currentContext }),
+        ...(input.curationSourceWindow === undefined ? {} : { curationSourceWindow: input.curationSourceWindow }),
       });
     }
 
@@ -88,6 +91,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         overrides: { model: null, role: null, environment: null, stage: null },
         activeTaskId: input.taskId,
         ...(input.currentContext === undefined ? {} : { curationCandidates: input.currentContext }),
+        ...(input.curationSourceWindow === undefined ? {} : { curationSourceWindow: input.curationSourceWindow }),
       });
       return { ...result, userIntent: intent };
     }
