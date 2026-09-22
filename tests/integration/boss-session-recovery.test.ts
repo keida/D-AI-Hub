@@ -226,4 +226,51 @@ describe("P4 Boss startup and rollover", () => {
       expect((await readdir(durableRoot)).filter((entry) => entry.startsWith("task-")).sort()).toEqual([first.taskId, "task-p4-malformed-neighbor"].sort());
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
+
+  it.each(["trailing-space", "aggregate-overflow"] as const)("keeps authoritative limitations recoverable through bounded Boss context: %s", async (caseName) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4r-limitations-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    try {
+      await mkdir(workspacePath, { recursive: true });
+      const options = { workspacePath, durableRoot, memoryDatabasePath };
+      const activate = createCodexActivation(createConfiguredDAIRuntime(options));
+      const first = await activate({ rawCommand: "@D-AI establish bounded limitations project", taskId: null });
+      expect(first.status).toBe("accepted");
+      const facts = caseName === "trailing-space"
+        ? [`${"L".repeat(255)} continuation`]
+        : Array.from({ length: 10 }, (_, index) => `Constraint ${index}: ${"X".repeat(230)}`);
+      const store = new LocalSqliteMemoryStore({ databasePath: memoryDatabasePath, workspacePath: dirname(memoryDatabasePath), mode: "writer", scopeId: resolveLocalMemoryScopeId(memoryDatabasePath), writerId: "primary-device" });
+      try {
+        await store.applyMutations(facts.map((fact, index) => ({ operation: "add" as const, memoryId: `p4r-limitation-${index}`, value: { kind: "curated-fact", fact, category: "project-memory", topicLabel: "workflow/process", critical: true, projectTaskId: first.taskId, taskScopeId: first.taskId, subjectKey: `p4r:${index}`, revision: 1, observedAt: "2026-09-17T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-17T00:00:00.000Z" })));
+      } finally { store.close(); }
+      const curated = await activate({ rawCommand: "@D-AI 整理", taskId: first.taskId, curationSourceWindow: windowFor(first.taskId) });
+      expect(curated.status, curated.message).toBe("completed");
+      const beforeState = await readFile(join(durableRoot, first.taskId, "state.json"));
+      const fresh = () => createCodexActivation(createConfiguredDAIRuntime(options));
+      const startup = await fresh()({ rawCommand: "@D-AI continue", taskId: null });
+      const repeated = await fresh()({ rawCommand: "@D-AI continue", taskId: null });
+      expect(startup).toMatchObject({ status: "accepted", taskId: first.taskId, bossSession: { decision: "CONTINUE_CURRENT_BOSS", startup: { recovery: { taskId: first.taskId }, nextAction: "resume canonical work." } } });
+      expect(repeated.bossSession?.startup).toEqual(startup.bossSession?.startup);
+      const presentation = startup.bossSession?.startup?.limitationsPresentation;
+      expect(presentation?.totalCount).toBe(facts.length);
+      if (caseName === "trailing-space") {
+        expect(startup.bossSession?.startup?.limitations).toEqual(["L".repeat(255)]);
+        expect(presentation).toMatchObject({ inlineCount: 1, omittedCount: 0, truncatedCount: 1, truncatedMemoryIds: ["p4r-limitation-0"] });
+      } else {
+        expect(presentation?.omittedCount).toBeGreaterThan(0);
+        expect(presentation?.omittedMemoryIds.length).toBe(presentation?.omittedCount);
+        expect(Buffer.byteLength(JSON.stringify(startup.bossSession?.startup?.limitations), "utf8")).toBeLessThanOrEqual(2048);
+      }
+      const rollover = await activate({ rawCommand: "@D-AI rollover", taskId: first.taskId, bossSession: { mode: "prepare", sourceKey: "boss-source" } });
+      expect(rollover).toMatchObject({ status: "accepted", taskId: first.taskId, bossSession: { decision: "ROLLOVER_PREPARED", handoff: { recovery: { taskId: first.taskId }, limitationsPresentation: { totalCount: facts.length } } } });
+      expect(await readFile(join(durableRoot, first.taskId, "state.json"))).toEqual(beforeState);
+      const reader = new LocalSqliteMemoryStore({ databasePath: memoryDatabasePath, workspacePath: dirname(memoryDatabasePath), mode: "reader", scopeId: resolveLocalMemoryScopeId(memoryDatabasePath), writerId: "primary-device" });
+      try {
+        const records = await reader.listTaskScopedBeliefs(first.taskId, "current", 256);
+        for (const fact of facts) expect(records.some((record) => typeof record.value === "object" && record.value !== null && "fact" in record.value && record.value.fact === fact)).toBe(true);
+      } finally { reader.close(); }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
 });
