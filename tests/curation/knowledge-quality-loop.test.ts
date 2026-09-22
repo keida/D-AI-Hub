@@ -331,8 +331,10 @@ describe("knowledge quality loop", () => {
           { operation: "add", memoryId: "superseded-old", value: { kind: "curated-fact", fact: "Old fact", category: "knowledge", subjectKey: "supersession-subject", revision: 1, observedAt: "2026-09-10T00:00:00.000Z", projectTaskId: null, taskScopeId: null }, recordedAt: "2026-09-10T00:00:00.000Z" },
           { operation: "add", memoryId: "superseding-new", value: { kind: "curated-fact", fact: "New fact", category: "knowledge", subjectKey: "supersession-subject", revision: 2, observedAt: "2026-09-12T00:00:00.000Z", supersedesMemoryIds: ["superseded-old"], projectTaskId: null, taskScopeId: null }, recordedAt: "2026-09-12T00:00:00.000Z" },
         ]);
-        const supersessionSnapshot = await createKnowledgeQualityLoop({ store: supersession.store, workspacePath: supersession.root, repositoryPath: supersession.root }).recover(null);
+        const supersessionLoop = createKnowledgeQualityLoop({ store: supersession.store, workspacePath: supersession.root, repositoryPath: supersession.root });
+        const supersessionSnapshot = await supersessionLoop.recover(null);
         expect(supersessionSnapshot).toMatchObject({ status: "available", records: [{ memoryId: "superseding-new", fact: "New fact" }] });
+        await expect(supersessionLoop.recover(null, "audit")).resolves.toMatchObject({ status: "available", records: [{ memoryId: "superseded-old" }, { memoryId: "superseding-new" }] });
       } finally {
         supersession.store.close();
       }

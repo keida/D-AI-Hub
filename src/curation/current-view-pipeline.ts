@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
+import { InvalidTaskStateError } from "../domain/errors.js";
+import { parseTaskBelief, selectTaskBeliefs } from "../memory/belief-model.js";
 import { LocalSqliteMemoryStore } from "../memory/local-sqlite-memory-store.js";
-import type { CurationCheckpoint, CurationCoverage, CurrentStateView, MemoryRecord } from "../memory/types.js";
+import type { CurationCheckpoint, CurationCheckpointMetadata, CurationCoverage, CurrentStateView, MemoryRecord } from "../memory/types.js";
 import { createKnowledgeQualityLoop, type CurationQualityFinding, type KnowledgeQualityLoop, type MemoryRecoverySnapshot } from "./knowledge-quality-loop.js";
 import { assertCurationCandidate, type CurationCandidate, type CurationResult, type CurationTopicLabel } from "./local-curation.js";
 
@@ -39,6 +41,18 @@ export interface CurationPipelineRecovery {
   readonly currentView: CurrentStateView | null;
   readonly viewFresh: boolean;
   readonly records: readonly MemoryRecord[];
+  readonly reason?: string;
+}
+
+export interface CurationPipelineRebuild {
+  readonly status: "available" | "empty" | "blocked";
+  readonly projectTaskId: string;
+  readonly checkpoint: CurationCheckpointMetadata | null;
+  readonly currentView: CurrentStateView | null;
+  readonly viewFresh: boolean;
+  readonly records: readonly MemoryRecord[];
+  readonly sourceCoverage: "unknown";
+  readonly safeToDeleteSourceChat: "NO";
   readonly reason?: string;
 }
 
@@ -80,6 +94,7 @@ export interface CurationPipelineOptions {
 }
 
 const defaultWindowLimit = 64;
+const defaultRebuildRecordLimit = 256;
 const durableSignal = /(?:decision|approved|approval|authorization|blocker|blocked|bug|root cause|milestone|preference|workflow|process|next action|next step|下一步|接下来|limitation|constraint|revised|supersed|retain|不要 push|只保留|好|可以)/iu;
 const transientSignal = /^(?:trace|debug|ephemeral|worker retry|transient tool output)\b/iu;
 
@@ -127,9 +142,9 @@ function topicLabel(text: string): CurationTopicLabel {
   if (/^(?:好|可以|yes|no)$/iu.test(text.trim())) return "workflow/process";
   if (/(?:bug|root cause|failure|blocked|blocker)/iu.test(text)) return "bug/root-cause";
   if (/(?:preference|prefer|喜欢|偏好)/iu.test(text)) return "preference";
+  if (/(?:decision|approved|approval|supersed|revision|决定)/iu.test(text)) return "architecture/decision";
   if (/(?:workflow|process|不要 push|只保留|整理|authorization|授权)/iu.test(text)) return "workflow/process";
   if (/(?:milestone|status|当前|进展|completed|完成)/iu.test(text)) return "project status";
-  if (/(?:decision|approved|approval|supersed|revision|决定)/iu.test(text)) return "architecture/decision";
   return "other/transient";
 }
 
@@ -168,6 +183,8 @@ export function extractCurationCandidates(messages: readonly PipelineSourceMessa
       category: "project-memory",
       source: "current-context",
       privacyRisk: privacyRisk(text),
+      recordKind: "belief",
+      provenance: { sourceMarker: message.marker, observedAt: message.observedAt, evidenceHash: sha256(canonicalJson(boundaryMessage(message))) },
       topicLabel: topicLabel(text),
       critical,
       projectTaskId: message.projectTaskId ?? projectTaskId,
@@ -184,13 +201,7 @@ export function extractCurationCandidates(messages: readonly PipelineSourceMessa
 
 function checkpointId(store: LocalSqliteMemoryStore, input: CurationPipelineInput, sourceKeySha256: string): string { return `cp-${sha256(`${store.scopeId}|${input.sourceType}|${sourceKeySha256}|${input.projectTaskId}`).slice(0, 32)}`; }
 
-function taskMatches(record: MemoryRecord, projectTaskId: string): boolean {
-  if (typeof record.value !== "object" || record.value === null || Array.isArray(record.value)) return false;
-  const value = record.value as { readonly projectTaskId?: unknown; readonly taskScopeId?: unknown };
-  return value.taskScopeId === projectTaskId || value.projectTaskId === projectTaskId;
-}
-
-interface StoredViewFact { readonly record: MemoryRecord; readonly fact: string; readonly subjectKey: string; readonly topicLabel: CurationTopicLabel; readonly supersedes: readonly string[] }
+interface StoredViewFact { readonly record: MemoryRecord; readonly fact: string; readonly subjectKey: string; readonly topicLabel: CurationTopicLabel | null; readonly critical: boolean; readonly revision: number; readonly observedAt: string | null }
 
 function explicitNextAction(fact: string): string | null {
   const match = /(?:\b(?:next action|next step)\s*(?:[:：]\s*|\bis\s+)|(?:下一步|接下来)(?:：\s*|是\s*|要\s*))(.+)$/iu.exec(fact);
@@ -198,39 +209,60 @@ function explicitNextAction(fact: string): string | null {
   return remainder === undefined || remainder.length === 0 ? null : remainder.slice(0, 256);
 }
 
-function storedViewFacts(records: readonly MemoryRecord[], projectTaskId: string): readonly StoredViewFact[] {
-  return records.flatMap((record) => {
-    if (!taskMatches(record, projectTaskId) || typeof record.value !== "object" || record.value === null || Array.isArray(record.value)) return [];
-    const value = record.value as { readonly kind?: unknown; readonly fact?: unknown; readonly subjectKey?: unknown; readonly topicLabel?: unknown; readonly supersedesMemoryIds?: unknown };
-    if (value.kind !== "curated-fact" || typeof value.fact !== "string") return [];
-    const label = value.topicLabel;
-    const accepted: CurationTopicLabel = label === "architecture/decision" || label === "bug/root-cause" || label === "project status" || label === "preference" || label === "workflow/process" || label === "other/transient" ? label : topicLabel(value.fact);
-    return [{ record, fact: value.fact, subjectKey: typeof value.subjectKey === "string" ? value.subjectKey : record.memoryId, topicLabel: accepted, supersedes: Array.isArray(value.supersedesMemoryIds) ? value.supersedesMemoryIds.filter((id): id is string => typeof id === "string") : [] }];
-  });
+function addPipelineProvenance(candidates: readonly CurationCandidate[], input: CurationPipelineInput): readonly CurationCandidate[] {
+  const sourceSession = hashCurationSourceKey(input.sourceKey);
+  const sourceCheckpoint = input.boundarySha256;
+  return candidates.map((candidate) => ({
+    ...candidate,
+    recordKind: "belief",
+    provenance: {
+      ...candidate.provenance,
+      sourceType: input.sourceType,
+      sourceProject: input.projectTaskId,
+      sourceSession,
+      sourceCheckpoint,
+      sourceMarker: candidate.provenance?.sourceMarker ?? candidate.memoryId,
+      observedAt: candidate.provenance?.observedAt ?? null,
+    },
+  }));
 }
 
-function buildCurrentView(records: readonly MemoryRecord[], projectTaskId: string, reference: string, version: number, verificationStatus: CurrentStateView["verificationStatus"]): CurrentStateView {
-  const facts = storedViewFacts(records, projectTaskId);
-  const superseded = new Set(facts.flatMap((fact) => fact.supersedes));
-  const current = facts.filter((fact) => !superseded.has(fact.record.memoryId)).sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
+function storedViewFacts(records: readonly MemoryRecord[], projectTaskId: string, currentOnly = false): readonly StoredViewFact[] {
+  const beliefs = currentOnly
+    ? records.map((record) => parseTaskBelief(record, projectTaskId)).filter((belief): belief is NonNullable<typeof belief> => belief !== null)
+    : selectTaskBeliefs(records, projectTaskId).current;
+  return beliefs.map((belief) => ({
+    record: belief.record,
+    fact: belief.fact,
+    subjectKey: belief.subjectKey,
+    topicLabel: belief.topicLabel as CurationTopicLabel | null,
+    critical: belief.critical,
+    revision: belief.revision,
+    observedAt: belief.observedAt,
+  }));
+}
+
+function buildCurrentView(records: readonly MemoryRecord[], projectTaskId: string, reference: string | null, version: number, verificationStatus: CurrentStateView["verificationStatus"], projectionOnly = false, currentOnly = false): CurrentStateView {
+  const facts = storedViewFacts(records, projectTaskId, currentOnly);
+  const current = [...facts].sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
   const texts = (predicate: (fact: StoredViewFact) => boolean): readonly string[] => current.filter(predicate).map(({ fact }) => fact.slice(0, 256));
-  let nextAction: string | null = null;
-  for (const { fact } of [...current].reverse()) {
-    const candidate = explicitNextAction(fact);
-    if (candidate !== null) {
-      nextAction = candidate;
-      break;
-    }
+  const nextActions = [...new Set(current.map(({ fact }) => explicitNextAction(fact)).filter((candidate): candidate is string => candidate !== null))];
+  if (nextActions.length > 1) throw new InvalidTaskStateError("Current-state view has conflicting next actions");
+  const factsBySubject = new Map<string, string>();
+  for (const { subjectKey, fact } of current) {
+    const existing = factsBySubject.get(subjectKey);
+    if (existing !== undefined && existing !== fact) throw new InvalidTaskStateError(`Current-state view has conflicting facts for subject ${subjectKey}`);
+    factsBySubject.set(subjectKey, fact);
   }
   return {
     identity: projectTaskId,
-    phase: "curated",
-    milestones: texts(({ fact, topicLabel: label }) => label === "project status" && /milestone|completed|完成|closed/iu.test(fact)),
-    currentWork: texts(({ fact }) => /current work|working|in progress|当前工作/iu.test(fact)),
-    confirmedDecisions: texts(({ fact, topicLabel: label }) => label === "architecture/decision" || /decision|approved|approval|决定/iu.test(fact)),
-    blockers: texts(({ fact, topicLabel: label }) => label === "bug/root-cause" || /blocker|blocked|failure|阻塞/iu.test(fact)),
-    limitations: texts(({ fact, topicLabel: label }) => label === "other/transient" && /limitation|constraint|cannot|not verified|限制/iu.test(fact)),
-    nextAction,
+    phase: null,
+    milestones: projectionOnly ? [] : texts(({ fact, topicLabel: label }) => label === "project status" && /milestone|completed|完成|closed/iu.test(fact)),
+    currentWork: projectionOnly ? [] : texts(({ fact }) => /current work|working|in progress|当前工作/iu.test(fact)),
+    confirmedDecisions: texts(({ fact, topicLabel: label }) => projectionOnly ? label === "architecture/decision" : label === "architecture/decision" || /decision|approved|approval|决定/iu.test(fact)),
+    blockers: texts(({ fact, topicLabel: label }) => projectionOnly ? label === "bug/root-cause" : label === "bug/root-cause" || /blocker|blocked|failure|阻塞/iu.test(fact)),
+    limitations: projectionOnly ? texts(({ topicLabel: label, critical }) => critical && (label === "workflow/process" || label === "other/transient")) : texts(({ fact, topicLabel: label }) => label === "other/transient" && /limitation|constraint|cannot|not verified|限制/iu.test(fact)),
+    nextAction: nextActions[0] ?? null,
     verificationStatus,
     relevantMemoryIds: current.map(({ record }) => record.memoryId),
     checkpointReference: reference,
@@ -375,6 +407,33 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     }
   }
 
+  async function rebuildCurrentState(projectTaskId: string, sourceType: "conversation" = "conversation", sourceKey?: string): Promise<CurationPipelineRebuild> {
+    if (!validIdentifier(projectTaskId)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: "Exact project task identity is required for current-state rebuild" };
+    if (sourceKey !== undefined && !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: "Exact source identity is invalid for current-state rebuild" };
+    let checkpoint: CurationCheckpointMetadata | null = null;
+    let checkpointReason: string | undefined;
+    if (sourceKey !== undefined) {
+      try {
+        checkpoint = await options.store.getCurationCheckpointForRebuild(sourceType, projectTaskId, hashCurationSourceKey(sourceKey));
+      } catch (error) {
+        checkpointReason = `Checkpoint metadata is unavailable for rebuild: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+    try {
+      const records = await options.store.listTaskScopedBeliefs(projectTaskId, "current", defaultRebuildRecordLimit);
+      const authoritativeRecords = await options.store.listTaskScoped(projectTaskId, defaultRebuildRecordLimit);
+      const version = checkpoint?.currentViewVersion ?? 0;
+      const currentView = buildCurrentView(records, projectTaskId, null, version, "verified", true, true);
+      const currentRecords = [...records];
+      const authoritativeSequence = authoritativeRecords.reduce((maximum, record) => Math.max(maximum, record.sequence), 0);
+      const checkpointStale = checkpoint !== null && (checkpoint.lastCommittedMemorySequence !== authoritativeSequence || canonicalJson(checkpoint.relevantMemoryIds) !== canonicalJson(currentView.relevantMemoryIds));
+      const diagnosticReason = checkpointStale ? "Checkpoint metadata is stale; in-memory current state was rebuilt from authoritative records" : checkpointReason;
+      return { status: currentRecords.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView, viewFresh: true, records: currentRecords, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", ...(diagnosticReason === undefined ? {} : { reason: diagnosticReason }) };
+    } catch (error) {
+      return { status: "blocked", projectTaskId, checkpoint, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   async function run(input: CurationPipelineInput): Promise<CurationPipelineResult> {
     const requested = finalizationRequested(input);
     if (input.sourceType !== "conversation" || !validSourceKey(input.sourceKey)) return blockedResult("Curation source identity is invalid; no source content was deleted");
@@ -388,7 +447,7 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     if (input.messages.some((message, index) => message.marker.trim() !== message.marker || message.marker.length === 0 || (index > 0 && (compareMarkers(input.messages[index - 1]!.marker, message.marker) >= 0 || numericMarkerGap(input.messages[index - 1]!.marker, message.marker))))) return blockedResult("Curation source markers are not strictly monotonic or contiguous; no source content was deleted");
     if (input.messages.at(-1)!.marker !== input.coveredThroughMarker) return blockedResult("Curation covered-through marker does not match the supplied window; no source content was deleted");
 
-    const candidates = extractCurationCandidates(input.messages, input.projectTaskId);
+    const candidates = addPipelineProvenance(extractCurationCandidates(input.messages, input.projectTaskId), input);
     const sourceHash = hashCurationSourceKey(input.sourceKey);
     let latest: CurationCheckpoint | null = null;
     try { latest = await options.store.getLatestCurationCheckpoint(input.sourceType, input.projectTaskId, sourceHash); } catch (error) { return boundedFallback(input, candidates, `Curation checkpoint read failed: ${error instanceof Error ? error.message : String(error)}`, null); }
@@ -411,7 +470,7 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     if (input.coverageConfidence !== "complete") return boundedFallback(input, candidates, `Curation coverage is ${input.coverageConfidence}; bounded supplied-window handling only`, latest);
     const newMessages = latest === null ? input.messages : input.messages.filter(({ marker }) => compareMarkers(marker, latest!.coveredThroughMarker) > 0);
     if (newMessages.length === 0) return boundedFallback(input, candidates, "Curation window contains no new markers; no checkpoint advancement", latest);
-    const newCandidates = latest === null ? candidates : extractCurationCandidates(newMessages, input.projectTaskId);
+    const newCandidates = latest === null ? candidates : addPipelineProvenance(extractCurationCandidates(newMessages, input.projectTaskId), input);
     let pendingCheckpoint: CurationCheckpoint | null = null;
     let curation: CurationResult | null = null;
     let consolidated = false;
@@ -423,12 +482,12 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
         if (pendingCheckpoint === null) throw new Error("Curation checkpoint was not prepared");
         return pendingCheckpoint;
       }, async () => {
-        const result = await loop.curate(context.candidates, { knownProjectTaskId: input.projectTaskId, taskScopeId: input.projectTaskId, recordedAt: now() });
+        const result = await loop.curate(context.candidates, { knownProjectTaskId: input.projectTaskId, taskScopeId: input.projectTaskId, recordedAt: now(), requireStrongProvenance: true, persistDecisions: true });
         curation = result;
         if (result.status === "blocked") throw new Error(`Curation quality/persistence failed closed: ${result.message}`);
         recovered = await loop.recover(input.projectTaskId);
         if (recovered.status === "blocked") throw new Error(`Curation recovery failed closed: ${recovered.reason ?? "unknown recovery failure"}`);
-        const records = await options.store.listAll();
+        const records = await options.store.listTaskScoped(input.projectTaskId, defaultRebuildRecordLimit);
         const unresolved = unresolvedCriticalIds(latest?.unresolvedCriticalIds ?? [], newCandidates, result);
         const newlyRetainedCount = (latest?.newRetainedSinceConsolidation ?? 0) + result.counts.added + result.counts.updated;
         const consolidateNow = shouldConsolidate(input, newlyRetainedCount, unresolved.length);
@@ -462,9 +521,10 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     const viewFresh = sha256(canonicalJson(checkpoint.currentView)) === checkpoint.currentViewSha256 && checkpoint.currentView.verificationStatus === "verified";
     if (!viewFresh) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: "Current-state view hash is stale or unverified" };
     try {
-      const records = (await Promise.all(checkpoint.relevantMemoryIds.map((memoryId) => options.store.get(memoryId)))).filter((record): record is MemoryRecord => record !== null && taskMatches(record, projectTaskId));
+      const taskRecords = await options.store.listTaskScoped(projectTaskId, defaultRebuildRecordLimit);
+      const records = taskRecords.filter((record) => checkpoint.relevantMemoryIds.includes(record.memoryId));
       if (records.length !== checkpoint.relevantMemoryIds.length) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: "Current-state view references missing or cross-project memory" };
-      const regenerated = buildCurrentView(records, projectTaskId, checkpoint.checkpointId, checkpoint.currentViewVersion, "verified");
+      const regenerated = buildCurrentView(taskRecords, projectTaskId, checkpoint.checkpointId, checkpoint.currentViewVersion, "verified");
       if (canonicalJson(regenerated) !== canonicalJson(checkpoint.currentView)) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: "Current-state view content is stale relative to relevant memory" };
       return { status: records.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: true, records };
     } catch (error) { return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
@@ -479,7 +539,7 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     try {
       const snapshot = await loop.recover(projectTaskId);
       if (snapshot.status === "blocked") throw new Error(snapshot.reason ?? "Current-state view recovery failed");
-      const records = await options.store.listAll();
+      const records = await options.store.listTaskScoped(projectTaskId, defaultRebuildRecordLimit);
       const refreshedView = buildCurrentView(records, projectTaskId, before.checkpointId, before.currentViewVersion, "verified");
       const sameRelevantIds = canonicalJson(refreshedView.relevantMemoryIds) === canonicalJson(before.relevantMemoryIds);
       const viewHashValid = sha256(canonicalJson(before.currentView)) === before.currentViewSha256;
@@ -495,5 +555,5 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     return recover(projectTaskId, sourceType, sourceKey);
   }
 
-  return { run, recover, refreshView };
+  return { run, recover, refreshView, rebuildCurrentState };
 }

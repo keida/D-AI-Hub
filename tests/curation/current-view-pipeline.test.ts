@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { access, mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -52,6 +52,273 @@ describe("current-state curation pipeline", () => {
       const result = await pipeline.run(input([message("m-001", fact, { subjectKey: "atlas:next-action" })]));
       expect(result).toMatchObject({ status: "completed", currentView: { nextAction: expected } });
       await expect(pipeline.recover("task-atlas", "conversation", "chat-pipeline-test")).resolves.toMatchObject({ status: "available", viewFresh: true, currentView: { nextAction: expected } });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds a corrupt projection from authoritative memory without source coverage", async () => {
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Next action: rebuild the current state.", { memoryId: "rebuild-next-action", subjectKey: "atlas:rebuild" })]));
+      expect(first.checkpoint).not.toBeNull();
+      const database = new DatabaseSync(databasePath);
+      try { database.prepare("UPDATE curation_checkpoints SET current_view_json = ? WHERE checkpoint_id = ?").run("{corrupt", first.checkpoint!.checkpointId); } finally { database.close(); }
+
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: { checkpointId: first.checkpoint!.checkpointId }, currentView: { nextAction: "rebuild the current state." }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds a valid projection with semantic equality and an unknown source verdict", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Approved decision; next action: verify the rebuild.", { memoryId: "rebuild-valid", subjectKey: "atlas:rebuild-valid" })]));
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: { checkpointId: first.checkpoint!.checkpointId }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+      expect(rebuilt.currentView).toEqual({ ...first.currentView, checkpointReference: null });
+      expect(rebuilt.currentView?.phase).toBeNull();
+    } finally { store.close(); }
+  });
+
+  it("recovers critical workflow constraints without prose-derived milestones or current work", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      await pipeline.run(input([message("m-001", "不要 push; milestone completed; current work is local.", { memoryId: "rebuild-constraint", subjectKey: "atlas:constraint", critical: true })]));
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { phase: null, milestones: [], currentWork: [], limitations: ["不要 push; milestone completed; current work is local."], checkpointReference: null } });
+    } finally { store.close(); }
+  });
+
+  it("projects decisions and blockers from validated labels only during rebuild", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([
+        { operation: "add", memoryId: "rebuild-labeled-decision", value: { kind: "curated-fact", fact: "Explicit decision record.", category: "project-memory", topicLabel: "architecture/decision", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:labeled-decision", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" },
+        { operation: "add", memoryId: "rebuild-unlabeled-decision", value: { kind: "curated-fact", fact: "The decision wording is descriptive only.", category: "project-memory", topicLabel: "workflow/process", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:unlabeled-decision", revision: 1, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" },
+        { operation: "add", memoryId: "rebuild-labeled-blocker", value: { kind: "curated-fact", fact: "Explicit blocker record.", category: "project-memory", topicLabel: "bug/root-cause", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:labeled-blocker", revision: 1, observedAt: "2026-09-13T00:00:02.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:02.000Z" },
+        { operation: "add", memoryId: "rebuild-unlabeled-blocker", value: { kind: "curated-fact", fact: "The blocker wording is descriptive only.", category: "project-memory", topicLabel: "project status", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:unlabeled-blocker", revision: 1, observedAt: "2026-09-13T00:00:03.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:03.000Z" },
+      ]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { confirmedDecisions: ["Explicit decision record."], blockers: ["Explicit blocker record."] } });
+    } finally { store.close(); }
+  });
+
+  it("keeps an omitted topicLabel untyped while retaining explicit nextAction", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([
+        { operation: "add", memoryId: "rebuild-omitted-label-prose", value: { kind: "curated-fact", fact: "Approved decision wording is descriptive; blocker and constraint wording are descriptive.", category: "project-memory", critical: true, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:omitted-label-prose", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" },
+        { operation: "add", memoryId: "rebuild-omitted-label-action", value: { kind: "curated-fact", fact: "Next action: inspect the untyped record.", category: "project-memory", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:omitted-label-action", revision: 1, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" },
+      ]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { phase: null, confirmedDecisions: [], blockers: [], limitations: [], nextAction: "inspect the untyped record." } });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds legacy curated facts with absent optional fields conservatively", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([{ operation: "add", memoryId: "rebuild-legacy-optional-fields", value: { kind: "curated-fact", fact: "Decision, blocker, and constraint wording only. Next action: inspect the legacy record.", category: "project-memory", projectTaskId: "task-atlas", taskScopeId: "task-atlas", revision: 1, evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" }]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { phase: null, confirmedDecisions: [], blockers: [], limitations: [], nextAction: "inspect the legacy record." } });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds after a valid projection hash mismatch", async () => {
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Next action: keep the authoritative memory.", { memoryId: "rebuild-hash", subjectKey: "atlas:rebuild-hash" })]));
+      const database = new DatabaseSync(databasePath);
+      try { database.prepare("UPDATE curation_checkpoints SET current_view_json = ? WHERE checkpoint_id = ?").run(JSON.stringify({ ...first.currentView, nextAction: "tampered projection" }), first.checkpoint!.checkpointId); } finally { database.close(); }
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { nextAction: "keep the authoritative memory." }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds when the current view representation is invalid", async () => {
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Next action: recover from the missing projection.", { memoryId: "rebuild-invalid-view", subjectKey: "atlas:rebuild-invalid-view" })]));
+      const database = new DatabaseSync(databasePath);
+      try { database.prepare("UPDATE curation_checkpoints SET current_view_json = ? WHERE checkpoint_id = ?").run("{}", first.checkpoint!.checkpointId); } finally { database.close(); }
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: { checkpointId: first.checkpoint!.checkpointId }, currentView: { nextAction: "recover from the missing projection." }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds when SQL stores a JSON null current view", async () => {
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Next action: recover from JSON null.", { memoryId: "rebuild-json-null", subjectKey: "atlas:rebuild-json-null" })]));
+      const database = new DatabaseSync(databasePath);
+      try { database.prepare("UPDATE curation_checkpoints SET current_view_json = json('null') WHERE checkpoint_id = ?").run(first.checkpoint!.checkpointId); } finally { database.close(); }
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: { checkpointId: first.checkpoint!.checkpointId }, currentView: { nextAction: "recover from JSON null.", checkpointReference: null }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("rebuilds from authoritative records when checkpoint metadata digest is corrupt", async () => {
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      await pipeline.run(input([message("m-001", "Next action: ignore corrupt checkpoint metadata.", { memoryId: "rebuild-corrupt-metadata", subjectKey: "atlas:rebuild-corrupt-metadata" })]));
+      const checkpoint = await store.getLatestCurationCheckpoint("conversation", "task-atlas", hashCurationSourceKey("chat-pipeline-test"));
+      const database = new DatabaseSync(databasePath);
+      try { database.prepare("UPDATE curation_checkpoints SET checkpoint_sha256 = ? WHERE checkpoint_id = ?").run(digest("corrupt-checkpoint"), checkpoint!.checkpointId); } finally { database.close(); }
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: null, currentView: { nextAction: "ignore corrupt checkpoint metadata.", checkpointReference: null }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+      expect(rebuilt.reason).toContain("Checkpoint metadata is unavailable");
+    } finally { store.close(); }
+  });
+
+  it("rebuilds without a checkpoint and does not upgrade coverage or duplicate memory", async () => {
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Next action: recover without a checkpoint.", { memoryId: "rebuild-no-checkpoint", subjectKey: "atlas:rebuild-no-checkpoint" })]));
+      const before = await store.listAll();
+      const beforeFiles = (await readdir(root)).sort();
+      const database = new DatabaseSync(databasePath);
+      try { database.prepare("DELETE FROM curation_checkpoints WHERE checkpoint_id = ?").run(first.checkpoint!.checkpointId); } finally { database.close(); }
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: null, currentView: { nextAction: "recover without a checkpoint.", checkpointReference: null }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+      expect(await store.listAll()).toEqual(before);
+      expect((await readdir(root)).sort()).toEqual(beforeFiles);
+    } finally { store.close(); }
+  });
+
+  it("marks a non-conflicting post-checkpoint write as stale metadata without failing rebuild", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Approved initial decision.", { memoryId: "rebuild-post-checkpoint-base", subjectKey: "atlas:post-checkpoint-base" })]));
+      await store.applyMutations([{ operation: "add", memoryId: "rebuild-post-checkpoint-new", value: { kind: "curated-fact", fact: "Local constraint is retained.", category: "project-memory", topicLabel: "workflow/process", critical: true, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:post-checkpoint-new", revision: 1, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" }]);
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas", "conversation", "chat-pipeline-test");
+      expect(rebuilt).toMatchObject({ status: "available", checkpoint: { checkpointId: first.checkpoint!.checkpointId }, currentView: { checkpointReference: null, relevantMemoryIds: ["rebuild-post-checkpoint-base", "rebuild-post-checkpoint-new"] }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+      expect(rebuilt.reason).toContain("Checkpoint metadata is stale");
+      expect(rebuilt.viewFresh).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it.each([
+    ["topicLabel", { topicLabel: "unsupported" }],
+    ["revision", { revision: 0 }],
+    ["observedAt", { observedAt: "not-a-timestamp" }],
+    ["supersedesMemoryIds", { supersedesMemoryIds: ["unsafe id"] }],
+    ["subjectKey", { subjectKey: "../unsafe" }],
+  ])("blocks malformed authoritative curated-fact %s", async (_field, override) => {
+    const { root, store } = await fixture();
+    try {
+      const value = { kind: "curated-fact", fact: "A structurally invalid fact.", category: "project-memory", topicLabel: "workflow/process", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:malformed", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [], ...override };
+      await store.applyMutations([{ operation: "add", memoryId: `rebuild-malformed-${_field}`, value, recordedAt: "2026-09-13T00:00:00.000Z" }]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "blocked", currentView: null, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("fails closed when the bounded rebuild query overflows", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations(Array.from({ length: 257 }, (_, index) => ({ operation: "add" as const, memoryId: `rebuild-overflow-${index}`, value: { kind: "curated-fact", fact: `Bounded fact ${index}.`, category: "project-memory", topicLabel: "workflow/process", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: `atlas:overflow-${index}`, revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" })));
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "blocked", currentView: null, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+      expect(rebuilt.reason).toContain("bounded rebuild limit");
+    } finally { store.close(); }
+  });
+
+  it("accepts a missing optional observedAt field during rebuild", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([{ operation: "add", memoryId: "rebuild-optional-observed-at", value: { kind: "curated-fact", fact: "A fact without an optional observation timestamp.", category: "project-memory", topicLabel: "project status", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:optional-observed-at", revision: 1, supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" }]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { relevantMemoryIds: ["rebuild-optional-observed-at"] }, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("blocks conflicting current next actions and same-subject facts", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([
+        { operation: "add", memoryId: "rebuild-conflict-action-a", value: { kind: "curated-fact", fact: "Next action: inspect the boundary.", category: "project-memory", topicLabel: "workflow/process", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:action-a", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" },
+        { operation: "add", memoryId: "rebuild-conflict-action-b", value: { kind: "curated-fact", fact: "Next action: rebuild the view.", category: "project-memory", topicLabel: "workflow/process", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:action-b", revision: 1, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" },
+      ]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "blocked", currentView: null, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("blocks distinct current facts for one subject without a supersession", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([
+        { operation: "add", memoryId: "rebuild-conflict-subject-a", value: { kind: "curated-fact", fact: "The current phase is review.", category: "project-memory", topicLabel: "project status", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:phase", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" },
+        { operation: "add", memoryId: "rebuild-conflict-subject-b", value: { kind: "curated-fact", fact: "The current phase is execution.", category: "project-memory", topicLabel: "project status", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:phase", revision: 2, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" },
+      ]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "blocked", currentView: null, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("blocks recovery when a new conflicting current record appears after the checkpoint", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      const first = await pipeline.run(input([message("m-001", "Next action: inspect the source boundary.", { memoryId: "rebuild-recovery-base", subjectKey: "atlas:recovery-base" })]));
+      await store.applyMutations([{ operation: "add", memoryId: "rebuild-recovery-new", value: { kind: "curated-fact", fact: "Next action: rebuild the current view.", category: "project-memory", topicLabel: "workflow/process", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:recovery-new", revision: 1, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" }]);
+      const recovered = await pipeline.recover("task-atlas", "conversation", "chat-pipeline-test");
+      expect(recovered).toMatchObject({ status: "blocked", checkpoint: { checkpointId: first.checkpoint!.checkpointId }, viewFresh: false });
+      expect(recovered.reason).toContain("conflicting next actions");
+    } finally { store.close(); }
+  });
+
+  it("blocks an invalid cross-subject or stale supersession", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([
+        { operation: "add", memoryId: "rebuild-invalid-target", value: { kind: "curated-fact", fact: "Target fact.", category: "project-memory", topicLabel: "architecture/decision", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:target", revision: 2, observedAt: "2026-09-13T00:00:02.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:02.000Z" },
+        { operation: "add", memoryId: "rebuild-invalid-superseder", value: { kind: "curated-fact", fact: "Superseding fact.", category: "project-memory", topicLabel: "architecture/decision", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:other", revision: 3, observedAt: "2026-09-13T00:00:03.000Z", supersedesMemoryIds: ["rebuild-invalid-target"], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:03.000Z" },
+      ]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "blocked", currentView: null, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO" });
+    } finally { store.close(); }
+  });
+
+  it("keeps related-memory retrieval exact for mixed task and project bindings", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([{ operation: "add", memoryId: "rebuild-mixed-binding", value: { kind: "curated-fact", fact: "Mixed binding must not leak.", category: "project-memory", subjectKey: "atlas:mixed", projectTaskId: "task-other", taskScopeId: "task-atlas", revision: 1, observedAt: "2026-09-13T00:00:00.000Z" }, recordedAt: "2026-09-13T00:00:00.000Z" }]);
+      await expect(store.retrieveRelatedMemories({ memoryId: "rebuild-mixed-binding", subjectKey: "atlas:mixed", projectTaskId: "task-atlas", category: "project-memory" })).resolves.toEqual([]);
+    } finally { store.close(); }
+  });
+
+  it("excludes superseded and cross-project records from rebuild", async () => {
+    const { root, store } = await fixture();
+    try {
+      await store.applyMutations([
+        { operation: "add", memoryId: "rebuild-superseded-old", value: { kind: "curated-fact", fact: "Old decision.", category: "project-memory", topicLabel: "architecture/decision", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:decision", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" },
+        { operation: "add", memoryId: "rebuild-superseded-new", value: { kind: "curated-fact", fact: "New decision.", category: "project-memory", topicLabel: "architecture/decision", projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:decision", revision: 2, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: ["rebuild-superseded-old"], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" },
+        { operation: "add", memoryId: "rebuild-other-project", value: { kind: "curated-fact", fact: "Other project decision.", category: "project-memory", topicLabel: "architecture/decision", projectTaskId: "task-other", taskScopeId: "task-other", subjectKey: "other:decision", revision: 1, observedAt: "2026-09-13T00:00:02.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:02.000Z" },
+      ]);
+      const rebuilt = await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { relevantMemoryIds: ["rebuild-superseded-new"] }, records: [{ memoryId: "rebuild-superseded-new" }] });
+    } finally { store.close(); }
+  });
+
+  it("is semantically idempotent across repeated rebuilds", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root });
+      await pipeline.run(input([message("m-001", "Approved decision; next action: repeat the rebuild.", { memoryId: "rebuild-idempotent", subjectKey: "atlas:rebuild-idempotent" })]));
+      const first = await pipeline.rebuildCurrentState("task-atlas");
+      const second = await pipeline.rebuildCurrentState("task-atlas");
+      expect(second.currentView).toEqual(first.currentView);
+      expect(second.records).toEqual(first.records);
+      expect(second.checkpoint).toEqual(first.checkpoint);
     } finally { store.close(); }
   });
 
@@ -228,14 +495,14 @@ describe("current-state curation pipeline", () => {
     } finally { store.close(); }
   });
 
-  it("uses the latest deterministic ordered explicit next action", async () => {
+  it("blocks when distinct current next actions remain unresolved", async () => {
     const { root, store } = await fixture();
     try {
       const pipeline = createCurationPipeline({ store, workspacePath: root });
       const first = await pipeline.run(input([message("m-001", "Next action: inspect the source boundary.", { memoryId: "next-action-old", subjectKey: "atlas:next-action-old" })]));
       const second = await pipeline.run(input([message("m-002", "Next action is run the bounded recovery.", { memoryId: "next-action-new", subjectKey: "atlas:next-action-new" })], { previousCoveredThroughMarker: first.checkpoint!.coveredThroughMarker, previousBoundarySha256: first.checkpoint!.boundarySha256 }));
-      expect(second).toMatchObject({ status: "completed", currentView: { nextAction: "run the bounded recovery." } });
-      await expect(pipeline.recover("task-atlas", "conversation", "chat-pipeline-test")).resolves.toMatchObject({ status: "available", viewFresh: true, currentView: { nextAction: "run the bounded recovery." } });
+      expect(second).toMatchObject({ status: "blocked", checkpointAdvanced: false, safeToDeleteSourceChat: "NO", currentView: { nextAction: "inspect the source boundary." } });
+      await expect(pipeline.recover("task-atlas", "conversation", "chat-pipeline-test")).resolves.toMatchObject({ status: "available", viewFresh: true, currentView: { nextAction: "inspect the source boundary." } });
     } finally { store.close(); }
   });
 
@@ -269,12 +536,12 @@ describe("current-state curation pipeline", () => {
     const { root, store } = await fixture();
     const pipeline = createCurationPipeline({ store, workspacePath: root });
     const first = await pipeline.run(input([message("m-001", "Approved initial decision for the bounded workflow.", { memoryId: "outcome-fact", subjectKey: "atlas:outcome", revision: 1 })], { sourceKey: "chat-outcomes" }));
-    const updated = await pipeline.run(input([message("m-002", "Approved initial decision for the bounded workflow after verification.", { memoryId: "outcome-fact", subjectKey: "atlas:outcome-v2", revision: 2 })], { sourceKey: "chat-outcomes", previousCoveredThroughMarker: first.checkpoint!.coveredThroughMarker, previousBoundarySha256: first.checkpoint!.boundarySha256 }));
-    expect(updated.curation).toMatchObject({ counts: { updated: 1 } });
-    expect(await store.get("outcome-fact")).toMatchObject({ value: { relatedMemoryIds: ["outcome-fact"] } });
-    await expect(store.retrieveRelatedMemories({ memoryId: "outcome-fact", subjectKey: "atlas:outcome-v2", projectTaskId: "task-atlas", category: "project-memory", limit: 8 })).resolves.toHaveLength(1);
-    await expect(store.retrieveRelatedMemories({ memoryId: null, subjectKey: "atlas:outcome-v2", projectTaskId: "task-atlas", category: "project-memory", limit: 17 })).rejects.toThrow("between 1 and 16");
-    const noop = await pipeline.run(input([message("m-003", "Approved initial decision for the bounded workflow after verification.", { memoryId: "outcome-fact", subjectKey: "atlas:outcome-v2", revision: 2 })], { sourceKey: "chat-outcomes", previousCoveredThroughMarker: updated.checkpoint!.coveredThroughMarker, previousBoundarySha256: updated.checkpoint!.boundarySha256 }));
+    const updated = await pipeline.run(input([message("m-002", "Approved initial decision for the bounded workflow after verification.", { memoryId: "outcome-fact-v2", subjectKey: "atlas:outcome", revision: 2, supersedesMemoryIds: ["outcome-fact"] })], { sourceKey: "chat-outcomes", previousCoveredThroughMarker: first.checkpoint!.coveredThroughMarker, previousBoundarySha256: first.checkpoint!.boundarySha256 }));
+    expect(updated.curation).toMatchObject({ counts: { added: 1, updated: 0 } });
+    expect(await store.get("outcome-fact-v2")).toMatchObject({ value: { relatedMemoryIds: ["outcome-fact"] } });
+    await expect(store.retrieveRelatedMemories({ memoryId: "outcome-fact-v2", subjectKey: "atlas:outcome", projectTaskId: "task-atlas", category: "project-memory", limit: 8 })).resolves.toHaveLength(2);
+    await expect(store.retrieveRelatedMemories({ memoryId: null, subjectKey: "atlas:outcome", projectTaskId: "task-atlas", category: "project-memory", limit: 17 })).rejects.toThrow("between 1 and 16");
+    const noop = await pipeline.run(input([message("m-003", "Approved initial decision for the bounded workflow after verification.", { memoryId: "outcome-fact-v2", subjectKey: "atlas:outcome", revision: 2, supersedesMemoryIds: ["outcome-fact"] })], { sourceKey: "chat-outcomes", previousCoveredThroughMarker: updated.checkpoint!.coveredThroughMarker, previousBoundarySha256: updated.checkpoint!.boundarySha256 }));
     expect(noop.curation).toMatchObject({ counts: { noOp: 1 } });
     const deferred = await pipeline.run(input([message("m-004", "A project fact from another task must defer.", { memoryId: "outcome-defer", subjectKey: "atlas:defer", projectTaskId: "task-other" })], { sourceKey: "chat-outcomes", previousCoveredThroughMarker: noop.checkpoint!.coveredThroughMarker, previousBoundarySha256: noop.checkpoint!.boundarySha256 }));
     expect(deferred).toMatchObject({ status: "blocked", safeToDeleteSourceChat: "NO", curation: { counts: { deferred: 1 } } });
@@ -293,6 +560,8 @@ describe("current-state curation pipeline", () => {
     const secondInput = input([message("m-002", "Approved architecture decision revised after verification.", { memoryId: "decision-v2", subjectKey: "atlas:architecture", revision: 2, supersedesMemoryIds: ["decision-v1"], critical: true })], { previousCoveredThroughMarker: first.checkpoint!.coveredThroughMarker, previousBoundarySha256: first.checkpoint!.boundarySha256 });
     const second = await pipeline.run(secondInput);
     expect(second).toMatchObject({ status: "completed", checkpointAdvanced: true, checkpoint: { coveredThroughMarker: "m-002", unresolvedCriticalIds: [], currentView: { verificationStatus: "verified" } } });
+    expect(await store.get("decision-v2")).toMatchObject({ value: { provenance: { sourceCheckpoint: secondInput.boundarySha256 } } });
+    expect((await store.get("decision-v2"))?.value).not.toMatchObject({ provenance: { sourceCheckpoint: first.checkpoint!.boundarySha256 } });
     expect(second.relatedMemoryIds).toEqual(expect.arrayContaining(["decision-v1"]));
     expect(second.relatedMemoryIds).not.toContain("decision-v2");
     expect(second.relatedMemoryIds.length).toBeLessThanOrEqual(32);
@@ -365,10 +634,10 @@ describe("current-state curation pipeline", () => {
     const pipeline = createCurationPipeline({ store, workspacePath: root });
     const privacy = await pipeline.run(input([message("m-001", "Confidential employer detail must not be retained.", { memoryId: "privacy-1", subjectKey: "atlas:private", critical: true })]));
     expect(privacy).toMatchObject({ status: "completed", safeToDeleteSuppliedContent: "NO", safeToDeleteSourceChat: "NO", curation: { counts: { rejected: 1 } }, checkpoint: { unresolvedCriticalIds: ["privacy-1"] } });
-    expect(await store.listAll()).toHaveLength(0);
+    await expect(store.listTaskScopedBeliefs("task-atlas", "current")).resolves.toEqual([]);
     const crossProject = await pipeline.run(input([message("m-002", "A project fact from another task must not cross scope.", { memoryId: "cross-project", subjectKey: "other:subject", projectTaskId: "task-beacon" })], { previousCoveredThroughMarker: privacy.checkpoint!.coveredThroughMarker, previousBoundarySha256: privacy.checkpoint!.boundarySha256 }));
     expect(crossProject).toMatchObject({ status: "blocked", checkpointAdvanced: false, safeToDeleteSourceChat: "NO" });
-    expect(await store.listAll()).toHaveLength(0);
+    expect(await store.listAll()).toMatchObject([{ value: { recordKind: "curation-decision", decision: "REJECT" } }]);
     expect(hashCurationSourceKey("chat-pipeline-test")).toHaveLength(64);
     await expect(access(databasePath)).resolves.toBeUndefined();
     store.close();
@@ -412,7 +681,7 @@ describe("current-state curation pipeline", () => {
     const database = new DatabaseSync(databasePath);
     try { database.prepare("UPDATE curation_checkpoints SET current_view_json = ? WHERE checkpoint_id = ?").run(JSON.stringify({ ...checkpoint.currentView, phase: "tampered" }), checkpoint.checkpointId); } finally { database.close(); }
     await expect(pipeline.recover("task-atlas", "conversation", "chat-pipeline-test")).resolves.toMatchObject({ status: "blocked", viewFresh: false });
-    await expect(pipeline.refreshView("task-atlas", "conversation", "chat-pipeline-test")).resolves.toMatchObject({ status: "available", viewFresh: true, checkpoint: { currentViewVersion: checkpoint.currentViewVersion + 1 }, currentView: { phase: "curated" } });
+    await expect(pipeline.refreshView("task-atlas", "conversation", "chat-pipeline-test")).resolves.toMatchObject({ status: "available", viewFresh: true, checkpoint: { currentViewVersion: checkpoint.currentViewVersion + 1 }, currentView: { phase: null } });
     store.close();
   });
 

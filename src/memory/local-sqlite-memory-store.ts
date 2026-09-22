@@ -5,7 +5,8 @@ import { resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
-import type { CurationCheckpoint, CurationCoverage, CurrentStateView, LocalSqliteMemoryStoreOptions, MemoryMutation, MemoryRecord, MemoryStoreMode, MemoryValue, PutMemoryInput, RelatedMemoryQuery } from "./types.js";
+import { selectTaskBeliefs } from "./belief-model.js";
+import type { CurationCheckpoint, CurationCheckpointMetadata, CurationCoverage, CurrentStateView, LocalSqliteMemoryStoreOptions, MemoryMutation, MemoryRecord, MemoryStoreMode, MemoryValue, PutMemoryInput, RelatedMemoryQuery } from "./types.js";
 
 interface MemoryRow {
   readonly memory_id: string;
@@ -235,9 +236,9 @@ function assertCheckpoint(checkpoint: CurationCheckpoint, validateView = true): 
   if (validateView) {
     if (typeof checkpoint.currentView !== "object" || checkpoint.currentView === null) throw new InvalidTaskStateError("Curation current view is required");
     assertIdentifier(checkpoint.currentView.identity, "Curation view identity");
-    assertBoundedText(checkpoint.currentView.phase, "Curation view phase");
+    if (checkpoint.currentView.phase !== null) assertBoundedText(checkpoint.currentView.phase, "Curation view phase");
     if (checkpoint.currentView.nextAction !== null) assertBoundedText(checkpoint.currentView.nextAction, "Curation view nextAction");
-    assertIdentifier(checkpoint.currentView.checkpointReference, "Curation view checkpointReference");
+    if (checkpoint.currentView.checkpointReference !== null) assertIdentifier(checkpoint.currentView.checkpointReference, "Curation view checkpointReference");
     assertStringList(checkpoint.currentView.milestones, "Curation view milestones");
     assertStringList(checkpoint.currentView.currentWork, "Curation view currentWork");
     assertStringList(checkpoint.currentView.confirmedDecisions, "Curation view confirmedDecisions");
@@ -260,7 +261,7 @@ function legacyCheckpointDigest(checkpoint: CurationCheckpoint): string {
   return sha256(canonicalJsonValue(payload));
 }
 
-function checkpointFromRow(row: CurationCheckpointRow, verifyIntegrity = true, validateView = true): CurationCheckpoint {
+function checkpointFromRow(row: CurationCheckpointRow, verifyIntegrity = true, validateView = true, parseView = true): CurationCheckpoint {
   let lastCandidateIds: unknown;
   let unresolvedCriticalIds: unknown;
   let relevantMemoryIds: unknown;
@@ -269,7 +270,7 @@ function checkpointFromRow(row: CurationCheckpointRow, verifyIntegrity = true, v
     lastCandidateIds = JSON.parse(row.last_candidate_ids_json) as unknown;
     unresolvedCriticalIds = JSON.parse(row.unresolved_critical_ids_json) as unknown;
     relevantMemoryIds = JSON.parse(row.relevant_memory_ids_json) as unknown;
-    currentView = JSON.parse(row.current_view_json) as unknown;
+    currentView = parseView ? JSON.parse(row.current_view_json) as unknown : null;
   } catch {
     throw new InvalidTaskStateError("Curation checkpoint JSON is corrupt");
   }
@@ -741,6 +742,22 @@ export class LocalSqliteMemoryStore {
     return rows.map(toRecord);
   }
 
+  public async listTaskScoped(projectTaskId: string, limit = 256): Promise<MemoryRecord[]> {
+    const normalizedProjectTaskId = assertIdentifier(projectTaskId, "Curation projectTaskId");
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new InvalidTaskStateError("Task-scoped memory limit must be a positive integer");
+    const rows = this.database
+      .prepare("SELECT memory_id, scope_id, writer_id, sequence, value_json, value_sha256, recorded_at FROM memory_records WHERE scope_id = ? AND writer_id = ? AND ((json_extract(value_json, '$.taskScopeId') = ? AND (json_extract(value_json, '$.projectTaskId') IS NULL OR json_extract(value_json, '$.projectTaskId') = ?)) OR (json_extract(value_json, '$.taskScopeId') IS NULL AND json_extract(value_json, '$.projectTaskId') = ?)) ORDER BY sequence ASC LIMIT ?")
+      .all(this.options.scopeId, this.options.writerId, normalizedProjectTaskId, normalizedProjectTaskId, normalizedProjectTaskId, limit + 1) as unknown as MemoryRow[];
+    if (rows.length > limit) throw new InvalidTaskStateError("Task-scoped memory exceeds the bounded rebuild limit");
+    return rows.map(toRecord);
+  }
+
+  public async listTaskScopedBeliefs(projectTaskId: string, mode: "current" | "audit" = "current", limit = 256): Promise<readonly MemoryRecord[]> {
+    const records = await this.listTaskScoped(projectTaskId, limit);
+    const selection = selectTaskBeliefs(records, projectTaskId, mode);
+    return (mode === "audit" ? selection.history : selection.current).map((belief) => belief.record);
+  }
+
   public getAppliedBundleReceipt(bundleId: string): AppliedMemoryBundleReceipt | null {
     const normalizedBundleId = assertIdentifier(bundleId, "Memory bundleId");
     let row: { readonly bundle_id: string; readonly records_sha256: string; readonly applied_at: string } | undefined;
@@ -1048,6 +1065,18 @@ export class LocalSqliteMemoryStore {
     return checkpoint;
   }
 
+  public async getCurationCheckpointForRebuild(sourceType: string, projectTaskId: string, sourceKeySha256: string): Promise<CurationCheckpointMetadata | null> {
+    const hasFinalizationColumns = assertCurationCheckpointSchema(this.database);
+    const normalizedSourceType = assertIdentifier(sourceType, "Curation sourceType");
+    const normalizedProjectTaskId = assertIdentifier(projectTaskId, "Curation projectTaskId");
+    assertSha256(sourceKeySha256, "Curation sourceKeySha256");
+    const row = this.database.prepare(`SELECT ${curationCheckpointSelectColumns(hasFinalizationColumns)} FROM curation_checkpoints WHERE scope_id = ? AND source_type = ? AND source_key_sha256 = ? AND project_task_id = ? ORDER BY last_curated_at DESC, checkpoint_id DESC LIMIT 1`).get(this.options.scopeId, normalizedSourceType, sourceKeySha256, normalizedProjectTaskId) as CurationCheckpointRow | undefined;
+    if (row === undefined) return null;
+    const parsed = checkpointFromRow(row, true, false, false);
+    const { currentView: _ignored, ...metadata } = parsed;
+    return metadata;
+  }
+
   public async retrieveRelatedMemories(query: RelatedMemoryQuery): Promise<readonly MemoryRecord[]> {
     const limit = query.limit ?? 8;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 16) throw new InvalidTaskStateError("Related-memory retrieval limit must be between 1 and 16");
@@ -1055,7 +1084,7 @@ export class LocalSqliteMemoryStore {
     if (query.subjectKey.trim() !== query.subjectKey || query.subjectKey.length === 0 || query.subjectKey.length > 128 || containsSecretShapedValue(query.subjectKey)) throw new InvalidTaskStateError("Related subjectKey is invalid");
     if (query.projectTaskId.trim() !== query.projectTaskId || query.projectTaskId.length === 0 || containsSecretShapedValue(query.projectTaskId)) throw new InvalidTaskStateError("Related projectTaskId is invalid");
     if (query.category.trim() !== query.category || query.category.length === 0 || query.category.length > 64 || containsSecretShapedValue(query.category)) throw new InvalidTaskStateError("Related category is invalid");
-    const rows = this.database.prepare("SELECT memory_id, scope_id, writer_id, sequence, value_json, value_sha256, recorded_at FROM memory_records WHERE scope_id = ? AND writer_id = ? AND (json_extract(value_json, '$.taskScopeId') = ? OR json_extract(value_json, '$.projectTaskId') = ?) AND (memory_id = ? OR json_extract(value_json, '$.subjectKey') = ? OR json_extract(value_json, '$.projectTaskId') = ? OR json_extract(value_json, '$.category') = ?) ORDER BY CASE WHEN memory_id = ? THEN 0 WHEN json_extract(value_json, '$.subjectKey') = ? THEN 1 WHEN json_extract(value_json, '$.projectTaskId') = ? THEN 2 WHEN json_extract(value_json, '$.category') = ? THEN 3 ELSE 4 END, COALESCE(json_extract(value_json, '$.observedAt'), '') DESC, sequence DESC, memory_id ASC LIMIT ?").all(this.options.scopeId, this.options.writerId, query.projectTaskId, query.projectTaskId, memoryId, query.subjectKey, query.projectTaskId, query.category, memoryId, query.subjectKey, query.projectTaskId, query.category, limit) as unknown as MemoryRow[];
+    const rows = this.database.prepare("SELECT memory_id, scope_id, writer_id, sequence, value_json, value_sha256, recorded_at FROM memory_records WHERE scope_id = ? AND writer_id = ? AND ((json_extract(value_json, '$.taskScopeId') = ? AND (json_extract(value_json, '$.projectTaskId') IS NULL OR json_extract(value_json, '$.projectTaskId') = ?)) OR (json_extract(value_json, '$.taskScopeId') IS NULL AND json_extract(value_json, '$.projectTaskId') = ?)) AND (memory_id = ? OR json_extract(value_json, '$.subjectKey') = ? OR json_extract(value_json, '$.projectTaskId') = ? OR json_extract(value_json, '$.category') = ?) ORDER BY CASE WHEN memory_id = ? THEN 0 WHEN json_extract(value_json, '$.subjectKey') = ? THEN 1 WHEN json_extract(value_json, '$.projectTaskId') = ? THEN 2 WHEN json_extract(value_json, '$.category') = ? THEN 3 ELSE 4 END, COALESCE(json_extract(value_json, '$.observedAt'), '') DESC, sequence DESC, memory_id ASC LIMIT ?").all(this.options.scopeId, this.options.writerId, query.projectTaskId, query.projectTaskId, query.projectTaskId, memoryId, query.subjectKey, query.projectTaskId, query.category, memoryId, query.subjectKey, query.projectTaskId, query.category, limit) as unknown as MemoryRow[];
     return rows.map(toRecord);
   }
 

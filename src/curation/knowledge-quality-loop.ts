@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { redactSensitiveText } from "../adapters/command-runner.js";
-import { containsSecretShapedValue } from "../domain/manifest-id.js";
+import { isSafeDurableReferenceShape, selectTaskBeliefs, type ParsedBelief } from "../memory/belief-model.js";
 import type { MemoryRecord } from "../memory/types.js";
 import {
   curateCurrentContext,
@@ -62,7 +62,7 @@ export interface MemoryRecoverySnapshot {
 }
 
 export interface KnowledgeQualityLoopOptions {
-  readonly store: CurationStore & { listAll(): Promise<readonly MemoryRecord[]> };
+  readonly store: CurationStore & { listAll(): Promise<readonly MemoryRecord[]>; listTaskScopedBeliefs?(projectTaskId: string, mode?: "current" | "audit", limit?: number): Promise<readonly MemoryRecord[]> };
   readonly workspacePath: string;
   readonly repositoryPath?: string | null;
   readonly maxSnapshotRecords?: number;
@@ -71,7 +71,7 @@ export interface KnowledgeQualityLoopOptions {
 
 export interface KnowledgeQualityLoop {
   curate(candidates: readonly CurationCandidate[], options?: CurationOptions): Promise<CurationResult>;
-  recover(taskId: string | null): Promise<MemoryRecoverySnapshot>;
+  recover(taskId: string | null, mode?: "current" | "audit"): Promise<MemoryRecoverySnapshot>;
 }
 
 interface StoredFact {
@@ -127,6 +127,22 @@ function storedFact(record: MemoryRecord): StoredFact | null {
   };
 }
 
+function storedFactFromBelief(belief: ParsedBelief): StoredFact {
+  return {
+    memoryId: belief.record.memoryId,
+    subjectKey: belief.subjectKey,
+    fact: belief.fact,
+    category: belief.category,
+    revision: belief.revision,
+    observedAt: belief.observedAt,
+    projectTaskId: belief.projectTaskId,
+    taskScopeId: belief.taskScopeId,
+    supersedesMemoryIds: belief.supersedesMemoryIds,
+    evidenceRefs: belief.evidenceRefs,
+    assetRefs: belief.assetRefs,
+  };
+}
+
 function compareFreshness(left: { readonly revision: number; readonly observedAt: string | null; readonly memoryId: string }, right: { readonly revision: number; readonly observedAt: string | null; readonly memoryId: string }): number {
   const freshness = compareFreshnessOnly(left, right);
   return freshness !== 0 ? freshness : left.memoryId.localeCompare(right.memoryId);
@@ -145,21 +161,9 @@ function taskMatches(fact: StoredFact, taskId: string | null): boolean {
   return fact.category !== "project-memory";
 }
 
-function isSecretOrForbiddenReference(reference: string): boolean {
-  return containsSecretShapedValue(reference) || /(?:password|secret|token|cookie|credential|auth|private-key)/iu.test(reference);
-}
-
 async function validateDurableReference(reference: string, kind: "evidence" | "asset", repositoryPath: string | null): Promise<boolean> {
-  if (isSecretOrForbiddenReference(reference)) return false;
-  if (/^https:\/\//iu.test(reference)) {
-    try {
-      const parsed = new URL(reference);
-      return parsed.username.length === 0 && parsed.password.length === 0;
-    } catch {
-      return false;
-    }
-  }
-  if (/^https?:\/\//iu.test(reference) || isAbsolute(reference) || /^[A-Za-z]:[\\/]/u.test(reference) || /^\\\\/u.test(reference)) return false;
+  if (!isSafeDurableReferenceShape(reference)) return false;
+  if (/^https:\/\//iu.test(reference)) return true;
   if (repositoryPath === null || reference.startsWith("../") || reference.startsWith("..\\") || reference.includes("\\")) return false;
   const root = resolve(repositoryPath);
   const target = resolve(root, reference);
@@ -230,91 +234,23 @@ export function createKnowledgeQualityLoop(options: KnowledgeQualityLoopOptions)
   const maxSnapshotRecords = options.maxSnapshotRecords ?? defaultSnapshotLimit;
   const now = options.now ?? (() => new Date().toISOString());
 
-  async function recover(taskId: string | null): Promise<MemoryRecoverySnapshot> {
+  async function recover(taskId: string | null, mode: "current" | "audit" = "current"): Promise<MemoryRecoverySnapshot> {
     try {
-      const records = await options.store.listAll();
-      const candidates = records
-        .map((record) => ({ record, fact: storedFact(record) }))
-        .filter((entry): entry is { readonly record: MemoryRecord; readonly fact: StoredFact } => entry.fact !== null && taskMatches(entry.fact, taskId));
-      const superseded = new Set(candidates.flatMap(({ record, fact }) => fact.supersedesMemoryIds.filter((memoryId) => {
-        const target = candidates.find((entry) => entry.record.memoryId === memoryId);
-        return target !== undefined
-          && target.fact.subjectKey === fact.subjectKey
-          && taskMatches(target.fact, taskId)
-          && compareFreshnessOnly(fact, target.fact) > 0;
-      })));
-      const visible = candidates.filter(({ record }) => !superseded.has(record.memoryId));
-      const duplicateFindings: CurationQualityFinding[] = [];
-      const duplicateGroups = new Map<string, readonly { readonly record: MemoryRecord; readonly fact: StoredFact }[]>();
-      for (const entry of visible) {
-        const duplicateKey = `${entry.fact.subjectKey}\u0000${entry.fact.fact}`;
-        duplicateGroups.set(duplicateKey, [...(duplicateGroups.get(duplicateKey) ?? []), entry]);
-      }
-      const deduplicatedVisible: { readonly record: MemoryRecord; readonly fact: StoredFact }[] = [];
-      for (const entries of duplicateGroups.values()) {
-        const ordered = [...entries].sort((left, right) => compareFreshness(left.fact, right.fact));
-        const selected = ordered.at(-1)!;
-        deduplicatedVisible.push(selected);
-        if (entries.length > 1) {
-          duplicateFindings.push({
-            code: "DUPLICATE_SUBJECT_RECORDS",
-            severity: "info",
-            memoryId: selected.record.memoryId,
-            subjectKey: selected.fact.subjectKey,
-            detail: "Recovery collapsed equivalent current records to one deterministic representative; duplicate records require review",
-          });
-        }
-      }
-      const conflictFindings: CurationQualityFinding[] = [];
-      const bySubject = new Map<string, readonly { readonly record: MemoryRecord; readonly fact: StoredFact }[]>();
-      for (const entry of deduplicatedVisible) {
-        const current = bySubject.get(entry.fact.subjectKey) ?? [];
-        bySubject.set(entry.fact.subjectKey, [...current, entry]);
-      }
-      for (const [subjectKey, entries] of bySubject) {
-        for (let leftIndex = 0; leftIndex < entries.length; leftIndex += 1) {
-          for (let rightIndex = leftIndex + 1; rightIndex < entries.length; rightIndex += 1) {
-            const left = entries[leftIndex]!;
-            const right = entries[rightIndex]!;
-            if (left.fact.fact !== right.fact.fact) {
-              conflictFindings.push({
-                code: "CONTRADICTORY_CURRENT_FACTS",
-                severity: "blocker",
-                memoryId: right.record.memoryId,
-                subjectKey,
-                detail: "Recovery found competing current records for one subject",
-              });
-            }
-          }
-        }
-      }
-      if (conflictFindings.length > 0) {
-        return {
-          status: "blocked",
-          taskId,
-          records: [],
-          truncated: false,
-          reason: "Task-scoped memory recovery found unresolved contradictory current facts",
-          findings: [...duplicateFindings, ...conflictFindings].slice(0, 8),
-        };
-      }
-      const bounded = deduplicatedVisible.slice(-maxSnapshotRecords);
+      const selection = selectTaskBeliefs(await options.store.listAll(), taskId, mode);
+      const visible = mode === "audit" ? selection.history : selection.current;
+      const duplicateFindings: CurationQualityFinding[] = selection.equivalentDuplicates.map(({ selected }) => ({ code: "DUPLICATE_SUBJECT_RECORDS", severity: "info", memoryId: selected.record.memoryId, subjectKey: selected.subjectKey, detail: "Recovery collapsed equivalent current records to one deterministic representative; duplicate records require review" }));
+      const bounded = visible.slice(-maxSnapshotRecords);
       return {
         status: bounded.length === 0 ? "empty" : "available",
         taskId,
-        records: bounded.map(({ record, fact }) => recoveryRecord(record, fact)),
-        truncated: deduplicatedVisible.length > bounded.length,
+        records: bounded.map((belief) => recoveryRecord(belief.record, storedFactFromBelief(belief))),
+        truncated: visible.length > bounded.length,
         ...(duplicateFindings.length > 0 ? { findings: duplicateFindings.slice(0, 8) } : {}),
-        ...(bounded.length === 0 ? { reason: "No task-scoped curated facts are available" } : {}),
+        ...(bounded.length === 0 ? { reason: "No task-scoped curated beliefs are available" } : {}),
       };
     } catch (error: unknown) {
-      return {
-        status: "blocked",
-        taskId,
-        records: [],
-        truncated: false,
-        reason: safeText(error instanceof Error ? error.message : String(error)),
-      };
+      const reason = safeText(error instanceof Error ? error.message : String(error));
+      return { status: "blocked", taskId, records: [], truncated: false, reason, findings: [{ code: reason.includes("concurrent") ? "CONTRADICTORY_CURRENT_FACTS" : "INVALID_BELIEF_STATE", severity: "blocker", detail: reason }] };
     }
   }
 
@@ -332,7 +268,6 @@ export function createKnowledgeQualityLoop(options: KnowledgeQualityLoopOptions)
       return qualityBlockedResult(`Knowledge quality preflight failed: ${safeText(error instanceof Error ? error.message : String(error))}`, [], [{ code: "PREFLIGHT_FAILED", severity: "blocker", detail: "Candidate validation or store inspection failed" }], selectedCount);
     }
 
-    const existingFacts = existing.map((record) => ({ record, fact: storedFact(record) })).filter((entry): entry is { readonly record: MemoryRecord; readonly fact: StoredFact } => entry.fact !== null);
     const taskScopeId = curationOptions.taskScopeId ?? curationOptions.knownProjectTaskId ?? null;
     const existingSnapshot = await recover(taskScopeId);
     if (existingSnapshot.status === "blocked") {
@@ -343,6 +278,9 @@ export function createKnowledgeQualityLoop(options: KnowledgeQualityLoopOptions)
         selectedCount,
       );
     }
+    const existingSelection = selectTaskBeliefs(existing, taskScopeId);
+    const existingHistoryFacts = existingSelection.history.map((belief) => ({ record: belief.record, recordKind: belief.recordKind, fact: storedFactFromBelief(belief) }));
+    const existingCurrentFacts = existingSelection.current.map((belief) => ({ record: belief.record, fact: storedFactFromBelief(belief) }));
     const ingestionObservedAt = curationOptions.recordedAt ?? now();
     const findings: CurationQualityFinding[] = [];
     const improvements: CurationImprovementCandidate[] = [];
@@ -361,7 +299,7 @@ export function createKnowledgeQualityLoop(options: KnowledgeQualityLoopOptions)
       improvements.push(...improvementCandidates);
       const normalized: NormalizedCandidate = { candidate: { ...original, subjectKey, observedAt }, subjectKey, observedAt, improvementCandidates };
       let invalidReference = false;
-      for (const reference of original.evidenceRefs ?? []) {
+      for (const reference of new Set([...(original.evidenceRefs ?? []), ...(original.provenance?.evidenceRefs ?? [])])) {
         if (!(await validateDurableReference(reference, "evidence", repositoryPath))) {
           invalidReference = true;
           findings.push({ code: "NON_DURABLE_REFERENCE", severity: "defer", memoryId: original.memoryId, subjectKey, detail: "Evidence reference is not a stable HTTPS or repository-relative file" });
@@ -392,8 +330,10 @@ export function createKnowledgeQualityLoop(options: KnowledgeQualityLoopOptions)
         continue;
       }
       const invalidSupersession = (original.supersedesMemoryIds ?? []).some((memoryId: string) => {
-        const target = existingFacts.find(({ record }) => record.memoryId === memoryId);
-        return target === undefined || target.fact.subjectKey !== subjectKey || !taskMatches(target.fact, taskScopeId);
+        const target = existingHistoryFacts.find(({ record }) => record.memoryId === memoryId);
+        if (target === undefined) return true;
+        const legacySubjectCompatibility = original.recordKind === "belief" && target.recordKind === "legacy/unknown";
+        return (!legacySubjectCompatibility && target.fact.subjectKey !== subjectKey) || !taskMatches(target.fact, taskScopeId);
       });
       if (invalidSupersession) {
         findings.push({ code: "INVALID_SUPERSESSION", severity: "blocker", memoryId: original.memoryId, subjectKey, detail: "Every supersession target must exist for the same subject and task scope" });
@@ -442,7 +382,7 @@ export function createKnowledgeQualityLoop(options: KnowledgeQualityLoopOptions)
         }
       }
 
-      const related = existingFacts.filter(({ fact }) => fact.subjectKey === subjectKey && taskMatches(fact, taskScopeId));
+      const related = existingCurrentFacts.filter(({ fact }) => fact.subjectKey === subjectKey && taskMatches(fact, taskScopeId));
       const current = [...related].sort((left, right) => compareFreshness(left.fact, right.fact)).at(-1);
       const currentFacts = related.filter(({ fact }) => current !== undefined && compareFreshnessOnly(fact, current.fact) === 0 && fact.fact !== current.fact.fact);
       if (currentFacts.length > 0) {

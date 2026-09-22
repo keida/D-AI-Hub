@@ -36,6 +36,100 @@ afterEach(async () => {
 });
 
 describe("local curation", () => {
+  it("stores a typed belief with bounded provenance", async () => {
+    const store = await createStore();
+    try {
+      const result = await curateCurrentContext(store, [candidate({
+        recordKind: "belief",
+        provenance: { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-001", observedAt: "2026-09-11T00:00:00.000Z", evidenceHash: "a".repeat(64) },
+      })], { taskScopeId: "task-a", recordedAt: "2026-09-11T00:00:00.000Z" });
+      expect(result).toMatchObject({ status: "completed", counts: { added: 1 }, safeToDeleteOriginalChat: "YES" });
+      expect(await store.get("fact-release-gate")).toMatchObject({ value: { recordKind: "belief", provenance: { sourceType: "conversation", evidenceHash: "a".repeat(64) } } });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("creates a new typed belief ID for a material change and preserves history", async () => {
+    const store = await createStore();
+    const provenance = { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-001", observedAt: "2026-09-11T00:00:00.000Z", evidenceHash: "a".repeat(64) };
+    try {
+      await curateCurrentContext(store, [candidate({ recordKind: "belief", subjectKey: "typed-subject", projectTaskId: "task-a", provenance })], { taskScopeId: "task-a", recordedAt: "2026-09-11T00:00:00.000Z" });
+      const result = await curateCurrentContext(store, [candidate({ recordKind: "belief", candidateId: "fact-release-v2", memoryId: "fact-release-v2", fact: "Local release checks require a clean worktree and independent verification.", subjectKey: "typed-subject", projectTaskId: "task-a", revision: 2, supersedesMemoryIds: ["fact-release-gate"], provenance: { ...provenance, sourceMarker: "m-002", observedAt: "2026-09-11T00:01:00.000Z", evidenceHash: "b".repeat(64) } })], { taskScopeId: "task-a", recordedAt: "2026-09-11T00:01:00.000Z" });
+      expect(result).toMatchObject({ status: "completed", counts: { added: 1, updated: 0 } });
+      expect(await store.get("fact-release-gate")).toMatchObject({ value: { fact: "Local release checks require a clean worktree." } });
+      expect(await store.get("fact-release-v2")).toMatchObject({ value: { recordKind: "belief", supersedesMemoryIds: ["fact-release-gate"] } });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("defers a typed belief when strong provenance is required but missing", async () => {
+    const store = await createStore();
+    try {
+      const result = await curateCurrentContext(store, [candidate({ recordKind: "belief" })], { requireStrongProvenance: true });
+      expect(result).toMatchObject({ status: "completed", counts: { added: 0, deferred: 1 }, safeToDeleteOriginalChat: "NO" });
+      expect(await store.get("fact-release-gate")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("requires strong provenance for an untyped candidate when the policy requests it", async () => {
+    const store = await createStore();
+    try {
+      const result = await curateCurrentContext(store, [candidate({ candidateId: "untyped-strong", memoryId: "untyped-strong" })], { requireStrongProvenance: true });
+      expect(result).toMatchObject({ status: "completed", counts: { added: 0, deferred: 1 }, locallyStored: false, safeToDeleteOriginalChat: "NO" });
+      expect(await store.get("untyped-strong")).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects caller-supplied evidence and decision record kinds without writes", async () => {
+    const store = await createStore();
+    try {
+      for (const recordKind of ["evidence", "curation-decision"] as const) {
+        const invalid = { ...candidate({ candidateId: `invalid-${recordKind}`, memoryId: `invalid-${recordKind}` }), recordKind } as unknown as CurationCandidate;
+        const result = await curateCurrentContext(store, [invalid]);
+        expect(result).toMatchObject({ status: "blocked", locallyStored: false, readBackVerified: false, safeToDeleteOriginalChat: "NO" });
+      }
+      expect(await store.listAfter(0)).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects malformed provenance timestamp and absolute temp evidence references without writes", async () => {
+    const store = await createStore();
+    const baseProvenance = { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-001", observedAt: "2026-09-11T00:00:00.000Z", evidenceHash: "a".repeat(64) };
+    try {
+      const badTimestamp = await curateCurrentContext(store, [candidate({ candidateId: "bad-provenance-time", memoryId: "bad-provenance-time", recordKind: "belief", provenance: { ...baseProvenance, observedAt: "2026-09-11" } })]);
+      expect(badTimestamp).toMatchObject({ status: "blocked", safeToDeleteOriginalChat: "NO" });
+      const badPath = await curateCurrentContext(store, [candidate({ candidateId: "bad-provenance-path", memoryId: "bad-provenance-path", recordKind: "belief", provenance: { ...baseProvenance, evidenceRefs: ["C:\\Users\\User\\AppData\\Local\\Temp\\evidence.md"] } })]);
+      expect(badPath).toMatchObject({ status: "blocked", safeToDeleteOriginalChat: "NO" });
+      const embeddedTraversal = await curateCurrentContext(store, [candidate({ candidateId: "bad-provenance-traversal", memoryId: "bad-provenance-traversal", recordKind: "belief", provenance: { ...baseProvenance, evidenceRefs: ["docs/../../private/evidence.md"] } })]);
+      expect(embeddedTraversal).toMatchObject({ status: "blocked", safeToDeleteOriginalChat: "NO" });
+      expect(await store.listAfter(0)).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("can persist a bounded curation decision without rejected raw content", async () => {
+    const store = await createStore();
+    try {
+      const result = await curateCurrentContext(store, [candidate({ privacyRisk: "possible-workplace" })], { persistDecisions: true, recordedAt: "2026-09-11T00:00:00.000Z" });
+      expect(result).toMatchObject({ status: "completed", counts: { deferred: 1 }, locallyStored: false, readBackVerified: false, safeToDeleteOriginalChat: "NO" });
+      const records = await store.listAfter(0);
+      expect(records).toHaveLength(1);
+      expect(records[0]?.value).toMatchObject({ recordKind: "curation-decision", decision: "DEFER" });
+      expect(records[0]?.value).not.toHaveProperty("fact");
+    } finally {
+      store.close();
+    }
+  });
+
   it("adds a useful supplied fact and verifies the committed read-back", async () => {
     const store = await createStore();
 

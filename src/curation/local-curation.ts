@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { containsSecretShapedValue } from "../domain/manifest-id.js";
-import type { MemoryMutation, MemoryRecord, MemoryValue } from "../memory/types.js";
+import type { MemoryMutation, MemoryProvenance, MemoryRecord, MemoryValue } from "../memory/types.js";
+import { validateMemoryProvenance } from "../memory/belief-model.js";
 import type { CurationQualityReport, MemoryRecoverySnapshot } from "./knowledge-quality-loop.js";
 
 export type CurationCategory = "knowledge" | "project-memory" | "cross-project-memory";
@@ -14,6 +16,8 @@ export interface CurationCandidate {
   readonly category: CurationCategory;
   readonly source: "current-context";
   readonly privacyRisk: CurationPrivacyRisk;
+  readonly recordKind?: "belief";
+  readonly provenance?: MemoryProvenance;
   readonly topicLabel?: CurationTopicLabel;
   readonly critical?: boolean;
   readonly relatedMemoryIds?: readonly string[];
@@ -35,6 +39,8 @@ export interface CurationOptions {
   readonly recordedAt?: string;
   readonly knownProjectTaskId?: string | null;
   readonly taskScopeId?: string | null;
+  readonly requireStrongProvenance?: boolean;
+  readonly persistDecisions?: boolean;
 }
 
 export interface CurationRecordResult {
@@ -122,6 +128,8 @@ export function assertCurationCandidate(candidate: CurationCandidate): void {
     throw new Error("Curation candidate memoryId is not a safe local identifier");
   }
   if (containsSecretShapedValue(candidate.fact)) throw new Error("Curation candidate fact contains secret-shaped content");
+  if (candidate.recordKind !== undefined && candidate.recordKind !== "belief") throw new Error("Curation candidate recordKind is not supported on the public curation path");
+  if (candidate.provenance !== undefined) validateMemoryProvenance(candidate.provenance);
   if (candidate.topicLabel !== undefined && !isTopicLabel(candidate.topicLabel)) throw new Error("Curation candidate topicLabel is not supported");
   if (candidate.critical !== undefined && typeof candidate.critical !== "boolean") throw new Error("Curation candidate critical flag is invalid");
   if (candidate.revision !== undefined && (!Number.isSafeInteger(candidate.revision) || candidate.revision < 1)) {
@@ -154,14 +162,15 @@ export function validateCurationCandidates(candidates: readonly CurationCandidat
   for (const candidate of candidates) assertCurationCandidate(candidate);
 }
 
-function storedObject(value: MemoryValue): { readonly fact?: string; readonly category?: string; readonly revision?: number; readonly projectTaskId?: string | null } | null {
+function storedObject(value: MemoryValue): { readonly fact?: string; readonly category?: string; readonly revision?: number; readonly projectTaskId?: string | null; readonly recordKind?: string } | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const record = value as { readonly fact?: unknown; readonly category?: unknown; readonly revision?: unknown; readonly projectTaskId?: unknown };
+  const record = value as { readonly fact?: unknown; readonly category?: unknown; readonly revision?: unknown; readonly projectTaskId?: unknown; readonly recordKind?: unknown };
   return {
     ...(typeof record.fact === "string" ? { fact: record.fact } : {}),
     ...(typeof record.category === "string" ? { category: record.category } : {}),
     ...(typeof record.revision === "number" ? { revision: record.revision } : {}),
     ...(typeof record.projectTaskId === "string" || record.projectTaskId === null ? { projectTaskId: record.projectTaskId } : {}),
+    ...(typeof record.recordKind === "string" ? { recordKind: record.recordKind } : {}),
   };
 }
 
@@ -195,6 +204,8 @@ function valueFor(candidate: CurationCandidate, options: CurationOptions): Memor
     category: candidate.category,
     source: candidate.source,
     privacyRisk: candidate.privacyRisk,
+    ...(candidate.recordKind === undefined ? {} : { recordKind: candidate.recordKind }),
+    ...(candidate.provenance === undefined ? {} : { provenance: candidate.provenance }),
     ...(candidate.topicLabel === undefined ? {} : { topicLabel: candidate.topicLabel }),
     ...(candidate.critical === undefined ? {} : { critical: candidate.critical }),
     ...(candidate.relatedMemoryIds === undefined ? {} : { relatedMemoryIds: [...candidate.relatedMemoryIds] }),
@@ -206,7 +217,24 @@ function valueFor(candidate: CurationCandidate, options: CurationOptions): Memor
     evidenceRefs: candidate.evidenceRefs === undefined ? [] : [...candidate.evidenceRefs],
     assetRefs: candidate.assetRefs === undefined ? [] : [...candidate.assetRefs],
     taskScopeId: options.taskScopeId ?? null,
-  };
+  } as unknown as MemoryValue;
+}
+
+function decisionMemoryId(candidate: CurationCandidate, decision: "DEFER" | "REJECT"): string {
+  return `curation-decision-${createHash("sha256").update(`${candidate.candidateId}|${decision}`, "utf8").digest("hex").slice(0, 32)}`;
+}
+
+function decisionValue(candidate: CurationCandidate, decision: "DEFER" | "REJECT", reason: string | undefined, taskScopeId: string | null): MemoryValue {
+  return {
+    recordKind: "curation-decision",
+    decision,
+    targetMemoryId: candidate.memoryId,
+    category: candidate.category,
+    projectTaskId: candidate.projectTaskId ?? null,
+    taskScopeId,
+    reason: reason === undefined ? null : summary(reason),
+    ...(candidate.provenance === undefined ? {} : { provenance: candidate.provenance }),
+  } as unknown as MemoryValue;
 }
 
 function resultRecords(prepared: readonly PreparedCandidate[]): CurationRecordResult[] {
@@ -266,6 +294,14 @@ export async function curateCurrentContext(
   try {
     for (const candidate of candidates) {
       assertCurationCandidate(candidate);
+      if (candidate.recordKind === "belief" || options.requireStrongProvenance === true) {
+        try {
+          validateMemoryProvenance(candidate.provenance, true);
+        } catch {
+          prepared.push({ candidate, decision: "DEFER", existing: null, reason: candidate.recordKind === "belief" ? "Strong provenance is required for this typed belief" : "Strong provenance is required by the curation policy" });
+          continue;
+        }
+      }
       if (candidate.privacyRisk === "workplace-confidential") {
         prepared.push({ candidate, decision: "REJECT", existing: null, reason: "Possible workplace-confidential information is not transferred" });
         continue;
@@ -289,6 +325,8 @@ export async function curateCurrentContext(
         prepared.push({ candidate, decision: "DEFER", existing, reason: "Existing memory is bound to a different project task" });
       } else if (sameConcept(candidate, existing)) {
         prepared.push({ candidate, decision: "NOOP", existing });
+      } else if (candidate.recordKind === "belief") {
+        prepared.push({ candidate, decision: "DEFER", existing, reason: "A changed typed belief requires a new memory ID and explicit supersession" });
       } else if (materiallyImproves(candidate, existing)) {
         prepared.push({ candidate, decision: "UPDATE", existing });
       } else {
@@ -307,11 +345,19 @@ export async function curateCurrentContext(
       value: valueFor(candidate, options),
       recordedAt: options.recordedAt ?? new Date().toISOString(),
     }));
+  const decisionMutations: MemoryMutation[] = options.persistDecisions
+    ? (await Promise.all(prepared.filter(({ decision }) => decision === "DEFER" || decision === "REJECT").map(async (entry) => {
+      const decision = entry.decision as "DEFER" | "REJECT";
+      const memoryId = decisionMemoryId(entry.candidate, decision);
+      return await store.get(memoryId) === null ? { operation: "add" as const, memoryId, value: decisionValue(entry.candidate, decision, entry.reason, options.taskScopeId ?? null), recordedAt: options.recordedAt ?? new Date().toISOString() } : null;
+    }))).filter((mutation): mutation is { readonly operation: "add"; readonly memoryId: string; readonly value: MemoryValue; readonly recordedAt: string } => mutation !== null)
+    : [];
   let applied: readonly MemoryRecord[] = [];
-  if (mutations.length > 0) {
+  const allMutations = [...mutations, ...decisionMutations];
+  if (allMutations.length > 0) {
     try {
-      applied = await store.applyMutations(mutations);
-      if (applied.length !== mutations.length) throw new Error("Curation transaction returned an incomplete read-back");
+      applied = await store.applyMutations(allMutations);
+      if (applied.length !== allMutations.length) throw new Error("Curation transaction returned an incomplete read-back");
     } catch (error) {
       const retained = prepared.filter(({ decision }) => decision !== "ADD" && decision !== "UPDATE");
       return blockedResult(
@@ -341,18 +387,19 @@ export async function curateCurrentContext(
   }
 
   const counts = countsFor(prepared, true);
-  const locallyStored = applied.length > 0 || counts.noOp > 0;
-  const readBackVerified = applied.length === mutations.length
-    && (applied.length > 0 || counts.noOp > 0);
+  const beliefApplied = applied.filter((record) => mutations.some((mutation) => mutation.memoryId === record.memoryId));
+  const locallyStored = beliefApplied.length > 0 || counts.noOp > 0;
+  const readBackVerified = applied.length === allMutations.length
+    && (beliefApplied.length > 0 || counts.noOp > 0);
   return {
     status: "completed",
     counts,
     records: resultRecords(prepared),
     locallyStored,
     readBackVerified,
-    safeToDeleteOriginalChat: locallyStored ? "YES" : "NO",
+    safeToDeleteOriginalChat: beliefApplied.length > 0 || counts.noOp > 0 ? "YES" : "NO",
     message: locallyStored
       ? "Selected durable facts were locally stored or already represented; source chat/transcript was not captured; SAFE TO DELETE ORIGINAL CHAT: YES for selected curated facts only"
-      : "No selected durable fact passed persistence; source chat/transcript remains untouched; SAFE TO DELETE ORIGINAL CHAT: NO",
+      : "No selected durable fact passed persistence; bounded curation decisions may be retained for audit; source chat/transcript remains untouched; SAFE TO DELETE ORIGINAL CHAT: NO",
   };
 }

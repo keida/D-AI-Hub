@@ -29,6 +29,73 @@ afterEach(async () => {
 });
 
 describe("LocalSqliteMemoryStore", () => {
+  it("separates typed beliefs from evidence and decisions while preserving an audit chain", async () => {
+    const databasePath = await createDatabasePath();
+    const writer = createWriter(databasePath);
+    const provenance = { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-002", observedAt: "2026-09-12T00:00:01.000Z", evidenceHash: "a".repeat(64) };
+    try {
+      await writer.applyMutations([
+        { operation: "add", memoryId: "legacy-belief", value: { kind: "curated-fact", fact: "Legacy belief.", category: "knowledge", subjectKey: "belief-subject", revision: 1, projectTaskId: "task-a", taskScopeId: "task-a" }, recordedAt: "2026-09-12T00:00:00.000Z" },
+        { operation: "add", memoryId: "typed-belief", value: { kind: "curated-fact", recordKind: "belief", fact: "Typed belief.", category: "knowledge", subjectKey: "belief-subject", revision: 2, observedAt: "2026-09-12T00:00:01.000Z", supersedesMemoryIds: ["legacy-belief"], projectTaskId: "task-a", taskScopeId: "task-a", provenance }, recordedAt: "2026-09-12T00:00:01.000Z" },
+        { operation: "add", memoryId: "evidence-a", value: { recordKind: "evidence", evidenceHash: "b".repeat(64), sourceType: "conversation", sourceMarker: "m-002", projectTaskId: "task-a", taskScopeId: "task-a" }, recordedAt: "2026-09-12T00:00:02.000Z" },
+        { operation: "add", memoryId: "decision-a", value: { recordKind: "curation-decision", decision: "DEFER", targetMemoryId: "typed-belief", projectTaskId: "task-a", taskScopeId: "task-a" }, recordedAt: "2026-09-12T00:00:03.000Z" },
+      ]);
+      await expect(writer.listTaskScopedBeliefs("task-a", "current")).resolves.toMatchObject([{ memoryId: "typed-belief", value: { recordKind: "belief" } }]);
+      await expect(writer.listTaskScopedBeliefs("task-a", "audit")).resolves.toMatchObject([{ memoryId: "legacy-belief" }, { memoryId: "typed-belief" }]);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("fails closed for invalid typed belief graphs and provenance", async () => {
+    const databasePath = await createDatabasePath();
+    const writer = createWriter(databasePath);
+    try {
+      await writer.applyMutations([
+        { operation: "add", memoryId: "typed-missing-target", value: { kind: "curated-fact", recordKind: "belief", fact: "Missing target.", category: "knowledge", subjectKey: "missing", revision: 2, supersedesMemoryIds: ["does-not-exist"], projectTaskId: "task-a", taskScopeId: "task-a", provenance: { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-001", observedAt: "2026-09-12T00:00:00.000Z", evidenceHash: "a".repeat(64) } }, recordedAt: "2026-09-12T00:00:00.000Z" },
+      ]);
+      await expect(writer.listTaskScopedBeliefs("task-a")).rejects.toThrow(/missing target/i);
+      const badWriter = createWriter(await createDatabasePath());
+      try {
+        await badWriter.applyMutations([{ operation: "add", memoryId: "typed-bad-provenance", value: { kind: "curated-fact", recordKind: "belief", fact: "Bad provenance.", category: "knowledge", subjectKey: "bad-provenance", revision: 1, supersedesMemoryIds: [], projectTaskId: "task-a", taskScopeId: "task-a", provenance: { evidenceHash: "not-a-hash" } }, recordedAt: "2026-09-12T00:00:01.000Z" }]);
+        await expect(badWriter.listTaskScopedBeliefs("task-a")).rejects.toThrow(/provenance/i);
+      } finally {
+        badWriter.close();
+      }
+      const cycleWriter = createWriter(await createDatabasePath());
+      try {
+        const strong = { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-001", observedAt: "2026-09-12T00:00:00.000Z", evidenceHash: "c".repeat(64) };
+        await cycleWriter.applyMutations([
+          { operation: "add", memoryId: "cycle-a", value: { kind: "curated-fact", recordKind: "belief", fact: "Cycle A.", category: "knowledge", subjectKey: "cycle", revision: 2, observedAt: "2026-09-12T00:00:02.000Z", supersedesMemoryIds: ["cycle-b"], projectTaskId: "task-a", taskScopeId: "task-a", provenance: strong }, recordedAt: "2026-09-12T00:00:02.000Z" },
+          { operation: "add", memoryId: "cycle-b", value: { kind: "curated-fact", recordKind: "belief", fact: "Cycle B.", category: "knowledge", subjectKey: "cycle", revision: 1, observedAt: "2026-09-12T00:00:01.000Z", supersedesMemoryIds: ["cycle-a"], projectTaskId: "task-a", taskScopeId: "task-a", provenance: strong }, recordedAt: "2026-09-12T00:00:01.000Z" },
+        ]);
+        await expect(cycleWriter.listTaskScopedBeliefs("task-a")).rejects.toThrow(/invalid supersession|cycle|concurrent/i);
+      } finally {
+        cycleWriter.close();
+      }
+    } finally {
+      writer.close();
+    }
+  });
+
+  it("supports exact typed supersession of a cross-subject legacy belief but blocks cross-task targets", async () => {
+    const databasePath = await createDatabasePath();
+    const writer = createWriter(databasePath);
+    const provenance = { sourceType: "conversation", sourceProject: "task-a", sourceSession: "session-a", sourceCheckpoint: "checkpoint-a", sourceMarker: "m-001", observedAt: "2026-09-12T00:00:00.000Z", evidenceHash: "a".repeat(64) };
+    try {
+      await writer.applyMutations([
+        { operation: "add", memoryId: "legacy-different-subject", value: { kind: "curated-fact", fact: "Legacy task fact.", category: "knowledge", projectTaskId: "task-a", taskScopeId: "task-a" }, recordedAt: "2026-09-12T00:00:00.000Z" },
+        { operation: "add", memoryId: "typed-cross-subject", value: { kind: "curated-fact", recordKind: "belief", fact: "Typed replacement.", category: "knowledge", subjectKey: "new-subject", revision: 2, observedAt: "2026-09-12T00:00:01.000Z", supersedesMemoryIds: ["legacy-different-subject"], projectTaskId: "task-a", taskScopeId: "task-a", provenance }, recordedAt: "2026-09-12T00:00:01.000Z" },
+      ]);
+      await expect(writer.listTaskScopedBeliefs("task-a", "current")).resolves.toMatchObject([{ memoryId: "typed-cross-subject" }]);
+      await expect(writer.listTaskScopedBeliefs("task-a", "audit")).resolves.toMatchObject([{ memoryId: "legacy-different-subject" }, { memoryId: "typed-cross-subject" }]);
+      await writer.applyMutations([{ operation: "add", memoryId: "typed-cross-task", value: { kind: "curated-fact", recordKind: "belief", fact: "Cross-task target.", category: "knowledge", subjectKey: "task-b-subject", revision: 2, observedAt: "2026-09-12T00:00:02.000Z", supersedesMemoryIds: ["legacy-different-subject"], projectTaskId: "task-b", taskScopeId: "task-b", provenance: { ...provenance, sourceProject: "task-b", sourceMarker: "m-002" } }, recordedAt: "2026-09-12T00:00:02.000Z" }]);
+      await expect(writer.listTaskScopedBeliefs("task-b", "current")).rejects.toThrow(/missing target|cross|scope/i);
+    } finally {
+      writer.close();
+    }
+  });
+
   it("retains a writer record after the database is reopened", async () => {
     const databasePath = await createDatabasePath();
     const writer = createWriter(databasePath);

@@ -34,7 +34,7 @@ export type CurationCoverage = "complete" | "partial" | "unknown";
 
 export interface CurrentStateView {
   readonly identity: string;
-  readonly phase: string;
+  readonly phase: string | null;
   readonly milestones: readonly string[];
   readonly currentWork: readonly string[];
   readonly confirmedDecisions: readonly string[];
@@ -43,7 +43,7 @@ export interface CurrentStateView {
   readonly nextAction: string | null;
   readonly verificationStatus: "verified" | "stale" | "unverified";
   readonly relevantMemoryIds: readonly string[];
-  readonly checkpointReference: string;
+  readonly checkpointReference: string | null;
 }
 
 export interface CurationCheckpoint {
@@ -69,6 +69,23 @@ export interface CurationCheckpoint {
   readonly earliestTrustedBoundarySha256: string | null;
   readonly coverageChainComplete: boolean | null;
 }
+
+export type MemoryRecordKind = "belief" | "evidence" | "curation-decision";
+
+export interface MemoryProvenance {
+  readonly sourceType?: string;
+  readonly sourceProject?: string;
+  readonly sourceSession?: string;
+  readonly sourceCheckpoint?: string;
+  readonly sourceMarker?: string;
+  readonly observedAt?: string | null;
+  readonly evidenceHash?: string;
+  readonly createdBy?: string;
+  readonly derivationVersion?: string;
+  readonly evidenceRefs?: readonly string[];
+}
+
+export type CurationCheckpointMetadata = Omit<CurationCheckpoint, "currentView">;
 
 export interface RelatedMemoryQuery {
   readonly memoryId: string | null;
