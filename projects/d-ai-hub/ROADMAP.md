@@ -1,5 +1,36 @@
 # Roadmap
 
+## Prerequisite publication order
+
+- P2 — Authoritative Rebuild / Belief: `PUBLISHED / CANONICAL`; publication base for P3 is `f8e9b10c0123b3f0b48e53997a63349a72b538fc`.
+- P3 — Local-only identity / zero-remote validation: next slice.
+- P4 — Boss recovery / rollover: after P3 publication review and canonical publication.
+- DAI-ARCH-001 — Active Task Recovery Completeness: publish after its minimal prerequisites are canonical; do not close it or repair DSH 2 / Weekly Review early.
+- DAI-ARCH-002: accepted but deferred until DAI-ARCH-001 is canonical. No implementation, runtime activation, or Skill Pulse durable-stage repair is authorized by this ticket entry.
+
+## DAI-ARCH-002 — Project-Owned Lifecycle Handoff (accepted, deferred)
+
+**Status.** `ACCEPTED / IMPLEMENTATION DEFERRED`.
+
+**Problem.** The ordinary D-AI-Hub lifecycle assumes D-AI-Hub performs `route → plan → execute → inspect → verify`. A separately owned project can complete execution and acceptance while its D-AI-Hub orchestration task remains at `route`. The Skill Pulse project Boss accepted SP-OPS-006 after a natural production run, yet D-AI-Hub correctly rejected direct `route → verify` for task `task-7b959c2155241137b16a5220`. Inventing unperformed stages would falsify the durable lifecycle.
+
+**Goal.** Reconcile a project-owned execution result through an explicit D-AI-Hub handoff while preserving the ordinary lifecycle and the project Boss ownership boundary. Implementation design may choose the smallest correct representation; a new stage, synthetic transitions, special event, or command is not prescribed.
+
+**Acceptance criteria**
+
+1. Ingestion accepts results only from the task's declared project execution owner, with explicit verifiable provenance and evidence.
+2. The handoff is typed and explicit; an ordinary `verify` transition or arbitrary caller cannot bypass lifecycle gates.
+3. The durable result distinguishes D-AI-executed stages, project-owned execution and acceptance, and D-AI-Hub orchestration reconciliation without recording unperformed `plan`, `execute`, or `inspect` stages.
+4. Replaying an identical accepted handoff is idempotent: it neither closes the task twice nor creates a second authoritative result. Conflicting replays fail closed.
+5. Missing, unverifiable, or mismatched owner/evidence fails closed without advancing stage or closing the task.
+6. A project Boss result is required before reconciliation. PASS or explicit closure is necessary but not alone sufficient to close; a defect result remains visible and cannot close the orchestration task automatically.
+7. Existing ordinary lifecycle transitions and their fail-closed rejection behavior remain unchanged, with regression evidence for both paths.
+8. A fresh recovery exposes the reconciled owner, provenance, result, and remaining lifecycle state without relying on chat history or unrelated project data.
+
+**Current case.** Skill Pulse task `task-7b959c2155241137b16a5220` stays at `route`, unclosed, `BLOCKED — awaiting lifecycle handoff capability`. Its project Boss owns execution and acceptance; D-AI-Hub does not rerun SP-OPS-006 or alter Skill Pulse files. This ticket does not authorize an immediate repair or implementation.
+
+**Dispatch gate.** Start only after P3 → P4 → DAI-ARCH-001 publication has completed and DAI-ARCH-001 is on canonical main. Use the then-current canonical base and a separately bounded implementation packet.
+
 ## Now — Codex-first D-AI V1 (accepted)
 
 0. Deliver the visible automation MVP: classify ordinary natural-language requests deterministically, preserve explicit `@D-AI` command priority, keep discussion/status read-only, and expose bounded delivery only through explicit dependency and publication-authority seams.
