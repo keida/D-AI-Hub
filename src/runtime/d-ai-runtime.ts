@@ -14,7 +14,8 @@ import { bootstrapTask, createLocalOnlyTaskReservationId, inspectGitMetadataMark
 import { closeTask, type CloseMode } from "../close/close-service.js";
 import { curateCurrentContext, validateCurationCandidates, type CurationCandidate, type CurationRecordResult, type CurationResult } from "../curation/local-curation.js";
 import { createKnowledgeQualityLoop, type CurationQualityReport, type MemoryRecoverySnapshot } from "../curation/knowledge-quality-loop.js";
-import { createCurationPipeline, type CurationFinalizationEvidence, type CurationPipelineInput, type CurationPipelineResult } from "../curation/current-view-pipeline.js";
+import { createCurationPipeline, type CurationFinalizationEvidence, type CurationPipelineInput, type CurationPipelineRebuild, type CurationPipelineResult } from "../curation/current-view-pipeline.js";
+import { defaultBossSessionPolicy, deriveBossRecovery, evaluateBossSignals, type BossRecoveryContext, type BossSessionDecision, type BossSessionMode, type BossSessionPolicy, type BossSessionSignals } from "./boss-session-recovery.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
   CapabilityMismatchError,
@@ -67,6 +68,13 @@ export interface DAIRequest {
   readonly publicationAuthority?: PublicationCloseAuthority | null;
   readonly curationCandidates?: readonly CurationCandidate[];
   readonly curationSourceWindow?: CurationPipelineInput;
+  readonly bossSession?: BossSessionRequest;
+}
+
+export interface BossSessionRequest {
+  readonly mode: BossSessionMode;
+  readonly signals?: BossSessionSignals;
+  readonly sourceKey?: string;
 }
 
 export interface PublicationCloseAuthority {
@@ -86,6 +94,18 @@ export interface DAIResponse {
   readonly curationQuality?: CurationQualityReport;
   readonly memorySnapshot?: MemoryRecoverySnapshot;
   readonly curationPipeline?: CurationPipelinePublicMetadata;
+  readonly bossSession?: {
+    readonly mode: BossSessionMode;
+    readonly decision: BossSessionDecision;
+    readonly triggers: readonly string[];
+    readonly project: string | null;
+    readonly phase: string | null;
+    readonly nextAction: string | null;
+    readonly currentStateVersion: number | null;
+    readonly checkpointReference: string | null;
+    readonly startup: BossRecoveryContext | null;
+    readonly handoff: BossRecoveryContext | null;
+  };
 }
 
 export interface CurationPipelinePublicMetadata {
@@ -133,6 +153,7 @@ export interface ExternalDAIRequest {
   readonly publicationAuthority?: PublicationCloseAuthority | null;
   readonly curationCandidates?: readonly CurationCandidate[];
   readonly curationSourceWindow?: CurationPipelineInput;
+  readonly bossSession?: BossSessionRequest;
 }
 
 export interface EnvironmentExecutionRequest {
@@ -182,6 +203,8 @@ export interface DAIRuntimeDependencies {
   readonly curateCurrentContext?: (candidates: readonly CurationCandidate[], options: { readonly knownProjectTaskId: string | null; readonly taskScopeId?: string | null }) => Promise<CurationResult>;
   readonly curateSourceWindow?: (input: CurationPipelineInput) => Promise<CurationPipelineResult>;
   readonly recoverKnowledgeSnapshot?: (taskId: string | null) => Promise<MemoryRecoverySnapshot>;
+  readonly rebuildCurrentState?: (taskId: string, sourceKey?: string) => Promise<CurationPipelineRebuild>;
+  readonly bossSessionPolicy?: BossSessionPolicy;
   readonly resolveRepositoryIdentity?: ResolveRepositoryIdentity | undefined;
   readonly workspacePath: string | null;
   readonly repositoryPath: string | null;
@@ -257,6 +280,16 @@ const curationSourceWindowSchema = z.object({
   finalWindow: z.boolean().optional(),
   trigger: z.enum(["window", "milestone", "explicit-consolidation", "source-delete-check"]).optional(),
 }).strict();
+const bossSessionSchema = z.object({
+  mode: z.enum(["startup", "prepare"]),
+  signals: z.object({
+    explicitRollover: z.boolean().optional(),
+    milestone: z.boolean().optional(),
+    phaseTransition: z.boolean().optional(),
+    acceptedTicketCount: z.number().int().nonnegative().max(1_000_000).optional(),
+  }).strict().optional(),
+  sourceKey: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u).optional(),
+}).strict();
 const requestSchema = z.object({
   command: commandSchema,
   sourceEnvironment: environmentSchema,
@@ -266,6 +299,7 @@ const requestSchema = z.object({
   publicationAuthority: publicationCloseAuthoritySchema.nullable().optional(),
   curationCandidates: z.array(z.unknown()).optional(),
   curationSourceWindow: curationSourceWindowSchema.optional(),
+  bossSession: bossSessionSchema.optional(),
 }).strict();
 const evidenceSchema = z.object({
   evidenceId: z.string().trim().min(1),
@@ -414,7 +448,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
-  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, curationSourceWindow, ...validated } = result.data;
+  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, curationSourceWindow, bossSession, ...validated } = result.data;
   return {
     ...validated,
     overrides: {
@@ -426,6 +460,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
     ...(publicationAuthority === undefined ? {} : { publicationAuthority }),
     ...(curationCandidates === undefined ? {} : { curationCandidates: curationCandidates as readonly CurationCandidate[] }),
     ...(curationSourceWindow === undefined ? {} : { curationSourceWindow: curationSourceWindow as CurationPipelineInput }),
+    ...(bossSession === undefined ? {} : { bossSession: bossSession as BossSessionRequest }),
   };
 }
 
@@ -2785,6 +2820,71 @@ async function resolveContinueProject(
   return candidates[0]!.taskId;
 }
 
+async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntimeDependencies, registry: RuntimeTaskRegistry): Promise<DAIResponse> {
+  const mode = request.bossSession!.mode;
+  const signals = request.bossSession!.signals ?? {};
+  const triggers = evaluateBossSignals(signals, dependencies.bossSessionPolicy ?? defaultBossSessionPolicy).triggers;
+  const metadata = (decision: BossSessionDecision, context: BossRecoveryContext | null) => ({
+    mode, decision, triggers,
+    project: context?.project ?? null,
+    phase: context?.phase ?? null,
+    nextAction: context?.nextAction ?? null,
+    currentStateVersion: context?.currentStateVersion ?? null,
+    checkpointReference: context?.checkpointReference ?? null,
+    startup: mode === "startup" ? context : null,
+    handoff: mode === "prepare" && decision === "ROLLOVER_PREPARED" ? context : null,
+  });
+  const blocked = (message: string, state: TaskState | null = null): DAIResponse => ({
+    ...(state === null ? blockedWithoutState(request.activeTaskId ?? "unassigned", request.sourceEnvironment, message) : response(state, "blocked", message)),
+    bossSession: metadata("BLOCKED", null),
+  });
+  if (request.command.kind !== "status") return blocked("Boss recovery requires a read-only status command");
+  if (dependencies.workspacePath === null) return blocked("Boss recovery requires a canonical workspace");
+  let discovery: CanonicalWorkspaceTaskDiscovery;
+  try { discovery = await discoverCanonicalWorkspaceTasks(request, dependencies); }
+  catch { return blocked("Boss recovery canonical task discovery failed closed"); }
+  if (discovery.kind === "unavailable") return blocked(`Boss recovery is blocked: ${discovery.message}`);
+  if (discovery.candidates.length !== 1 || discovery.allWorkspaceCandidates.length !== 1 || discovery.otherEnvironmentCandidates.length !== 0 || discovery.repositoryConflicts.length !== 0 || (discovery.mode === "repository" && discovery.localOnlyCandidates.length !== 0)) {
+    return blocked("Boss recovery requires exactly one canonical project task without identity conflicts");
+  }
+  const discovered = discovery.candidates[0]!;
+  if (request.activeTaskId !== undefined && request.activeTaskId !== null && request.activeTaskId !== discovered.taskId) return blocked("Explicit task identity conflicts with the canonical project task");
+  const owner = registry.owner(discovered.taskId);
+  if (registry.isBlocked(discovered.taskId) || (owner !== null && owner !== request.sourceEnvironment)) return blocked("Boss recovery is blocked because task ownership changed or a failed handoff remains");
+  const state = await dependencies.store.load(discovered.taskId).catch(() => null);
+  if (state === null || JSON.stringify(state) !== JSON.stringify(discovered)) return blocked("Canonical durable task changed during Boss recovery");
+  const identity = await validateCurrentProjectIdentity(state, dependencies);
+  if (identity.kind !== "valid") return blocked(`Boss recovery identity is blocked: ${identity.message}`, state);
+  const project = discovery.mode === "repository" ? remoteRepositoryIdentity(state) : localProjectIdentity(state);
+  if (project === null) return blocked("Canonical project identity is missing", state);
+  if (dependencies.rebuildCurrentState === undefined) return blocked("Authoritative current-state rebuild is unavailable", state);
+  const sourceKey = request.bossSession!.sourceKey;
+  let rebuilt: CurationPipelineRebuild;
+  try { rebuilt = await dependencies.rebuildCurrentState(state.taskId, sourceKey); }
+  catch { return blocked("Authoritative current-state rebuild failed closed", state); }
+  if (mode === "prepare" && sourceKey !== undefined && rebuilt.checkpoint === null) return blocked("Requested rollover source has no canonical checkpoint", state);
+  let derived: ReturnType<typeof deriveBossRecovery>;
+  try { derived = deriveBossRecovery(project, state, rebuilt, mode, signals, dependencies.bossSessionPolicy ?? defaultBossSessionPolicy); }
+  catch { return blocked("Canonical Boss recovery projection failed closed", state); }
+  if (derived.decision === "BLOCKED" || derived.context === null) return blocked(`Boss recovery is blocked: ${derived.reason ?? "canonical state unavailable"}`, state);
+  try {
+    const readBackState = await dependencies.store.load(state.taskId);
+    const readBackDiscovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+    const readBackView = await dependencies.rebuildCurrentState(state.taskId, sourceKey);
+    if (readBackState === null || JSON.stringify(readBackState) !== JSON.stringify(state)
+      || readBackDiscovery.kind !== "available" || readBackDiscovery.mode !== discovery.mode || readBackDiscovery.repository !== discovery.repository
+      || readBackDiscovery.candidates.length !== 1 || readBackDiscovery.allWorkspaceCandidates.length !== 1 || readBackDiscovery.candidates[0]?.taskId !== state.taskId
+      || readBackDiscovery.otherEnvironmentCandidates.length !== 0 || readBackDiscovery.repositoryConflicts.length !== 0
+      || (readBackDiscovery.mode === "repository" && readBackDiscovery.localOnlyCandidates.length !== 0)
+      || registry.isBlocked(state.taskId) || (registry.owner(state.taskId) !== null && registry.owner(state.taskId) !== request.sourceEnvironment)
+      || JSON.stringify(readBackView) !== JSON.stringify(rebuilt)) return blocked("Canonical Boss recovery state changed during final read-back", state);
+  } catch { return blocked("Canonical Boss recovery final read-back failed closed", state); }
+  return {
+    ...response(state, "accepted", mode === "startup" ? `Boss startup reused canonical task ${state.taskId} and loaded authoritative state` : derived.decision === "ROLLOVER_PREPARED" ? `Boss rollover prepared for canonical task ${state.taskId}` : `Boss rollover assessment retained canonical task ${state.taskId}`),
+    bossSession: metadata(derived.decision, derived.context),
+  };
+}
+
 export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request: ExternalDAIRequest) => Promise<DAIResponse> {
   validateDependencies(dependencies);
   const registry = createRuntimeTaskRegistry();
@@ -2935,6 +3035,7 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
         `Sync${request.command.project === null ? "" : ` for project ${request.command.project}`} is recognized but unsupported in this runtime; no durable task was created or mutated`,
       );
     }
+    if (request.bossSession !== undefined) return bossSessionResponse(request, dependencies, registry);
     if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
       const selection = await selectExplicitDurableTask(request.activeTaskId, request, dependencies, registry);
       if (selection !== null) {
@@ -3208,6 +3309,16 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     now: (): Date => new Date(),
     discoverActiveTasks: (workspacePath: string): Promise<readonly TaskState[]> => store.discoverActiveTasks(workspacePath),
     recoverKnowledgeSnapshot: (taskId: string | null): Promise<MemoryRecoverySnapshot> => recoverConfiguredKnowledgeSnapshot(memoryDatabasePath, memoryRoot, memoryScopeId, root, taskId),
+    rebuildCurrentState: async (taskId: string, sourceKey?: string): Promise<CurationPipelineRebuild> => {
+      if (!existsSync(memoryDatabasePath)) return { status: "blocked", projectTaskId: taskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: "Local memory database is unavailable" };
+      let memoryStore: LocalSqliteMemoryStore | undefined;
+      try {
+        memoryStore = new LocalSqliteMemoryStore({ databasePath: memoryDatabasePath, workspacePath: memoryRoot, mode: "reader", scopeId: memoryScopeId, writerId: "primary-device" });
+        return await createCurationPipeline({ store: memoryStore, workspacePath: memoryRoot, repositoryPath: root }).rebuildCurrentState(taskId, "conversation", sourceKey);
+      } catch (error: unknown) {
+        return { status: "blocked", projectTaskId: taskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: error instanceof Error ? error.message : String(error) };
+      } finally { memoryStore?.close(); }
+    },
     curateCurrentContext: async (candidates: readonly CurationCandidate[], curationOptions: { readonly knownProjectTaskId: string | null; readonly taskScopeId?: string | null }): Promise<CurationResult> => {
         if (candidates.length === 0) return curateCurrentContext(null, candidates, curationOptions);
         validateCurationCandidates(candidates);

@@ -3,13 +3,14 @@ import { classifyUserIntent, type UserIntent } from "../automation/user-intent.j
 import type { CurationCandidate } from "../curation/local-curation.js";
 import type { CurationPipelineInput } from "../curation/current-view-pipeline.js";
 import type { AgentExecutionDirective, DeliveryRequest, DeliveryResult, PublicationAuthority } from "../automation/delivery.js";
-import type { DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
+import type { BossSessionRequest, DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
 
 export interface CodexActivationInput {
   readonly rawCommand: string;
   readonly taskId: string | null;
   readonly currentContext?: readonly CurationCandidate[];
   readonly curationSourceWindow?: CurationPipelineInput;
+  readonly bossSession?: BossSessionRequest;
 }
 
 export interface CodexActivationOptions {
@@ -31,6 +32,10 @@ function defaultsForStatus(): ReturnType<typeof parseDAIInvocation> {
 
 function isExplicitStatusOverride(text: string): boolean {
   return /^@D-AI\s+status(?:\s|[,，:：]|$)/iu.test(text.trim());
+}
+
+function isBossPreparationRequest(text: string): boolean {
+  return /^(?:(?:@D-AI\s+)?(?:换 Boss|新 Boss|rollover|prepare boss rollover))$/iu.test(text.trim().replace(/\s+/gu, " "));
 }
 
 function parseExplicitStatusInvocation(text: string): ReturnType<typeof parseDAIInvocation> {
@@ -63,6 +68,13 @@ function naturalResponse(input: CodexActivationInput, intent: UserIntent, status
 export function createCodexActivation(runtime: DAIRuntimeHandler, options: CodexActivationOptions = {}): (input: CodexActivationInput) => Promise<CodexActivationResponse> {
   return async (input: CodexActivationInput): Promise<CodexActivationResponse> => {
     const rawText = input.rawCommand.trim();
+    if (isBossPreparationRequest(rawText) || /^@D-AI\s+continue$/iu.test(rawText)) {
+      const prepare = isBossPreparationRequest(rawText);
+      const bossSession: BossSessionRequest = prepare
+        ? { ...input.bossSession, mode: "prepare", signals: { ...input.bossSession?.signals, explicitRollover: true }, ...(input.bossSession?.sourceKey !== undefined ? {} : input.curationSourceWindow === undefined ? {} : { sourceKey: input.curationSourceWindow.sourceKey }) }
+        : input.bossSession ?? { mode: "startup" };
+      return runtime({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: { model: null, role: null, environment: null, stage: null }, activeTaskId: input.taskId, bossSession });
+    }
     if (rawText.startsWith("@D-AI")) {
       const parsed = isExplicitStatusOverride(rawText) ? parseExplicitStatusInvocation(rawText) : parseDAIInvocation(rawText);
       return runtime({
@@ -72,6 +84,7 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         activeTaskId: input.taskId,
         ...(input.currentContext === undefined ? {} : { curationCandidates: input.currentContext }),
         ...(input.curationSourceWindow === undefined ? {} : { curationSourceWindow: input.curationSourceWindow }),
+        ...(input.bossSession === undefined ? {} : { bossSession: input.bossSession }),
       });
     }
 

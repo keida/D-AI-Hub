@@ -1497,8 +1497,18 @@ describe("D-AI runtime", () => {
       ...runtimeHarness.dependencies.adapters,
       work: adapterWithReceiveProbe(runtimeHarness.dependencies.adapters.work, (envelope) => { receivedHandoffIds.push(envelope.handoffId); }),
     };
-    const handle = createDAIRuntime({ ...runtimeHarness.dependencies, store: failingStore, adapters });
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies, store: failingStore, adapters,
+      discoverActiveTasks: async () => {
+        const taskId = runtimeHarness.savedStates.at(-1)?.taskId;
+        const state = taskId === undefined ? null : await runtimeHarness.store.load(taskId);
+        return state === null ? [] : [state];
+      },
+    });
     const accepted = await handle(intentRequest("chat", noOverrides));
+    const initial = await runtimeHarness.store.load(accepted.taskId);
+    if (initial === null) throw new InvalidTaskStateError("Expected a durable task state");
+    await runtimeHarness.store.save({ ...initial, contextManifest: [...initial.contextManifest, "local-project:123e4567-e89b-12d3-a456-426614174000"] });
 
     const result = await handle({ command: { kind: "handoff", target: "work" }, sourceEnvironment: "codex", overrides: noOverrides });
 
@@ -1510,8 +1520,11 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.handoffService.status(handoffId).state).toBe("rejected");
     await expect(runtimeHarness.store.load(accepted.taskId)).resolves.toMatchObject({ stage: "handoff", handoffState: "rejected" });
     const sourceStatus = await handle({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const bossStatus = await handle({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides, activeTaskId: accepted.taskId, bossSession: { mode: "startup" } });
     const targetStatus = await handle({ command: { kind: "status" }, sourceEnvironment: "work", overrides: noOverrides });
     expect(sourceStatus.status).toBe("blocked");
+    expect(bossStatus).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+    expect(bossStatus.message).toMatch(/ownership changed|failed handoff/i);
     expect(targetStatus.status).toBe("blocked");
     expect(runtimeHarness.savedStates.filter((state) => state.stage === "handoff").map((state) => state.handoffState)).toEqual([
       "pending",
