@@ -4,7 +4,7 @@ import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildCurationBoundarySha256, createCurationPipeline, extractCurationCandidates, hashCurationSourceKey, type CurationPipelineInput, type PipelineSourceMessage } from "../../src/curation/current-view-pipeline.js";
+import { buildCurationBoundarySha256, createCurationPipeline, extractCurationCandidates, hashCurationSourceKey, inspectRecoveryCompleteness, type CurationPipelineInput, type PipelineSourceMessage } from "../../src/curation/current-view-pipeline.js";
 import type { CurationCheckpoint } from "../../src/memory/types.js";
 import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 
@@ -36,6 +36,78 @@ async function fixture(): Promise<{ readonly root: string; readonly databasePath
 afterEach(async () => { await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
 
 describe("current-state curation pipeline", () => {
+  it("enumerates missing canonical fields without inventing values", () => {
+    expect(inspectRecoveryCompleteness("", null, [])).toMatchObject({
+      status: "INCOMPLETE", projection: "UNAVAILABLE", canonicalNextAction: null,
+      missingFields: ["project-identity", "task-pointer", "phase", "blockers", "nextAction", "authoritative-state"],
+    });
+  });
+
+  it("distinguishes an explicit canonical action from an incomplete recovery diagnostic", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
+      await pipeline.run(input([message("m-001", "Next action: verify current-state recovery.", { subjectKey: "atlas:next" })]));
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", currentView: { phase: null, nextAction: "verify current-state recovery." }, recoveryCompleteness: {
+        status: "INCOMPLETE", missingFields: ["phase"], projection: "UNAVAILABLE", canonicalNextAction: "verify current-state recovery.", diagnosticReason: expect.stringContaining("phase"),
+      } });
+      expect(await createCurationPipeline({ store, workspacePath: root }).rebuildCurrentState("task-atlas")).toMatchObject({ recoveryCompleteness: { status: "INCOMPLETE", missingFields: ["project-identity", "phase"] } });
+    } finally { store.close(); }
+  });
+
+  it("permits a complete projection only from explicit phase and nextAction facts", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
+      await pipeline.run(input([
+        message("m-001", "Current phase: pilot verification", { subjectKey: "atlas:phase" }),
+        message("m-002", "Next action: continue the accepted task.", { subjectKey: "atlas:next" }),
+      ]));
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ recoveryCompleteness: {
+        status: "COMPLETE", missingFields: [], projection: "AVAILABLE", canonicalNextAction: "continue the accepted task.", diagnosticReason: null,
+      } });
+      const view = rebuilt.currentView!;
+      expect(inspectRecoveryCompleteness("task-other", view, rebuilt.records, [], true)).toMatchObject({ status: "INCOMPLETE", canonicalNextAction: null, missingFields: ["task-pointer"] });
+      expect(inspectRecoveryCompleteness("task-atlas", { ...view, verificationStatus: "stale" }, rebuilt.records, [], true)).toMatchObject({ status: "INCOMPLETE", canonicalNextAction: null, missingFields: ["authoritative-state"] });
+      expect(inspectRecoveryCompleteness("task-atlas", view, rebuilt.records)).toMatchObject({ status: "INCOMPLETE", canonicalNextAction: null, missingFields: ["project-identity"] });
+    } finally { store.close(); }
+  });
+
+  it("reports lossy authoritative fields without presenting truncated nextAction as canonical", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
+      await pipeline.run(input([
+        message("m-001", `Current phase: ${"p".repeat(300)}`, { subjectKey: "atlas:phase" }),
+        message("m-002", `Current blocker: ${"b".repeat(300)}`, { subjectKey: "atlas:blocker" }),
+        message("m-003", `Next action: ${"n".repeat(300)}`, { subjectKey: "atlas:next" }),
+      ]));
+      await expect(pipeline.rebuildCurrentState("task-atlas")).resolves.toMatchObject({
+        projectionLosses: ["phase", "nextAction", "blocker"],
+        recoveryCompleteness: { status: "INCOMPLETE", missingFields: ["authoritative-projection"], projection: "UNAVAILABLE", canonicalNextAction: null },
+      });
+    } finally { store.close(); }
+  });
+
+  it("does not mistake a long limitation mentioning blocked work for blocker projection loss", async () => {
+    const { root, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
+      await pipeline.run(input([
+        message("m-001", "Current phase: pilot verification", { subjectKey: "atlas:phase" }),
+        message("m-002", "Next action: continue the accepted task.", { subjectKey: "atlas:next" }),
+      ]));
+      const limitation = `Constraint: blocked by an external schedule; ${"detail ".repeat(45)}`.trim();
+      await store.applyMutations([{ operation: "add", memoryId: "atlas-long-limitation", value: { kind: "curated-fact", fact: limitation, category: "project-memory", topicLabel: "workflow/process", critical: true, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:limitation", revision: 1, observedAt: "2026-09-13T00:00:01.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:01.000Z" }]);
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas");
+      expect(rebuilt).toMatchObject({ status: "available", projectionLosses: [], recoveryCompleteness: { status: "COMPLETE", projection: "AVAILABLE", missingFields: [] } });
+      expect(rebuilt.currentView?.limitations).toHaveLength(1);
+      expect(rebuilt.currentView?.blockers).toEqual([]);
+    } finally { store.close(); }
+  });
+
   it.each([
     ["Next action: ship the bounded fix.", "ship the bounded fix."],
     ["next action is ship the bounded fix.", "ship the bounded fix."],

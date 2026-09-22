@@ -448,6 +448,44 @@ const stageMatrixPolicies: readonly ModelPolicy[] = [
 ];
 
 describe("D-AI runtime", () => {
+  it("returns typed BLOCKED when canonical Boss task loading fails", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const seeded = await seedProjectState(runtimeHarness);
+    const failingStore: DAIRuntimeDependencies["store"] = {
+      ...runtimeHarness.dependencies.store,
+      load: async () => { throw new InvalidTaskStateError("durable task read failed"); },
+    };
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store: failingStore,
+      repositoryPath: workspacePath,
+      resolveRepositoryIdentity: async () => "github.com/acme/D-AI-Hub",
+      discoverActiveTasks: async () => [seeded],
+    });
+    const result = await runtime({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides, activeTaskId: seeded.taskId, bossSession: { mode: "startup" } });
+    expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED", startup: null, recoveryCompleteness: { status: "BLOCKED", projection: "UNAVAILABLE", canonicalNextAction: null } } });
+  });
+
+  it("fails closed when a rebuild provider omits projection-loss evidence", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const seeded = await seedProjectState(runtimeHarness);
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      repositoryPath: workspacePath,
+      resolveRepositoryIdentity: async () => "github.com/acme/D-AI-Hub",
+      discoverActiveTasks: async () => [seeded],
+      rebuildCurrentState: async () => ({
+        status: "available", projectTaskId: seeded.taskId, checkpoint: null, currentView: {
+          identity: seeded.taskId, phase: "pilot", milestones: [], currentWork: [], confirmedDecisions: [], blockers: [], limitations: [], nextAction: "resume canonical work.", verificationStatus: "verified", relevantMemoryIds: [], checkpointReference: null,
+        }, viewFresh: true, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO",
+      }),
+    });
+    const result = await runtime({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides, activeTaskId: seeded.taskId, bossSession: { mode: "startup" } });
+    expect(result).toMatchObject({ status: "blocked", message: expect.stringMatching(/projection-loss inspection is unavailable/i), bossSession: {
+      decision: "BLOCKED", startup: null, recoveryCompleteness: { status: "BLOCKED", projection: "UNAVAILABLE", canonicalNextAction: null },
+    } });
+  });
+
   it("redacts injected finalization markers and reason at the public runtime boundary", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const seeded = await seedProjectState(runtimeHarness);

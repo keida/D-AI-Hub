@@ -14,7 +14,7 @@ import { bootstrapTask, createLocalOnlyTaskReservationId, inspectGitMetadataMark
 import { closeTask, type CloseMode } from "../close/close-service.js";
 import { curateCurrentContext, validateCurationCandidates, type CurationCandidate, type CurationRecordResult, type CurationResult } from "../curation/local-curation.js";
 import { createKnowledgeQualityLoop, type CurationQualityReport, type MemoryRecoverySnapshot } from "../curation/knowledge-quality-loop.js";
-import { createCurationPipeline, type CurationFinalizationEvidence, type CurationPipelineInput, type CurationPipelineRebuild, type CurationPipelineResult } from "../curation/current-view-pipeline.js";
+import { createCurationPipeline, inspectRecoveryCompleteness, type CurationFinalizationEvidence, type CurationPipelineInput, type CurationPipelineRebuild, type CurationPipelineResult, type RecoveryCompleteness } from "../curation/current-view-pipeline.js";
 import { defaultBossSessionPolicy, deriveBossRecovery, evaluateBossSignals, type BossRecoveryContext, type BossSessionDecision, type BossSessionMode, type BossSessionPolicy, type BossSessionSignals } from "./boss-session-recovery.js";
 import { advanceDebugSession, createDebugSession, setDebugHypothesis, type DebugSession } from "../debugging/debug-session.js";
 import {
@@ -103,6 +103,7 @@ export interface DAIResponse {
     readonly nextAction: string | null;
     readonly currentStateVersion: number | null;
     readonly checkpointReference: string | null;
+    readonly recoveryCompleteness: RecoveryCompleteness;
     readonly startup: BossRecoveryContext | null;
     readonly handoff: BossRecoveryContext | null;
   };
@@ -203,7 +204,7 @@ export interface DAIRuntimeDependencies {
   readonly curateCurrentContext?: (candidates: readonly CurationCandidate[], options: { readonly knownProjectTaskId: string | null; readonly taskScopeId?: string | null }) => Promise<CurationResult>;
   readonly curateSourceWindow?: (input: CurationPipelineInput) => Promise<CurationPipelineResult>;
   readonly recoverKnowledgeSnapshot?: (taskId: string | null) => Promise<MemoryRecoverySnapshot>;
-  readonly rebuildCurrentState?: (taskId: string, sourceKey?: string) => Promise<CurationPipelineRebuild>;
+  readonly rebuildCurrentState?: (taskId: string, sourceKey?: string, canonicalProjectIdentityVerified?: boolean) => Promise<CurationPipelineRebuild>;
   readonly bossSessionPolicy?: BossSessionPolicy;
   readonly resolveRepositoryIdentity?: ResolveRepositoryIdentity | undefined;
   readonly workspacePath: string | null;
@@ -2824,19 +2825,21 @@ async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntime
   const mode = request.bossSession!.mode;
   const signals = request.bossSession!.signals ?? {};
   const triggers = evaluateBossSignals(signals, dependencies.bossSessionPolicy ?? defaultBossSessionPolicy).triggers;
-  const metadata = (decision: BossSessionDecision, context: BossRecoveryContext | null) => ({
+  const blockedCompleteness = (reason: string, missingFields: RecoveryCompleteness["missingFields"] = []): RecoveryCompleteness => ({ status: "BLOCKED", missingFields, projection: "UNAVAILABLE", canonicalNextAction: null, diagnosticReason: reason });
+  const metadata = (decision: BossSessionDecision, context: BossRecoveryContext | null, recoveryCompleteness: RecoveryCompleteness) => ({
     mode, decision, triggers,
     project: context?.project ?? null,
     phase: context?.phase ?? null,
     nextAction: context?.nextAction ?? null,
     currentStateVersion: context?.currentStateVersion ?? null,
     checkpointReference: context?.checkpointReference ?? null,
+    recoveryCompleteness,
     startup: mode === "startup" ? context : null,
     handoff: mode === "prepare" && decision === "ROLLOVER_PREPARED" ? context : null,
   });
-  const blocked = (message: string, state: TaskState | null = null): DAIResponse => ({
+  const blocked = (message: string, state: TaskState | null = null, recoveryCompleteness: RecoveryCompleteness = blockedCompleteness(message)): DAIResponse => ({
     ...(state === null ? blockedWithoutState(request.activeTaskId ?? "unassigned", request.sourceEnvironment, message) : response(state, "blocked", message)),
-    bossSession: metadata("BLOCKED", null),
+    bossSession: metadata("BLOCKED", null, recoveryCompleteness),
   });
   if (request.command.kind !== "status") return blocked("Boss recovery requires a read-only status command");
   if (dependencies.workspacePath === null) return blocked("Boss recovery requires a canonical workspace");
@@ -2845,32 +2848,46 @@ async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntime
   catch { return blocked("Boss recovery canonical task discovery failed closed"); }
   if (discovery.kind === "unavailable") return blocked(`Boss recovery is blocked: ${discovery.message}`);
   if (discovery.candidates.length !== 1 || discovery.allWorkspaceCandidates.length !== 1 || discovery.otherEnvironmentCandidates.length !== 0 || discovery.repositoryConflicts.length !== 0 || (discovery.mode === "repository" && discovery.localOnlyCandidates.length !== 0)) {
-    return blocked("Boss recovery requires exactly one canonical project task without identity conflicts");
+    const reason = "Boss recovery requires exactly one canonical project task without identity conflicts";
+    const onlyWorkspaceTask = discovery.allWorkspaceCandidates.length === 1 ? discovery.allWorkspaceCandidates[0]! : null;
+    const missingFields = onlyWorkspaceTask !== null && projectIdentityMode(onlyWorkspaceTask) === null
+      ? ["project-identity"] as const
+      : discovery.allWorkspaceCandidates.length === 0 ? ["task-pointer"] as const : [];
+    return blocked(reason, null, blockedCompleteness(reason, missingFields));
   }
   const discovered = discovery.candidates[0]!;
   if (request.activeTaskId !== undefined && request.activeTaskId !== null && request.activeTaskId !== discovered.taskId) return blocked("Explicit task identity conflicts with the canonical project task");
   const owner = registry.owner(discovered.taskId);
   if (registry.isBlocked(discovered.taskId) || (owner !== null && owner !== request.sourceEnvironment)) return blocked("Boss recovery is blocked because task ownership changed or a failed handoff remains");
-  const state = await dependencies.store.load(discovered.taskId).catch(() => null);
+  let state: TaskState | null;
+  try { state = await dependencies.store.load(discovered.taskId); }
+  catch { return blocked("Canonical durable task load failed closed"); }
   if (state === null || JSON.stringify(state) !== JSON.stringify(discovered)) return blocked("Canonical durable task changed during Boss recovery");
   const identity = await validateCurrentProjectIdentity(state, dependencies);
-  if (identity.kind !== "valid") return blocked(`Boss recovery identity is blocked: ${identity.message}`, state);
+  if (identity.kind !== "valid") {
+    const reason = `Boss recovery identity is blocked: ${identity.message}`;
+    return blocked(reason, state, blockedCompleteness(reason, projectIdentityMode(state) === null ? ["project-identity"] : []));
+  }
   const project = discovery.mode === "repository" ? remoteRepositoryIdentity(state) : localProjectIdentity(state);
   if (project === null) return blocked("Canonical project identity is missing", state);
   if (dependencies.rebuildCurrentState === undefined) return blocked("Authoritative current-state rebuild is unavailable", state);
   const sourceKey = request.bossSession!.sourceKey;
   let rebuilt: CurationPipelineRebuild;
-  try { rebuilt = await dependencies.rebuildCurrentState(state.taskId, sourceKey); }
+  try { rebuilt = await dependencies.rebuildCurrentState(state.taskId, sourceKey, true); }
   catch { return blocked("Authoritative current-state rebuild failed closed", state); }
-  if (mode === "prepare" && sourceKey !== undefined && rebuilt.checkpoint === null) return blocked("Requested rollover source has no canonical checkpoint", state);
+  if (rebuilt.status === "blocked") return blocked(`Authoritative current-state access is blocked: ${rebuilt.reason ?? "unavailable"}`, state);
+  if (rebuilt.projectionLosses === undefined) return blocked("Authoritative projection-loss inspection is unavailable", state);
+  const recoveryCompleteness = inspectRecoveryCompleteness(state.taskId, rebuilt.currentView, rebuilt.records, rebuilt.projectionLosses, true);
+  if (recoveryCompleteness.status !== "COMPLETE") return blocked(recoveryCompleteness.diagnosticReason ?? "Recovery is incomplete", state, recoveryCompleteness);
+  if (mode === "prepare" && sourceKey !== undefined && rebuilt.checkpoint === null) return blocked("Requested rollover source has no canonical checkpoint", state, recoveryCompleteness);
   let derived: ReturnType<typeof deriveBossRecovery>;
   try { derived = deriveBossRecovery(project, state, rebuilt, mode, signals, dependencies.bossSessionPolicy ?? defaultBossSessionPolicy); }
   catch { return blocked("Canonical Boss recovery projection failed closed", state); }
-  if (derived.decision === "BLOCKED" || derived.context === null) return blocked(`Boss recovery is blocked: ${derived.reason ?? "canonical state unavailable"}`, state);
+  if (derived.decision === "BLOCKED" || derived.context === null) return blocked(`Boss recovery is blocked: ${derived.reason ?? "canonical state unavailable"}`, state, recoveryCompleteness);
   try {
     const readBackState = await dependencies.store.load(state.taskId);
     const readBackDiscovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
-    const readBackView = await dependencies.rebuildCurrentState(state.taskId, sourceKey);
+    const readBackView = await dependencies.rebuildCurrentState(state.taskId, sourceKey, true);
     if (readBackState === null || JSON.stringify(readBackState) !== JSON.stringify(state)
       || readBackDiscovery.kind !== "available" || readBackDiscovery.mode !== discovery.mode || readBackDiscovery.repository !== discovery.repository
       || readBackDiscovery.candidates.length !== 1 || readBackDiscovery.allWorkspaceCandidates.length !== 1 || readBackDiscovery.candidates[0]?.taskId !== state.taskId
@@ -2881,7 +2898,7 @@ async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntime
   } catch { return blocked("Canonical Boss recovery final read-back failed closed", state); }
   return {
     ...response(state, "accepted", mode === "startup" ? `Boss startup reused canonical task ${state.taskId} and loaded authoritative state` : derived.decision === "ROLLOVER_PREPARED" ? `Boss rollover prepared for canonical task ${state.taskId}` : `Boss rollover assessment retained canonical task ${state.taskId}`),
-    bossSession: metadata(derived.decision, derived.context),
+    bossSession: metadata(derived.decision, derived.context, recoveryCompleteness),
   };
 }
 
@@ -3309,12 +3326,12 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     now: (): Date => new Date(),
     discoverActiveTasks: (workspacePath: string): Promise<readonly TaskState[]> => store.discoverActiveTasks(workspacePath),
     recoverKnowledgeSnapshot: (taskId: string | null): Promise<MemoryRecoverySnapshot> => recoverConfiguredKnowledgeSnapshot(memoryDatabasePath, memoryRoot, memoryScopeId, root, taskId),
-    rebuildCurrentState: async (taskId: string, sourceKey?: string): Promise<CurationPipelineRebuild> => {
+    rebuildCurrentState: async (taskId: string, sourceKey?: string, canonicalProjectIdentityVerified = false): Promise<CurationPipelineRebuild> => {
       if (!existsSync(memoryDatabasePath)) return { status: "blocked", projectTaskId: taskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: "Local memory database is unavailable" };
       let memoryStore: LocalSqliteMemoryStore | undefined;
       try {
         memoryStore = new LocalSqliteMemoryStore({ databasePath: memoryDatabasePath, workspacePath: memoryRoot, mode: "reader", scopeId: memoryScopeId, writerId: "primary-device" });
-        return await createCurationPipeline({ store: memoryStore, workspacePath: memoryRoot, repositoryPath: root }).rebuildCurrentState(taskId, "conversation", sourceKey);
+        return await createCurationPipeline({ store: memoryStore, workspacePath: memoryRoot, repositoryPath: root, canonicalProjectIdentityVerified }).rebuildCurrentState(taskId, "conversation", sourceKey);
       } catch (error: unknown) {
         return { status: "blocked", projectTaskId: taskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: error instanceof Error ? error.message : String(error) };
       } finally { memoryStore?.close(); }
