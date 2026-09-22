@@ -32,6 +32,7 @@ import {
   type EnvironmentExecutionResult,
   type ExternalDAIRequest,
 } from "../../src/runtime/d-ai-runtime.js";
+import type { CurationPipelineResult } from "../../src/curation/current-view-pipeline.js";
 import { discoverSkillMetadata, selectCapabilities } from "../../src/skills/registry.js";
 import { loadSelectedSkill } from "../../src/skills/skill-loader.js";
 import type {
@@ -447,6 +448,80 @@ const stageMatrixPolicies: readonly ModelPolicy[] = [
 ];
 
 describe("D-AI runtime", () => {
+  it("redacts injected finalization markers and reason at the public runtime boundary", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const seeded = await seedProjectState(runtimeHarness);
+    const secretMarker = ["sk", "proj", "a".repeat(20)].join("-");
+    const privateReason = "WORKPLACE-CONFIDENTIAL-FINALIZATION-DETAIL-MUST-NOT-APPEAR";
+    const privateSummary = "PRIVATE-INTERNAL-CURATION-SUMMARY-MUST-NOT-APPEAR";
+    const failedPipeline: CurationPipelineResult = {
+      status: "blocked",
+      mode: "bounded-fallback",
+      curation: {
+        status: "blocked",
+        counts: { added: 0, updated: 0, noOp: 0, deferred: 1, rejected: 0 },
+        records: [{ decision: "DEFER", memoryId: "private-result", category: "knowledge", summary: privateSummary }],
+        locallyStored: false,
+        readBackVerified: false,
+        safeToDeleteOriginalChat: "NO",
+        message: privateSummary,
+      },
+      checkpoint: null,
+      currentView: null,
+      checkpointAdvanced: false,
+      checkpointRecorded: false,
+      coverageAdvanced: false,
+      consolidated: false,
+      relatedMemoryIds: [],
+      safeToDeleteSuppliedContent: "NO",
+      safeToDeleteSourceChat: "NO",
+      finalization: {
+        earliestTrustedAnchor: { marker: "m-visible", boundarySha256: "0".repeat(64) },
+        latestCheckpoint: { checkpointId: "checkpoint-private", coveredThroughMarker: secretMarker, currentViewVersion: 1 },
+        chainComplete: false,
+        uncuratedTailCount: 0,
+        unresolvedCriticalCount: 0,
+        currentViewFresh: false,
+        freshRecovery: false,
+        safeToDeleteSourceChat: "NO",
+        reason: privateReason,
+      },
+      message: privateReason,
+    };
+    const handle = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      repositoryPath: workspacePath,
+      resolveRepositoryIdentity: async () => "github.com/acme/D-AI-Hub",
+      curateSourceWindow: async () => failedPipeline,
+    });
+    const result = await handle({
+      command: { kind: "curate" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      activeTaskId: seeded.taskId,
+      curationSourceWindow: {
+        sourceType: "conversation",
+        sourceKey: "runtime-finalization-redaction",
+        projectTaskId: seeded.taskId,
+        messages: [{ marker: "m-001", text: "Approved bounded finalization boundary.", observedAt: "2026-09-22T00:00:00.000Z", memoryId: "redaction-fact", subjectKey: "redaction:fact" }],
+        previousCoveredThroughMarker: null,
+        previousBoundarySha256: null,
+        sourceStartAttested: true,
+        coveredThroughMarker: "m-001",
+        boundarySha256: "0".repeat(64),
+        coverageConfidence: "complete",
+      },
+    });
+    const serialized = JSON.stringify(result);
+    expect(result).toMatchObject({ status: "blocked", curationPipeline: { curation: null, safeToDeleteSourceChat: "NO", finalization: { earliestTrustedAnchor: { marker: "m-visible" }, latestCheckpoint: { coveredThroughMarker: "[REDACTED]" }, safeToDeleteSourceChat: "NO", reason: "Source-chat finalization is blocked; source chat deletion remains NO" } } });
+    expect(serialized).not.toContain(secretMarker);
+    expect(serialized).not.toContain(privateReason);
+    expect(serialized).not.toContain(privateSummary);
+    expect(serialized).not.toContain("private-result");
+    expect(serialized).not.toContain("summary");
+    expect(result.message).toBe("Local curation pipeline blocked; no source chat deletion is permitted");
+  });
+
   it("fails closed when exact gate:<name> evidence is missing", async () => {
     const runtimeHarness = harness(genericCompletedExecution, evaluateHardGates, "YES");
 

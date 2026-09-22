@@ -5,6 +5,7 @@ import type { CurationQualityReport, MemoryRecoverySnapshot } from "./knowledge-
 export type CurationCategory = "knowledge" | "project-memory" | "cross-project-memory";
 export type CurationPrivacyRisk = "local-private" | "possible-workplace" | "workplace-confidential";
 export type CurationDecision = "ADD" | "UPDATE" | "NOOP" | "DEFER" | "REJECT";
+export type CurationTopicLabel = "architecture/decision" | "bug/root-cause" | "project status" | "preference" | "workflow/process" | "other/transient";
 
 export interface CurationCandidate {
   readonly candidateId: string;
@@ -13,6 +14,9 @@ export interface CurationCandidate {
   readonly category: CurationCategory;
   readonly source: "current-context";
   readonly privacyRisk: CurationPrivacyRisk;
+  readonly topicLabel?: CurationTopicLabel;
+  readonly critical?: boolean;
+  readonly relatedMemoryIds?: readonly string[];
   readonly revision?: number;
   readonly projectTaskId?: string;
   readonly subjectKey?: string;
@@ -86,6 +90,10 @@ function isPrivacyRisk(value: unknown): value is CurationPrivacyRisk {
   return value === "local-private" || value === "possible-workplace" || value === "workplace-confidential";
 }
 
+function isTopicLabel(value: unknown): value is CurationTopicLabel {
+  return value === "architecture/decision" || value === "bug/root-cause" || value === "project status" || value === "preference" || value === "workflow/process" || value === "other/transient";
+}
+
 function assertReferenceList(value: readonly string[] | undefined, label: string): void {
   if (value === undefined) return;
   if (!Array.isArray(value) || value.some((reference) => typeof reference !== "string" || reference.trim() !== reference || reference.length === 0 || reference.length > 512 || containsSecretShapedValue(reference))) {
@@ -114,6 +122,8 @@ export function assertCurationCandidate(candidate: CurationCandidate): void {
     throw new Error("Curation candidate memoryId is not a safe local identifier");
   }
   if (containsSecretShapedValue(candidate.fact)) throw new Error("Curation candidate fact contains secret-shaped content");
+  if (candidate.topicLabel !== undefined && !isTopicLabel(candidate.topicLabel)) throw new Error("Curation candidate topicLabel is not supported");
+  if (candidate.critical !== undefined && typeof candidate.critical !== "boolean") throw new Error("Curation candidate critical flag is invalid");
   if (candidate.revision !== undefined && (!Number.isSafeInteger(candidate.revision) || candidate.revision < 1)) {
     throw new Error("Curation candidate revision must be a positive integer");
   }
@@ -136,6 +146,7 @@ export function assertCurationCandidate(candidate: CurationCandidate): void {
   assertReferenceList(candidate.supersedesMemoryIds, "supersedesMemoryIds");
   assertReferenceList(candidate.evidenceRefs, "evidenceRefs");
   assertReferenceList(candidate.assetRefs, "assetRefs");
+  assertReferenceList(candidate.relatedMemoryIds, "relatedMemoryIds");
 }
 
 export function validateCurationCandidates(candidates: readonly CurationCandidate[]): void {
@@ -184,6 +195,9 @@ function valueFor(candidate: CurationCandidate, options: CurationOptions): Memor
     category: candidate.category,
     source: candidate.source,
     privacyRisk: candidate.privacyRisk,
+    ...(candidate.topicLabel === undefined ? {} : { topicLabel: candidate.topicLabel }),
+    ...(candidate.critical === undefined ? {} : { critical: candidate.critical }),
+    ...(candidate.relatedMemoryIds === undefined ? {} : { relatedMemoryIds: [...candidate.relatedMemoryIds] }),
     revision: candidate.revision ?? 1,
     projectTaskId: candidate.projectTaskId ?? null,
     subjectKey: candidate.subjectKey ?? candidate.memoryId,
