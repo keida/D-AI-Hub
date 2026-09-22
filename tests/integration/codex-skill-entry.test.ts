@@ -207,7 +207,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("returns BLOCKED when the configured Codex workspace is not a Git repository", async () => {
+  it("keeps generic intent read-only when a configured Codex workspace is local-only", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-connector-"));
     const workspacePath = join(root, "unrelated-workspace");
     const executionSkillPath = join(repositoryRoot, "tests", "fixtures", "skills", "typescript-execution");
@@ -222,7 +222,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       expect(result.exitCode, result.stderr).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
       expect(response).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
-      expect(response.message).toMatch(/Configured Codex.*Git repository root/i);
+      expect(response.message).toMatch(/No active local-only D-AI task matches this workspace/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

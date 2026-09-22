@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import type { Environment, TaskState } from "../domain/types.js";
 import type { DurableContextStore } from "../state/durable-context-store.js";
@@ -11,6 +11,7 @@ export interface BootstrapInput {
   readonly environment: Environment;
   readonly workspacePath: string | null;
   readonly repositoryPath: string | null;
+  readonly localProjectId?: string | null;
 }
 
 interface InspectedIdentity {
@@ -20,6 +21,45 @@ interface InspectedIdentity {
 }
 
 const excludedDirectoryNames: ReadonlySet<string> = new Set([".d-ai", ".git", "node_modules"]);
+const localProjectIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+export type GitMetadataInspection =
+  | { readonly kind: "absent" }
+  | { readonly kind: "present"; readonly markerPath: string };
+
+export async function inspectGitMetadataMarkers(suppliedPath: string): Promise<GitMetadataInspection> {
+  let currentPath: string;
+  try {
+    currentPath = await realpath(resolve(suppliedPath));
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new InvalidTaskStateError(`Unable to inspect Git metadata at ${resolve(suppliedPath)}: ${reason}`);
+  }
+  while (true) {
+    const markerPath = join(currentPath, ".git");
+    try {
+      await lstat(markerPath);
+      return { kind: "present", markerPath };
+    } catch (error: unknown) {
+      const code = typeof error === "object" && error !== null && "code" in error
+        ? String((error as { code?: unknown }).code)
+        : "";
+      if (code !== "ENOENT") {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new InvalidTaskStateError(`Unable to inspect Git metadata at ${markerPath}: ${reason}`);
+      }
+    }
+    const parentPath = dirname(currentPath);
+    if (parentPath === currentPath) return { kind: "absent" };
+    currentPath = parentPath;
+  }
+}
+
+export async function createLocalOnlyTaskReservationId(workspacePath: string, environment: Environment): Promise<string> {
+  const canonicalWorkspacePath = await realpath(resolve(workspacePath));
+  const stableWorkspacePath = process.platform === "win32" ? canonicalWorkspacePath.toLowerCase() : canonicalWorkspacePath;
+  return `task-${sha256(`local-only-reservation\n${environment}\n${stableWorkspacePath}`).slice(0, 24)}`;
+}
 
 function sha256(content: string | Buffer): string {
   return createHash("sha256").update(content).digest("hex");
@@ -79,12 +119,30 @@ function assertBootstrapInput(input: BootstrapInput): void {
   if (input.workspacePath === null && input.repositoryPath === null) {
     throw new InvalidTaskStateError("Bootstrap identity is ambiguous: provide workspacePath or repositoryPath");
   }
+  if (input.localProjectId !== undefined && input.localProjectId !== null) {
+    if (input.repositoryPath !== null) {
+      throw new InvalidTaskStateError("Local-only project identity cannot be combined with a repository identity");
+    }
+    if (!localProjectIdPattern.test(input.localProjectId)) {
+      throw new InvalidTaskStateError("Local-only project identity must be a UUID");
+    }
+  }
 }
 
 function assertRecoveredIdentity(state: TaskState, identities: readonly string[]): void {
   const storedIdentities = state.contextManifest.filter((entry) => entry.startsWith("identity:"));
-  if (storedIdentities.length !== identities.length || storedIdentities.some((entry) => !identities.includes(entry))) {
+  const expectedIdentities = identities.filter((entry) => entry.startsWith("identity:"));
+  if (storedIdentities.length !== expectedIdentities.length || storedIdentities.some((entry) => !expectedIdentities.includes(entry))) {
     throw new InvalidTaskStateError(`Bootstrap identity mismatch for task ${state.taskId}`);
+  }
+  const storedLocalProjects = state.contextManifest.filter((entry) => entry.startsWith("local-project:"));
+  const expectedLocalProjects = identities.filter((entry) => entry.startsWith("local-project:"));
+  const storedRemoteRepositories = state.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
+  if (storedLocalProjects.length !== expectedLocalProjects.length
+    || storedLocalProjects.some((entry) => !expectedLocalProjects.includes(entry))
+    || (expectedLocalProjects.length > 0 && storedRemoteRepositories.length > 0)
+    || (storedLocalProjects.length > 0 && storedRemoteRepositories.length > 0)) {
+    throw new InvalidTaskStateError(`Bootstrap project identity mismatch for task ${state.taskId}`);
   }
 }
 
@@ -94,6 +152,9 @@ export async function prepareBootstrapTask(input: BootstrapInput, store: Durable
     ...(input.workspacePath === null ? [] : [await inspectIdentity("workspace", input.workspacePath)]),
     ...(input.repositoryPath === null ? [] : [await inspectIdentity("repository", input.repositoryPath)]),
   ].map(serializeIdentity);
+  if (input.localProjectId !== undefined && input.localProjectId !== null) {
+    identities.push(`local-project:${input.localProjectId}`);
+  }
   const taskId = input.taskId ?? createTaskId(input.goal, input.environment, identities);
   const existingState = await store.load(taskId);
   if (existingState !== null) {
