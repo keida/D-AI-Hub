@@ -332,7 +332,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("blocks a configured Codex new task when Git root resolution fails without durable writes", async () => {
+  it("creates one local-only task when configured Codex has no Git root", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-configured-bootstrap-no-git-"));
     const workspacePath = join(root, "workspace");
     const durableRoot = join(root, "durable");
@@ -344,9 +344,15 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         taskId: null,
       });
 
-      expect(result).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
-      expect(result.message).toMatch(/configured Codex|Git repository|repository root/i);
-      await expect(readdir(durableRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(result).toMatchObject({ environment: "codex", status: "accepted", stage: "bootstrap" });
+      expect(result.message).toMatch(/local-only.*Git backing/i);
+      expect(result.taskId).toMatch(/^task-/u);
+      const store = new FileDurableContextStore(durableRoot);
+      const tasks = await store.discoverActiveTasks(workspacePath);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]?.taskId).toBe(result.taskId);
+      expect(tasks[0]?.contextManifest.filter((entry) => entry.startsWith("local-project:"))).toHaveLength(1);
+      expect(tasks[0]?.contextManifest.filter((entry) => entry.startsWith("remote-repository:"))).toHaveLength(0);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -370,17 +376,59 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     }
   });
 
-  it("blocks a configured Codex new task when origin inspection fails without durable writes", async () => {
+  it("creates and reuses one local-only task when configured Codex Git has no remotes", async () => {
     const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-no-origin-", null);
     try {
+      const activate = createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }));
+      const result = await activate({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+
+      expect(result).toMatchObject({ environment: "codex", status: "accepted", stage: "bootstrap" });
+      expect(result.message).toMatch(/local-only.*Git backing/i);
+      const repeated = await activate({ rawCommand: "@D-AI establish repository guarantee again", taskId: null });
+      expect(repeated).toMatchObject({ taskId: result.taskId, status: "accepted", stage: "bootstrap" });
+      const tasks = await new FileDurableContextStore(fixture.durableRoot).discoverActiveTasks(fixture.repositoryPath);
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]?.contextManifest.filter((entry) => entry.startsWith("local-project:"))).toHaveLength(1);
+      expect(tasks[0]?.contextManifest.filter((entry) => entry.startsWith("remote-repository:"))).toHaveLength(0);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks local-only establish when a zero-remote Git repository has a corrupt index", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-corrupt-index-", null);
+    try {
+      await writeFile(join(fixture.repositoryPath, ".git", "index"), "corrupted index\n", "utf8");
       const result = await createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,
         durableRoot: fixture.durableRoot,
       }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
 
       expect(result).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
-      expect(result.message).toMatch(/configured Codex|origin|inspect/i);
+      expect(result.message).toMatch(/Git|status|health|repository/i);
       await expect(readdir(fixture.durableRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the canonical origin identity when an unrelated secondary remote is configured", async () => {
+    const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-secondary-", "https://github.com/acme/d-ai.git");
+    try {
+      await git(fixture.repositoryPath, ["remote", "add", "backup", "https://github.com/other/d-ai.git"]);
+      const result = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: fixture.repositoryPath,
+        durableRoot: fixture.durableRoot,
+      }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
+
+      expect(result.taskId).toMatch(/^task-/u);
+      expect(result.status).toBe("blocked");
+      const state = await new FileDurableContextStore(fixture.durableRoot).load(result.taskId);
+      expect(state).not.toBeNull();
+      expect(state!.contextManifest.filter((entry) => entry.startsWith("remote-repository:"))).toEqual(["remote-repository:github.com/acme/d-ai"]);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }
@@ -486,14 +534,19 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         durableRoot: fixture.durableRoot,
       }));
       const first = await activate({ rawCommand: "@D-AI establish first task", taskId: null });
-      const second = await activate({ rawCommand: "@D-AI establish second task", taskId: null });
+      const firstState = await new FileDurableContextStore(fixture.durableRoot).load(first.taskId);
+      if (firstState === null) throw new Error("Expected the first configured task to persist");
+      const secondTaskId = "task-codex-configured-second";
+      const store = new FileDurableContextStore(fixture.durableRoot);
+      await store.createIfAbsent({ ...firstState, taskId: secondTaskId, durableContext: null });
+      expect(await store.discoverActiveTasks(fixture.repositoryPath)).toHaveLength(2);
       const before = await snapshotFiles(fixture.durableRoot);
 
       const result = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
 
       expect(result).toMatchObject({ taskId: "ambiguous", status: "blocked" });
       expect(result.message).toContain(first.taskId);
-      expect(result.message).toContain(second.taskId);
+      expect(result.message).toContain(secondTaskId);
       expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
@@ -560,7 +613,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     ["Git root", async (repositoryPath: string) => { await rename(join(repositoryPath, ".git"), join(repositoryPath, "..", "git-hidden")); await mkdir(join(repositoryPath, ".git")); }],
     ["origin", async (repositoryPath: string) => { await git(repositoryPath, ["remote", "remove", "origin"]); }],
     ["canonical remote identity", async (repositoryPath: string) => { await git(repositoryPath, ["remote", "set-url", "origin", "https://example.com/acme/d-ai.git"]); }],
-  ] as const)("preserves an existing configured Codex task when %s preflight becomes unavailable", async (_label, invalidateRepository) => {
+  ] as const)("blocks an existing configured Codex task when %s preflight becomes unavailable without local fallback", async (_label, invalidateRepository) => {
     const fixture = await createConfiguredBootstrapFixture("d-ai-configured-bootstrap-existing-preflight-", "https://github.com/acme/d-ai.git");
     try {
       const first = await createCodexActivation(createConfiguredDAIRuntime({
@@ -587,6 +640,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         }, lease);
       });
       await invalidateRepository(fixture.repositoryPath);
+      const before = await snapshotFiles(fixture.durableRoot);
 
       const result = await createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,
@@ -594,7 +648,9 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
       }))({ rawCommand: "@D-AI establish repository guarantee", taskId: null });
 
       expect(result).toMatchObject({ taskId: first.taskId, environment: "codex", status: "blocked" });
-      await expect(store.load(first.taskId)).resolves.toMatchObject({ taskId: first.taskId, stage: "recover" });
+      expect(result.message).toMatch(/repository-backed|Git identity|no local-only duplicate/i);
+      await expect(store.load(first.taskId)).resolves.toMatchObject({ taskId: first.taskId, stage: "bootstrap" });
+      expect(await snapshotFiles(fixture.durableRoot)).toEqual(before);
     } finally {
       await rm(fixture.root, { recursive: true, force: true });
     }

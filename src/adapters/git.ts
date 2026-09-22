@@ -309,6 +309,23 @@ export async function resolveGitRepositoryRoot(repositoryPath: string): Promise<
   ));
 }
 
+export async function inspectConfiguredGitRemotes(repositoryPath: string): Promise<readonly string[]> {
+  const root = await resolveGitRepositoryRoot(repositoryPath);
+  const output = (await runGitRead(root, ["remote"], "remote")).stdout;
+  if (output.length === 0) return [];
+  const lines = output.split(/\r?\n/u);
+  if (lines.at(-1) !== "") {
+    throw new GitLocalStateError("ambiguous", "Git remote listing has malformed command output");
+  }
+  lines.pop();
+  return lines.map((remote) => assertRemoteName(remote));
+}
+
+export async function inspectGitRepositoryHealth(repositoryPath: string): Promise<void> {
+  const root = await resolveGitRepositoryRoot(repositoryPath);
+  await runGitRead(root, ["status", "--porcelain=v1", "--untracked-files=all"], "status --porcelain=v1");
+}
+
 export async function inspectCurrentGitState(repositoryPath: string, remote: string): Promise<LocalGitState> {
   const root = await resolveGitRepositoryRoot(repositoryPath);
   const branch = outputValue(await runGitRead(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], "symbolic-ref --short HEAD"), "Git branch");

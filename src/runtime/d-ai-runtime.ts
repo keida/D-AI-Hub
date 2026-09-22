@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -7,9 +8,9 @@ import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { createCodexExecutionAdapter, createCodexRecoveryPointCapture } from "../adapters/codex-local.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
-import { inspectCurrentGitState, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
+import { inspectConfiguredGitRemotes, inspectCurrentGitState, inspectGitRepositoryHealth, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
 import { GitHubCliAdapter, resolveGitHubRepository, type GitHubAdapter } from "../adapters/github.js";
-import { bootstrapTask, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
+import { bootstrapTask, createLocalOnlyTaskReservationId, inspectGitMetadataMarkers, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
 import { closeTask, type CloseMode } from "../close/close-service.js";
 import { curateCurrentContext, validateCurationCandidates, type CurationCandidate, type CurationRecordResult, type CurationResult } from "../curation/local-curation.js";
 import { createKnowledgeQualityLoop, type CurationQualityReport, type MemoryRecoverySnapshot } from "../curation/knowledge-quality-loop.js";
@@ -24,6 +25,7 @@ import {
   UnsavedContextError,
   VerificationGateError,
 } from "../domain/errors.js";
+import { canonicalPath } from "../domain/canonical-path.js";
 import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { isDurableTaskId } from "../domain/task-id.js";
@@ -462,6 +464,7 @@ function validateExecutionResult(result: EnvironmentExecutionResult): Environmen
 
 const executionIdentityPrefixes = ["branch:", "remote:", "ref:", "artifact:commit:", "local-state:", "remote-repository:"] as const;
 const remoteRepositoryIdentityPattern = /^remote-repository:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const localProjectIdentityPattern = /^local-project:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const projectCandidateDisplayLimit = 3;
 const projectCandidateFieldMaxLength = 96;
 
@@ -1419,7 +1422,27 @@ async function executeIntent(
     }
     throw error;
   }
-  return registry.serializeMutation(
+  if (isExplicitNewTaskIntent(command.text)
+    && isLocalOnlyTask(bootstrapped)
+    && bootstrapped.durableContext === null
+    && dependencies.store.createIfAbsent !== undefined) {
+    return registry.serializeMutation(
+      bootstrapped.taskId,
+      async () => {
+        try {
+          const durableContext = await dependencies.store.createIfAbsent!(bootstrapped);
+          return response({ ...bootstrapped, durableContext }, "accepted", `Established local-only task ${bootstrapped.taskId}; Git backing is not available yet`);
+        } catch (error: unknown) {
+          if (!(error instanceof TaskOwnershipError)) throw error;
+          const raced = await waitForRacedLocalOnlyTask(bootstrapped.taskId, request, dependencies);
+          return raced === null
+            ? blockedWithoutState(bootstrapped.taskId, request.sourceEnvironment, error.message)
+            : response(raced, "accepted", `Reused local-only task ${raced.taskId}; Git backing is not available yet`);
+        }
+      },
+    );
+  }
+  const result = await registry.serializeMutation(
     bootstrapped.taskId,
     () => withDurableTaskOwnership(
       bootstrapped.taskId,
@@ -1432,14 +1455,80 @@ async function executeIntent(
             ? await persistState(dependencies.store, bootstrapped, lease)
             : bootstrapped
         );
+        if (isLocalOnlyTask(ownedBootstrap) && isExplicitNewTaskIntent(command.text)) {
+          return response(ownedBootstrap, "accepted", `Established local-only task ${ownedBootstrap.taskId}; Git backing is not available yet`);
+        }
         return executeIntentExclusive(request, ownedBootstrap, dependencies, registry, lease, transfer);
       },
     ),
   );
+  if (isExplicitNewTaskIntent(command.text)
+    && result.status === "blocked"
+    && dependencies.workspacePath !== null
+    && isLocalOnlyTask(bootstrapped)
+    && /actively owned|durable ownership/i.test(result.message)) {
+    const raced = await waitForRacedLocalOnlyTask(bootstrapped.taskId, request, dependencies);
+    if (raced !== null) return response(raced, "accepted", `Reused local-only task ${raced.taskId}; Git backing is not available yet`);
+  }
+  return result;
 }
 
 function isExplicitNewTaskIntent(text: string): boolean {
   return /^(?:establish|setup|initialize|new[- ]task)\b/iu.test(text.trim());
+}
+
+async function workspaceMutationKey(workspacePath: string): Promise<string> {
+  const canonicalWorkspacePath = await canonicalPath(workspacePath);
+  const stableWorkspacePath = process.platform === "win32" ? canonicalWorkspacePath.toLowerCase() : canonicalWorkspacePath;
+  return `workspace:${stableWorkspacePath.replaceAll("\\", "/")}`;
+}
+
+function isTransientLocalOnlyReservationLoadError(error: unknown, taskId: string): boolean {
+  return error instanceof InvalidTaskStateError
+    && error.message.startsWith(`Durable task state is missing for task ${taskId} at `)
+    && error.message.includes("while snapshot artifacts remain");
+}
+
+async function loadLocalOnlyReservationState(taskId: string, store: DurableContextStore): Promise<TaskState | null> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() <= deadline) {
+    try {
+      return await store.load(taskId);
+    } catch (error: unknown) {
+      if (!isTransientLocalOnlyReservationLoadError(error, taskId)) throw error;
+    }
+    await new Promise<void>((resolvePromise) => { setTimeout(resolvePromise, 25); });
+  }
+  throw new ConfiguredBootstrapPreflightError(`Configured Codex local-only reservation ${taskId} did not resolve within the bounded wait; durable state remains incomplete`);
+}
+
+async function waitForRacedLocalOnlyTask(
+  taskId: string,
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+): Promise<TaskState | null> {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() <= deadline) {
+    let raced: TaskState | null;
+    try {
+      raced = await dependencies.store.load(taskId);
+    } catch (error: unknown) {
+      if (!isTransientLocalOnlyReservationLoadError(error, taskId)) throw error;
+      raced = null;
+    }
+    if (raced !== null
+      && raced.stage !== "close"
+      && raced.environment === request.sourceEnvironment
+      && isLocalOnlyTask(raced)
+      && dependencies.workspacePath !== null
+      && await matchesWorkspaceIdentity(raced.contextManifest, dependencies.workspacePath)) {
+      const identity = await validateCurrentProjectIdentity(raced, dependencies);
+      if (identity.kind === "valid") return raced;
+      return null;
+    }
+    await new Promise<void>((resolvePromise) => { setTimeout(resolvePromise, 25); });
+  }
+  return null;
 }
 
 function remoteRepositoryIdentity(state: TaskState): string | null {
@@ -1451,40 +1540,168 @@ function remoteRepositoryIdentity(state: TaskState): string | null {
     : null;
 }
 
+function localProjectIdentity(state: TaskState): string | null {
+  const localEntries = state.contextManifest.filter((entry) => entry.startsWith("local-project:"));
+  if (localEntries.length !== 1 || state.contextManifest.some((entry) => entry.startsWith("remote-repository:"))) return null;
+  const identity = localEntries[0]!;
+  return localProjectIdentityPattern.test(identity) ? identity : null;
+}
+
+function isLocalOnlyTask(state: TaskState): boolean {
+  return localProjectIdentity(state) !== null;
+}
+
+function isRepositoryBackedTask(state: TaskState): boolean {
+  return state.contextManifest.some((entry) => entry.startsWith("remote-repository:"));
+}
+
+function projectIdentityMode(state: TaskState): "repository" | "local-only" | null {
+  if (isLocalOnlyTask(state)) return "local-only";
+  return remoteRepositoryIdentity(state) !== null && !state.contextManifest.some((entry) => entry.startsWith("local-project:"))
+    ? "repository"
+    : null;
+}
+
 type CanonicalWorkspaceTaskDiscovery =
-  | { readonly kind: "unavailable"; readonly message: string }
-  | { readonly kind: "available"; readonly repository: string; readonly candidates: readonly TaskState[] };
+  | { readonly kind: "unavailable"; readonly message: string; readonly repositoryCandidates: readonly TaskState[]; readonly otherEnvironmentCandidates: readonly TaskState[]; readonly allWorkspaceCandidates: readonly TaskState[] }
+  | {
+    readonly kind: "available";
+    readonly mode: "repository" | "local-only";
+    readonly repository: string | null;
+    readonly candidates: readonly TaskState[];
+    readonly localOnlyCandidates: readonly TaskState[];
+    readonly repositoryCandidates: readonly TaskState[];
+    readonly repositoryConflicts: readonly TaskState[];
+    readonly otherEnvironmentCandidates: readonly TaskState[];
+    readonly allWorkspaceCandidates: readonly TaskState[];
+  };
 
 async function discoverCanonicalWorkspaceTasks(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
 ): Promise<CanonicalWorkspaceTaskDiscovery> {
-  if (dependencies.workspacePath === null) return { kind: "unavailable", message: "Workspace identity is unavailable" };
-  if (dependencies.repositoryPath === null) return { kind: "unavailable", message: "Repository identity is unavailable" };
+  if (dependencies.workspacePath === null) return { kind: "unavailable", message: "Workspace identity is unavailable", repositoryCandidates: [], otherEnvironmentCandidates: [], allWorkspaceCandidates: [] };
   const discover = dependencies.discoverActiveTasks
     ?? (dependencies.store.discoverActiveTasks === undefined
       ? undefined
       : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
-  if (discover === undefined) return { kind: "unavailable", message: "Configured Codex task discovery is unavailable" };
-  if (dependencies.resolveRepositoryIdentity === undefined) return { kind: "unavailable", message: "Configured Codex repository identity is unavailable" };
+  if (discover === undefined) return { kind: "unavailable", message: "Configured Codex task discovery is unavailable", repositoryCandidates: [], otherEnvironmentCandidates: [], allWorkspaceCandidates: [] };
+  const discovered = await connectorOutcome(
+    () => discover(dependencies.workspacePath!),
+    (error) => error instanceof Error ? error.message : String(error),
+  );
+  if (discovered.kind === "blocked") return { kind: "unavailable", message: `Workspace task discovery blocked: ${discovered.message}`, repositoryCandidates: [], otherEnvironmentCandidates: [], allWorkspaceCandidates: [] };
+  const workspaceCandidates: TaskState[] = [];
+  const otherEnvironmentCandidates: TaskState[] = [];
+  for (const state of discovered.value) {
+    if (state.stage === "close" || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) continue;
+    if (state.environment === request.sourceEnvironment) workspaceCandidates.push(state);
+    else otherEnvironmentCandidates.push(state);
+  }
+  const localOnlyCandidates = workspaceCandidates.filter(isLocalOnlyTask).sort((left, right) => left.taskId.localeCompare(right.taskId));
+  const repositoryCandidates = workspaceCandidates.filter(isRepositoryBackedTask).sort((left, right) => left.taskId.localeCompare(right.taskId));
+  const allWorkspaceCandidates = [...workspaceCandidates, ...otherEnvironmentCandidates].sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (dependencies.repositoryPath === null) {
+    if (repositoryCandidates.length > 0) return { kind: "unavailable", message: "Repository-backed tasks exist but the current repository identity is unavailable", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+    return { kind: "available", mode: "local-only", repository: null, candidates: localOnlyCandidates, localOnlyCandidates, repositoryCandidates, repositoryConflicts: [], otherEnvironmentCandidates, allWorkspaceCandidates };
+  }
+  if (dependencies.resolveRepositoryIdentity === undefined) return { kind: "unavailable", message: "Configured Codex repository identity is unavailable", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
   let repository: string;
   try {
     repository = await dependencies.resolveRepositoryIdentity();
   } catch {
-    return { kind: "unavailable", message: "Configured Codex repository identity could not be resolved" };
+    try {
+      await resolveGitRepositoryRoot(dependencies.workspacePath);
+    } catch {
+      let metadata: Awaited<ReturnType<typeof inspectGitMetadataMarkers>>;
+      try {
+        metadata = await inspectGitMetadataMarkers(dependencies.workspacePath);
+      } catch {
+        return { kind: "unavailable", message: "Configured Codex Git metadata could not be inspected", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+      }
+      if (metadata.kind === "present") {
+        return { kind: "unavailable", message: "Configured Codex Git metadata exists but the repository root could not be resolved", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+      }
+      if (repositoryCandidates.length > 0) return { kind: "unavailable", message: "Configured Codex Git identity could not be resolved while repository-backed tasks exist in this workspace", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+      return { kind: "available", mode: "local-only", repository: null, candidates: localOnlyCandidates, localOnlyCandidates, repositoryCandidates, repositoryConflicts: [], otherEnvironmentCandidates, allWorkspaceCandidates };
+    }
+    try {
+      if ((await inspectConfiguredGitRemotes(dependencies.workspacePath)).length === 0) {
+        if (repositoryCandidates.length > 0) return { kind: "unavailable", message: "Configured Codex Git identity could not be resolved while repository-backed tasks exist in this workspace", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+        try {
+          await inspectGitRepositoryHealth(dependencies.workspacePath);
+        } catch {
+          return { kind: "unavailable", message: "Configured Codex Git repository health could not be verified", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+        }
+        return { kind: "available", mode: "local-only", repository: null, candidates: localOnlyCandidates, localOnlyCandidates, repositoryCandidates, repositoryConflicts: [], otherEnvironmentCandidates, allWorkspaceCandidates };
+      }
+    } catch {
+      return { kind: "unavailable", message: "Configured Codex Git metadata could not be inspected", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+    }
+    return { kind: "unavailable", message: "Configured Codex repository identity could not be resolved", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
   }
-  const discovered = await connectorOutcome(
-    () => discover(dependencies.workspacePath!),
-    closeConnectorFailure,
-  );
-  if (discovered.kind === "blocked") return { kind: "unavailable", message: `Workspace task discovery blocked: ${discovered.message}` };
-  const candidates: TaskState[] = [];
-  for (const state of discovered.value) {
-    if (state.stage === "close" || state.environment !== request.sourceEnvironment || remoteRepositoryIdentity(state) !== repository) continue;
-    if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
+  const candidates = workspaceCandidates
+    .filter((state) => projectIdentityMode(state) === "repository" && remoteRepositoryIdentity(state) === repository)
+    .sort((left, right) => left.taskId.localeCompare(right.taskId));
+  const repositoryConflicts = repositoryCandidates.filter((state) => !candidates.some((candidate) => candidate.taskId === state.taskId));
+  return { kind: "available", mode: "repository", repository, candidates, localOnlyCandidates, repositoryCandidates, repositoryConflicts, otherEnvironmentCandidates, allWorkspaceCandidates };
+}
+
+type ProjectIdentityValidation =
+  | { readonly kind: "valid" }
+  | { readonly kind: "blocked"; readonly message: string };
+
+async function validateCurrentProjectIdentity(
+  state: TaskState,
+  dependencies: DAIRuntimeDependencies,
+): Promise<ProjectIdentityValidation> {
+  const mode = projectIdentityMode(state);
+  if (mode === null) return { kind: "blocked", message: "Current durable task has a missing, malformed, or mixed project identity" };
+  if (mode === "local-only") {
+    if (dependencies.repositoryPath === null) return { kind: "valid" };
+    if (dependencies.resolveRepositoryIdentity === undefined) {
+      return { kind: "blocked", message: "Current Git identity is unavailable; local-only task use is blocked until project identity is verified" };
+    }
+    try {
+      await dependencies.resolveRepositoryIdentity();
+      return { kind: "blocked", message: "Local-only task is obsolete because this workspace now resolves to Git; require future explicit LOCAL → REPOSITORY IDENTITY PROMOTION" };
+    } catch {
+      try {
+        await resolveGitRepositoryRoot(dependencies.workspacePath ?? "");
+      } catch {
+        let metadata: Awaited<ReturnType<typeof inspectGitMetadataMarkers>>;
+        try {
+          metadata = await inspectGitMetadataMarkers(dependencies.workspacePath ?? "");
+        } catch {
+          return { kind: "blocked", message: "Current Git metadata could not be inspected; local-only task use is blocked until project identity is verified" };
+        }
+        return metadata.kind === "absent"
+          ? { kind: "valid" }
+          : { kind: "blocked", message: "Current Git metadata exists but its repository root could not be resolved; local-only task use is blocked and requires future explicit LOCAL → REPOSITORY IDENTITY PROMOTION" };
+      }
+      try {
+        if ((await inspectConfiguredGitRemotes(dependencies.workspacePath ?? "")).length === 0) {
+          await inspectGitRepositoryHealth(dependencies.workspacePath ?? "");
+          return { kind: "valid" };
+        }
+      } catch {
+        return { kind: "blocked", message: "Current Git metadata could not be inspected; local-only task use is blocked until project identity is verified" };
+      }
+      return { kind: "blocked", message: "Current Git identity could not be resolved; local-only task use is blocked and requires future explicit LOCAL → REPOSITORY IDENTITY PROMOTION" };
+    }
   }
-  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
-  return { kind: "available", repository, candidates };
+  if (dependencies.repositoryPath === null || dependencies.resolveRepositoryIdentity === undefined) {
+    return { kind: "blocked", message: "Current repository identity is unavailable; repository-backed task use is blocked" };
+  }
+  let repository: string;
+  try {
+    repository = await dependencies.resolveRepositoryIdentity();
+  } catch {
+    return { kind: "blocked", message: "Current repository identity could not be resolved; repository-backed task use is blocked" };
+  }
+  return remoteRepositoryIdentity(state) === repository
+    ? { kind: "valid" }
+    : { kind: "blocked", message: "Persisted repository identity conflicts with the inspected current repository; task use is blocked without writes" };
 }
 
 type CurationTaskIdentity =
@@ -1512,18 +1729,8 @@ async function resolveCurationTaskIdentity(
     if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
       return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: task does not belong to the current workspace" };
     }
-    if (dependencies.resolveRepositoryIdentity === undefined || dependencies.repositoryPath === null) {
-      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: canonical repository identity is unavailable" };
-    }
-    let repository: string;
-    try {
-      repository = await dependencies.resolveRepositoryIdentity();
-    } catch {
-      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: canonical repository identity could not be resolved" };
-    }
-    if (remoteRepositoryIdentity(state) !== repository) {
-      return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: task does not belong to the current canonical repository" };
-    }
+    const identity = await validateCurrentProjectIdentity(state, dependencies);
+    if (identity.kind === "blocked") return { kind: "blocked", taskId: state.taskId, message: `Curation task validation failed: ${identity.message}` };
     return { kind: "resolved", knownProjectTaskId: state.taskId };
   }
 
@@ -1532,6 +1739,12 @@ async function resolveCurationTaskIdentity(
     return hasProjectMemory
       ? { kind: "blocked", taskId: "unassigned", message: `${discovery.message}; project-memory curation remains blocked` }
       : { kind: "resolved", knownProjectTaskId: null };
+  }
+  if (discovery.mode === "repository" && discovery.localOnlyCandidates.length > 0) {
+    return { kind: "blocked", taskId: discovery.localOnlyCandidates[0]!.taskId, message: "Curation task validation failed: local-only task is obsolete because this workspace now resolves to Git; require future explicit LOCAL → REPOSITORY IDENTITY PROMOTION" };
+  }
+  if (discovery.repositoryConflicts.length > 0) {
+    return { kind: "blocked", taskId: discovery.repositoryConflicts[0]!.taskId, message: "Curation task validation failed: persisted repository identity conflicts with the inspected current repository" };
   }
   if (discovery.candidates.length > 1) {
     return {
@@ -1551,9 +1764,9 @@ async function selectGenericIntentTask(
   dependencies: DAIRuntimeDependencies,
 ): Promise<GenericIntentSelection | null> {
   if (request.sourceEnvironment !== "codex"
+    || dependencies.workspacePath === null
     || dependencies.repositoryPath === null
     || (dependencies.discoverActiveTasks === undefined && dependencies.store.discoverActiveTasks === undefined)
-    || dependencies.resolveRepositoryIdentity === undefined
     || isExplicitNewTaskIntent(request.command.kind === "intent" ? request.command.text : "")) return null;
   const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
   if (discovery.kind === "unavailable") {
@@ -1565,7 +1778,13 @@ async function selectGenericIntentTask(
   if (discovery.candidates.length === 0) {
     return {
       kind: "blocked",
-      response: blockedWithoutState("unassigned", request.sourceEnvironment, "No active D-AI task matches this canonical workspace and repository. Use @D-AI establish for explicit new-task authority"),
+      response: blockedWithoutState(
+        "unassigned",
+        request.sourceEnvironment,
+        discovery.mode === "local-only"
+          ? "No active local-only D-AI task matches this workspace. Use @D-AI establish for explicit new-task authority"
+          : "No active D-AI task matches this canonical workspace and repository. Use @D-AI establish for explicit new-task authority",
+      ),
     };
   }
   if (discovery.candidates.length > 1) {
@@ -1579,6 +1798,64 @@ async function selectGenericIntentTask(
     kind: "blocked",
     response: response(candidate, "blocked", `Generic intent matched active task ${candidate.taskId}, but no configured safe operation is available; no durable task was created or mutated`),
   };
+}
+
+async function selectExplicitLocalOnlyTask(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+): Promise<DAIResponse | null> {
+  if (request.command.kind !== "intent" || !isExplicitNewTaskIntent(request.command.text)) return null;
+  const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+  if (discovery.kind === "unavailable") {
+    if (discovery.repositoryCandidates.length > 0) {
+      return blockedWithoutState(
+        discovery.repositoryCandidates.length === 1 ? discovery.repositoryCandidates[0]!.taskId : "ambiguous",
+        request.sourceEnvironment,
+        `Current Git identity could not be resolved while repository-backed task(s) already exist: ${discovery.repositoryCandidates.map((candidate) => candidate.taskId).join(", ")}; no local-only duplicate was created`,
+      );
+    }
+    if (discovery.allWorkspaceCandidates.length > 0) {
+      return blockedWithoutState(
+        discovery.allWorkspaceCandidates.length === 1 ? discovery.allWorkspaceCandidates[0]!.taskId : "ambiguous",
+        request.sourceEnvironment,
+        `Active task(s) already match this workspace across environments or identity states: ${discovery.allWorkspaceCandidates.map((candidate) => candidate.taskId).join(", ")}; explicit local-only establish is blocked and no duplicate was created`,
+      );
+    }
+    return null;
+  }
+  if (discovery.mode === "local-only" && discovery.candidates.length > 1) {
+    return blockedWithoutState(
+      "ambiguous",
+      request.sourceEnvironment,
+      `Multiple active local-only D-AI tasks match this workspace: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`,
+    );
+  }
+  if (discovery.mode === "repository" && discovery.localOnlyCandidates.length > 0) {
+    const taskId = discovery.localOnlyCandidates.length === 1 ? discovery.localOnlyCandidates[0]!.taskId : "ambiguous";
+    return blockedWithoutState(
+      taskId,
+      request.sourceEnvironment,
+      `Local-only task${discovery.localOnlyCandidates.length === 1 ? ` ${taskId}` : "s"} already exists in this workspace; automatic promotion to a repository identity is blocked and no new task was created`,
+    );
+  }
+  if (discovery.allWorkspaceCandidates.length > 0 && !(discovery.mode === "local-only" && discovery.candidates.length === 1 && discovery.allWorkspaceCandidates.length === 1)) {
+    return blockedWithoutState(
+      discovery.allWorkspaceCandidates.length === 1 ? discovery.allWorkspaceCandidates[0]!.taskId : "ambiguous",
+      request.sourceEnvironment,
+      `Active task(s) already match this workspace across environments or identity states: ${discovery.allWorkspaceCandidates.map((candidate) => candidate.taskId).join(", ")}; explicit local-only establish is blocked and no duplicate was created`,
+    );
+  }
+  if (discovery.mode === "repository") return null;
+  if (discovery.candidates.length === 0) return null;
+  if (discovery.candidates.length > 1) {
+    return blockedWithoutState(
+      "ambiguous",
+      request.sourceEnvironment,
+      `Multiple active local-only D-AI tasks match this workspace: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`,
+    );
+  }
+  const candidate = discovery.candidates[0]!;
+  return response(candidate, "accepted", `Reused the existing local-only task ${candidate.taskId}; repeated establish created no duplicate task`);
 }
 
 async function continueTaskExclusive(
@@ -2347,6 +2624,12 @@ async function selectExplicitDurableTask(
   if (state.environment !== request.sourceEnvironment) {
     return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
   }
+  if (dependencies.repositoryPath !== null
+    && dependencies.resolveRepositoryIdentity !== undefined
+    && (dependencies.discoverActiveTasks !== undefined || dependencies.store.discoverActiveTasks !== undefined)) {
+    const identity = await validateCurrentProjectIdentity(state, dependencies);
+    if (identity.kind === "blocked") return response(state, "blocked", identity.message);
+  }
   const owner = registry.owner(state.taskId);
   if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
     return response(state, "blocked", `Task ${state.taskId} ownership changed while durable task selection was loading state`);
@@ -2363,19 +2646,47 @@ async function selectDiscoveredDurableTask(
   if (dependencies.workspacePath === null) {
     return blockedWithoutState("unassigned", request.sourceEnvironment, "Workspace identity is unavailable; select a task explicitly");
   }
-  const discover = dependencies.discoverActiveTasks
-    ?? (dependencies.store.discoverActiveTasks === undefined
-      ? undefined
-      : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
-  if (discover === undefined) return null;
-  const discovered = await connectorOutcome(
-    () => discover(dependencies.workspacePath!),
-    closeConnectorFailure,
-  );
-  if (discovered.kind === "blocked") {
-    return blockedWithoutState("unassigned", request.sourceEnvironment, `Workspace task discovery blocked: ${discovered.message}`);
+  let candidates: TaskState[];
+  if (dependencies.repositoryPath !== null && dependencies.resolveRepositoryIdentity !== undefined) {
+    const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+    if (discovery.kind === "unavailable") {
+      if (discovery.otherEnvironmentCandidates.length > 0 && discovery.repositoryCandidates.length === 0) {
+        const candidate = discovery.otherEnvironmentCandidates[0]!;
+        return response(candidate, "blocked", `Task ${candidate.taskId} is owned by ${candidate.environment}, not ${request.sourceEnvironment}`);
+      }
+      const taskId = discovery.repositoryCandidates.length === 1 ? discovery.repositoryCandidates[0]!.taskId : "unassigned";
+      return blockedWithoutState(taskId, request.sourceEnvironment, `${discovery.message}; workspace task selection is blocked without writes`);
+    }
+    if (discovery.otherEnvironmentCandidates.length > 0 && discovery.candidates.length === 0) {
+      const candidate = discovery.otherEnvironmentCandidates[0]!;
+      return response(candidate, "blocked", `Task ${candidate.taskId} is owned by ${candidate.environment}, not ${request.sourceEnvironment}`);
+    }
+    if (discovery.otherEnvironmentCandidates.length > 0) {
+      return blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this workspace: ${[...discovery.candidates, ...discovery.otherEnvironmentCandidates].map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> to disambiguate`);
+    }
+    if (discovery.mode === "repository" && discovery.localOnlyCandidates.length > 0) {
+      return response(discovery.localOnlyCandidates[0]!, "blocked", "Local-only task is obsolete because this workspace now resolves to Git; require future explicit LOCAL → REPOSITORY IDENTITY PROMOTION");
+    }
+    if (discovery.repositoryConflicts.length > 0) {
+      return response(discovery.repositoryConflicts[0]!, "blocked", "Persisted repository identity conflicts with the inspected current repository; workspace task selection is blocked");
+    }
+    candidates = [...discovery.candidates];
+  } else {
+    const discover = dependencies.discoverActiveTasks
+      ?? (dependencies.store.discoverActiveTasks === undefined
+        ? undefined
+        : (workspacePath: string): Promise<readonly TaskState[]> => dependencies.store.discoverActiveTasks!(workspacePath));
+    if (discover === undefined) return null;
+    const discovered = await connectorOutcome(
+      () => discover(dependencies.workspacePath!),
+      closeConnectorFailure,
+    );
+    if (discovered.kind === "blocked") {
+      return blockedWithoutState("unassigned", request.sourceEnvironment, `Workspace task discovery blocked: ${discovered.message}`);
+    }
+    candidates = [...discovered.value];
   }
-  const candidates = [...discovered.value].sort((left, right) => left.taskId.localeCompare(right.taskId));
+  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
   if (candidates.length === 0) {
     return blockedWithoutState(
       "unassigned",
@@ -2595,6 +2906,29 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
       }
     }
     if (request.command.kind === "sync") {
+      if (request.sourceEnvironment === "codex") {
+        const localTask = request.activeTaskId === undefined || request.activeTaskId === null
+          ? null
+          : await dependencies.store.load(request.activeTaskId);
+        if (localTask !== null
+          && isLocalOnlyTask(localTask)
+          && dependencies.workspacePath !== null
+          && await matchesWorkspaceIdentity(localTask.contextManifest, dependencies.workspacePath)) {
+          return blockedWithoutState(localTask.taskId, request.sourceEnvironment, "Sync is blocked for a local-only project identity; Git backing is required and no durable task was created or mutated");
+        }
+        if (request.activeTaskId === undefined || request.activeTaskId === null) {
+          const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+          if (discovery.kind === "available" && discovery.mode === "local-only") {
+            if (discovery.candidates.length > 1) {
+              return blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active local-only D-AI tasks match this workspace; sync is blocked without writes: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}`);
+            }
+            const candidate = discovery.candidates[0];
+            if (candidate !== undefined) {
+              return blockedWithoutState(candidate.taskId, request.sourceEnvironment, "Sync is blocked for a local-only project identity; Git backing is required and no durable task was created or mutated");
+            }
+          }
+        }
+      }
       return blockedWithoutState(
         request.activeTaskId ?? "unassigned",
         request.sourceEnvironment,
@@ -2620,9 +2954,18 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
       }
     }
     if (request.command.kind === "intent") {
-      const selection = await selectGenericIntentTask(request, dependencies);
-      if (selection?.kind === "blocked") return selection.response;
-      return executeIntent(request, request.command, dependencies, registry);
+      const intentCommand = request.command;
+      const runIntent = async (): Promise<DAIResponse> => {
+        const explicitLocalSelection = await selectExplicitLocalOnlyTask(request, dependencies);
+        if (explicitLocalSelection !== null) return explicitLocalSelection;
+        const selection = await selectGenericIntentTask(request, dependencies);
+        if (selection?.kind === "blocked") return selection.response;
+        return executeIntent(request, intentCommand, dependencies, registry);
+      };
+      if (isExplicitNewTaskIntent(intentCommand.text) && dependencies.workspacePath !== null) {
+        return registry.serializeMutation(await workspaceMutationKey(dependencies.workspacePath), runIntent);
+      }
+      return runIntent();
     }
     if (request.command.kind === "continue") {
       if (request.activeTaskId === undefined || request.activeTaskId === null) {
@@ -2735,38 +3078,83 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
   });
   const codexExecution = createCodexExecutionAdapter(() => new Date(), enterpriseHost);
   const codexRecovery = createCodexRecoveryPointCapture(() => new Date(), enterpriseHost);
+  const resolveConfiguredRepositoryIdentity = async (repositoryPath: string): Promise<string> => {
+    const configuredRemotes = await inspectConfiguredGitRemotes(repositoryPath);
+    if (configuredRemotes.length === 0) throw new InvalidTaskStateError("Configured Git repository has no remote identity");
+    const origin = await inspectCurrentGitState(repositoryPath, "origin");
+    return resolveGitHubRepository(origin.remoteUrl, enterpriseHost).repository;
+  };
+  const prepareConfiguredLocalOnlyTask = async (input: BootstrapInput, configuredStore: DurableContextStore): Promise<TaskState> => {
+    let localOnlyTaskId: string;
+    try {
+      localOnlyTaskId = await createLocalOnlyTaskReservationId(input.workspacePath!, input.environment);
+    } catch {
+      throw new ConfiguredBootstrapPreflightError("Configured Codex local-only workspace identity could not be resolved");
+    }
+    const localOnlyInput: BootstrapInput = { ...input, taskId: localOnlyTaskId, repositoryPath: null };
+    const existing = await loadLocalOnlyReservationState(localOnlyTaskId, configuredStore);
+    if (existing !== null) {
+      if (existing.stage === "close"
+        || existing.environment !== input.environment
+        || !isLocalOnlyTask(existing)
+        || !await matchesWorkspaceIdentity(existing.contextManifest, input.workspacePath!)) {
+        throw new ConfiguredBootstrapPreflightError("Configured Codex local-only reservation conflicts with the current workspace or environment");
+      }
+      return existing;
+    }
+    if (isExplicitNewTaskIntent(input.goal)) {
+      try {
+        return await prepareBootstrapTask({
+          ...localOnlyInput,
+          localProjectId: randomUUID(),
+        }, configuredStore);
+      } catch (error: unknown) {
+        if (isBootstrapIdentityInspectionFailure(error)) {
+          throw new ConfiguredBootstrapPreflightError("Configured Codex local-only workspace identity could not be resolved");
+        }
+        throw error;
+      }
+    }
+    throw new ConfiguredBootstrapPreflightError("Configured Codex Git repository root could not be resolved");
+  };
   const prepareConfiguredBootstrapTask = async (input: BootstrapInput, configuredStore: DurableContextStore): Promise<TaskState> => {
     if (input.environment === "codex" && input.workspacePath !== null && input.repositoryPath === root) {
       let repositoryPath: string;
       try {
         repositoryPath = await resolveGitRepositoryRoot(input.workspacePath);
       } catch {
-        let existing: TaskState;
+        let metadata: Awaited<ReturnType<typeof inspectGitMetadataMarkers>>;
         try {
-          existing = await prepareBootstrapTask(input, configuredStore);
-        } catch (error: unknown) {
-          if (isBootstrapIdentityInspectionFailure(error)) {
-            throw new ConfiguredBootstrapPreflightError("Configured Codex Git repository root could not be resolved");
-          }
-          throw error;
+          metadata = await inspectGitMetadataMarkers(input.workspacePath);
+        } catch {
+          throw new ConfiguredBootstrapPreflightError("Configured Codex Git metadata could not be inspected");
         }
-        if (existing.durableContext !== null) return existing;
-        throw new ConfiguredBootstrapPreflightError("Configured Codex Git repository root could not be resolved");
+        if (metadata.kind === "present") {
+          throw new ConfiguredBootstrapPreflightError(`Configured Codex Git metadata exists at ${metadata.markerPath}, but the repository root could not be resolved`);
+        }
+        return prepareConfiguredLocalOnlyTask(input, configuredStore);
+      }
+      let configuredRemotes: readonly string[];
+      try {
+        configuredRemotes = await inspectConfiguredGitRemotes(repositoryPath);
+      } catch {
+        throw new ConfiguredBootstrapPreflightError("Configured Codex Git metadata could not be inspected");
+      }
+      if (configuredRemotes.length === 0) {
+        try {
+          await inspectGitRepositoryHealth(repositoryPath);
+        } catch {
+          throw new ConfiguredBootstrapPreflightError("Configured Codex Git repository health could not be verified");
+        }
+        return prepareConfiguredLocalOnlyTask(input, configuredStore);
       }
       const prepared = await prepareBootstrapTask({ ...input, repositoryPath }, configuredStore);
-      let local;
-      try {
-        local = await inspectCurrentGitState(input.workspacePath, "origin");
-      } catch {
-        if (prepared.durableContext !== null) return prepared;
-        throw new ConfiguredBootstrapPreflightError("Configured Codex origin remote could not be inspected");
-      }
       let remoteRepository: string;
       try {
-        remoteRepository = resolveGitHubRepository(local.remoteUrl, enterpriseHost).repository;
+        remoteRepository = await resolveConfiguredRepositoryIdentity(repositoryPath);
       } catch {
         if (prepared.durableContext !== null) return prepared;
-        throw new ConfiguredBootstrapPreflightError("Configured Codex GitHub repository identity could not be resolved from origin");
+        throw new ConfiguredBootstrapPreflightError("Configured Codex GitHub repository identity could not be resolved from configured remotes");
       }
       const remoteEntries = prepared.contextManifest.filter((entry) => entry.startsWith("remote-repository:"));
       if (remoteEntries.length > 1 || (remoteEntries.length === 1 && remoteEntries[0] !== `remote-repository:${remoteRepository}`)) {
@@ -2789,8 +3177,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
     workspacePath: root,
     repositoryPath: root,
     resolveRepositoryIdentity: async (): Promise<string> => {
-      const local = await inspectCurrentGitState(root, "origin");
-      return resolveGitHubRepository(local.remoteUrl, enterpriseHost).repository;
+      return resolveConfiguredRepositoryIdentity(root);
     },
     skillRoots: [join(root, ".agents", "skills")],
     modelPolicies: defaultModelPolicies,

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
-import { inspectCurrentGitState, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, literalExcludePathspec } from "../../src/adapters/git.js";
+import { inspectConfiguredGitRemotes, inspectCurrentGitState, inspectGitRepositoryHealth, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, literalExcludePathspec } from "../../src/adapters/git.js";
 
 async function git(cwd: string | null, argumentsList: readonly string[]): Promise<void> {
   await runCommand({ command: "git", arguments: argumentsList, cwd });
@@ -161,6 +161,35 @@ describe("inspectLocalGitState", () => {
 
       expect(state.worktreeStatus).toContain("notes.txt");
       expect(state.worktreeStatus).not.toContain(".d-ai");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports exactly the configured Git remote names, including zero", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-git-configured-remotes-"));
+    try {
+      await git(root, ["init", "-b", "main"]);
+      await expect(inspectConfiguredGitRemotes(root)).resolves.toEqual([]);
+      await git(root, ["remote", "add", "origin", "https://github.com/example/d-ai.git"]);
+      await git(root, ["remote", "add", "backup", "https://github.com/example/d-ai-backup.git"]);
+      await expect(inspectConfiguredGitRemotes(root)).resolves.toEqual(["backup", "origin"]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a corrupt Git index during repository health inspection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-git-health-corrupt-index-"));
+    try {
+      await git(root, ["init", "-b", "main"]);
+      await git(root, ["config", "user.email", "d-ai-test@example.invalid"]);
+      await git(root, ["config", "user.name", "D-AI Test"]);
+      await writeFile(join(root, "tracked.txt"), "tracked\n", "utf8");
+      await git(root, ["add", "tracked.txt"]);
+      await git(root, ["commit", "-m", "test: corrupt index health"]);
+      await writeFile(join(root, ".git", "index"), "corrupted index\n", "utf8");
+      await expect(inspectGitRepositoryHealth(root)).rejects.toThrow(/status|index|Git/i);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
