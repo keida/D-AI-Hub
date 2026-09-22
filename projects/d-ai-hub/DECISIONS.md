@@ -1,5 +1,25 @@
 # Decisions
 
+## 2026-09-22 — Accept Project-Owned Lifecycle Handoff as DAI-ARCH-002
+
+**Context**
+
+Skill Pulse project Boss independently accepted its natural production run, but D-AI-Hub's orchestration task `task-7b959c2155241137b16a5220` remains at `route`. The ordinary lifecycle correctly rejects `route → verify`; D-AI-Hub did not perform `plan`, `execute`, or `inspect`, so those stages cannot be recorded as if they occurred. This is one confirmed cross-project lifecycle blocker, not evidence that ordinary transitions should be relaxed.
+
+**Decision**
+
+Accept the bounded architecture ticket [DAI-ARCH-002 — Project-Owned Lifecycle Handoff](ROADMAP.md#dai-arch-002--project-owned-lifecycle-handoff-accepted-deferred). Its goal is an explicit, typed ingestion and reconciliation boundary for evidence from the declared project execution owner, preserving provenance, fail-closed behavior, idempotency, ordinary transitions, and the separation between project execution and D-AI-Hub orchestration. The implementation form remains open; this decision does not prescribe a stage, synthetic transition, event, or command.
+
+Keep the Skill Pulse durable task and its `route` stage unchanged and unclosed, marked `BLOCKED — awaiting lifecycle handoff capability`. Do not start DAI-ARCH-002 implementation now. Complete P3, P4, and DAI-ARCH-001 publication in order; dispatch DAI-ARCH-002 only after DAI-ARCH-001 enters canonical main, from the then-current canonical base.
+
+**Consequences**
+
+Project Boss continues to own project-internal execution, review, and acceptance. D-AI-Hub retains the orchestration pointer and durable state without duplicating that execution. Neither project acceptance alone nor an arbitrary caller may close the D-AI-Hub task; the evidence and owner must pass the future handoff contract. Existing `route → plan → execute → inspect → verify` behavior is unchanged until a separately reviewed implementation is authorized.
+
+**Revisit trigger**
+
+Design and dispatch after DAI-ARCH-001 is canonical. Any broader lifecycle redesign or automatic project-result ingestion requires separate evidence and scope approval.
+
 ## 2026-09-04 — Separate privacy intent from live GitHub visibility
 
 **Context**

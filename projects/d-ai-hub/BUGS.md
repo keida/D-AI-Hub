@@ -2,6 +2,17 @@
 
 ## Open
 
+### BUG-006 — Project-owned acceptance cannot enter D-AI-Hub orchestration lifecycle
+
+- Severity: high workflow blocker for the affected cross-project task.
+- Status: open; tracked by accepted, deferred [DAI-ARCH-002](ROADMAP.md#dai-arch-002--project-owned-lifecycle-handoff-accepted-deferred).
+- Project/task: Skill Pulse F3 / `task-7b959c2155241137b16a5220`; project execution owner is Skill Pulse project Boss.
+- Observed: project Boss accepted SP-OPS-006 from the natural production run, while the D-AI-Hub durable task remains at `route`. A direct `route → verify` attempt was rejected by the ordinary transition guard.
+- Project Boss evidence reported for the 2026-09-22 13:30:01 Pacific/Auckland natural run: Scheduler result `0`, collector and snapshot validation PASS, snapshot commit `0b41473d…`, Netlify production deploy ready, immutable and alias manifests HTTP 200, Git-blob SHA-256 provenance PASS, with no manual trigger, retry, or repair. This is project acceptance evidence, not a D-AI lifecycle transition.
+- Expected: a typed, owner-authenticated and evidence-backed project-result handoff can reconcile D-AI-Hub orchestration without recording D-AI execution stages that did not occur.
+- Current handling: task remains at `route`, unclosed, `BLOCKED — awaiting lifecycle handoff capability`; no manual rewrite, forced transition, or fake intermediate stage.
+- Resolution condition: DAI-ARCH-002 is implemented and independently verified after the prerequisite publication sequence, then the real Skill Pulse evidence is reconciled through that accepted mechanism.
+
 ### BUG-001 — Local Git CLI authentication may be unavailable in a new environment
 
 - Severity: medium
