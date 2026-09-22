@@ -183,6 +183,8 @@ describe("inspectLocalGitState", () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-git-health-corrupt-index-"));
     try {
       await git(root, ["init", "-b", "main"]);
+      await git(root, ["config", "user.email", "d-ai-test@example.invalid"]);
+      await git(root, ["config", "user.name", "D-AI Test"]);
       await writeFile(join(root, "tracked.txt"), "tracked\n", "utf8");
       await git(root, ["add", "tracked.txt"]);
       await git(root, ["commit", "-m", "test: corrupt index health"]);
