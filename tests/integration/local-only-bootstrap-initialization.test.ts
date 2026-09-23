@@ -50,6 +50,60 @@ function deferred() {
   return { promise, resolve };
 }
 
+interface PausedInitialization {
+  readonly root: string;
+  readonly workspacePath: string;
+  readonly taskId: string;
+  readonly taskRoot: string;
+  readonly durableRoot: string;
+  readonly store: FileDurableContextStore;
+}
+
+async function withPausedInitialization(run: (fixture: PausedInitialization) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "d-ai-p3r-guard-"));
+  const workspacePath = join(root, "workspace");
+  const durableRoot = join(root, "durable");
+  await mkdir(workspacePath, { recursive: true });
+  const taskId = await createLocalOnlyTaskReservationId(workspacePath, "codex");
+  const taskRoot = join(durableRoot, taskId);
+  const stateCommitEntered = deferred();
+  const releaseStateCommit = deferred();
+  barrier.statePath = join(taskRoot, "state.json");
+  barrier.stateCommitEntered = stateCommitEntered.resolve;
+  barrier.releaseStateCommit = releaseStateCommit.promise;
+  const store = new FileDurableContextStore(durableRoot);
+  const writer = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({
+    rawCommand: "@D-AI establish guard writer", taskId: null,
+  });
+  let completed = false;
+  try {
+    const first = await Promise.race([
+      stateCommitEntered.promise.then(() => ({ kind: "state-commit" as const })),
+      writer.then(
+        () => ({ kind: "writer-completed" as const }),
+        (error: unknown) => ({ kind: "writer-failed" as const, error }),
+      ),
+    ]);
+    if (first.kind === "writer-failed") throw first.error;
+    if (first.kind === "writer-completed") throw new Error("Initialization writer completed before state commit barrier");
+    await expect(store.load(taskId)).rejects.toThrow(/state is missing.*snapshot artifacts remain/);
+    await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).resolves.toBe("in-progress");
+    await run({ root, workspacePath, taskId, taskRoot, durableRoot, store });
+    completed = true;
+  } finally {
+    releaseStateCommit.resolve();
+    const [writerResult] = await Promise.allSettled([writer]);
+    barrier.statePath = "";
+    barrier.stateCommitEntered = null;
+    barrier.releaseStateCommit = null;
+    await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    if (completed) {
+      if (writerResult!.status === "rejected") throw writerResult!.reason;
+      expect(writerResult!.value).toMatchObject({ status: "accepted", taskId });
+    }
+  }
+}
+
 describe("configured local-only bootstrap during initial publication", () => {
   it("reuses one task when a second bootstrap read sees a valid partial publication", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-p3r-initialization-"));
@@ -114,95 +168,119 @@ describe("configured local-only bootstrap during initial publication", () => {
     }
   }, 20_000);
 
-  it("waits only for a current, owned, matching publication and expires its bounded budget", async () => {
-    const root = await mkdtemp(join(tmpdir(), "d-ai-p3r-guard-"));
-    const workspacePath = join(root, "workspace");
-    const durableRoot = join(root, "durable");
-    await mkdir(workspacePath, { recursive: true });
-    const taskId = await createLocalOnlyTaskReservationId(workspacePath, "codex");
-    const taskRoot = join(durableRoot, taskId);
-    const stateCommitEntered = deferred();
-    const releaseStateCommit = deferred();
-    barrier.statePath = join(taskRoot, "state.json");
-    barrier.stateCommitEntered = stateCommitEntered.resolve;
-    barrier.releaseStateCommit = releaseStateCommit.promise;
-    const store = new FileDurableContextStore(durableRoot);
-    const writer = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({
-      rawCommand: "@D-AI establish guard writer", taskId: null,
-    });
-    try {
-      await stateCommitEntered.promise;
-      await expect(store.load(taskId)).rejects.toThrow(/state is missing.*snapshot artifacts remain/);
-      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).resolves.toBe("in-progress");
+  it("rejects a different workspace during initial publication", async () => {
+    await withPausedInitialization(async ({ root, taskId, store }) => {
       const otherWorkspace = join(root, "other-workspace");
       await mkdir(otherWorkspace);
       await expect(store.inspectInitialCreation(taskId, "codex", otherWorkspace)).rejects.toThrow(/workspace identity mismatch/);
+    });
+  }, 20_000);
 
-      const markerPath = join(taskRoot, "initializing");
-      const marker = await readFile(markerPath, "utf8");
-      const originalMarkerStat = await stat(markerPath);
-      const staleAt = new Date(Date.now() - 31_000);
-      await utimes(markerPath, staleAt, staleAt);
-      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/stale/);
-      await utimes(markerPath, originalMarkerStat.atime, originalMarkerStat.mtime);
-
-      await rm(markerPath);
-      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/state is missing.*snapshot artifacts remain/);
-      await writeFile(markerPath, marker, "utf8");
-      await utimes(markerPath, originalMarkerStat.atime, originalMarkerStat.mtime);
-
-      await writeFile(markerPath, "wrong-task\n", "utf8");
-      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/invalid/);
-      await writeFile(markerPath, marker, "utf8");
-      await utimes(markerPath, originalMarkerStat.atime, originalMarkerStat.mtime);
-
+  it("rejects an environment mismatch in a fresh valid initialization", async () => {
+    await withPausedInitialization(async ({ taskId, workspacePath, store }) => {
       await expect(store.inspectInitialCreation(taskId, "chat", workspacePath)).rejects.toThrow(/environment mismatch/);
+    });
+  }, 20_000);
+
+  it("rejects a stale initialization marker", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      const staleAt = new Date(Date.now() - 31_000);
+      await utimes(join(taskRoot, "initializing"), staleAt, staleAt);
+      const ownershipGeneration = (await readdir(join(taskRoot, "ownership")))[0]!;
+      const beforeMarker = new Date(staleAt.getTime() - 5_000);
+      await utimes(join(taskRoot, "ownership", ownershipGeneration, "owner.json"), beforeMarker, beforeMarker);
+      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/stale/);
+    });
+  }, 20_000);
+
+  it("rejects a missing initialization marker beside partial artifacts", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      await rm(join(taskRoot, "initializing"));
+      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/state is missing.*snapshot artifacts remain/);
+    });
+  }, 20_000);
+
+  it("rejects a malformed initialization marker", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      await writeFile(join(taskRoot, "initializing"), "wrong-task\n", "utf8");
+      const ownershipGeneration = (await readdir(join(taskRoot, "ownership")))[0]!;
+      const generationId = (await readdir(join(taskRoot, "generations")))[0]!;
+      const now = Date.now();
+      const ownerAt = new Date(now - 15_000);
+      const markerAt = new Date(now - 10_000);
+      const generationAt = new Date(now - 5_000);
+      await utimes(join(taskRoot, "ownership", ownershipGeneration, "owner.json"), ownerAt, ownerAt);
+      await utimes(join(taskRoot, "initializing"), markerAt, markerAt);
+      await utimes(join(taskRoot, "generations", generationId), generationAt, generationAt);
+      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/invalid/);
+    });
+  }, 20_000);
+
+  it("rejects a marker that predates its owner generation", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
       const ownershipGeneration = (await readdir(join(taskRoot, "ownership")))[0]!;
       const ownerPath = join(taskRoot, "ownership", ownershipGeneration, "owner.json");
-      const originalOwnerStat = await stat(ownerPath);
-      const afterMarker = new Date(originalMarkerStat.mtimeMs + 5_000);
+      const markerStat = await stat(join(taskRoot, "initializing"));
+      const afterMarker = new Date(markerStat.mtimeMs + 5_000);
       await utimes(ownerPath, afterMarker, afterMarker);
       await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/predates its owner generation/);
-      await utimes(ownerPath, originalOwnerStat.atime, originalOwnerStat.mtime);
+    });
+  }, 20_000);
+
+  it("rejects a mismatched ownership token", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      const ownershipGeneration = (await readdir(join(taskRoot, "ownership")))[0]!;
+      const ownerPath = join(taskRoot, "ownership", ownershipGeneration, "owner.json");
       const owner = await readFile(ownerPath, "utf8");
       await writeFile(ownerPath, owner.replace(taskId, "task-wrong-owner"), "utf8");
-      await utimes(ownerPath, originalOwnerStat.atime, originalOwnerStat.mtime);
+      const markerStat = await stat(join(taskRoot, "initializing"));
+      const beforeMarker = new Date(markerStat.mtimeMs - 5_000);
+      await utimes(ownerPath, beforeMarker, beforeMarker);
       await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/ownership token mismatch/);
-      await writeFile(ownerPath, owner, "utf8");
-      await utimes(ownerPath, originalOwnerStat.atime, originalOwnerStat.mtime);
-      const leasePath = join(taskRoot, "ownership", ownershipGeneration, "lease");
-      const originalLeaseStat = await stat(leasePath);
-      await utimes(leasePath, staleAt, staleAt);
+    });
+  }, 20_000);
+
+  it("rejects an inactive ownership lease", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      const ownershipGeneration = (await readdir(join(taskRoot, "ownership")))[0]!;
+      const staleAt = new Date(Date.now() - 31_000);
+      await utimes(join(taskRoot, "ownership", ownershipGeneration, "lease"), staleAt, staleAt);
       await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/no longer active/);
-      await utimes(leasePath, originalLeaseStat.atime, originalLeaseStat.mtime);
+    });
+  }, 20_000);
+
+  it("rejects a generation that predates its marker", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
       const generationRoot = join(taskRoot, "generations");
       const generationId = (await readdir(generationRoot))[0]!;
-      const generationPath = join(generationRoot, generationId);
-      const generationStat = await stat(generationPath);
-      await utimes(generationPath, staleAt, staleAt);
+      const staleAt = new Date(Date.now() - 31_000);
+      await utimes(join(generationRoot, generationId), staleAt, staleAt);
       await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/predates its marker/);
-      await utimes(generationPath, generationStat.atime, generationStat.mtime);
-      const generationManifestPath = join(generationRoot, generationId, "manifest.json");
-      const generationManifest = await readFile(generationManifestPath, "utf8");
-      await writeFile(generationManifestPath, "{}\n", "utf8");
-      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/generation|manifest/i);
-      await writeFile(generationManifestPath, generationManifest, "utf8");
-      const contextPath = join(taskRoot, "context.json");
-      const context = await readFile(contextPath, "utf8");
-      await writeFile(contextPath, "{}\n", "utf8");
-      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/does not match its generation/);
-      await writeFile(contextPath, context, "utf8");
+    });
+  }, 20_000);
 
+  it("rejects a corrupt generation manifest", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      const generationRoot = join(taskRoot, "generations");
+      const generationId = (await readdir(generationRoot))[0]!;
+      await writeFile(join(generationRoot, generationId, "manifest.json"), "{}\n", "utf8");
+      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/generation|manifest/i);
+    });
+  }, 20_000);
+
+  it("rejects a corrupt published companion", async () => {
+    await withPausedInitialization(async ({ taskId, taskRoot, workspacePath, store }) => {
+      await writeFile(join(taskRoot, "context.json"), "{}\n", "utf8");
+      await expect(store.inspectInitialCreation(taskId, "codex", workspacePath)).rejects.toThrow(/does not match its generation/);
+    });
+  }, 20_000);
+
+  it("expires the bounded wait when initialization never completes", async () => {
+    await withPausedInitialization(async ({ workspacePath, durableRoot }) => {
       const reader = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({
         rawCommand: "@D-AI establish timeout reader", taskId: null,
       });
       await expect(reader).resolves.toMatchObject({ status: "blocked", message: expect.stringMatching(/bounded wait.*incomplete/i) });
-    } finally {
-      releaseStateCommit.resolve();
-      await writer;
-      barrier.statePath = "";
-      barrier.releaseStateCommit = null;
-      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
-    }
+    });
   }, 20_000);
 });
