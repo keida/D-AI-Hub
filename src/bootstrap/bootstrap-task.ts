@@ -146,7 +146,7 @@ function assertRecoveredIdentity(state: TaskState, identities: readonly string[]
   }
 }
 
-export async function prepareBootstrapTask(input: BootstrapInput, store: DurableContextStore): Promise<TaskState> {
+export async function prepareBootstrapTask(input: BootstrapInput, store: DurableContextStore, inspectedState?: TaskState | null): Promise<TaskState> {
   assertBootstrapInput(input);
   const identities = [
     ...(input.workspacePath === null ? [] : [await inspectIdentity("workspace", input.workspacePath)]),
@@ -156,7 +156,7 @@ export async function prepareBootstrapTask(input: BootstrapInput, store: Durable
     identities.push(`local-project:${input.localProjectId}`);
   }
   const taskId = input.taskId ?? createTaskId(input.goal, input.environment, identities);
-  const existingState = await store.load(taskId);
+  const existingState = inspectedState === undefined ? await store.load(taskId) : inspectedState;
   if (existingState !== null) {
     if (existingState.goal !== input.goal || existingState.environment !== input.environment) {
       throw new InvalidTaskStateError(`Bootstrap input does not match recovered task ${taskId}`);
