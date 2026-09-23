@@ -23,6 +23,8 @@ export type TaskOwnershipTransfer = (targetEnvironment: Environment) => Promise<
 
 export interface DurableContextStore {
   load(taskId: string): Promise<TaskState | null>;
+  /** Inspect a missing-state publication window without relaxing load's durable integrity check. */
+  inspectInitialCreation?(taskId: string, environment: Environment, workspacePath: string): Promise<"in-progress" | "published">;
   /** Return non-closed durable tasks whose persisted workspace identity matches the supplied workspace. */
   discoverActiveTasks?(workspacePath: string): Promise<readonly TaskState[]>;
   loadGenerationManifest?(taskId: string, manifestId: string): Promise<DurableContextManifest>;

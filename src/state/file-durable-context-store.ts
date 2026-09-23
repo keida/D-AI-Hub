@@ -689,6 +689,117 @@ export class FileDurableContextStore implements DurableContextStore {
     return state;
   }
 
+  public async inspectInitialCreation(taskId: string, environment: Environment, workspacePath: string): Promise<"in-progress" | "published"> {
+    assertTaskId(taskId);
+    const paths = createSnapshotPaths(this.rootPath, taskId);
+    const markerPath = join(paths.taskRoot, initializationReservationFile);
+    let marker: string;
+    let markerStat: Awaited<ReturnType<typeof stat>>;
+    try {
+      [marker, markerStat] = await Promise.all([readFile(markerPath, "utf8"), stat(markerPath)]);
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) {
+        if (await this.load(taskId) !== null) return "published";
+        throw new InvalidTaskStateError(`Initial durable creation marker is missing for task ${taskId}`);
+      }
+      throw error;
+    }
+    if (marker !== `${taskId}\n` || !markerStat.isFile() || Date.now() - markerStat.mtimeMs > FILE_DURABLE_CONTEXT_LEASE_MS) {
+      throw new InvalidTaskStateError(`Initial durable creation marker is invalid or stale for task ${taskId}`);
+    }
+
+    const ownershipRoot = join(paths.taskRoot, ownershipDirectoryName);
+    const latest = await this.latestOwnershipGeneration(ownershipRoot);
+    if (latest === null) throw new TaskOwnershipError(`Initial durable creation has no owner for task ${taskId}`);
+    const owner = await this.readOwnershipRecord(latest.generationPath);
+    const ownerRecordStat = await stat(join(latest.generationPath, ownershipOwnerFile));
+    if (markerStat.mtimeMs < ownerRecordStat.mtimeMs) {
+      throw new TaskOwnershipError(`Initial durable marker predates its owner generation for task ${taskId}`);
+    }
+    try {
+      await this.assertCurrentTaskOwnership({ taskId, environment, generation: latest.generation, ownerToken: owner.ownerToken });
+    } catch (error: unknown) {
+      if (error instanceof TaskOwnershipError && error.message.includes("no longer active")) {
+        try {
+          await stat(markerPath);
+        } catch (markerError: unknown) {
+          if (isMissingFileError(markerError) && await this.load(taskId) !== null) return "published";
+        }
+      }
+      throw error;
+    }
+
+    const generationDirectory = join(paths.taskRoot, "generations");
+    let generations: Dirent<string>[];
+    try {
+      generations = await readdir(generationDirectory, { withFileTypes: true });
+    } catch (error: unknown) {
+      throw new InvalidTaskStateError(`Initial durable generation is unavailable for task ${taskId}: ${describeError(error)}`);
+    }
+    if (generations.length !== 1 || !generations[0]?.isDirectory() || !isSafeManifestId(generations[0].name)) {
+      throw new InvalidTaskStateError(`Initial durable generation is ambiguous or invalid for task ${taskId}`);
+    }
+    const generationStat = await stat(join(generationDirectory, generations[0].name));
+    if (generationStat.mtimeMs < markerStat.mtimeMs) {
+      throw new InvalidTaskStateError(`Initial durable generation predates its marker for task ${taskId}`);
+    }
+    const manifest = await this.loadGenerationManifest(taskId, generations[0].name);
+    if (manifest.environment !== environment || manifest.taskId !== taskId) {
+      throw new InvalidTaskStateError(`Initial durable generation identity mismatch for task ${taskId}`);
+    }
+    const generationStatePath = generationPath(paths, manifest.manifestId, paths.state);
+    const generationState = parseTaskState(parseJson(await readFile(generationStatePath, "utf8"), taskId, generationStatePath), generationStatePath);
+    if (generationState.taskId !== taskId || generationState.environment !== environment
+      || generationState.durableContext === null || JSON.stringify(generationState.durableContext) !== JSON.stringify(manifest)) {
+      throw new InvalidTaskStateError(`Initial durable generation state identity mismatch for task ${taskId}`);
+    }
+    if (!await matchesCanonicalWorkspaceIdentity(generationState.contextManifest, await realpath(resolve(workspacePath)))) {
+      throw new InvalidTaskStateError(`Initial durable generation workspace identity mismatch for task ${taskId}`);
+    }
+
+    const visible = await readdir(paths.taskRoot);
+    const publicationOrder = [paths.context, paths.evidence, paths.approval, paths.handoff, paths.recovery, paths.manifest];
+    let gap = false;
+    for (const path of publicationOrder) {
+      const present = visible.includes(basename(path));
+      if (!present) { gap = true; continue; }
+      if (gap) throw new InvalidTaskStateError(`Initial durable publication order is invalid for task ${taskId}`);
+      const content = await readFile(path, "utf8");
+      const expectedHash = manifest.hashes[path];
+      const topLevelManifest = path === paths.manifest
+        ? parseManifest(parseJson(content, taskId, path), taskId, path)
+        : null;
+      if (topLevelManifest !== null && JSON.stringify(topLevelManifest) !== JSON.stringify(manifest)) {
+        throw new InvalidTaskStateError(`Initial durable manifest differs from its generation for task ${taskId}`);
+      }
+      const observedHash = topLevelManifest === null
+        ? createHashForContent(content)
+        : createHashForContent(createCanonicalManifestContent(topLevelManifest));
+      if (expectedHash === undefined || observedHash !== expectedHash) {
+        throw new InvalidTaskStateError(`Initial durable artifact does not match its generation for task ${taskId} at ${path}`);
+      }
+    }
+    if (visible.includes(basename(paths.state))) {
+      if (await this.load(taskId) !== null) return "published";
+      throw new InvalidTaskStateError(`Initial durable state is unavailable for task ${taskId}`);
+    }
+    if (await loadActivePointer(paths, taskId) !== null) {
+      if (await this.load(taskId) !== null) return "published";
+      throw new InvalidTaskStateError(`Initial durable pointer precedes state for task ${taskId}`);
+    }
+    try {
+      const currentMarker = await stat(markerPath);
+      if (Date.now() - currentMarker.mtimeMs > FILE_DURABLE_CONTEXT_LEASE_MS) {
+        throw new InvalidTaskStateError(`Initial durable creation marker expired for task ${taskId}`);
+      }
+    } catch (error: unknown) {
+      if (!isMissingFileError(error)) throw error;
+      if (await this.load(taskId) !== null) return "published";
+      throw new InvalidTaskStateError(`Initial durable creation marker disappeared before publication for task ${taskId}`);
+    }
+    return "in-progress";
+  }
+
   public async save(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest> {
     if (authorization === undefined) {
       return this.createIfAbsent(state);

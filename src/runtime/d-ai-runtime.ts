@@ -1524,13 +1524,24 @@ function isTransientLocalOnlyReservationLoadError(error: unknown, taskId: string
     && error.message.includes("while snapshot artifacts remain");
 }
 
-async function loadLocalOnlyReservationState(taskId: string, store: DurableContextStore): Promise<TaskState | null> {
+async function inspectLocalOnlyInitialization(
+  error: unknown,
+  taskId: string,
+  environment: Environment,
+  workspacePath: string,
+  store: DurableContextStore,
+): Promise<void> {
+  if (!isTransientLocalOnlyReservationLoadError(error, taskId) || store.inspectInitialCreation === undefined) throw error;
+  await store.inspectInitialCreation(taskId, environment, workspacePath);
+}
+
+async function loadLocalOnlyReservationState(taskId: string, environment: Environment, workspacePath: string, store: DurableContextStore): Promise<TaskState | null> {
   const deadline = Date.now() + 1_000;
   while (Date.now() <= deadline) {
     try {
       return await store.load(taskId);
     } catch (error: unknown) {
-      if (!isTransientLocalOnlyReservationLoadError(error, taskId)) throw error;
+      await inspectLocalOnlyInitialization(error, taskId, environment, workspacePath, store);
     }
     await new Promise<void>((resolvePromise) => { setTimeout(resolvePromise, 25); });
   }
@@ -1548,7 +1559,8 @@ async function waitForRacedLocalOnlyTask(
     try {
       raced = await dependencies.store.load(taskId);
     } catch (error: unknown) {
-      if (!isTransientLocalOnlyReservationLoadError(error, taskId)) throw error;
+      if (dependencies.workspacePath === null) throw error;
+      await inspectLocalOnlyInitialization(error, taskId, request.sourceEnvironment, dependencies.workspacePath, dependencies.store);
       raced = null;
     }
     if (raced !== null
@@ -3193,7 +3205,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
       throw new ConfiguredBootstrapPreflightError("Configured Codex local-only workspace identity could not be resolved");
     }
     const localOnlyInput: BootstrapInput = { ...input, taskId: localOnlyTaskId, repositoryPath: null };
-    const existing = await loadLocalOnlyReservationState(localOnlyTaskId, configuredStore);
+    const existing = await loadLocalOnlyReservationState(localOnlyTaskId, input.environment, input.workspacePath!, configuredStore);
     if (existing !== null) {
       if (existing.stage === "close"
         || existing.environment !== input.environment
@@ -3208,7 +3220,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
         return await prepareBootstrapTask({
           ...localOnlyInput,
           localProjectId: randomUUID(),
-        }, configuredStore);
+        }, configuredStore, null);
       } catch (error: unknown) {
         if (isBootstrapIdentityInspectionFailure(error)) {
           throw new ConfiguredBootstrapPreflightError("Configured Codex local-only workspace identity could not be resolved");
