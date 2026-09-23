@@ -16,8 +16,9 @@ function windowFor(taskId: string): CurationPipelineInput {
     { marker: "m-001", text: "Milestone: canonical checkpoint verified.", observedAt: "2026-09-17T00:00:00.000Z", subjectKey: "boss:milestone" },
     { marker: "m-002", text: "Current blocker: dependency unavailable.", observedAt: "2026-09-17T00:00:01.000Z", subjectKey: "boss:blocker" },
     { marker: "m-003", text: "Next action: resume canonical work.", observedAt: "2026-09-17T00:00:02.000Z", subjectKey: "boss:next" },
+    { marker: "m-004", text: "Current phase: pilot verification", observedAt: "2026-09-17T00:00:03.000Z", subjectKey: "boss:phase" },
   ] as const;
-  return { sourceType: "conversation", sourceKey: "boss-source", projectTaskId: taskId, messages, previousCoveredThroughMarker: null, previousBoundarySha256: null, sourceStartAttested: true, coveredThroughMarker: "m-003", boundarySha256: buildCurationBoundarySha256(null, null, messages), coverageConfidence: "complete" };
+  return { sourceType: "conversation", sourceKey: "boss-source", projectTaskId: taskId, messages, previousCoveredThroughMarker: null, previousBoundarySha256: null, sourceStartAttested: true, coveredThroughMarker: "m-004", boundarySha256: buildCurationBoundarySha256(null, null, messages), coverageConfidence: "complete" };
 }
 
 function oversizedWindowFor(taskId: string): CurationPipelineInput {
@@ -27,8 +28,9 @@ function oversizedWindowFor(taskId: string): CurationPipelineInput {
     base.messages[1]!,
     ...Array.from({ length: 20 }, (_, index) => ({ marker: `m-${String(index + 3).padStart(3, "0")}`, text: `Retained bounded fixture context ${index + 1}.`, observedAt: `2026-09-17T00:00:${String(index + 2).padStart(2, "0")}.000Z`, subjectKey: `boss:retained:${index + 1}` })),
     { marker: "m-023", text: "Next action: resume canonical work.", observedAt: "2026-09-17T00:00:22.000Z", memoryId: "boss-next-v1", subjectKey: "boss:next" },
+    { marker: "m-024", text: "Current phase: pilot verification", observedAt: "2026-09-17T00:00:23.000Z", subjectKey: "boss:phase" },
   ];
-  return { ...base, messages, coveredThroughMarker: "m-023", boundarySha256: buildCurationBoundarySha256(null, null, messages) };
+  return { ...base, messages, coveredThroughMarker: "m-024", boundarySha256: buildCurationBoundarySha256(null, null, messages) };
 }
 
 async function gitWorkspace(root: string, remote: boolean): Promise<void> {
@@ -42,6 +44,34 @@ async function gitWorkspace(root: string, remote: boolean): Promise<void> {
 }
 
 describe("P4 Boss startup and rollover", () => {
+  it.each([
+    { project: "DSH 2", messageCount: 3, missingFields: ["phase"], canonicalNextAction: "resume canonical work." },
+    { project: "Weekly Review", messageCount: 2, missingFields: ["phase", "nextAction"], canonicalNextAction: null },
+  ])("returns typed INCOMPLETE without a Boss projection for $project shaped state", async ({ messageCount, missingFields, canonicalNextAction }) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-recovery-incomplete-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    try {
+      await mkdir(workspacePath, { recursive: true });
+      const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot, memoryDatabasePath }));
+      const established = await activate({ rawCommand: "@D-AI establish incomplete recovery fixture", taskId: null });
+      const source = windowFor(established.taskId);
+      const messages = source.messages.slice(0, messageCount);
+      const curated = await activate({ rawCommand: "@D-AI 整理", taskId: established.taskId, curationSourceWindow: {
+        ...source, messages, coveredThroughMarker: messages.at(-1)!.marker, boundarySha256: buildCurationBoundarySha256(null, null, messages),
+      } });
+      expect(curated.status).toBe("completed");
+      const before = await readFile(join(durableRoot, established.taskId, "state.json"));
+      const startup = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot, memoryDatabasePath }))({ rawCommand: "@D-AI continue", taskId: null });
+      expect(startup).toMatchObject({ status: "blocked", taskId: established.taskId, bossSession: {
+        decision: "BLOCKED", phase: null, nextAction: null, startup: null, handoff: null,
+        recoveryCompleteness: { status: "INCOMPLETE", missingFields, projection: "UNAVAILABLE", canonicalNextAction, diagnosticReason: expect.stringContaining("missing fields") },
+      } });
+      expect(await readFile(join(durableRoot, established.taskId, "state.json"))).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
   it.each(["no-git", "zero-remote", "remote"] as const)("recovers the same canonical task and state after restart; project=%s", async (mode) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-p4-boss-"));
     const workspacePath = join(root, "workspace");
@@ -67,13 +97,13 @@ describe("P4 Boss startup and rollover", () => {
       const fresh = () => createCodexActivation(createConfiguredDAIRuntime(options));
       const startup = await fresh()({ rawCommand: "@D-AI continue", taskId: null });
       const repeated = await fresh()({ rawCommand: "@D-AI continue", taskId: null });
-      expect(startup).toMatchObject({ status: "accepted", taskId, bossSession: { decision: "CONTINUE_CURRENT_BOSS", startup: { taskId, phase: null, nextAction: "resume canonical work.", blockers: ["Current blocker: dependency unavailable."], taskAndView: { viewIdentity: taskId, verificationStatus: "verified" }, recovery: { taskId } } } });
+      expect(startup).toMatchObject({ status: "accepted", taskId, bossSession: { decision: "CONTINUE_CURRENT_BOSS", recoveryCompleteness: { status: "COMPLETE", projection: "AVAILABLE" }, startup: { taskId, phase: "pilot verification", nextAction: "resume canonical work.", blockers: ["Current blocker: dependency unavailable."], taskAndView: { viewIdentity: taskId, verificationStatus: "verified" }, recovery: { taskId } } } });
       expect(repeated.bossSession?.startup).toEqual(startup.bossSession?.startup);
       expect(startup.bossSession?.project).toMatch(mode === "remote" ? /^github\.com\/acme\/d-ai$/u : /^local-project:/u);
       const ready = await activate({ rawCommand: "@D-AI rollover", taskId, bossSession: { mode: "prepare", sourceKey: "boss-source" } });
       expect(ready).toMatchObject({ status: "accepted", taskId, bossSession: { decision: "ROLLOVER_PREPARED", handoff: { taskId, nextAction: "resume canonical work.", blockers: ["Current blocker: dependency unavailable."], recovery: { taskId } } } });
       const wrongSource = await activate({ rawCommand: "@D-AI rollover", taskId, bossSession: { mode: "prepare", sourceKey: "wrong-source" } });
-      expect(wrongSource).toMatchObject({ status: "blocked", taskId, bossSession: { decision: "BLOCKED", handoff: null } });
+      expect(wrongSource).toMatchObject({ status: "blocked", taskId, bossSession: { decision: "BLOCKED", handoff: null, recoveryCompleteness: { status: "COMPLETE", projection: "AVAILABLE" } } });
       const threshold = await activate({ rawCommand: "@D-AI status", taskId, bossSession: { mode: "prepare", signals: { acceptedTicketCount: 10 } } });
       expect(threshold).toMatchObject({ status: "accepted", taskId, bossSession: { decision: "ROLLOVER_RECOMMENDED", triggers: ["accepted-ticket-threshold"], handoff: null } });
       expect(await readFile(join(durableRoot, taskId, "state.json"))).toEqual(before);
@@ -167,7 +197,7 @@ describe("P4 Boss startup and rollover", () => {
       const startup = await createCodexActivation(createConfiguredDAIRuntime(options))({ rawCommand: "@D-AI continue", taskId: null });
       expect(startup).toMatchObject({ status: "accepted", taskId: first.taskId, bossSession: { currentStateVersion: null, checkpointReference: null, startup: { limitations: ["Local constraint is retained."], nextAction: "resume canonical work.", recovery: { taskId: first.taskId, currentStateVersion: null, checkpointReference: null } } } });
       const prepare = await activate({ rawCommand: "@D-AI rollover", taskId: first.taskId, bossSession: { mode: "prepare", sourceKey: "boss-source" } });
-      expect(prepare).toMatchObject({ status: "blocked", taskId: first.taskId, bossSession: { decision: "BLOCKED", handoff: null } });
+      expect(prepare).toMatchObject({ status: "blocked", taskId: first.taskId, bossSession: { decision: "BLOCKED", handoff: null, recoveryCompleteness: { status: "COMPLETE", projection: "AVAILABLE" } } });
       expect(prepare.message).toMatch(/checkpoint metadata/i);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
@@ -186,7 +216,7 @@ describe("P4 Boss startup and rollover", () => {
       await store.withTaskOwnership(state.taskId, "codex", async (lease) => store.save({ ...state, contextManifest: state.contextManifest.filter((entry) => !entry.startsWith("local-project:")) }, lease));
       const before = await readFile(join(durableRoot, state.taskId, "state.json"));
       const result = await activate({ rawCommand: "@D-AI continue", taskId: null });
-      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED", recoveryCompleteness: { status: "BLOCKED", missingFields: ["project-identity"], projection: "UNAVAILABLE" } } });
       expect(await readFile(join(durableRoot, state.taskId, "state.json"))).toEqual(before);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
@@ -224,6 +254,30 @@ describe("P4 Boss startup and rollover", () => {
       const result = await activate({ rawCommand: "@D-AI continue", taskId: first.taskId });
       expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
       expect((await readdir(durableRoot)).filter((entry) => entry.startsWith("task-")).sort()).toEqual([first.taskId, "task-p4-malformed-neighbor"].sort());
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("keeps typed completeness COMPLETE when the existing P4 blocker display bound blocks startup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-complete-p4-bound-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    try {
+      await mkdir(workspacePath, { recursive: true });
+      const options = { workspacePath, durableRoot, memoryDatabasePath };
+      const activate = createCodexActivation(createConfiguredDAIRuntime(options));
+      const established = await activate({ rawCommand: "@D-AI establish complete recovery fixture", taskId: null });
+      expect(established.status).toBe("accepted");
+      const curated = await activate({ rawCommand: "@D-AI 整理", taskId: established.taskId, curationSourceWindow: windowFor(established.taskId) });
+      expect(curated.status).toBe("completed");
+      const writer = new LocalSqliteMemoryStore({ databasePath: memoryDatabasePath, workspacePath: dirname(memoryDatabasePath), mode: "writer", scopeId: resolveLocalMemoryScopeId(memoryDatabasePath), writerId: "primary-device" });
+      try {
+        await writer.applyMutations(Array.from({ length: 16 }, (_, index) => ({ operation: "add" as const, memoryId: `extra-blocker-${index}`, value: { kind: "curated-fact", fact: `Current blocker: external dependency ${index}.`, category: "project-memory", topicLabel: "bug/root-cause", critical: true, projectTaskId: established.taskId, taskScopeId: established.taskId, subjectKey: `extra:blocker:${index}`, revision: 1, observedAt: "2026-09-17T00:00:04.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-17T00:00:04.000Z" })));
+      } finally { writer.close(); }
+      const before = await readFile(join(durableRoot, established.taskId, "state.json"));
+      const result = await createCodexActivation(createConfiguredDAIRuntime(options))({ rawCommand: "@D-AI continue", taskId: null });
+      expect(result).toMatchObject({ status: "blocked", taskId: established.taskId, bossSession: { decision: "BLOCKED", startup: null, recoveryCompleteness: { status: "COMPLETE", missingFields: [], projection: "AVAILABLE" } } });
+      expect(await readFile(join(durableRoot, established.taskId, "state.json"))).toEqual(before);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
 
