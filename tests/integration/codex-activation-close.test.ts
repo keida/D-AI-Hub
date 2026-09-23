@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { GitHubCliAdapter } from "../../src/adapters/github.js";
@@ -23,6 +23,88 @@ const gateNames = [
   "durable-context",
   "critical-unsaved-context",
 ] as const;
+
+function createTimeoutDiagnosticProbe(test: string, root: string, runtimeRoot: string, durableRoot: string) {
+  const startedAt = performance.now();
+  const activeChildren = new Map<number, string>();
+  let nextChildId = 0;
+  let phase = "TEST_START";
+  let lastCompletedPhase = "TEST_START";
+  let operationActive = false;
+  let cleanupStarted = false;
+  let rollbackResolved = false;
+  let closeResolved = false;
+  const emit = (event: string, details: Record<string, unknown> = {}): void => {
+    console.info(`[P3R-T1-CI-DIAG] ${JSON.stringify({
+      event,
+      test,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      rootId: basename(root),
+      phase,
+      lastCompletedPhase,
+      activeOperation: operationActive ? phase : null,
+      cleanupStarted,
+      rollbackResolved,
+      closeResolved,
+      ...details,
+    })}`);
+  };
+  const watchdog = setTimeout(() => {
+    const handles = (process as unknown as {
+      _getActiveHandles(): readonly { constructor?: { name?: string }; pid?: number }[];
+    })._getActiveHandles();
+    emit("NEAR_TIMEOUT", {
+      processId: process.pid,
+      runtimeRoot,
+      durableRoot,
+      activeTestChildren: [...activeChildren.values()],
+      expectedTestChildrenExited: activeChildren.size === 0,
+      activeResources: process.getActiveResourcesInfo(),
+      activeHandles: handles.map((handle) => ({ type: handle.constructor?.name ?? "unknown", pid: handle.pid ?? null })),
+    });
+    void Promise.allSettled([readdir(root), readdir(durableRoot)]).then(([temp, durable]) => {
+      emit("NEAR_TIMEOUT_FILES", {
+        tempEntries: temp.status === "fulfilled" ? temp.value : "unavailable",
+        durableEntries: durable.status === "fulfilled" ? durable.value : "unavailable",
+      });
+    });
+  }, 17_000);
+  watchdog.unref();
+  emit("TEST_START", { runtimeRoot, durableRoot });
+  return {
+    begin(name: string): void {
+      phase = name;
+      operationActive = true;
+      if (name === "CLEANUP") cleanupStarted = true;
+      emit(`${name}_BEGIN`);
+    },
+    end(name: string): void {
+      if (name === "ROLLBACK") rollbackResolved = true;
+      if (name === "CLOSE") closeResolved = true;
+      lastCompletedPhase = name;
+      operationActive = false;
+      emit(`${name}_END`);
+    },
+    async child<T>(name: string, invoke: () => Promise<T>): Promise<T> {
+      const id = ++nextChildId;
+      activeChildren.set(id, name);
+      emit("CHILD_BEGIN", { child: name });
+      let outcome = "rejected";
+      try {
+        const result = await invoke();
+        outcome = "fulfilled";
+        return result;
+      } finally {
+        activeChildren.delete(id);
+        emit("CHILD_END", { child: name, outcome });
+      }
+    },
+    finish(): void {
+      clearTimeout(watchdog);
+      emit("TEST_END");
+    },
+  };
+}
 
 async function git(cwd: string | null, arguments_: readonly string[]): Promise<string> {
   return (await runCommand({ command: "git", arguments: arguments_, cwd })).stdout.trim();
@@ -749,41 +831,64 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     const workspacePath = join(repositoryRoot, "packages", "app");
     const durableRoot = join(workspacePath, ".d-ai");
     const skillPath = join(workspacePath, ".agents", "skills", "verify-local");
+    const probe = createTimeoutDiagnosticProbe("preserves a nested workspace through production recovery capture and rollback", root, workspacePath, durableRoot);
+    const gitCommand = (cwd: string | null, arguments_: readonly string[]) =>
+      probe.child(`git ${arguments_[0]}`, () => git(cwd, arguments_));
     try {
+      probe.begin("SETUP");
       await mkdir(skillPath, { recursive: true });
       await writeFile(join(skillPath, "SKILL.md"), `---\nname: verify-local\ndescription: Bounded local verification\nmetadata:\n  triggers: '["verify"]'\n  compatibleEnvironments: '["codex"]'\n  compatibleStages: '["execute"]'\n---\n\n# Bounded local verification\n`, "utf8");
       await writeFile(join(workspacePath, "artifact.txt"), "known good\n", "utf8");
-      await git(null, ["init", "--initial-branch=main", repositoryRoot]);
-      await git(repositoryRoot, ["config", "user.email", "d-ai@example.test"]);
-      await git(repositoryRoot, ["config", "user.name", "D-AI Test"]);
-      await git(repositoryRoot, ["add", "packages/app"]);
-      await git(repositoryRoot, ["commit", "-m", "test: nested recovery baseline"]);
-      await git(repositoryRoot, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      await gitCommand(null, ["init", "--initial-branch=main", repositoryRoot]);
+      await gitCommand(repositoryRoot, ["config", "user.email", "d-ai@example.test"]);
+      await gitCommand(repositoryRoot, ["config", "user.name", "D-AI Test"]);
+      await gitCommand(repositoryRoot, ["add", "packages/app"]);
+      await gitCommand(repositoryRoot, ["commit", "-m", "test: nested recovery baseline"]);
+      await gitCommand(repositoryRoot, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
+      probe.end("SETUP");
 
+      probe.begin("ACTIVATION");
       const runtime = createConfiguredDAIRuntime({ workspacePath });
       const activate = createCodexActivation(runtime);
+      probe.end("ACTIVATION");
+      probe.begin("ESTABLISH_BOOTSTRAP");
       const executed = await activate({ rawCommand: "@D-AI establish verify nested workspace", taskId: null });
+      probe.end("ESTABLISH_BOOTSTRAP");
       expect(executed.status).toBe("completed");
+      probe.begin("DURABLE_PERSISTENCE");
       const beforeRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
       expect(beforeRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
+      probe.end("DURABLE_PERSISTENCE");
 
+      probe.begin("EXECUTION");
       await writeFile(join(workspacePath, "artifact.txt"), "regression\n", "utf8");
-      await git(repositoryRoot, ["add", "packages/app/artifact.txt"]);
-      await git(repositoryRoot, ["commit", "-m", "test: nested regression"]);
+      await gitCommand(repositoryRoot, ["add", "packages/app/artifact.txt"]);
+      await gitCommand(repositoryRoot, ["commit", "-m", "test: nested regression"]);
       await writeFile(join(workspacePath, "user-work.txt"), "preserve me\n", "utf8");
+      probe.end("EXECUTION");
 
+      probe.begin("ROLLBACK");
       const rolledBack = await activate({ rawCommand: "@D-AI rollback", taskId: executed.taskId });
+      probe.end("ROLLBACK");
+      probe.begin("RECOVERY_VERIFY");
       const recoveryHead = beforeRollback?.recoverySnapshot?.head;
       if (recoveryHead === undefined) throw new Error("Expected recovery head");
-      await expect(git(repositoryRoot, ["diff", "--name-status", recoveryHead, "HEAD"])).resolves.toBe("");
+      await expect(gitCommand(repositoryRoot, ["diff", "--name-status", recoveryHead, "HEAD"])).resolves.toBe("");
       expect(rolledBack.message).toMatch(/rollback restored/i);
       const afterRollback = await new FileDurableContextStore(durableRoot).load(executed.taskId);
       expect(afterRollback?.recoverySnapshot?.workspacePath).toBe(await realpath(workspacePath));
       expect(afterRollback?.rollbackAudit?.verification.passed).toBe(true);
-      await expect(git(repositoryRoot, ["show", "HEAD:packages/app/artifact.txt"])).resolves.toBe("known good");
-      await expect(git(repositoryRoot, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
+      await expect(gitCommand(repositoryRoot, ["show", "HEAD:packages/app/artifact.txt"])).resolves.toBe("known good");
+      await expect(gitCommand(repositoryRoot, ["stash", "list"])).resolves.toMatch(/d-ai-rollback-/);
+      probe.end("RECOVERY_VERIFY");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      probe.begin("CLEANUP");
+      try {
+        await rm(root, { recursive: true, force: true });
+        probe.end("CLEANUP");
+      } finally {
+        probe.finish();
+      }
     }
   });
 
@@ -997,22 +1102,30 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
     const bareRemotePath = join(root, "remote.git");
     const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
     const previousEnterpriseHost = process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST;
+    const probe = createTimeoutDiagnosticProbe("honors an explicit Enterprise GitHub host through Codex bootstrap, execution, recovery, and publication close", root, workspacePath, durableRoot);
+    const gitCommand = (cwd: string | null, arguments_: readonly string[]) =>
+      probe.child(`git ${arguments_[0]}`, () => git(cwd, arguments_));
     try {
+      probe.begin("SETUP");
       process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST = "wrong.example.test";
       await mkdir(verificationSkillPath, { recursive: true });
       await writeFile(join(verificationSkillPath, "SKILL.md"), `---\nname: verify-local\ndescription: Bounded local verification\nmetadata:\n  triggers: '["verify"]'\n  compatibleEnvironments: '["codex"]'\n  compatibleStages: '["execute"]'\n---\n\n# Bounded local verification\n`, "utf8");
       await writeFile(join(workspacePath, "artifact.txt"), "enterprise artifact\n", "utf8");
-      await git(null, ["init", "--bare", bareRemotePath]);
-      await git(workspacePath, ["init", "--initial-branch=main"]);
-      await git(workspacePath, ["config", "user.email", "d-ai@example.test"]);
-      await git(workspacePath, ["config", "user.name", "D-AI Test"]);
-      await git(workspacePath, ["add", "."]);
-      await git(workspacePath, ["commit", "-m", "enterprise verification fixture"]);
-      await git(workspacePath, ["remote", "add", "origin", "https://git.example.test/acme/d-ai.git"]);
+      await gitCommand(null, ["init", "--bare", bareRemotePath]);
+      await gitCommand(workspacePath, ["init", "--initial-branch=main"]);
+      await gitCommand(workspacePath, ["config", "user.email", "d-ai@example.test"]);
+      await gitCommand(workspacePath, ["config", "user.name", "D-AI Test"]);
+      await gitCommand(workspacePath, ["add", "."]);
+      await gitCommand(workspacePath, ["commit", "-m", "enterprise verification fixture"]);
+      await gitCommand(workspacePath, ["remote", "add", "origin", "https://git.example.test/acme/d-ai.git"]);
+      probe.end("SETUP");
       const transport: GitTransport = {
-        pushRef: async (localRepositoryPath, _endpoint, ref, head) => pushGitRef(localRepositoryPath, bareRemotePath, ref, head),
-        readRef: async (_localRepositoryPath, _endpoint, ref) => readRemoteRef(bareRemotePath, ref, null),
+        pushRef: async (localRepositoryPath, _endpoint, ref, head) =>
+          probe.child("git transport push", () => pushGitRef(localRepositoryPath, bareRemotePath, ref, head)),
+        readRef: async (_localRepositoryPath, _endpoint, ref) =>
+          probe.child("git transport read", () => readRemoteRef(bareRemotePath, ref, null)),
       };
+      probe.begin("ACTIVATION");
       const runtime = createConfiguredDAIRuntime({
         workspacePath,
         durableRoot,
@@ -1020,19 +1133,27 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         gitHub: GitHubCliAdapter.forTestTransport({ mode: "test", enterpriseHost: "git.example.test" }, transport),
       });
       const activate = createCodexActivation(runtime);
+      probe.end("ACTIVATION");
 
+      probe.begin("ESTABLISH_BOOTSTRAP");
       const verified = await activate({ rawCommand: "@D-AI establish verify Enterprise workspace", taskId: null });
+      probe.end("ESTABLISH_BOOTSTRAP");
       expect(verified).toMatchObject({ environment: "codex", status: "completed", stage: "verify" });
       expect(verified.message).toMatch(/verification/i);
+      probe.begin("DURABLE_PERSISTENCE");
       const task = await new FileDurableContextStore(durableRoot).load(verified.taskId);
       expect(task?.contextManifest).toContain("remote-repository:git.example.test/acme/d-ai");
       expect(task?.recoveryPoint).not.toBeNull();
       const beforeGeneric = await snapshotFiles(durableRoot);
+      probe.end("DURABLE_PERSISTENCE");
+      probe.begin("RECOVERY");
       const generic = await activate({ rawCommand: "@D-AI inspect current context", taskId: null });
       expect(generic).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "blocked" });
       expect(generic.message).toMatch(/matched active task|no configured safe operation/i);
       expect(await snapshotFiles(durableRoot)).toEqual(beforeGeneric);
+      probe.end("RECOVERY");
 
+      probe.begin("CLOSE");
       const closed = await runtime({
         command: { kind: "close" },
         sourceEnvironment: "codex",
@@ -1041,13 +1162,22 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
         publicationRequested: true,
         publicationAuthority: { grantedBy: "user", allowCommit: true, allowPush: true },
       });
+      probe.end("CLOSE");
       expect(closed).toMatchObject({ taskId: verified.taskId, environment: "codex", status: "completed", stage: "close" });
       expect(closed.message).toMatch(/YES/i);
-      await expect(git(bareRemotePath, ["rev-parse", "refs/heads/main"])).resolves.toMatch(/^[a-f0-9]{40}$/);
+      probe.begin("REMOTE_VERIFY");
+      await expect(gitCommand(bareRemotePath, ["rev-parse", "refs/heads/main"])).resolves.toMatch(/^[a-f0-9]{40}$/);
+      probe.end("REMOTE_VERIFY");
     } finally {
-      if (previousEnterpriseHost === undefined) delete process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST;
-      else process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST = previousEnterpriseHost;
-      await rm(root, { recursive: true, force: true });
+      probe.begin("CLEANUP");
+      try {
+        if (previousEnterpriseHost === undefined) delete process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST;
+        else process.env.D_AI_GITHUB_EXTERNAL_ENTERPRISE_HOST = previousEnterpriseHost;
+        await rm(root, { recursive: true, force: true });
+        probe.end("CLEANUP");
+      } finally {
+        probe.finish();
+      }
     }
   });
 });
