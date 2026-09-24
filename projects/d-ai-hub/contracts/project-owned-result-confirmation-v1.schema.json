@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "D-AI project-owned result human confirmation event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schemaVersion", "eventId", "authorityState", "intent", "project", "dai", "result", "artifact", "evidenceRefs", "confirmedAt", "operatorContext"],
+  "properties": {
+    "contract": { "const": "dai.project-result-confirmation" },
+    "schemaVersion": { "const": 1 },
+    "eventId": { "type": "string", "pattern": "^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$" },
+    "authorityState": { "const": "HUMAN-CONFIRMED" },
+    "intent": { "const": "RECONCILE_PROJECT_OWNED_RESULT" },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "workId", "executionOwnerId"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/nonempty" },
+        "workId": { "$ref": "#/$defs/nonempty" },
+        "executionOwnerId": { "$ref": "#/$defs/nonempty" }
+      }
+    },
+    "dai": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId"],
+      "properties": {
+        "taskId": { "type": "string", "pattern": "^task-[A-Za-z0-9._-]+$" }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resultId", "contract", "schemaVersion"],
+      "properties": {
+        "resultId": { "$ref": "#/$defs/nonempty" },
+        "contract": { "const": "dai.project-result" },
+        "schemaVersion": { "const": 1 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositoryIdentity", "canonicalPath", "publicationCommitSha", "gitBlobOid", "sha256"],
+      "properties": {
+        "repositoryIdentity": { "$ref": "#/$defs/nonempty" },
+        "canonicalPath": { "$ref": "#/$defs/nonempty" },
+        "publicationCommitSha": { "$ref": "#/$defs/objectId" },
+        "gitBlobOid": { "$ref": "#/$defs/objectId" },
+        "sha256": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "kind", "repositoryIdentity", "commitSha", "path", "blobOid", "sha256"],
+            "properties": {
+              "id": { "$ref": "#/$defs/nonempty" },
+              "kind": { "const": "git-blob" },
+              "repositoryIdentity": { "$ref": "#/$defs/nonempty" },
+              "commitSha": { "$ref": "#/$defs/objectId" },
+              "path": { "$ref": "#/$defs/nonempty" },
+              "blobOid": { "$ref": "#/$defs/objectId" },
+              "sha256": { "$ref": "#/$defs/digest" }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "kind", "url", "immutableId", "sha256"],
+            "properties": {
+              "id": { "$ref": "#/$defs/nonempty" },
+              "kind": { "const": "https-object" },
+              "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+              "immutableId": { "$ref": "#/$defs/nonempty" },
+              "sha256": { "$ref": "#/$defs/digest" }
+            }
+          }
+        ]
+      }
+    },
+    "confirmedAt": { "type": "string", "format": "date-time" },
+    "operatorContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "sessionId", "interactionId"],
+      "properties": {
+        "host": { "const": "local" },
+        "sessionId": { "$ref": "#/$defs/nonempty" },
+        "interactionId": { "$ref": "#/$defs/nonempty" }
+      }
+    }
+  },
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "objectId": { "type": "string", "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$" }
+  }
+}
