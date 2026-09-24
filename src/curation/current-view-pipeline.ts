@@ -44,6 +44,16 @@ export interface CurationPipelineRecovery {
   readonly reason?: string;
 }
 
+export type RecoveryCompletenessField = "project-identity" | "task-pointer" | "phase" | "blockers" | "nextAction" | "authoritative-state" | "authoritative-projection";
+
+export interface RecoveryCompleteness {
+  readonly status: "COMPLETE" | "INCOMPLETE" | "BLOCKED";
+  readonly missingFields: readonly RecoveryCompletenessField[];
+  readonly projection: "AVAILABLE" | "UNAVAILABLE";
+  readonly canonicalNextAction: string | null;
+  readonly diagnosticReason: string | null;
+}
+
 export interface CurationPipelineRebuild {
   readonly status: "available" | "empty" | "blocked";
   readonly projectTaskId: string;
@@ -53,6 +63,8 @@ export interface CurationPipelineRebuild {
   readonly records: readonly MemoryRecord[];
   readonly sourceCoverage: "unknown";
   readonly safeToDeleteSourceChat: "NO";
+  readonly projectionLosses?: readonly ("phase" | "nextAction" | "blocker")[];
+  readonly recoveryCompleteness?: RecoveryCompleteness;
   readonly reason?: string;
 }
 
@@ -89,13 +101,14 @@ export interface CurationPipelineOptions {
   readonly store: LocalSqliteMemoryStore;
   readonly workspacePath: string;
   readonly repositoryPath?: string | null;
+  readonly canonicalProjectIdentityVerified?: boolean;
   readonly now?: () => string;
   readonly maxWindowMessages?: number;
 }
 
 const defaultWindowLimit = 64;
 const defaultRebuildRecordLimit = 256;
-const durableSignal = /(?:decision|approved|approval|authorization|blocker|blocked|bug|root cause|milestone|preference|workflow|process|next action|next step|下一步|接下来|limitation|constraint|revised|supersed|retain|不要 push|只保留|好|可以)/iu;
+const durableSignal = /(?:decision|approved|approval|authorization|blocker|blocked|bug|root cause|milestone|phase|preference|workflow|process|next action|next step|下一步|接下来|limitation|constraint|revised|supersed|retain|不要 push|只保留|好|可以)/iu;
 const transientSignal = /^(?:trace|debug|ephemeral|worker retry|transient tool output)\b/iu;
 
 function sha256(value: string): string { return createHash("sha256").update(value, "utf8").digest("hex"); }
@@ -203,10 +216,19 @@ function checkpointId(store: LocalSqliteMemoryStore, input: CurationPipelineInpu
 
 interface StoredViewFact { readonly record: MemoryRecord; readonly fact: string; readonly subjectKey: string; readonly topicLabel: CurationTopicLabel | null; readonly critical: boolean; readonly revision: number; readonly observedAt: string | null }
 
+function explicitRemainder(fact: string, pattern: RegExp): string | null {
+  const remainder = pattern.exec(fact)?.[1]?.trim();
+  return remainder === undefined || remainder.length === 0 ? null : remainder;
+}
+
 function explicitNextAction(fact: string): string | null {
-  const match = /(?:\b(?:next action|next step)\s*(?:[:：]\s*|\bis\s+)|(?:下一步|接下来)(?:：\s*|是\s*|要\s*))(.+)$/iu.exec(fact);
-  const remainder = match?.[1]?.trim();
-  return remainder === undefined || remainder.length === 0 ? null : remainder.slice(0, 256);
+  const remainder = explicitRemainder(fact, /(?:\b(?:next action|next step)\s*(?:[:：]\s*|\bis\s+)|(?:下一步|接下来)(?:：\s*|是\s*|要\s*))(.+)$/iu);
+  return remainder === null ? null : remainder.slice(0, 256);
+}
+
+function explicitPhase(fact: string): string | null {
+  const remainder = explicitRemainder(fact.trim(), /^(?:current\s+phase|phase)\s*[:：]\s*(.+)$/iu);
+  return remainder === null ? null : remainder.slice(0, 256);
 }
 
 function addPipelineProvenance(candidates: readonly CurationCandidate[], input: CurationPipelineInput): readonly CurationCandidate[] {
@@ -242,10 +264,57 @@ function storedViewFacts(records: readonly MemoryRecord[], projectTaskId: string
   }));
 }
 
+function currentViewProjectionLosses(records: readonly MemoryRecord[], projectTaskId: string): readonly ("phase" | "nextAction" | "blocker")[] {
+  const losses = new Set<"phase" | "nextAction" | "blocker">();
+  for (const { fact, topicLabel } of storedViewFacts(records, projectTaskId, true)) {
+    if ((explicitRemainder(fact.trim(), /^(?:current\s+phase|phase)\s*[:：]\s*(.+)$/iu)?.length ?? 0) > 256) losses.add("phase");
+    if ((explicitRemainder(fact, /(?:\b(?:next action|next step)\s*(?:[:：]\s*|\bis\s+)|(?:下一步|接下来)(?:：\s*|是\s*|要\s*))(.+)$/iu)?.length ?? 0) > 256) losses.add("nextAction");
+    if (fact.length > 256 && topicLabel === "bug/root-cause") losses.add("blocker");
+  }
+  return (["phase", "nextAction", "blocker"] as const).filter((loss) => losses.has(loss));
+}
+
+export function inspectRecoveryCompleteness(
+  projectTaskId: string,
+  currentView: CurrentStateView | null,
+  records: readonly MemoryRecord[],
+  projectionLosses: readonly ("phase" | "nextAction" | "blocker")[] = [],
+  canonicalProjectIdentityVerified = false,
+): RecoveryCompleteness {
+  const missingFields: RecoveryCompletenessField[] = [];
+  if (!canonicalProjectIdentityVerified) missingFields.push("project-identity");
+  const taskPointerValid = validIdentifier(projectTaskId) && currentView?.identity === projectTaskId;
+  if (!taskPointerValid) missingFields.push("task-pointer");
+  if (typeof currentView?.phase !== "string" || currentView.phase.trim().length === 0) missingFields.push("phase");
+  if (currentView === null || !Array.isArray(currentView.blockers)) missingFields.push("blockers");
+  if (typeof currentView?.nextAction !== "string" || currentView.nextAction.trim().length === 0) missingFields.push("nextAction");
+  const recordIds = new Set(records.map((record) => record.memoryId));
+  const viewIds = new Set(currentView?.relevantMemoryIds ?? []);
+  const authoritativeStatePresent = currentView !== null && currentView.verificationStatus === "verified" && records.length > 0
+    && viewIds.size === recordIds.size && [...recordIds].every((id) => viewIds.has(id));
+  if (!authoritativeStatePresent) missingFields.push("authoritative-state");
+  if (projectionLosses.length > 0) missingFields.push("authoritative-projection");
+  const status = missingFields.length === 0 ? "COMPLETE" : "INCOMPLETE";
+  return {
+    status,
+    missingFields,
+    projection: status === "COMPLETE" ? "AVAILABLE" : "UNAVAILABLE",
+    canonicalNextAction: canonicalProjectIdentityVerified && taskPointerValid && authoritativeStatePresent && !projectionLosses.includes("nextAction")
+      ? currentView?.nextAction ?? null : null,
+    diagnosticReason: status === "COMPLETE" ? null : `Recovery completeness is incomplete; authoritative projection unavailable; missing fields: ${missingFields.join(", ")}`,
+  };
+}
+
+function blockedRecoveryCompleteness(reason: string): RecoveryCompleteness {
+  return { status: "BLOCKED", missingFields: [], projection: "UNAVAILABLE", canonicalNextAction: null, diagnosticReason: reason };
+}
+
 function buildCurrentView(records: readonly MemoryRecord[], projectTaskId: string, reference: string | null, version: number, verificationStatus: CurrentStateView["verificationStatus"], projectionOnly = false, currentOnly = false): CurrentStateView {
   const facts = storedViewFacts(records, projectTaskId, currentOnly);
   const current = [...facts].sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
   const texts = (predicate: (fact: StoredViewFact) => boolean): readonly string[] => current.filter(predicate).map(({ fact }) => fact.slice(0, 256));
+  const phases = [...new Set(current.map(({ fact }) => explicitPhase(fact)).filter((phase): phase is string => phase !== null))];
+  if (phases.length > 1) throw new InvalidTaskStateError("Current-state view has conflicting phases");
   const nextActions = [...new Set(current.map(({ fact }) => explicitNextAction(fact)).filter((candidate): candidate is string => candidate !== null))];
   if (nextActions.length > 1) throw new InvalidTaskStateError("Current-state view has conflicting next actions");
   const factsBySubject = new Map<string, string>();
@@ -256,7 +325,7 @@ function buildCurrentView(records: readonly MemoryRecord[], projectTaskId: strin
   }
   return {
     identity: projectTaskId,
-    phase: null,
+    phase: phases[0] ?? null,
     milestones: projectionOnly ? [] : texts(({ fact, topicLabel: label }) => label === "project status" && /milestone|completed|完成|closed/iu.test(fact)),
     currentWork: projectionOnly ? [] : texts(({ fact }) => /current work|working|in progress|当前工作/iu.test(fact)),
     confirmedDecisions: texts(({ fact, topicLabel: label }) => projectionOnly ? label === "architecture/decision" : label === "architecture/decision" || /decision|approved|approval|决定/iu.test(fact)),
@@ -408,8 +477,8 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
   }
 
   async function rebuildCurrentState(projectTaskId: string, sourceType: "conversation" = "conversation", sourceKey?: string): Promise<CurationPipelineRebuild> {
-    if (!validIdentifier(projectTaskId)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: "Exact project task identity is required for current-state rebuild" };
-    if (sourceKey !== undefined && !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: "Exact source identity is invalid for current-state rebuild" };
+    if (!validIdentifier(projectTaskId)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness("Exact project task identity is required for current-state rebuild"), reason: "Exact project task identity is required for current-state rebuild" };
+    if (sourceKey !== undefined && !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness("Exact source identity is invalid for current-state rebuild"), reason: "Exact source identity is invalid for current-state rebuild" };
     let checkpoint: CurationCheckpointMetadata | null = null;
     let checkpointReason: string | undefined;
     if (sourceKey !== undefined) {
@@ -425,12 +494,15 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
       const version = checkpoint?.currentViewVersion ?? 0;
       const currentView = buildCurrentView(records, projectTaskId, null, version, "verified", true, true);
       const currentRecords = [...records];
+      const projectionLosses = currentViewProjectionLosses(currentRecords, projectTaskId);
       const authoritativeSequence = authoritativeRecords.reduce((maximum, record) => Math.max(maximum, record.sequence), 0);
       const checkpointStale = checkpoint !== null && (checkpoint.lastCommittedMemorySequence !== authoritativeSequence || canonicalJson(checkpoint.relevantMemoryIds) !== canonicalJson(currentView.relevantMemoryIds));
       const diagnosticReason = checkpointStale ? "Checkpoint metadata is stale; in-memory current state was rebuilt from authoritative records" : checkpointReason;
-      return { status: currentRecords.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView, viewFresh: true, records: currentRecords, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", ...(diagnosticReason === undefined ? {} : { reason: diagnosticReason }) };
+      const recoveryCompleteness = inspectRecoveryCompleteness(projectTaskId, currentView, currentRecords, projectionLosses, options.canonicalProjectIdentityVerified ?? false);
+      return { status: currentRecords.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView, viewFresh: true, records: currentRecords, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", projectionLosses, recoveryCompleteness, ...(diagnosticReason === undefined ? {} : { reason: diagnosticReason }) };
     } catch (error) {
-      return { status: "blocked", projectTaskId, checkpoint, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", reason: error instanceof Error ? error.message : String(error) };
+      const reason = error instanceof Error ? error.message : String(error);
+      return { status: "blocked", projectTaskId, checkpoint, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness(reason), reason };
     }
   }
 
