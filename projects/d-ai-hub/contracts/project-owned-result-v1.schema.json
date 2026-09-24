@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "D-AI project-owned result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "schemaVersion", "resultId", "project", "dai", "execution", "acceptance", "evidence"],
+  "properties": {
+    "contract": { "const": "dai.project-result" },
+    "schemaVersion": { "const": 1 },
+    "resultId": { "$ref": "#/$defs/nonempty" },
+    "supersedesResultId": { "$ref": "#/$defs/nonempty" },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "workId", "executionOwnerId"],
+      "properties": {
+        "identity": { "$ref": "#/$defs/nonempty" },
+        "workId": { "$ref": "#/$defs/nonempty" },
+        "executionOwnerId": { "$ref": "#/$defs/nonempty" }
+      }
+    },
+    "dai": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId"],
+      "properties": { "taskId": { "type": "string", "pattern": "^task-[A-Za-z0-9._-]+$" } }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "scope"],
+      "properties": {
+        "verdict": { "enum": ["PASS", "FAIL", "BLOCKED"] },
+        "scope": { "$ref": "#/$defs/scope" },
+        "observedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "authorityId", "acceptedScope", "acceptedAt"],
+      "properties": {
+        "verdict": { "enum": ["ACCEPTED", "REJECTED"] },
+        "authorityId": { "$ref": "#/$defs/nonempty" },
+        "acceptedScope": { "$ref": "#/$defs/scope" },
+        "acceptedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "refs", "case"],
+      "properties": {
+        "profile": { "const": "skill-pulse.sp-ops-006/v1" },
+        "refs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/evidenceRef" } },
+        "case": { "$ref": "#/$defs/spOps006" }
+      }
+    }
+  },
+  "$defs": {
+    "nonempty": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "objectId": { "type": "string", "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$" },
+    "scope": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/nonempty" } },
+    "evidenceRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "kind", "repositoryIdentity", "commitSha", "path", "blobOid", "sha256"],
+          "properties": {
+            "id": { "$ref": "#/$defs/nonempty" },
+            "kind": { "const": "git-blob" },
+            "repositoryIdentity": { "$ref": "#/$defs/nonempty" },
+            "commitSha": { "$ref": "#/$defs/objectId" },
+            "path": { "$ref": "#/$defs/nonempty" },
+            "blobOid": { "$ref": "#/$defs/objectId" },
+            "sha256": { "$ref": "#/$defs/digest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "kind", "url", "immutableId", "sha256"],
+          "properties": {
+            "id": { "$ref": "#/$defs/nonempty" },
+            "kind": { "const": "https-object" },
+            "url": { "type": "string", "format": "uri", "pattern": "^https://" },
+            "immutableId": { "$ref": "#/$defs/nonempty" },
+            "sha256": { "$ref": "#/$defs/digest" }
+          }
+        }
+      ]
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check", "verdict", "checkedAt", "evidenceRefId"],
+      "properties": {
+        "check": { "$ref": "#/$defs/nonempty" },
+        "verdict": { "enum": ["PASS", "FAIL", "BLOCKED"] },
+        "checkedAt": { "type": "string", "format": "date-time" },
+        "evidenceRefId": { "$ref": "#/$defs/nonempty" }
+      }
+    },
+    "spOps006": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["naturalSchedulerInstanceId", "schedulerEvents", "runtimeLogSha256", "runtimeLogEvidenceRefId", "snapshot", "netlify"],
+      "properties": {
+        "naturalSchedulerInstanceId": { "$ref": "#/$defs/nonempty" },
+        "schedulerEvents": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["eventId", "recordId", "evidenceRefId"],
+            "properties": {
+              "eventId": { "type": "integer", "minimum": 0 },
+              "recordId": { "type": "integer", "minimum": 0 },
+              "evidenceRefId": { "$ref": "#/$defs/nonempty" }
+            }
+          }
+        },
+        "runtimeLogSha256": { "$ref": "#/$defs/digest" },
+        "runtimeLogEvidenceRefId": { "$ref": "#/$defs/nonempty" },
+        "snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commitSha", "gitBlobOid", "gitBlobSha256", "evidenceRefId"],
+          "properties": {
+            "commitSha": { "$ref": "#/$defs/objectId" },
+            "gitBlobOid": { "$ref": "#/$defs/objectId" },
+            "gitBlobSha256": { "$ref": "#/$defs/digest" },
+            "evidenceRefId": { "$ref": "#/$defs/nonempty" }
+          }
+        },
+        "netlify": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["deployId", "immutableManifestUrl", "immutableManifestVerification", "productionAliasVerification"],
+          "properties": {
+            "deployId": { "$ref": "#/$defs/nonempty" },
+            "immutableManifestUrl": { "type": "string", "format": "uri", "pattern": "^https://" },
+            "immutableManifestVerification": { "allOf": [{ "$ref": "#/$defs/verification" }, { "type": "object", "properties": { "check": { "const": "immutable-deploy-manifest" } } }] },
+            "productionAliasVerification": { "allOf": [{ "$ref": "#/$defs/verification" }, { "type": "object", "properties": { "check": { "const": "production-alias" } } }] }
+          }
+        }
+      }
+    }
+  }
+}
