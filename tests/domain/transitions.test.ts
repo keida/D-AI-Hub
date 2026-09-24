@@ -32,6 +32,11 @@ describe("assertStageTransition", () => {
     expect(() => assertStageTransition("execute", "close")).toThrow(InvalidTaskStateError);
   });
 
+  it("does not promote a route-stage project-owned handoff directly to verify or close", () => {
+    expect(() => assertStageTransition("route", "verify")).toThrow(InvalidTaskStateError);
+    expect(() => assertStageTransition("route", "close")).toThrow(InvalidTaskStateError);
+  });
+
   it("rejects unknown stages explicitly", () => {
     expect(() => assertStageTransition("unknown" as Stage, "route")).toThrow(InvalidTaskStateError);
     expect(() => assertStageTransition("bootstrap", "unknown" as Stage)).toThrow(InvalidTaskStateError);
