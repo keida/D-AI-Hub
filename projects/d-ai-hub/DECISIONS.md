@@ -1,5 +1,29 @@
 # Decisions
 
+## 2026-09-24 — Honor Weekly Review natural-run freeze
+
+**Authority**
+
+The Weekly Review Project Boss confirmed `PAUSED / WAITING`, with the current project phase `CODEX-WEEKLY-008 — Natural Run Acceptance / PRE-TRIGGER FREEZE`. The project next action is to wait for the real Codex Scheduled trigger at 2026-09-27 16:00 Pacific/Auckland, then assess that natural-run evidence through the Weekly Review Project Boss. Durable task `task-97b1668e26b1fffb84d18050` remains the canonical resume anchor; its older `bootstrap / establish explicit curation` state is stale and lacks `phase,nextAction`.
+
+**Decision**
+
+Record `NO REPAIR — PROJECT PAUSED / WAITING FOR NATURAL TRIGGER`. Do not fill the durable `phase` or `nextAction` merely to make D-AI-Hub recovery report `COMPLETE`, manually trigger the run, change scheduler behavior, or modify the Weekly Review project while its pre-trigger freeze is in force. `INCOMPLETE: phase,nextAction` is currently expected for this owner-confirmed pause, not unresolved repair debt. Weekly Review Project Boss owns the natural-run acceptance. DAI-ARCH-002 architecture work may proceed independently after this documentation enters canonical main.
+
+## 2026-09-24 — Honor DSH 2 paused project disposition
+
+**Authority**
+
+The DSH 2 Project Boss confirmed the project activity state is `PAUSED / WAITING FOR USER DECISION`, with no active execution objective and execution phase intentionally unset. The durable task `task-fb6d8a19f0beb3f467c1f424` remains the unique canonical resume anchor.
+
+**Decision**
+
+Record `NO REPAIR — PROJECT PAUSED / PHASE INTENTIONALLY UNSET` in the D-AI-Hub control plane. Do not write `phase = PAUSED`, infer a phase from the durable `bootstrap` stage, backfill a former phase, or mutate DSH 2 project files, state, task, or memory merely to obtain `COMPLETE`. DAI-ARCH-001 reporting `INCOMPLETE: phase` is expected for this owner-confirmed paused state; it does not indicate that the phase was lost.
+
+**Resume condition**
+
+The user chooses Quiet Bay, Bubble Port, Dive Chamber, Field Station, Sketch Workshop, or explicitly requests a new direction. Resume the same canonical task. The DSH 2 Project Boss then defines an explicit objective and execution phase before the canonical phase is updated and recovery completeness is rerun. Do not create a new task solely because the project resumes.
+
 ## 2026-09-22 — Accept Project-Owned Lifecycle Handoff as DAI-ARCH-002
 
 **Context**
