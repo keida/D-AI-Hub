@@ -1,16 +1,16 @@
 # Roadmap
 
-## Prerequisite publication order
+## Completed prerequisite publication chain
 
-- P2 — Authoritative Rebuild / Belief: `PUBLISHED / CANONICAL`; publication base for P3 is `f8e9b10c0123b3f0b48e53997a63349a72b538fc`.
-- P3 — Local-only identity / zero-remote validation: next slice.
-- P4 — Boss recovery / rollover: after P3 publication review and canonical publication.
-- DAI-ARCH-001 — Active Task Recovery Completeness: publish after its minimal prerequisites are canonical; do not close it or repair DSH 2 / Weekly Review early.
-- DAI-ARCH-002: accepted but deferred until DAI-ARCH-001 is canonical. No implementation, runtime activation, or Skill Pulse durable-stage repair is authorized by this ticket entry.
+- P2 authoritative rebuild, P3 local-only identity, P4 Boss recovery, and their bounded repairs are `PUBLISHED / CANONICAL`.
+- DAI-ARCH-001 recovery completeness is `PUBLISHED / CANONICAL`. DSH 2 and Weekly Review retain owner-confirmed paused dispositions; neither is repaired to force completeness.
+- DAI-ARCH-002 HUMAN-CONFIRMED handoff is `PUBLISHED / CANONICAL`. Skill Pulse has a verified project-owned handoff, while its durable task remains open at `route` and is not close-eligible on the current evidence. Runtime/global binding activation and HOST-ATTESTED authority remain separate, unimplemented work.
 
-## DAI-ARCH-002 — Project-Owned Lifecycle Handoff (accepted, deferred)
+<a name="dai-arch-002--project-owned-lifecycle-handoff-accepted-deferred"></a>
 
-**Status.** `ACCEPTED / IMPLEMENTATION DEFERRED`.
+## DAI-ARCH-002 — Project-Owned Lifecycle Handoff (published)
+
+**Status.** HUMAN-CONFIRMED contract and bounded handoff mechanism `PUBLISHED / CANONICAL`; HOST-ATTESTED remains deferred. The published mechanism is not a global runtime binding activation or task close decision.
 
 **Problem.** The ordinary D-AI-Hub lifecycle assumes D-AI-Hub performs `route → plan → execute → inspect → verify`. A separately owned project can complete execution and acceptance while its D-AI-Hub orchestration task remains at `route`. The Skill Pulse project Boss accepted SP-OPS-006 after a natural production run, yet D-AI-Hub correctly rejected direct `route → verify` for task `task-7b959c2155241137b16a5220`. Inventing unperformed stages would falsify the durable lifecycle.
 
@@ -18,7 +18,7 @@
 
 **Acceptance criteria**
 
-1. Ingestion accepts results only from the task's declared project execution owner, with explicit verifiable provenance and evidence.
+1. Reconciliation binds the typed project-owned result to the task's declared project execution owner and exact immutable evidence, under the separately verified HUMAN-CONFIRMED authority mode; it does not claim HOST-ATTESTED Boss identity.
 2. The handoff is typed and explicit; an ordinary `verify` transition or arbitrary caller cannot bypass lifecycle gates.
 3. The durable result distinguishes D-AI-executed stages, project-owned execution and acceptance, and D-AI-Hub orchestration reconciliation without recording unperformed `plan`, `execute`, or `inspect` stages.
 4. Replaying an identical accepted handoff is idempotent: it neither closes the task twice nor creates a second authoritative result. Conflicting replays fail closed.
@@ -27,9 +27,27 @@
 7. Existing ordinary lifecycle transitions and their fail-closed rejection behavior remain unchanged, with regression evidence for both paths.
 8. A fresh recovery exposes the reconciled owner, provenance, result, and remaining lifecycle state without relying on chat history or unrelated project data.
 
-**Current case.** Skill Pulse task `task-7b959c2155241137b16a5220` stays at `route`, unclosed, `BLOCKED — awaiting lifecycle handoff capability`. Its project Boss owns execution and acceptance; D-AI-Hub does not rerun SP-OPS-006 or alter Skill Pulse files. This ticket does not authorize an immediate repair or implementation.
+**Current case.** Skill Pulse task `task-7b959c2155241137b16a5220` remains open at `route`. The published project-owned result and HUMAN-CONFIRMED handoff are bound to this task, with disposition `HANDOFF_VERIFIED_AWAITING_CLOSE_DECISION`. Its historical objective and completion criteria remain unknown, so handoff acceptance does not establish close eligibility. D-AI-Hub does not rerun SP-OPS-006 or alter Skill Pulse production files.
 
-**Dispatch gate.** Start only after P3 → P4 → DAI-ARCH-001 publication has completed and DAI-ARCH-001 is on canonical main. Use the then-current canonical base and a separately bounded implementation packet.
+**Publication boundary.** P3 → P4 → DAI-ARCH-001 prerequisites and the HUMAN-CONFIRMED handoff are canonical. Any further close or host-attestation work needs its own bounded decision.
+
+## DAI-ARCH-003 — Routable Task Succession (design candidate)
+
+**Status.** `DESIGN ACCEPTED / READY FOR BOUNDED IMPLEMENTATION`; implementation is not started. The 2026-09-25 Skill Pulse Project Boss governance decision is forward-looking: task `task-7b959c2155241137b16a5220` remains open at `route` as a historical recovery/evidence anchor, but is `LEGACY_FROZEN`, receives no new work, and is not the current resume anchor. Its original completion criteria remain unknown. This ticket does not write that disposition into durable task state or create a successor.
+
+**Problem.** Current discovery selects every non-closed task in a workspace, while default establish/status/continue and Boss startup assume exactly one matching open task. Per-task active generation pointers and per-task atomic creation do not represent a project-level current task. An open frozen historical task therefore blocks a later, explicitly chartered current task.
+
+**Bounded model.** Add a typed routing/governance disposition independent of project phase and lifecycle stage: `ROUTABLE` (current), `PAUSED_RESUMABLE` (current resume anchor, with no active execution), or `LEGACY_FROZEN` (explicit-ID historical inspection only). Preserve old durable records without backfill by treating an absent disposition as routable during migration; never infer frozen or paused from `bootstrap`, `route`, missing phase, or task age. An explicit frozen change needs an auditable owner decision, effective time, project/task binding, and reason. It must not change `goal`, `stage`, close state, or the project-owned handoff.
+
+**Selection and pointer.** Keep full, integrity-checked discovery of all open tasks. Derive the default current pointer from exactly one task with a routable or paused-resumable disposition for the exact canonical project, workspace, and environment. Zero eligible tasks means no default resume target; multiple eligible tasks or identity conflicts fail closed. A frozen task stays addressable by exact task ID for read-only recovery and project-owned audit, but normal establish/continue/status/Boss startup must not select it as the current task. A current runtime registry pointer must be invalidated when its task becomes frozen. Do not turn the per-task active generation pointer into a project pointer or silently rewrite it.
+
+**Successor gate.** Only an expressly approved new task charter may create a successor while a frozen task remains open. The charter must bind canonical project identity, explicit objective, owned/excluded scope, completion criteria, termination condition, initial phase/state where applicable, and initial canonical nextAction. Do not derive these from the legacy task or from a free-form `establish` keyword. Use the existing bootstrap state creation with a distinct stable charter/task identity; configured local-only reservation must not reuse the frozen task ID. A project-scoped cross-runtime election/ownership guard must recheck eligible tasks, publish one new task, then verify a single eligible result. Per-task `createIfAbsent` and in-process workspace serialization alone cannot provide this cross-task guarantee. Any valid in-progress publication must use the bounded P3R initialization-aware path; malformed or stale partial state still fails closed.
+
+**Implementation seam.** Expected narrow modules: `src/domain/types.ts` for the typed disposition; `src/state/file-durable-context-store.ts` and `src/state/durable-context-store.ts` for strict persisted validation and project-scoped election; `src/runtime/d-ai-runtime.ts` for current-task selection, explicit-ID read-only fencing, and Boss startup selection; `src/bootstrap/bootstrap-task.ts` for a distinct charter-bound successor ID. Only add an entry/parser change if the approved charter cannot enter through an existing typed request. Keep ordinary lifecycle transitions, recovery-completeness checks, P4 presentation, and the DAI-ARCH-002 project-owned audit unchanged.
+
+**Recovery and regression.** Explicit frozen-task recovery reports open status, `LEGACY_FROZEN`, not-current-anchor, no task-owned nextAction, unresolved historical scope, and its existing project-owned handoff/audit by exact task ID. Keep DAI-ARCH-001 completeness unchanged; an incomplete historical task stays incomplete. Default recovery targets the sole eligible task and remains blocked if none or ambiguous. DSH 2 and Weekly Review remain paused but resumable under their existing task IDs, with their present incompleteness unchanged. Ordinary one-task projects keep reuse behavior. Concurrent successor establishment must converge on one new eligible task across independent runtimes, with no duplicate and no regression in P3R/P3R-T1 local-only initialization behavior.
+
+**Excluded.** No Skill Pulse successor or close, no reassignment of PROD/PERF work, no lifecycle/identity/completeness redesign, no project-owned handoff migration, no general task scheduler, and no runtime/global binding activation.
 
 ## Now — Codex-first D-AI V1 (accepted)
 

@@ -1,5 +1,11 @@
 # Decisions
 
+## 2026-09-25 — Freeze the ambiguous Skill Pulse legacy task for future routing
+
+The Skill Pulse Project Boss confirmed a forward-looking `LEGACY_FROZEN` disposition for D-AI task `task-7b959c2155241137b16a5220`, effective 2026-09-25 Pacific/Auckland. The task remains open at `route`, with durable `goal=establish`, as an explicit-ID historical recovery/evidence anchor. It receives no new work, is not the continuing project resume anchor, and has no task-owned blocker or nextAction. The original objective and completion criteria were not recovered; this decision does not reconstruct them, declare the task complete, or authorize close or a successor. The existing HUMAN-CONFIRMED project-owned handoff stays bound to this task.
+
+DSH 2 and Weekly Review have different owner-confirmed paused dispositions: their existing tasks remain resumable. Paused project activity and frozen historical routing are not lifecycle stages or execution phases. The [DAI-ARCH-003 design](ROADMAP.md#dai-arch-003--routable-task-succession-design-candidate) is accepted as `READY FOR BOUNDED IMPLEMENTATION`, with Slice A routing disposition preceding Slice B successor establishment. Until those slices are separately implemented and published, the Skill Pulse decision is documented control-plane governance; no durable routing field or current-task pointer has been changed.
+
 ## 2026-09-25 — Add HUMAN-CONFIRMED authority mode to DAI-ARCH-002
 
 **Scope and precedence**
@@ -98,7 +104,7 @@ Skill Pulse project Boss independently accepted its natural production run, but 
 
 **Decision**
 
-Accept the bounded architecture ticket [DAI-ARCH-002 — Project-Owned Lifecycle Handoff](ROADMAP.md#dai-arch-002--project-owned-lifecycle-handoff-accepted-deferred). Its goal is an explicit, typed ingestion and reconciliation boundary for evidence from the declared project execution owner, preserving provenance, fail-closed behavior, idempotency, ordinary transitions, and the separation between project execution and D-AI-Hub orchestration. The implementation form remains open; this decision does not prescribe a stage, synthetic transition, event, or command.
+Accept the bounded architecture ticket [DAI-ARCH-002 — Project-Owned Lifecycle Handoff](ROADMAP.md#dai-arch-002--project-owned-lifecycle-handoff-published). Its goal is an explicit, typed ingestion and reconciliation boundary for evidence from the declared project execution owner, preserving provenance, fail-closed behavior, idempotency, ordinary transitions, and the separation between project execution and D-AI-Hub orchestration. The implementation form remains open; this decision does not prescribe a stage, synthetic transition, event, or command.
 
 Keep the Skill Pulse durable task and its `route` stage unchanged and unclosed, marked `BLOCKED — awaiting lifecycle handoff capability`. Do not start DAI-ARCH-002 implementation now. Complete P3, P4, and DAI-ARCH-001 publication in order; dispatch DAI-ARCH-002 only after DAI-ARCH-001 enters canonical main, from the then-current canonical base.
 
