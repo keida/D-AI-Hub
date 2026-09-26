@@ -4,6 +4,7 @@ import type { CurationCandidate } from "../curation/local-curation.js";
 import type { CurationPipelineInput } from "../curation/current-view-pipeline.js";
 import type { AgentExecutionDirective, DeliveryRequest, DeliveryResult, PublicationAuthority } from "../automation/delivery.js";
 import type { BossSessionRequest, DAIResponse, ExternalDAIRequest } from "../runtime/d-ai-runtime.js";
+import type { TaskCharter } from "../domain/types.js";
 
 export interface CodexActivationInput {
   readonly rawCommand: string;
@@ -11,6 +12,8 @@ export interface CodexActivationInput {
   readonly currentContext?: readonly CurationCandidate[];
   readonly curationSourceWindow?: CurationPipelineInput;
   readonly bossSession?: BossSessionRequest;
+  readonly taskCharter?: TaskCharter;
+  readonly confirmedTaskCharterDigest?: string;
 }
 
 export interface CodexActivationOptions {
@@ -68,6 +71,11 @@ function naturalResponse(input: CodexActivationInput, intent: UserIntent, status
 export function createCodexActivation(runtime: DAIRuntimeHandler, options: CodexActivationOptions = {}): (input: CodexActivationInput) => Promise<CodexActivationResponse> {
   return async (input: CodexActivationInput): Promise<CodexActivationResponse> => {
     const rawText = input.rawCommand.trim();
+    if (input.taskCharter !== undefined && !rawText.startsWith("@D-AI")) {
+      return {
+        ...naturalResponse(input, classifyUserIntent(rawText), "blocked", "An approved task charter requires an explicit @D-AI establish command"),
+      };
+    }
     if (isBossPreparationRequest(rawText) || /^@D-AI\s+continue$/iu.test(rawText)) {
       const prepare = isBossPreparationRequest(rawText);
       const bossSession: BossSessionRequest = prepare
@@ -85,6 +93,8 @@ export function createCodexActivation(runtime: DAIRuntimeHandler, options: Codex
         ...(input.currentContext === undefined ? {} : { curationCandidates: input.currentContext }),
         ...(input.curationSourceWindow === undefined ? {} : { curationSourceWindow: input.curationSourceWindow }),
         ...(input.bossSession === undefined ? {} : { bossSession: input.bossSession }),
+        ...(input.taskCharter === undefined ? {} : { taskCharter: input.taskCharter }),
+        ...(input.confirmedTaskCharterDigest === undefined ? {} : { confirmedTaskCharterDigest: input.confirmedTaskCharterDigest }),
       });
     }
 

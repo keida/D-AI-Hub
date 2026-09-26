@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { link, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
 import { assertSafeManifestId, containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-id.js";
@@ -16,6 +16,8 @@ import type {
   TaskOwnershipTransitionAuthorizer,
   TaskStateWriteAuthorization,
 } from "./durable-context-store.js";
+import { parseApprovedTaskCharter, taskCharterContentDigest, taskCharterSchema, taskCharterTaskId } from "./task-charter.js";
+import { taskCharterConfirmationEventSchema } from "./task-charter.js";
 import { matchesCanonicalWorkspaceIdentity } from "./workspace-identity.js";
 
 const credentialFieldPattern = /(?:api[_-]?(?:key|token)|access[_-]?token|auth(?:orization)?|credential|cookie|password|private[_-]?key|secret|session[_-]?token)/i;
@@ -165,6 +167,8 @@ const taskStateSchema = z
     environment: environmentSchema,
     stage: stageSchema,
     routingDisposition: z.enum(["ROUTABLE", "PAUSED_RESUMABLE", "LEGACY_FROZEN"]).optional(),
+    taskCharter: taskCharterSchema.optional(),
+    taskCharterConfirmation: taskCharterConfirmationEventSchema.optional(),
     role: roleSchema,
     routingDecision: z
       .object({
@@ -248,6 +252,47 @@ function createHashForContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
+function projectSuccessorContendersPath(rootPath: string, projectIdentity: string): string {
+  const projectKey = createHashForContent(`dai-project-election-v1\n${projectIdentity}`);
+  return join(rootPath, projectSuccessorContendersDirectory, projectKey, "contenders");
+}
+
+function successorOwnerBinding(state: TaskState): { environment: Environment; workspacePath: string; repositoryPath: string | null } {
+  const identityPath = (kind: "workspace" | "repository"): string | null => {
+    const entries = state.contextManifest.filter((entry) => entry.startsWith(`identity:${kind}:`));
+    if (entries.length === 0 && kind === "repository") return null;
+    if (entries.length !== 1) throw new InvalidTaskStateError(`Successor requires one canonical ${kind} ownership identity`);
+    const match = new RegExp(`^identity:${kind}:(.*):([a-f0-9]{64})$`, "u").exec(entries[0]!);
+    if (match === null || match[1]!.length === 0) throw new InvalidTaskStateError(`Successor has an invalid ${kind} ownership identity`);
+    return match[1]!;
+  };
+  return {
+    environment: state.environment,
+    workspacePath: identityPath("workspace")!,
+    repositoryPath: identityPath("repository"),
+  };
+}
+
+function successorOwnerBindingDigest(binding: { environment: Environment; workspacePath: string; repositoryPath: string | null }): string {
+  return createHashForContent(JSON.stringify(binding));
+}
+
+async function writeImmutableFile(targetPath: string, content: string): Promise<boolean> {
+  const temporaryPath = join(dirname(targetPath), `.${basename(targetPath)}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporaryPath, content, { encoding: "utf8", flag: "wx" });
+    try {
+      await link(temporaryPath, targetPath);
+      return true;
+    } catch (error: unknown) {
+      if (isAlreadyExistsError(error)) return false;
+      throw error;
+    }
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}
+
 function isTaskOwnershipTransition(authorization: TaskStateWriteAuthorization): authorization is TaskOwnershipTransition {
   return "targetEnvironment" in authorization;
 }
@@ -296,8 +341,46 @@ function parseTaskState(value: unknown, targetPath: string): TaskState {
     const reason = issue === undefined ? "schema validation failed" : `${issue.path.join(".")}: ${issue.message}`;
     throw new InvalidTaskStateError(`Invalid task state at ${targetPath}: ${reason}`);
   }
+  if (result.data.taskCharter !== undefined) {
+    const charter = parseApprovedTaskCharter(result.data.taskCharter);
+    const confirmation = result.data.taskCharterConfirmation;
+    if (confirmation === undefined || confirmation.projectIdentity !== charter.projectIdentity
+      || confirmation.confirmedCharterDigest !== taskCharterContentDigest(charter)) {
+      throw new InvalidTaskStateError(`Task charter confirmation event does not bind the exact project and content digest at ${targetPath}`);
+    }
+  } else if (result.data.taskCharterConfirmation !== undefined) {
+    throw new InvalidTaskStateError(`Task charter confirmation event has no corresponding charter at ${targetPath}`);
+  }
   return result.data;
 }
+
+export interface FileDurableContextStoreTestHooks {
+  readonly afterInitialCompanionsWritten?: (() => Promise<void>) | undefined;
+}
+
+interface ProjectSuccessorContender {
+  readonly schemaVersion: 1;
+  readonly projectIdentity: string;
+  readonly charterDigest: string;
+  readonly taskId: string;
+  readonly bindingDigest: string;
+  readonly environment: Environment;
+  readonly workspacePath: string;
+  readonly repositoryPath: string | null;
+}
+
+const projectSuccessorContenderSchema = z.object({
+  schemaVersion: z.literal(1),
+  projectIdentity: z.string().trim().min(1).max(512),
+  charterDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  taskId: z.string().regex(/^task-[a-f0-9]{24}$/u),
+  bindingDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+  environment: environmentSchema,
+  workspacePath: z.string().trim().min(1).max(4096),
+  repositoryPath: z.string().trim().min(1).max(4096).nullable(),
+}).strict();
+
+const projectSuccessorContendersDirectory = ".project-successor-election";
 
 function parseManifest(value: unknown, taskId: string, targetPath: string): DurableContextManifest {
   const result = manifestSchema.safeParse(value);
@@ -568,13 +651,269 @@ async function publishActivePointer(paths: SnapshotPaths, manifestId: string, ow
   );
 }
 
+async function rebaseStagedSuccessor(stagingRoot: string, finalRoot: string, taskId: string, state: TaskState): Promise<void> {
+  const stagedPaths = createSnapshotPaths(stagingRoot, taskId);
+  const finalPaths = createSnapshotPaths(finalRoot, taskId);
+  const previousManifest = state.durableContext;
+  if (previousManifest === null || previousManifest.taskId !== taskId) {
+    throw new InvalidTaskStateError(`Staged successor ${taskId} has no canonical manifest`);
+  }
+  const companionFiles = [
+    [stagedPaths.context, finalPaths.context],
+    [stagedPaths.evidence, finalPaths.evidence],
+    [stagedPaths.approval, finalPaths.approval],
+    [stagedPaths.handoff, finalPaths.handoff],
+    [stagedPaths.recovery, finalPaths.recovery],
+  ] as const;
+  const contents = new Map<string, string>();
+  for (const [stagedPath, finalPath] of companionFiles) contents.set(finalPath, await readFile(stagedPath, "utf8"));
+
+  const manifestBase: DurableContextManifest = {
+    ...previousManifest,
+    manifestId: randomUUID(),
+    durablePaths: allDurablePaths(finalPaths),
+    hashes: {},
+    recordedAt: new Date().toISOString(),
+  };
+  assertSafeManifestId(manifestBase.manifestId, "Successor manifest id");
+  const persistedState = { ...state, durableContext: manifestBase };
+  const hashes: Record<string, string> = {};
+  for (const [path, content] of contents) hashes[path] = createHashForContent(content);
+  hashes[finalPaths.state] = createHashForContent(createCanonicalStateContent(persistedState));
+  hashes[finalPaths.manifest] = createHashForContent(createCanonicalManifestContent(manifestBase));
+  const manifest: DurableContextManifest = { ...manifestBase, hashes };
+  assertManifestContract(manifest, taskId, finalPaths);
+  const stateContent = serialize({ ...state, durableContext: manifest });
+  const manifestContent = serialize(manifest);
+  const generationContents = new Map<string, string>([
+    ...contents,
+    [finalPaths.manifest, manifestContent],
+    [finalPaths.state, stateContent],
+  ]);
+  await writeGenerationAtomically(stagedPaths, manifest.manifestId, generationContents);
+  for (const [stagedPath, finalPath] of companionFiles) await writeAtomically(stagedPath, contents.get(finalPath)!);
+  await writeAtomically(stagedPaths.manifest, manifestContent);
+  await writeAtomically(stagedPaths.state, stateContent);
+  const previousPointer = await loadActivePointer(stagedPaths, taskId);
+  if (previousPointer === null) throw new InvalidTaskStateError(`Staged successor ${taskId} has no active durable pointer`);
+  await publishActivePointer(stagedPaths, manifest.manifestId, previousPointer.ownershipGeneration);
+}
+
+async function verifyRebasedStagedSuccessor(stagingRoot: string, finalRoot: string, taskId: string): Promise<TaskState> {
+  const stagedPaths = createSnapshotPaths(stagingRoot, taskId);
+  const finalPaths = createSnapshotPaths(finalRoot, taskId);
+  const pointer = await loadActivePointer(stagedPaths, taskId);
+  if (pointer === null) throw new InvalidTaskStateError(`Rebased successor ${taskId} has no active pointer`);
+  const manifestPath = generationPath(stagedPaths, pointer.manifestId, stagedPaths.manifest);
+  const manifest = parseManifest(parseJson(await readRequiredContent(taskId, manifestPath, "rebased generation manifest"), taskId, manifestPath), taskId, manifestPath);
+  if (manifest.manifestId !== pointer.manifestId) throw new InvalidTaskStateError(`Rebased successor ${taskId} active pointer does not match its manifest`);
+  assertManifestContract(manifest, taskId, finalPaths);
+  const manifestHash = manifest.hashes[finalPaths.manifest];
+  if (manifestHash === undefined || createHashForContent(createCanonicalManifestContent(manifest)) !== manifestHash) {
+    throw new InvalidTaskStateError(`Rebased successor ${taskId} manifest hash is invalid`);
+  }
+  const companionSchemas: readonly [string, z.ZodType][] = [
+    [finalPaths.context, contextRecordSchema],
+    [finalPaths.evidence, evidenceRecordSchema],
+    [finalPaths.approval, approvalRecordSchema],
+    [finalPaths.handoff, handoffRecordSchema],
+    [finalPaths.recovery, recoveryRecordSchema],
+  ];
+  for (const [finalPath, schema] of companionSchemas) {
+    const expectedHash = manifest.hashes[finalPath];
+    if (expectedHash === undefined) throw new InvalidTaskStateError(`Rebased successor ${taskId} is missing companion hash ${finalPath}`);
+    const physicalPath = generationPath(stagedPaths, pointer.manifestId, join(stagedPaths.taskRoot, basename(finalPath)));
+    const content = await readRequiredContent(taskId, physicalPath, expectedHash);
+    assertRawHash(taskId, physicalPath, content, expectedHash);
+    parseCompanionRecord(parseJson(content, taskId, physicalPath), taskId, physicalPath, schema);
+  }
+  const statePath = generationPath(stagedPaths, pointer.manifestId, stagedPaths.state);
+  const stateHash = manifest.hashes[finalPaths.state];
+  if (stateHash === undefined) throw new InvalidTaskStateError(`Rebased successor ${taskId} is missing state hash`);
+  const stateContent = await readRequiredContent(taskId, statePath, stateHash);
+  const state = parseTaskState(parseJson(stateContent, taskId, statePath), statePath);
+  assertNoCredentialLikeFields(state, statePath, "state");
+  if (createHashForContent(createCanonicalStateContent(state)) !== stateHash
+    || state.durableContext === null || JSON.stringify(state.durableContext) !== JSON.stringify(manifest)) {
+    throw new InvalidTaskStateError(`Rebased successor ${taskId} state does not match its final-root manifest`);
+  }
+  const generationManifestPath = generationPath(stagedPaths, pointer.manifestId, stagedPaths.manifest);
+  const generationManifestContent = await readRequiredContent(taskId, generationManifestPath, manifestHash);
+  const generationManifest = parseManifest(parseJson(generationManifestContent, taskId, generationManifestPath), taskId, generationManifestPath);
+  if (JSON.stringify(generationManifest) !== JSON.stringify(manifest)) throw new InvalidTaskStateError(`Rebased successor ${taskId} generation manifest mismatch`);
+  return state;
+}
+
 export class FileDurableContextStore implements DurableContextStore {
   private readonly rootPath: string;
+  private readonly testHooks: FileDurableContextStoreTestHooks;
   private readonly saveLocks = new Map<string, Promise<void>>();
   private readonly issuedTransitions = new WeakSet<TaskOwnershipTransition>();
 
-  public constructor(rootPath: string) {
+  public constructor(rootPath: string, testHooks: FileDurableContextStoreTestHooks = {}) {
     this.rootPath = resolve(rootPath);
+    this.testHooks = testHooks;
+  }
+
+  public async registerProjectSuccessorContender(state: TaskState, projectIdentity: string, charterDigest: string): Promise<"registered" | "conflict"> {
+    const normalizedProjectIdentity = projectIdentity.trim();
+    const charter = parseApprovedTaskCharter(state.taskCharter);
+    const confirmation = taskCharterConfirmationEventSchema.safeParse(state.taskCharterConfirmation);
+    if (normalizedProjectIdentity.length === 0 || normalizedProjectIdentity.length > 512
+      || !/^[a-f0-9]{64}$/u.test(charterDigest)
+      || charter.projectIdentity !== normalizedProjectIdentity
+      || taskCharterContentDigest(charter) !== charterDigest
+      || !confirmation.success
+      || confirmation.data.projectIdentity !== normalizedProjectIdentity
+      || confirmation.data.confirmedCharterDigest !== charterDigest
+      || state.taskId !== taskCharterTaskId(normalizedProjectIdentity, charterDigest)) {
+      throw new InvalidTaskStateError(`Project successor contender identity is invalid (project=${normalizedProjectIdentity.length > 0 && normalizedProjectIdentity.length <= 512}, digest=${/^[a-f0-9]{64}$/u.test(charterDigest)}, taskId=${state.taskId === taskCharterTaskId(normalizedProjectIdentity, charterDigest)})`);
+    }
+    const ownerBinding = successorOwnerBinding(state);
+    const bindingDigest = successorOwnerBindingDigest(ownerBinding);
+    const contendersPath = projectSuccessorContendersPath(this.rootPath, normalizedProjectIdentity);
+    await mkdir(contendersPath, { recursive: true });
+    const contender: ProjectSuccessorContender = {
+      schemaVersion: 1,
+      projectIdentity: normalizedProjectIdentity,
+      charterDigest,
+      taskId: state.taskId,
+      bindingDigest,
+      ...ownerBinding,
+    };
+    const contenderPath = join(contendersPath, `${charterDigest}-${bindingDigest}.json`);
+    await writeImmutableFile(contenderPath, serialize(contender));
+    const contenders = await this.readProjectSuccessorContenders(normalizedProjectIdentity);
+    const ownContender = contenders.find((entry) => entry.charterDigest === charterDigest && entry.bindingDigest === bindingDigest);
+    if (ownContender === undefined || ownContender.taskId !== state.taskId) {
+      throw new InvalidTaskStateError("Project successor contender could not be verified after registration");
+    }
+    return this.hasContenderConflict(contenders) ? "conflict" : "registered";
+  }
+
+  public async hasProjectSuccessorConflict(projectIdentity: string): Promise<boolean> {
+    return this.hasContenderConflict(await this.readProjectSuccessorContenders(projectIdentity.trim()));
+  }
+
+  private hasContenderConflict(contenders: readonly ProjectSuccessorContender[]): boolean {
+    return new Set(contenders.map((entry) => entry.charterDigest)).size > 1
+      || new Set(contenders.map((entry) => entry.bindingDigest)).size > 1;
+  }
+
+  private async readProjectSuccessorContenders(projectIdentity: string): Promise<readonly ProjectSuccessorContender[]> {
+    const contendersPath = projectSuccessorContendersPath(this.rootPath, projectIdentity);
+    let entries: Dirent<string>[];
+    try {
+      entries = await readdir(contendersPath, { withFileTypes: true });
+    } catch (error: unknown) {
+      if (isMissingFileError(error)) return [];
+      throw new InvalidTaskStateError(`Unable to inspect project successor election for ${projectIdentity}: ${describeError(error)}`);
+    }
+    const contenders: ProjectSuccessorContender[] = [];
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.startsWith(".") && entry.name.endsWith(".tmp")) continue;
+      if (!entry.isFile() || !/^[a-f0-9]{64}-[a-f0-9]{64}\.json$/u.test(entry.name)) {
+        throw new InvalidTaskStateError(`Invalid project successor election entry for ${projectIdentity}: ${entry.name}`);
+      }
+      let parsed: unknown;
+      try { parsed = JSON.parse(await readFile(join(contendersPath, entry.name), "utf8")); }
+      catch (error: unknown) { throw new InvalidTaskStateError(`Invalid project successor contender ${entry.name}: ${describeError(error)}`); }
+      const result = projectSuccessorContenderSchema.safeParse(parsed);
+      if (!result.success) throw new InvalidTaskStateError(`Invalid project successor contender ${entry.name}`);
+      const contender = result.data;
+      if (contender.projectIdentity !== projectIdentity
+        || entry.name !== `${contender.charterDigest}-${contender.bindingDigest}.json`
+        || successorOwnerBindingDigest({
+          environment: contender.environment,
+          workspacePath: contender.workspacePath,
+          repositoryPath: contender.repositoryPath,
+        }) !== contender.bindingDigest
+        || contender.taskId !== taskCharterTaskId(projectIdentity, contender.charterDigest)) {
+        throw new InvalidTaskStateError(`Project successor contender identity mismatch for ${projectIdentity}`);
+      }
+      contenders.push(contender);
+    }
+    return contenders.sort((left, right) => `${left.charterDigest}-${left.bindingDigest}`.localeCompare(`${right.charterDigest}-${right.bindingDigest}`));
+  }
+
+  public async createSuccessorIfAbsent(state: TaskState, projectIdentity: string, charterDigest: string): Promise<DurableContextManifest> {
+    const charter = parseApprovedTaskCharter(state.taskCharter);
+    if (charter.projectIdentity !== projectIdentity || taskCharterContentDigest(charter) !== charterDigest
+      || state.taskId !== taskCharterTaskId(projectIdentity, charterDigest)
+      || state.routingDisposition !== "ROUTABLE" || state.durableContext !== null) {
+      throw new InvalidTaskStateError("Successor state does not match its approved project charter");
+    }
+    if (await this.registerProjectSuccessorContender(state, projectIdentity, charterDigest) === "conflict") {
+      throw new TaskOwnershipError("Competing approved task charters conflict for this project; explicit resolution is required");
+    }
+    const finalPaths = createSnapshotPaths(this.rootPath, state.taskId);
+    const existing = await this.load(state.taskId);
+    if (existing !== null) {
+      if (existing.routingDisposition !== "ROUTABLE" || existing.taskCharter === undefined
+        || taskCharterContentDigest(existing.taskCharter) !== charterDigest
+        || existing.taskCharter.projectIdentity !== projectIdentity
+        || JSON.stringify(successorOwnerBinding(existing)) !== JSON.stringify(successorOwnerBinding(state))) {
+        throw new TaskOwnershipError(`Successor task id ${state.taskId} is already occupied by different durable state`);
+      }
+      if (await this.hasProjectSuccessorConflict(projectIdentity)) throw new TaskOwnershipError("Competing task charters conflict for this project; explicit resolution is required");
+      if (existing.durableContext === null) throw new InvalidTaskStateError(`Published successor ${state.taskId} is missing its durable manifest`);
+      return existing.durableContext;
+    }
+    await mkdir(this.rootPath, { recursive: true });
+    const stagingRoot = join(this.rootPath, `.successor-staging-${randomUUID()}`);
+    let published = false;
+    try {
+      const stagedStore = new FileDurableContextStore(stagingRoot, this.testHooks);
+      await stagedStore.createIfAbsent(state);
+      const staged = await stagedStore.load(state.taskId);
+      if (staged === null || staged.durableContext === null || staged.taskCharter === undefined
+        || taskCharterContentDigest(staged.taskCharter) !== charterDigest) {
+        throw new InvalidTaskStateError("Staged successor did not pass strict durable read-back");
+      }
+      const initialManifestId = staged.durableContext.manifestId;
+      await rebaseStagedSuccessor(stagingRoot, this.rootPath, state.taskId, staged);
+      const rebased = await verifyRebasedStagedSuccessor(stagingRoot, this.rootPath, state.taskId);
+      if (rebased === null || rebased.durableContext === null || rebased.durableContext.manifestId === initialManifestId) {
+        throw new InvalidTaskStateError("Rebased successor did not pass strict staging-root read-back");
+      }
+      await stagedStore.loadGenerationManifest(state.taskId, initialManifestId);
+      const initialGenerationPath = generationRoot(createSnapshotPaths(stagingRoot, state.taskId), initialManifestId);
+      await rm(initialGenerationPath, { recursive: true, force: false });
+      if (await this.hasProjectSuccessorConflict(projectIdentity)) {
+        throw new TaskOwnershipError("Competing task charters conflict for this project; explicit resolution is required");
+      }
+      try {
+        await rename(createSnapshotPaths(stagingRoot, state.taskId).taskRoot, finalPaths.taskRoot);
+        published = true;
+      } catch (error: unknown) {
+        let destinationExists = false;
+        try { destinationExists = (await stat(finalPaths.taskRoot)).isDirectory(); }
+        catch (statError: unknown) { if (!isMissingFileError(statError)) throw statError; }
+        if (!destinationExists) throw error;
+        const winner = await this.load(state.taskId);
+        if (winner === null || winner.taskCharter === undefined || taskCharterContentDigest(winner.taskCharter) !== charterDigest
+          || winner.environment !== state.environment
+          || JSON.stringify(successorOwnerBinding(winner)) !== JSON.stringify(successorOwnerBinding(state))) {
+          throw new TaskOwnershipError(`Concurrent successor publication for ${state.taskId} did not converge on the approved charter`);
+        }
+      }
+      const publishedState = await this.load(state.taskId);
+      if (publishedState === null || publishedState.durableContext === null || publishedState.taskCharter === undefined
+        || publishedState.routingDisposition !== "ROUTABLE" || taskCharterContentDigest(publishedState.taskCharter) !== charterDigest
+        || publishedState.taskCharter.projectIdentity !== projectIdentity) {
+        throw new InvalidTaskStateError("Final-root strict load rejected the published successor");
+      }
+      if (await this.hasProjectSuccessorConflict(projectIdentity)) {
+        throw new TaskOwnershipError("Competing task charters conflict for this project; explicit resolution is required");
+      }
+      return publishedState.durableContext;
+    } finally {
+      await rm(stagingRoot, { recursive: true, force: true });
+      if (published) {
+        const finalized = await this.load(state.taskId);
+        if (finalized === null) throw new InvalidTaskStateError(`Published successor ${state.taskId} disappeared after publication`);
+      }
+    }
   }
 
   public async discoverActiveTasks(workspacePath: string): Promise<readonly TaskState[]> {
@@ -912,6 +1251,7 @@ export class FileDurableContextStore implements DurableContextStore {
       if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
       await writeAtomically(path, content);
     }
+    if (this.testHooks.afterInitialCompanionsWritten !== undefined) await this.testHooks.afterInitialCompanionsWritten();
     if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
     await writeAtomically(paths.manifest, manifestContent);
     if (ownedLease !== undefined) await this.assertCurrentTaskOwnership(ownedLease);
