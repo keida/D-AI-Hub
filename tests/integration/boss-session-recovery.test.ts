@@ -112,6 +112,44 @@ describe("P4 Boss startup and rollover", () => {
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
 
+  it("starts from the sole eligible task while retaining a legacy-frozen historical task", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-routing-disposition-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    try {
+      await mkdir(workspacePath, { recursive: true });
+      const options = { workspacePath, durableRoot, memoryDatabasePath };
+      const activate = createCodexActivation(createConfiguredDAIRuntime(options));
+      const established = await activate({ rawCommand: "@D-AI establish routing disposition fixture", taskId: null });
+      await activate({ rawCommand: "@D-AI 整理", taskId: established.taskId, curationSourceWindow: windowFor(established.taskId) });
+
+      const store = new FileDurableContextStore(durableRoot);
+      const routable = await store.load(established.taskId);
+      if (routable === null) throw new Error("Expected established routing task");
+      const frozenTaskId = "task-routing-legacy-frozen";
+      await store.createIfAbsent!({
+        ...routable,
+        taskId: frozenTaskId,
+        environment: "work",
+        routingDisposition: "LEGACY_FROZEN",
+        durableContext: null,
+      });
+      const before = await readFile(join(durableRoot, established.taskId, "state.json"));
+
+      const startup = await createCodexActivation(createConfiguredDAIRuntime(options))({ rawCommand: "@D-AI continue", taskId: null });
+
+      expect(startup).toMatchObject({
+        status: "accepted",
+        taskId: established.taskId,
+        bossSession: { decision: "CONTINUE_CURRENT_BOSS", startup: { taskId: established.taskId } },
+      });
+      expect((await store.load(frozenTaskId))?.routingDisposition).toBe("LEGACY_FROZEN");
+      expect(await readFile(join(durableRoot, established.taskId, "state.json"))).toEqual(before);
+      expect(await store.discoverActiveTasks(workspacePath)).toHaveLength(2);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
   it("fails closed on ambiguous or conflicting task identity without writing", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-p4-conflict-"));
     const workspacePath = join(root, "workspace");

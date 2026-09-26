@@ -164,6 +164,7 @@ const taskStateSchema = z
     constraints: z.array(z.string()),
     environment: environmentSchema,
     stage: stageSchema,
+    routingDisposition: z.enum(["ROUTABLE", "PAUSED_RESUMABLE", "LEGACY_FROZEN"]).optional(),
     role: roleSchema,
     routingDecision: z
       .object({

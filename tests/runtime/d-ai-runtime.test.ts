@@ -2219,6 +2219,170 @@ describe("D-AI runtime", () => {
     expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
   });
 
+  it("routes project continuation to the sole eligible task and ignores legacy-frozen history", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const routable = await seedProjectState(runtimeHarness);
+    const frozen: TaskState = { ...routable, taskId: "task-routing-frozen", routingDisposition: "LEGACY_FROZEN" };
+    await runtimeHarness.store.save(frozen);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [frozen, routable],
+    });
+
+    const result = await runtime({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: routable.taskId, status: "accepted" });
+    expect((await runtimeHarness.store.load(frozen.taskId))?.routingDisposition).toBe("LEGACY_FROZEN");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("reuses a sole PAUSED_RESUMABLE task for explicit project continuation", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const base = await seedProjectState(runtimeHarness);
+    const paused: TaskState = { ...base, routingDisposition: "PAUSED_RESUMABLE" };
+    await runtimeHarness.store.save(paused);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [paused],
+    });
+
+    const result = await runtime({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: paused.taskId, status: "accepted" });
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("excludes a frozen-only workspace from default status and blocks establish without creating a successor", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const initial = await createDAIRuntime(runtimeHarness.dependencies)(intentRequest("codex", noOverrides));
+    const state = await runtimeHarness.store.load(initial.taskId);
+    if (state === null) throw new Error("Expected a durable task");
+    const frozen: TaskState = {
+      ...state,
+      contextManifest: [...state.contextManifest, "local-project:11111111-1111-4111-8111-111111111111"],
+      routingDisposition: "LEGACY_FROZEN",
+    };
+    await runtimeHarness.store.save(frozen);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const runtime = createDAIRuntime({ ...runtimeHarness.dependencies, discoverActiveTasks: async () => [frozen] });
+
+    const status = await runtime({ command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides });
+    const establish = await runtime({ command: { kind: "intent", text: "establish successor" }, sourceEnvironment: "codex", overrides: noOverrides });
+
+    expect(status).toMatchObject({ taskId: "unassigned", status: "blocked" });
+    expect(status.message).toContain("No active D-AI task matches this workspace");
+    expect(establish).toMatchObject({ taskId: frozen.taskId, status: "blocked" });
+    expect(establish.message).toContain("Only legacy-frozen tasks match this workspace");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+    expect((await runtimeHarness.store.load(frozen.taskId))?.routingDisposition).toBe("LEGACY_FROZEN");
+  });
+
+  it("fails closed when more than one routable or paused task matches a project", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const routable = await seedProjectState(runtimeHarness);
+    const paused: TaskState = { ...routable, taskId: "task-routing-paused", routingDisposition: "PAUSED_RESUMABLE" };
+    await runtimeHarness.store.save(paused);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [paused, routable],
+    });
+
+    const result = await runtime({
+      command: { kind: "continue", taskIdOrProject: "D-AI-Hub" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.message).toContain("Multiple active durable tasks found for project D-AI-Hub");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("allows exact-ID read-only status for legacy-frozen tasks but blocks continue without writes", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const base = await seedProjectState(runtimeHarness);
+    const frozen: TaskState = { ...base, taskId: "task-routing-explicit-frozen", routingDisposition: "LEGACY_FROZEN" };
+    await runtimeHarness.store.save(frozen);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const runtime = createDAIRuntime(runtimeHarness.dependencies);
+
+    const status = await runtime({
+      command: { kind: "status" }, sourceEnvironment: "codex", overrides: noOverrides, activeTaskId: frozen.taskId,
+    });
+    const continued = await runtime({
+      command: { kind: "continue", taskIdOrProject: frozen.taskId }, sourceEnvironment: "codex", overrides: noOverrides,
+    });
+
+    expect(status).toMatchObject({ taskId: frozen.taskId, status: "accepted" });
+    expect(status.message).toContain("Read-only historical inspection");
+    expect(status.message).toContain("LEGACY_FROZEN");
+    expect(status.message).toContain("not selected as current");
+    expect(continued).toMatchObject({ taskId: frozen.taskId, status: "blocked" });
+    expect(continued.message).toContain("Legacy-frozen tasks");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+    expect((await runtimeHarness.store.load(frozen.taskId))?.routingDisposition).toBe("LEGACY_FROZEN");
+  });
+
+  it("rechecks routing disposition after acquiring ownership before continuing", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const routable = await seedProjectState(runtimeHarness);
+    let loads = 0;
+    const changingStore: DurableContextStore = {
+      ...runtimeHarness.store,
+      load: async (taskId) => {
+        const state = await runtimeHarness.store.load(taskId);
+        loads += 1;
+        return state === null || loads === 1 ? state : { ...state, routingDisposition: "LEGACY_FROZEN" };
+      },
+    };
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const beforeExecutions = runtimeHarness.executed.length;
+    const runtime = createDAIRuntime({ ...runtimeHarness.dependencies, store: changingStore });
+
+    const result = await runtime({
+      command: { kind: "continue", taskIdOrProject: routable.taskId },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: routable.taskId, status: "blocked" });
+    expect(result.message).toContain("Legacy-frozen tasks");
+    expect(loads).toBe(2);
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+    expect(runtimeHarness.executed).toHaveLength(beforeExecutions);
+  });
+
+  it("blocks handoff when a previously selected runtime task becomes legacy-frozen", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const runtime = createDAIRuntime(runtimeHarness.dependencies);
+    const started = await runtime(intentRequest("codex", noOverrides));
+    const state = await runtimeHarness.store.load(started.taskId);
+    if (state === null) throw new Error("Expected an active task");
+    await runtimeHarness.store.save({ ...state, routingDisposition: "LEGACY_FROZEN" });
+    const beforeWrites = runtimeHarness.savedStates.length;
+
+    const result = await runtime({
+      command: { kind: "handoff", target: "work" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+    });
+
+    expect(result).toMatchObject({ taskId: started.taskId, status: "blocked" });
+    expect(result.message).toContain("Legacy-frozen tasks");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
   it("does not resolve a malformed persisted repository identity", async () => {
     const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
     const state = await seedProjectState(runtimeHarness);
@@ -2241,8 +2405,8 @@ describe("D-AI runtime", () => {
       overrides: noOverrides,
     });
 
-    expect(result).toMatchObject({ taskId: "unassigned", status: "blocked" });
-    expect(result.message).toBe("No active durable task found for project D-AI-Hub");
+    expect(result).toMatchObject({ taskId: "ambiguous", status: "blocked" });
+    expect(result.message).toBe("An active task has malformed project identity; project selection is blocked without writes");
     expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
   });
 

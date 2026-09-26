@@ -31,7 +31,7 @@ import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { isDurableTaskId } from "../domain/task-id.js";
 import { assertStageTransition } from "../domain/transitions.js";
-import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskState, VerificationEvidence } from "../domain/types.js";
+import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskRoutingDisposition, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { CurationCoverage } from "../memory/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
 import { FileHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
@@ -368,6 +368,7 @@ interface RuntimeTaskRegistry {
   readonly isBlocked: (taskId: string) => boolean;
   readonly transfer: (taskId: string, environment: Environment) => void;
   readonly block: (taskId: string) => void;
+  readonly forget: (taskId: string) => void;
   readonly serializeMutation: (taskId: string, operation: () => Promise<DAIResponse>) => Promise<DAIResponse>;
 }
 
@@ -414,6 +415,10 @@ function createRuntimeTaskRegistry(): RuntimeTaskRegistry {
     },
     block: (taskId: string): void => {
       blockedTaskIds.add(taskId);
+      owners = ownersWithoutTask(owners, taskId);
+    },
+    forget: (taskId: string): void => {
+      blockedTaskIds.delete(taskId);
       owners = ownersWithoutTask(owners, taskId);
     },
     serializeMutation: async (taskId: string, operation: () => Promise<DAIResponse>): Promise<DAIResponse> => {
@@ -1313,6 +1318,10 @@ async function requireActiveState(
   const taskId = registry.activeTaskId(environment);
   if (taskId === null) return null;
   const state = await store.load(taskId);
+  if (state !== null && isLegacyFrozen(state)) {
+    registry.forget(taskId);
+    return null;
+  }
   return registry.isActiveOwner(taskId, environment) ? state : null;
 }
 
@@ -1624,6 +1633,18 @@ type CanonicalWorkspaceTaskDiscovery =
     readonly allWorkspaceCandidates: readonly TaskState[];
   };
 
+function taskRoutingDisposition(state: TaskState): TaskRoutingDisposition {
+  return state.routingDisposition ?? "ROUTABLE";
+}
+
+function defaultRoutingCandidates(states: readonly TaskState[]): TaskState[] {
+  return states.filter((state) => taskRoutingDisposition(state) !== "LEGACY_FROZEN");
+}
+
+function isLegacyFrozen(state: TaskState): boolean {
+  return taskRoutingDisposition(state) === "LEGACY_FROZEN";
+}
+
 async function discoverCanonicalWorkspaceTasks(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
@@ -1760,10 +1781,10 @@ async function resolveCurationTaskIdentity(
   request: DAIRequest,
   dependencies: DAIRuntimeDependencies,
 ): Promise<CurationTaskIdentity> {
-  const candidates = request.curationCandidates ?? [];
+  const curationCandidates = request.curationCandidates ?? [];
   const sourceTaskId = request.curationSourceWindow?.projectTaskId;
-  if (candidates.length === 0 && sourceTaskId === undefined) return { kind: "resolved", knownProjectTaskId: null };
-  const hasProjectMemory = sourceTaskId !== undefined || candidates.some((candidate) => candidate.category === "project-memory");
+  if (curationCandidates.length === 0 && sourceTaskId === undefined) return { kind: "resolved", knownProjectTaskId: null };
+  const hasProjectMemory = sourceTaskId !== undefined || curationCandidates.some((candidate) => candidate.category === "project-memory");
   if (request.activeTaskId !== undefined && request.activeTaskId !== null) {
     const loaded = await connectorOutcome(() => dependencies.store.load(request.activeTaskId!), closeConnectorFailure);
     if (loaded.kind === "blocked") {
@@ -1777,6 +1798,7 @@ async function resolveCurationTaskIdentity(
     if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
       return { kind: "blocked", taskId: state.taskId, message: "Curation task validation failed: task does not belong to the current workspace" };
     }
+    if (isLegacyFrozen(state)) return { kind: "blocked", taskId: state.taskId, message: "Legacy-frozen tasks are available only for read-only inspection and recovery" };
     const identity = await validateCurrentProjectIdentity(state, dependencies);
     if (identity.kind === "blocked") return { kind: "blocked", taskId: state.taskId, message: `Curation task validation failed: ${identity.message}` };
     return { kind: "resolved", knownProjectTaskId: state.taskId };
@@ -1794,14 +1816,15 @@ async function resolveCurationTaskIdentity(
   if (discovery.repositoryConflicts.length > 0) {
     return { kind: "blocked", taskId: discovery.repositoryConflicts[0]!.taskId, message: "Curation task validation failed: persisted repository identity conflicts with the inspected current repository" };
   }
-  if (discovery.candidates.length > 1) {
+  const candidates = defaultRoutingCandidates(discovery.candidates);
+  if (candidates.length > 1) {
     return {
       kind: "blocked",
       taskId: "unassigned",
-      message: `Multiple active D-AI tasks match this canonical workspace and repository: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}; curation is blocked without writes`,
+      message: `Multiple active D-AI tasks match this canonical workspace and repository: ${candidates.map((candidate) => candidate.taskId).join(", ")}; curation is blocked without writes`,
     };
   }
-  return { kind: "resolved", knownProjectTaskId: discovery.candidates[0]?.taskId ?? null };
+  return { kind: "resolved", knownProjectTaskId: candidates[0]?.taskId ?? null };
 }
 
 type GenericIntentSelection =
@@ -1823,7 +1846,11 @@ async function selectGenericIntentTask(
       : discovery.message;
     return { kind: "blocked", response: blockedWithoutState("unassigned", request.sourceEnvironment, `${message}; generic intent remains read-only`) };
   }
-  if (discovery.candidates.length === 0) {
+  if (discovery.allWorkspaceCandidates.some((state) => projectIdentityMode(state) === null)) {
+    return { kind: "blocked", response: blockedWithoutState("ambiguous", request.sourceEnvironment, "An active task has malformed project identity; generic routing is blocked without writes") };
+  }
+  const candidates = defaultRoutingCandidates(discovery.candidates);
+  if (candidates.length === 0) {
     return {
       kind: "blocked",
       response: blockedWithoutState(
@@ -1835,13 +1862,13 @@ async function selectGenericIntentTask(
       ),
     };
   }
-  if (discovery.candidates.length > 1) {
+  if (candidates.length > 1) {
     return {
       kind: "blocked",
-      response: blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this canonical workspace and repository: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> or use @D-AI continue <task-id>`),
+      response: blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this canonical workspace and repository: ${candidates.map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> or use @D-AI continue <task-id>`),
     };
   }
-  const candidate = discovery.candidates[0]!;
+  const candidate = candidates[0]!;
   return {
     kind: "blocked",
     response: response(candidate, "blocked", `Generic intent matched active task ${candidate.taskId}, but no configured safe operation is available; no durable task was created or mutated`),
@@ -1871,11 +1898,17 @@ async function selectExplicitLocalOnlyTask(
     }
     return null;
   }
-  if (discovery.mode === "local-only" && discovery.candidates.length > 1) {
+  const identityConflicts = discovery.allWorkspaceCandidates.filter((state) => projectIdentityMode(state) === null);
+  if (identityConflicts.length > 0) {
+    return blockedWithoutState(identityConflicts.length === 1 ? identityConflicts[0]!.taskId : "ambiguous", request.sourceEnvironment, `Active task(s) already match this workspace across environments or identity states with malformed project identity: ${identityConflicts.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`);
+  }
+  const routingCandidates = defaultRoutingCandidates(discovery.candidates);
+  const workspaceRoutingCandidates = defaultRoutingCandidates(discovery.allWorkspaceCandidates);
+  if (discovery.mode === "local-only" && routingCandidates.length > 1) {
     return blockedWithoutState(
       "ambiguous",
       request.sourceEnvironment,
-      `Multiple active local-only D-AI tasks match this workspace: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`,
+      `Multiple active local-only D-AI tasks match this workspace: ${routingCandidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`,
     );
   }
   if (discovery.mode === "repository" && discovery.localOnlyCandidates.length > 0) {
@@ -1886,23 +1919,40 @@ async function selectExplicitLocalOnlyTask(
       `Local-only task${discovery.localOnlyCandidates.length === 1 ? ` ${taskId}` : "s"} already exists in this workspace; automatic promotion to a repository identity is blocked and no new task was created`,
     );
   }
-  if (discovery.allWorkspaceCandidates.length > 0 && !(discovery.mode === "local-only" && discovery.candidates.length === 1 && discovery.allWorkspaceCandidates.length === 1)) {
+  if (discovery.repositoryConflicts.length > 0) {
+    return response(discovery.repositoryConflicts[0]!, "blocked", "Persisted repository identity conflicts with the inspected current repository; establish is blocked without writes");
+  }
+  const otherEnvironmentRoutingCandidates = defaultRoutingCandidates(discovery.otherEnvironmentCandidates);
+  if (otherEnvironmentRoutingCandidates.length > 0 || workspaceRoutingCandidates.length > 1) {
+    const blockingCandidates = [...new Map(
+      [...workspaceRoutingCandidates, ...otherEnvironmentRoutingCandidates].map((candidate) => [candidate.taskId, candidate]),
+    ).values()];
     return blockedWithoutState(
-      discovery.allWorkspaceCandidates.length === 1 ? discovery.allWorkspaceCandidates[0]!.taskId : "ambiguous",
+      blockingCandidates.length === 1 ? blockingCandidates[0]!.taskId : "ambiguous",
       request.sourceEnvironment,
-      `Active task(s) already match this workspace across environments or identity states: ${discovery.allWorkspaceCandidates.map((candidate) => candidate.taskId).join(", ")}; explicit local-only establish is blocked and no duplicate was created`,
+      `Active task(s) already match this workspace across environments or identity states: ${blockingCandidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked and no duplicate was created`,
     );
   }
+  if (workspaceRoutingCandidates.length === 1) {
+    const candidate = workspaceRoutingCandidates[0]!;
+    if (candidate.environment !== request.sourceEnvironment) {
+      return response(candidate, "blocked", `Task ${candidate.taskId} is owned by ${candidate.environment}, not ${request.sourceEnvironment}`);
+    }
+    return response(candidate, "accepted", `Reused the existing active task ${candidate.taskId}; repeated establish created no duplicate task`);
+  }
+  if (discovery.allWorkspaceCandidates.length > 0 && workspaceRoutingCandidates.length === 0) {
+    return blockedWithoutState(discovery.allWorkspaceCandidates[0]!.taskId, request.sourceEnvironment, "Only legacy-frozen tasks match this workspace; successor creation is outside this routing-disposition slice");
+  }
   if (discovery.mode === "repository") return null;
-  if (discovery.candidates.length === 0) return null;
-  if (discovery.candidates.length > 1) {
+  if (routingCandidates.length === 0) return null;
+  if (routingCandidates.length > 1) {
     return blockedWithoutState(
       "ambiguous",
       request.sourceEnvironment,
-      `Multiple active local-only D-AI tasks match this workspace: ${discovery.candidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`,
+      `Multiple active local-only D-AI tasks match this workspace: ${routingCandidates.map((candidate) => candidate.taskId).join(", ")}; explicit establish is blocked without writes`,
     );
   }
-  const candidate = discovery.candidates[0]!;
+  const candidate = routingCandidates[0]!;
   return response(candidate, "accepted", `Reused the existing local-only task ${candidate.taskId}; repeated establish created no duplicate task`);
 }
 
@@ -1926,6 +1976,10 @@ async function continueTaskExclusive(
   }
   if (request.sourceEnvironment !== state.environment) {
     return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
+  }
+  if (isLegacyFrozen(state)) {
+    registry.forget(state.taskId);
+    return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
   const owner = registry.owner(state.taskId);
   if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
@@ -2071,6 +2125,16 @@ async function continueTask(
       dependencies,
     );
   }
+  if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
+    return withKnowledgeSnapshot(response(state, "blocked", `Task ${state.taskId} belongs to a different workspace; run D-AI from its workspace or select a matching task`), state.taskId, dependencies);
+  }
+  if (request.sourceEnvironment !== state.environment) {
+    return withKnowledgeSnapshot(response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`), state.taskId, dependencies);
+  }
+  if (isLegacyFrozen(state)) {
+    registry.forget(state.taskId);
+    return withKnowledgeSnapshot(response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery"), state.taskId, dependencies);
+  }
   const result = await registry.serializeMutation(
     state.taskId,
     () => withDurableTaskOwnership(
@@ -2097,6 +2161,10 @@ async function rollbackActiveTaskExclusive(
   const state = await dependencies.store.load(taskId);
   if (state === null || !registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} became unavailable while rollback was loading durable state`);
+  }
+  if (isLegacyFrozen(state)) {
+    registry.forget(taskId);
+    return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
   if (state.recoveryPoint === null) {
     return response(state, "blocked", "Rollback requires a persisted recovery point");
@@ -2267,6 +2335,10 @@ async function handoffTaskExclusive(
     registry.block(taskId);
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is unavailable for handoff`);
   }
+  if (isLegacyFrozen(state)) {
+    registry.forget(taskId);
+    return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
+  }
   if (state.handoffState !== "none") {
     return response(state, "blocked", `Task ${state.taskId} cannot hand off from state ${state.handoffState}`);
   }
@@ -2389,6 +2461,10 @@ async function completeHandoffExclusive(
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} is unavailable for handoff completion`);
   }
   const state = loadedState.value;
+  if (isLegacyFrozen(state)) {
+    registry.forget(taskId);
+    return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
+  }
   const handoffStatus = await connectorOutcome(
     () => Promise.resolve(dependencies.adapters[request.sourceEnvironment].status(command.handoffId)),
     completionConnectorFailure,
@@ -2534,6 +2610,10 @@ async function closeActiveTaskExclusive(
   if (state === null || !registry.isActiveOwner(taskId, request.sourceEnvironment)) {
     return blockedWithoutState(taskId, request.sourceEnvironment, `Task ${taskId} became unavailable while close was loading durable state`);
   }
+  if (isLegacyFrozen(state)) {
+    registry.forget(taskId);
+    return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
+  }
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
   }
@@ -2666,9 +2746,6 @@ async function selectExplicitDurableTask(
   if (dependencies.workspacePath === null || !(await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath))) {
     return response(state, "blocked", `Task ${state.taskId} belongs to a different workspace; run D-AI from its workspace or select a matching task`);
   }
-  if (state.stage === "close") {
-    return response(state, "blocked", `Task ${state.taskId} is not active; current stage is close`);
-  }
   if (state.environment !== request.sourceEnvironment) {
     return response(state, "blocked", `Task ${state.taskId} is owned by ${state.environment}, not ${request.sourceEnvironment}`);
   }
@@ -2677,6 +2754,14 @@ async function selectExplicitDurableTask(
     && (dependencies.discoverActiveTasks !== undefined || dependencies.store.discoverActiveTasks !== undefined)) {
     const identity = await validateCurrentProjectIdentity(state, dependencies);
     if (identity.kind === "blocked") return response(state, "blocked", identity.message);
+  }
+  if (isLegacyFrozen(state)) {
+    registry.forget(state.taskId);
+    if (request.command.kind === "status") return response(state, "accepted", `Read-only historical inspection of LEGACY_FROZEN task ${state.taskId}; not selected as current`);
+    return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
+  }
+  if (state.stage === "close") {
+    return response(state, "blocked", `Task ${state.taskId} is not active; current stage is close`);
   }
   const owner = registry.owner(state.taskId);
   if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
@@ -2697,6 +2782,9 @@ async function selectDiscoveredDurableTask(
   let candidates: TaskState[];
   if (dependencies.repositoryPath !== null && dependencies.resolveRepositoryIdentity !== undefined) {
     const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+    if (discovery.kind === "available") {
+      for (const candidate of discovery.allWorkspaceCandidates) if (isLegacyFrozen(candidate)) registry.forget(candidate.taskId);
+    }
     if (discovery.kind === "unavailable") {
       if (discovery.otherEnvironmentCandidates.length > 0 && discovery.repositoryCandidates.length === 0) {
         const candidate = discovery.otherEnvironmentCandidates[0]!;
@@ -2705,12 +2793,16 @@ async function selectDiscoveredDurableTask(
       const taskId = discovery.repositoryCandidates.length === 1 ? discovery.repositoryCandidates[0]!.taskId : "unassigned";
       return blockedWithoutState(taskId, request.sourceEnvironment, `${discovery.message}; workspace task selection is blocked without writes`);
     }
-    if (discovery.otherEnvironmentCandidates.length > 0 && discovery.candidates.length === 0) {
-      const candidate = discovery.otherEnvironmentCandidates[0]!;
+    if (discovery.allWorkspaceCandidates.some((candidate) => projectIdentityMode(candidate) === null)) {
+      return blockedWithoutState("ambiguous", request.sourceEnvironment, "An active task has malformed project identity; workspace task selection is blocked without writes");
+    }
+    const otherEnvironmentRoutingCandidates = defaultRoutingCandidates(discovery.otherEnvironmentCandidates);
+    if (otherEnvironmentRoutingCandidates.length > 0 && discovery.candidates.length === 0) {
+      const candidate = otherEnvironmentRoutingCandidates[0]!;
       return response(candidate, "blocked", `Task ${candidate.taskId} is owned by ${candidate.environment}, not ${request.sourceEnvironment}`);
     }
-    if (discovery.otherEnvironmentCandidates.length > 0) {
-      return blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this workspace: ${[...discovery.candidates, ...discovery.otherEnvironmentCandidates].map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> to disambiguate`);
+    if (otherEnvironmentRoutingCandidates.length > 0) {
+      return blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple active D-AI tasks match this workspace: ${[...discovery.candidates, ...otherEnvironmentRoutingCandidates].map((candidate) => candidate.taskId).join(", ")}. Add --task <task-id> to disambiguate`);
     }
     if (discovery.mode === "repository" && discovery.localOnlyCandidates.length > 0) {
       return response(discovery.localOnlyCandidates[0]!, "blocked", "Local-only task is obsolete because this workspace now resolves to Git; require future explicit LOCAL → REPOSITORY IDENTITY PROMOTION");
@@ -2732,8 +2824,13 @@ async function selectDiscoveredDurableTask(
     if (discovered.kind === "blocked") {
       return blockedWithoutState("unassigned", request.sourceEnvironment, `Workspace task discovery blocked: ${discovered.message}`);
     }
+    for (const candidate of discovered.value) if (isLegacyFrozen(candidate)) registry.forget(candidate.taskId);
+    if (discovered.value.some((candidate) => projectIdentityMode(candidate) === null)) {
+      return blockedWithoutState("ambiguous", request.sourceEnvironment, "An active task has malformed project identity; workspace task selection is blocked without writes");
+    }
     candidates = [...discovered.value];
   }
+  candidates = defaultRoutingCandidates(candidates);
   candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
   if (candidates.length === 0) {
     return blockedWithoutState(
@@ -2816,21 +2913,25 @@ async function resolveContinueProject(
   }
   const candidates: TaskState[] = [];
   for (const state of discovered.value) {
-    if (!isDurableTaskId(state.taskId) || state.stage === "close" || canonicalProjectName(state) !== command.taskIdOrProject) continue;
+    if (!isDurableTaskId(state.taskId) || state.stage === "close") continue;
     if (await matchesWorkspaceIdentity(state.contextManifest, dependencies.workspacePath)) candidates.push(state);
   }
-  candidates.sort((left, right) => left.taskId.localeCompare(right.taskId));
-  if (candidates.length === 0) return noMatch();
-  if (candidates.length > 1) {
-    const displayedCandidates = candidates.slice(0, projectCandidateDisplayLimit);
-    const omittedCount = candidates.length - displayedCandidates.length;
+  if (candidates.some((state) => projectIdentityMode(state) === null)) {
+    return blockedWithoutState("ambiguous", request.sourceEnvironment, "An active task has malformed project identity; project selection is blocked without writes");
+  }
+  const eligible = defaultRoutingCandidates(candidates).filter((state) => canonicalProjectName(state) === command.taskIdOrProject);
+  eligible.sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (eligible.length === 0) return noMatch();
+  if (eligible.length > 1) {
+    const displayedCandidates = eligible.slice(0, projectCandidateDisplayLimit);
+    const omittedCount = eligible.length - displayedCandidates.length;
     return blockedWithoutState(
       "ambiguous",
       request.sourceEnvironment,
-      `Multiple active durable tasks found for project ${command.taskIdOrProject}; showing ${displayedCandidates.length} of ${candidates.length} candidates: ${displayedCandidates.map(projectCandidateDescription).join(", ")}; ${omittedCount} candidates omitted`,
+      `Multiple active durable tasks found for project ${command.taskIdOrProject}; showing ${displayedCandidates.length} of ${eligible.length} candidates: ${displayedCandidates.map(projectCandidateDescription).join(", ")}; ${omittedCount} candidates omitted`,
     );
   }
-  return candidates[0]!.taskId;
+  return eligible[0]!.taskId;
 }
 
 async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntimeDependencies, registry: RuntimeTaskRegistry): Promise<DAIResponse> {
@@ -2859,15 +2960,20 @@ async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntime
   try { discovery = await discoverCanonicalWorkspaceTasks(request, dependencies); }
   catch { return blocked("Boss recovery canonical task discovery failed closed"); }
   if (discovery.kind === "unavailable") return blocked(`Boss recovery is blocked: ${discovery.message}`);
-  if (discovery.candidates.length !== 1 || discovery.allWorkspaceCandidates.length !== 1 || discovery.otherEnvironmentCandidates.length !== 0 || discovery.repositoryConflicts.length !== 0 || (discovery.mode === "repository" && discovery.localOnlyCandidates.length !== 0)) {
+  for (const candidate of discovery.allWorkspaceCandidates) if (isLegacyFrozen(candidate)) registry.forget(candidate.taskId);
+  const routingCandidates = defaultRoutingCandidates(discovery.candidates);
+  const workspaceRoutingCandidates = defaultRoutingCandidates(discovery.allWorkspaceCandidates);
+  const otherEnvironmentRoutingCandidates = defaultRoutingCandidates(discovery.otherEnvironmentCandidates);
+  const malformedIdentity = discovery.allWorkspaceCandidates.some((candidate) => projectIdentityMode(candidate) === null);
+  if (routingCandidates.length !== 1 || workspaceRoutingCandidates.length !== 1 || otherEnvironmentRoutingCandidates.length !== 0 || discovery.repositoryConflicts.length !== 0 || malformedIdentity || (discovery.mode === "repository" && discovery.localOnlyCandidates.length !== 0)) {
     const reason = "Boss recovery requires exactly one canonical project task without identity conflicts";
-    const onlyWorkspaceTask = discovery.allWorkspaceCandidates.length === 1 ? discovery.allWorkspaceCandidates[0]! : null;
+    const onlyWorkspaceTask = workspaceRoutingCandidates.length === 1 ? workspaceRoutingCandidates[0]! : null;
     const missingFields = onlyWorkspaceTask !== null && projectIdentityMode(onlyWorkspaceTask) === null
       ? ["project-identity"] as const
-      : discovery.allWorkspaceCandidates.length === 0 ? ["task-pointer"] as const : [];
+      : workspaceRoutingCandidates.length === 0 ? ["task-pointer"] as const : [];
     return blocked(reason, null, blockedCompleteness(reason, missingFields));
   }
-  const discovered = discovery.candidates[0]!;
+  const discovered = routingCandidates[0]!;
   if (request.activeTaskId !== undefined && request.activeTaskId !== null && request.activeTaskId !== discovered.taskId) return blocked("Explicit task identity conflicts with the canonical project task");
   const owner = registry.owner(discovered.taskId);
   if (registry.isBlocked(discovered.taskId) || (owner !== null && owner !== request.sourceEnvironment)) return blocked("Boss recovery is blocked because task ownership changed or a failed handoff remains");
@@ -2900,10 +3006,17 @@ async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntime
     const readBackState = await dependencies.store.load(state.taskId);
     const readBackDiscovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
     const readBackView = await dependencies.rebuildCurrentState(state.taskId, sourceKey, true);
+    if (readBackDiscovery.kind === "available") {
+      for (const candidate of readBackDiscovery.allWorkspaceCandidates) if (isLegacyFrozen(candidate)) registry.forget(candidate.taskId);
+    }
+    const readBackRoutingCandidates = readBackDiscovery.kind === "available" ? defaultRoutingCandidates(readBackDiscovery.candidates) : [];
+    const readBackWorkspaceRoutingCandidates = readBackDiscovery.kind === "available" ? defaultRoutingCandidates(readBackDiscovery.allWorkspaceCandidates) : [];
+    const readBackOtherEnvironmentRoutingCandidates = readBackDiscovery.kind === "available" ? defaultRoutingCandidates(readBackDiscovery.otherEnvironmentCandidates) : [];
+    const readBackMalformedIdentity = readBackDiscovery.kind === "available" && readBackDiscovery.allWorkspaceCandidates.some((candidate) => projectIdentityMode(candidate) === null);
     if (readBackState === null || JSON.stringify(readBackState) !== JSON.stringify(state)
       || readBackDiscovery.kind !== "available" || readBackDiscovery.mode !== discovery.mode || readBackDiscovery.repository !== discovery.repository
-      || readBackDiscovery.candidates.length !== 1 || readBackDiscovery.allWorkspaceCandidates.length !== 1 || readBackDiscovery.candidates[0]?.taskId !== state.taskId
-      || readBackDiscovery.otherEnvironmentCandidates.length !== 0 || readBackDiscovery.repositoryConflicts.length !== 0
+      || readBackRoutingCandidates.length !== 1 || readBackWorkspaceRoutingCandidates.length !== 1 || readBackRoutingCandidates[0]?.taskId !== state.taskId
+      || readBackOtherEnvironmentRoutingCandidates.length !== 0 || readBackDiscovery.repositoryConflicts.length !== 0 || readBackMalformedIdentity
       || (readBackDiscovery.mode === "repository" && readBackDiscovery.localOnlyCandidates.length !== 0)
       || registry.isBlocked(state.taskId) || (registry.owner(state.taskId) !== null && registry.owner(state.taskId) !== request.sourceEnvironment)
       || JSON.stringify(readBackView) !== JSON.stringify(rebuilt)) return blocked("Canonical Boss recovery state changed during final read-back", state);
