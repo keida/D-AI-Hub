@@ -147,12 +147,15 @@ export interface CloseVerdict {
   readonly reasons: readonly string[];
 }
 
+export type TaskRoutingDisposition = "ROUTABLE" | "PAUSED_RESUMABLE" | "LEGACY_FROZEN";
+
 export interface TaskState {
   readonly taskId: string;
   readonly goal: string;
   readonly constraints: readonly string[];
   readonly environment: Environment;
   readonly stage: Stage;
+  readonly routingDisposition?: TaskRoutingDisposition | undefined;
   readonly role: Role;
   readonly routingDecision: RoutingDecision | null;
   readonly selectedCapabilities: readonly string[];

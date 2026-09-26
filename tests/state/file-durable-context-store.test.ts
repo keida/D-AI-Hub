@@ -117,6 +117,27 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("round-trips routing dispositions while preserving legacy absence and rejecting unknown values", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    try {
+      const legacy = createState("task-routing-legacy", "Preserve legacy routing default");
+      await store.save(legacy);
+      expect(await store.load(legacy.taskId)).not.toHaveProperty("routingDisposition");
+
+      for (const [index, routingDisposition] of (["ROUTABLE", "PAUSED_RESUMABLE", "LEGACY_FROZEN"] as const).entries()) {
+        const state = { ...createState(`task-routing-${index}`, "Persist routing disposition"), routingDisposition };
+        await store.save(state);
+        expect((await store.load(state.taskId))?.routingDisposition).toBe(routingDisposition);
+      }
+
+      const invalid = { ...createState("task-routing-invalid", "Reject invalid routing disposition"), routingDisposition: "UNKNOWN" } as unknown as TaskState;
+      await expect(store.save(invalid)).rejects.toThrow("Invalid task state");
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("reloads the manifest-addressed generation and rejects generation corruption", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
