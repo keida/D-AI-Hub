@@ -13,7 +13,13 @@ param(
   [string]$CurationPayloadPath,
 
   [Parameter(Mandatory = $false)]
-  [string]$MemoryDatabasePath
+  [string]$MemoryDatabasePath,
+
+  [Parameter(Mandatory = $false)]
+  [string]$TaskCharterFile,
+
+  [Parameter(Mandatory = $false)]
+  [string]$ApproveTaskCharterDigest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,6 +66,22 @@ function Assert-CurationInputs {
   }
 }
 
+function Assert-TaskCharterInput {
+  if ([string]::IsNullOrWhiteSpace($TaskCharterFile) -ne [string]::IsNullOrWhiteSpace($ApproveTaskCharterDigest)) {
+    throw 'Task charter file and explicit approval digest must be supplied together'
+  }
+  if (-not [string]::IsNullOrWhiteSpace($TaskCharterFile)) {
+    Assert-FullyQualifiedPath $TaskCharterFile 'Task charter file path'
+    if (-not (Test-Path -LiteralPath $TaskCharterFile -PathType Leaf)) {
+      throw 'Task charter file is not readable'
+    }
+    Get-Content -LiteralPath $TaskCharterFile -Raw -ErrorAction Stop | Out-Null
+    if ($ApproveTaskCharterDigest -notmatch '^[a-f0-9]{64}$') {
+      throw 'Explicit task charter approval must be the exact lowercase SHA-256 digest'
+    }
+  }
+}
+
 function Assert-InstalledSkillRoot([string]$Candidate) {
   Assert-FullyQualifiedPath $Candidate 'Installed D-AI Skill root'
   $skillManifestPath = Join-Path $Candidate 'SKILL.md'
@@ -101,6 +123,7 @@ $skillRoot = Split-Path -Parent $PSScriptRoot
 $repositoryRoot = $null
 try {
   Assert-CurationInputs
+  Assert-TaskCharterInput
   Assert-InstalledSkillRoot $skillRoot
   $bindingPath = Join-Path $skillRoot '.runtime-root'
   if (-not (Test-Path -LiteralPath $bindingPath -PathType Leaf)) {
@@ -138,6 +161,10 @@ if (-not [string]::IsNullOrWhiteSpace($CurationPayloadPath)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($MemoryDatabasePath)) {
   $arguments += @('--memory-database', $MemoryDatabasePath)
+}
+if (-not [string]::IsNullOrWhiteSpace($TaskCharterFile)) {
+  $arguments += @('--task-charter-file', $TaskCharterFile)
+  $arguments += @('--approve-task-charter', $ApproveTaskCharterDigest)
 }
 
 & $npm @arguments

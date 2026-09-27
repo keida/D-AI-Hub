@@ -30,6 +30,9 @@ export interface DurableContextStore {
   loadGenerationManifest?(taskId: string, manifestId: string): Promise<DurableContextManifest>;
   verifyDurableSnapshot?(manifest: DurableContextManifest): Promise<void>;
   createIfAbsent?(state: TaskState): Promise<DurableContextManifest>;
+  registerProjectSuccessorContender?(state: TaskState, projectIdentity: string, charterDigest: string): Promise<"registered" | "conflict">;
+  hasProjectSuccessorConflict?(projectIdentity: string): Promise<boolean>;
+  createSuccessorIfAbsent?(state: TaskState, projectIdentity: string, charterDigest: string): Promise<DurableContextManifest>;
   save(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest>;
   saveCloseCandidate?(candidate: CloseCandidate, lease?: TaskOwnershipLease): Promise<void>;
   loadCloseCandidate?(taskId: string): Promise<CloseCandidate | null>;

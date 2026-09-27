@@ -31,7 +31,7 @@ import { containsSecretShapedValue, isSafeManifestId } from "../domain/manifest-
 import { hasExactPathHashEquality } from "../domain/recovery-integrity.js";
 import { isDurableTaskId } from "../domain/task-id.js";
 import { assertStageTransition } from "../domain/transitions.js";
-import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskRoutingDisposition, TaskState, VerificationEvidence } from "../domain/types.js";
+import type { CloseVerdict, Environment, RecoveryPoint, RecoverySnapshot, Role, RollbackAudit, Stage, TaskCharter, TaskRoutingDisposition, TaskState, VerificationEvidence } from "../domain/types.js";
 import type { CurationCoverage } from "../memory/types.js";
 import type { DAICommand } from "../entry/command-parser.js";
 import { FileHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../handoff/handoff-service.js";
@@ -57,6 +57,7 @@ import { FileDurableContextStore } from "../state/file-durable-context-store.js"
 import { LocalSqliteMemoryStore } from "../memory/local-sqlite-memory-store.js";
 import { resolveDefaultMemoryDatabasePath, resolveLocalMemoryScopeId } from "../memory/local-memory-path.js";
 import { matchesWorkspaceIdentity } from "../state/workspace-identity.js";
+import { parseApprovedTaskCharter, taskCharterContentDigest, taskCharterSchema, taskCharterTaskId } from "../state/task-charter.js";
 import { evaluateHardGates, type GateEvidence, type GateResult, type HardGateInput } from "../verification/gates.js";
 
 export interface DAIRequest {
@@ -69,6 +70,8 @@ export interface DAIRequest {
   readonly curationCandidates?: readonly CurationCandidate[];
   readonly curationSourceWindow?: CurationPipelineInput;
   readonly bossSession?: BossSessionRequest;
+  readonly taskCharter?: TaskCharter;
+  readonly confirmedTaskCharterDigest?: string;
 }
 
 export interface BossSessionRequest {
@@ -90,6 +93,7 @@ export interface DAIResponse {
   readonly status: "accepted" | "blocked" | "completed";
   readonly evidence: readonly VerificationEvidence[];
   readonly message: string;
+  readonly taskCharter?: TaskCharter;
   readonly curationRecords?: readonly Pick<CurationRecordResult, "memoryId" | "category" | "decision">[];
   readonly curationQuality?: CurationQualityReport;
   readonly memorySnapshot?: MemoryRecoverySnapshot;
@@ -155,6 +159,8 @@ export interface ExternalDAIRequest {
   readonly curationCandidates?: readonly CurationCandidate[];
   readonly curationSourceWindow?: CurationPipelineInput;
   readonly bossSession?: BossSessionRequest;
+  readonly taskCharter?: TaskCharter;
+  readonly confirmedTaskCharterDigest?: string;
 }
 
 export interface EnvironmentExecutionRequest {
@@ -301,6 +307,8 @@ const requestSchema = z.object({
   curationCandidates: z.array(z.unknown()).optional(),
   curationSourceWindow: curationSourceWindowSchema.optional(),
   bossSession: bossSessionSchema.optional(),
+  taskCharter: taskCharterSchema.optional(),
+  confirmedTaskCharterDigest: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
 }).strict();
 const evidenceSchema = z.object({
   evidenceId: z.string().trim().min(1),
@@ -454,7 +462,7 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
   if (!result.success) {
     throw new InvalidTaskStateError(`Invalid D-AI request: ${validationReason(result.error.issues)}`);
   }
-  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, curationSourceWindow, bossSession, ...validated } = result.data;
+  const { activeTaskId, publicationRequested, publicationAuthority, curationCandidates, curationSourceWindow, bossSession, taskCharter, confirmedTaskCharterDigest, ...validated } = result.data;
   return {
     ...validated,
     overrides: {
@@ -467,6 +475,8 @@ function validateRequest(request: ExternalDAIRequest): DAIRequest {
     ...(curationCandidates === undefined ? {} : { curationCandidates: curationCandidates as readonly CurationCandidate[] }),
     ...(curationSourceWindow === undefined ? {} : { curationSourceWindow: curationSourceWindow as CurationPipelineInput }),
     ...(bossSession === undefined ? {} : { bossSession: bossSession as BossSessionRequest }),
+    ...(taskCharter === undefined ? {} : { taskCharter: parseApprovedTaskCharter(taskCharter) }),
+    ...(confirmedTaskCharterDigest === undefined ? {} : { confirmedTaskCharterDigest }),
   };
 }
 
@@ -607,6 +617,7 @@ function response(state: TaskState, status: DAIResponse["status"], message: stri
     status,
     evidence: state.verificationEvidence.map(redactEvidence),
     message: redactSensitiveText(message),
+    ...(state.taskCharter === undefined ? {} : { taskCharter: state.taskCharter }),
   };
 }
 
@@ -1441,6 +1452,8 @@ async function executeIntentExclusive(
   lease: TaskOwnershipLease,
   transfer: TaskOwnershipTransfer,
 ): Promise<DAIResponse> {
+  const conflict = await projectSuccessorConflictMessage(bootstrapped, dependencies.store);
+  if (conflict !== null) return response(bootstrapped, "blocked", conflict);
   const routed = await routeIntent(bootstrapped, request, dependencies, lease, transfer);
   return executeRoutedState(routed.state, routed.skills, dependencies, registry, routed.lease);
 }
@@ -1637,6 +1650,18 @@ function taskRoutingDisposition(state: TaskState): TaskRoutingDisposition {
   return state.routingDisposition ?? "ROUTABLE";
 }
 
+function electionProjectIdentity(state: TaskState): string | null {
+  const repository = remoteRepositoryIdentity(state);
+  if (repository !== null) return `remote-repository:${repository}`;
+  return localProjectIdentity(state);
+}
+
+async function projectSuccessorConflictMessage(state: TaskState, store: DurableContextStore): Promise<string | null> {
+  const identity = electionProjectIdentity(state);
+  if (identity === null || store.hasProjectSuccessorConflict === undefined || !await store.hasProjectSuccessorConflict(identity)) return null;
+  return `Project ${identity} has a durable successor charter or owner-binding conflict requiring explicit resolution`;
+}
+
 function defaultRoutingCandidates(states: readonly TaskState[]): TaskState[] {
   return states.filter((state) => taskRoutingDisposition(state) !== "LEGACY_FROZEN");
 }
@@ -1670,6 +1695,18 @@ async function discoverCanonicalWorkspaceTasks(
   const localOnlyCandidates = workspaceCandidates.filter(isLocalOnlyTask).sort((left, right) => left.taskId.localeCompare(right.taskId));
   const repositoryCandidates = workspaceCandidates.filter(isRepositoryBackedTask).sort((left, right) => left.taskId.localeCompare(right.taskId));
   const allWorkspaceCandidates = [...workspaceCandidates, ...otherEnvironmentCandidates].sort((left, right) => left.taskId.localeCompare(right.taskId));
+  if (dependencies.store.hasProjectSuccessorConflict !== undefined) {
+    const electionIdentities = new Set(allWorkspaceCandidates.map(electionProjectIdentity).filter((identity): identity is string => identity !== null));
+    if (dependencies.repositoryPath !== null && dependencies.resolveRepositoryIdentity !== undefined) {
+      try { electionIdentities.add(`remote-repository:${await dependencies.resolveRepositoryIdentity()}`); }
+      catch { /* The ordinary identity-resolution path below reports the concrete failure. */ }
+    }
+    for (const identity of electionIdentities) {
+      if (await dependencies.store.hasProjectSuccessorConflict(identity)) {
+        return { kind: "unavailable", message: `Project ${identity} has a durable successor charter or owner-binding conflict requiring explicit resolution`, repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
+      }
+    }
+  }
   if (dependencies.repositoryPath === null) {
     if (repositoryCandidates.length > 0) return { kind: "unavailable", message: "Repository-backed tasks exist but the current repository identity is unavailable", repositoryCandidates, otherEnvironmentCandidates, allWorkspaceCandidates };
     return { kind: "available", mode: "local-only", repository: null, candidates: localOnlyCandidates, localOnlyCandidates, repositoryCandidates, repositoryConflicts: [], otherEnvironmentCandidates, allWorkspaceCandidates };
@@ -1714,6 +1751,175 @@ async function discoverCanonicalWorkspaceTasks(
     .sort((left, right) => left.taskId.localeCompare(right.taskId));
   const repositoryConflicts = repositoryCandidates.filter((state) => !candidates.some((candidate) => candidate.taskId === state.taskId));
   return { kind: "available", mode: "repository", repository, candidates, localOnlyCandidates, repositoryCandidates, repositoryConflicts, otherEnvironmentCandidates, allWorkspaceCandidates };
+}
+
+async function establishApprovedSuccessor(
+  request: DAIRequest,
+  dependencies: DAIRuntimeDependencies,
+): Promise<DAIResponse> {
+  const charter = request.taskCharter;
+  if (charter === undefined || request.command.kind !== "intent" || !isExplicitNewTaskIntent(request.command.text)) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "Successor establishment requires an approved charter on an explicit @D-AI establish invocation");
+  }
+  if (dependencies.workspacePath === null) return blockedWithoutState("unassigned", request.sourceEnvironment, "Successor establishment requires a canonical workspace identity");
+  const discovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+  if (discovery.kind === "unavailable") return blockedWithoutState("unassigned", request.sourceEnvironment, `${discovery.message}; successor establishment is blocked without writes`);
+  const malformed = discovery.allWorkspaceCandidates.filter((state) => projectIdentityMode(state) === null);
+  if (malformed.length > 0) return blockedWithoutState("ambiguous", request.sourceEnvironment, "A workspace task has malformed project identity; successor establishment is blocked without writes");
+  if (discovery.mode === "repository" && discovery.localOnlyCandidates.length > 0) {
+    return blockedWithoutState(discovery.localOnlyCandidates[0]!.taskId, request.sourceEnvironment, "A local-only task exists in this workspace; automatic promotion to repository identity is blocked");
+  }
+  if (discovery.repositoryConflicts.length > 0) {
+    return response(discovery.repositoryConflicts[0]!, "blocked", "Persisted repository identity conflicts with the inspected repository; successor establishment is blocked");
+  }
+
+  const localProjectIdentities = [...new Set(discovery.allWorkspaceCandidates.map(localProjectIdentity).filter((identity): identity is string => identity !== null))];
+  if (discovery.mode === "local-only" && localProjectIdentities.length > 1) {
+    return blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple local-project identities match this workspace: ${localProjectIdentities.join(", ")}; successor establishment is blocked`);
+  }
+  const expectedProjectIdentity = discovery.mode === "repository"
+    ? `remote-repository:${discovery.repository}`
+    : localProjectIdentities[0] ?? null;
+  if (expectedProjectIdentity === null) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "A local-only successor requires an existing stable local-project identity; no workspace-derived identity will be invented");
+  }
+  if (charter.projectIdentity !== expectedProjectIdentity) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, `Approved charter projectIdentity must exactly match the inspected project identity ${expectedProjectIdentity}`);
+  }
+  const projectTasks = discovery.allWorkspaceCandidates.filter((state) => electionProjectIdentity(state) === expectedProjectIdentity);
+  const foreignOwners = projectTasks.filter((state) => state.environment !== request.sourceEnvironment);
+  if (foreignOwners.length > 0) {
+    return response(foreignOwners[0]!, "blocked", `Project task ownership belongs to ${foreignOwners[0]!.environment}; successor creation cannot cross environment ownership`);
+  }
+  const eligible = projectTasks.filter((state) => !isLegacyFrozen(state) && state.stage !== "close");
+  if (eligible.length === 1) {
+    const existing = eligible[0]!;
+    if (existing.taskCharter === undefined) return response(existing, "accepted", `Reused the existing active project task ${existing.taskId}; no successor was created`);
+    const existingDigest = taskCharterContentDigest(existing.taskCharter);
+    const suppliedDigest = taskCharterContentDigest(charter);
+    if (dependencies.store.registerProjectSuccessorContender === undefined) {
+      return response(existing, "blocked", "A charter-bound successor exists but durable election registration is unavailable");
+    }
+    try {
+      const publishedRegistration = await dependencies.store.registerProjectSuccessorContender(existing, expectedProjectIdentity, existingDigest);
+      if (publishedRegistration === "conflict") {
+        return response(existing, "blocked", "Project successor election already contains a charter or owner-binding conflict; explicit resolution is required");
+      }
+    } catch {
+      return response(existing, "blocked", "The published successor could not be verified in the durable election ledger; project use remains blocked");
+    }
+    if (existingDigest !== suppliedDigest) {
+      const challenger: TaskState = {
+        ...existing,
+        taskId: taskCharterTaskId(expectedProjectIdentity, suppliedDigest),
+        goal: charter.objective,
+        taskCharter: charter,
+        taskCharterConfirmation: {
+          confirmationId: randomUUID(),
+          confirmedAt: dependencies.now().toISOString(),
+          projectIdentity: expectedProjectIdentity,
+          confirmedCharterDigest: suppliedDigest,
+          channel: "explicit-task-charter-digest",
+        },
+        durableContext: null,
+      };
+      let registration: "registered" | "conflict";
+      try {
+        registration = await dependencies.store.registerProjectSuccessorContender(challenger, expectedProjectIdentity, suppliedDigest);
+      } catch {
+        let conflictIsDurable = false;
+        try { conflictIsDurable = dependencies.store.hasProjectSuccessorConflict !== undefined && await dependencies.store.hasProjectSuccessorConflict(expectedProjectIdentity); }
+        catch { /* An unreadable election remains blocked, but is not described as durably conflicted. */ }
+        return response(existing, "blocked", conflictIsDurable
+          ? "A different approved successor charter conflicts with the published successor; durable conflict is confirmed and explicit resolution is required"
+          : "A different approved successor charter was submitted, but conflict registration could not be verified; this request is blocked and no durable conflict is claimed");
+      }
+      if (registration === "registered") {
+        return response(existing, "blocked", "A different approved successor charter is durably registered; explicit conflict resolution is required");
+      }
+      return response(existing, "blocked", "A different approved successor charter conflicts with the published successor; the conflict is durable and explicit resolution is required");
+    }
+    if (dependencies.store.hasProjectSuccessorConflict !== undefined
+      && await dependencies.store.hasProjectSuccessorConflict(expectedProjectIdentity)) {
+      return response(existing, "blocked", "Project successor election is durably conflicted; explicit resolution is required");
+    }
+    return response(existing, "accepted", `Reused the existing charter-bound successor ${existing.taskId}; no duplicate task was created`);
+  }
+  if (eligible.length > 1) {
+    return blockedWithoutState("ambiguous", request.sourceEnvironment, `Multiple eligible project tasks already exist: ${eligible.map((state) => state.taskId).join(", ")}; successor creation is blocked`);
+  }
+  const frozen = projectTasks.filter(isLegacyFrozen);
+  if (frozen.length === 0) {
+    return blockedWithoutState("unassigned", request.sourceEnvironment, "DAI-ARCH-003B only establishes a successor for a legacy-frozen project; no matching frozen task was found");
+  }
+  if (dependencies.store.registerProjectSuccessorContender === undefined
+    || dependencies.store.hasProjectSuccessorConflict === undefined
+    || dependencies.store.createSuccessorIfAbsent === undefined) {
+    return blockedWithoutState(frozen[0]!.taskId, request.sourceEnvironment, "Durable project-successor election is unavailable; no successor was created");
+  }
+  const charterDigest = taskCharterContentDigest(charter);
+  const confirmationEvent = {
+    confirmationId: randomUUID(),
+    confirmedAt: dependencies.now().toISOString(),
+    projectIdentity: expectedProjectIdentity,
+    confirmedCharterDigest: charterDigest,
+    channel: "explicit-task-charter-digest" as const,
+  };
+  let prepared: TaskState;
+  let successorRepositoryPath: string | null = null;
+  if (discovery.mode === "repository") {
+    if (dependencies.repositoryPath === null) {
+      return blockedWithoutState(frozen[0]!.taskId, request.sourceEnvironment, "Configured repository path is unavailable for successor identity inspection");
+    }
+    try { successorRepositoryPath = await resolveGitRepositoryRoot(dependencies.workspacePath); }
+    catch { return blockedWithoutState(frozen[0]!.taskId, request.sourceEnvironment, "The actual Git repository root could not be resolved for successor ownership binding"); }
+  }
+  try {
+    prepared = await prepareBootstrapTask({
+      taskId: taskCharterTaskId(expectedProjectIdentity, charterDigest),
+      goal: charter.objective,
+      environment: request.sourceEnvironment,
+      workspacePath: dependencies.workspacePath,
+      repositoryPath: successorRepositoryPath,
+      ...(discovery.mode === "local-only" ? { localProjectId: localProjectIdentity(frozen[0]!)!.slice("local-project:".length) } : {}),
+    }, dependencies.store, null);
+    if (discovery.mode === "repository") {
+      const remoteIdentity = `remote-repository:${discovery.repository}`;
+      prepared = {
+        ...prepared,
+        contextManifest: prepared.contextManifest.includes(remoteIdentity)
+          ? [...prepared.contextManifest]
+          : [...prepared.contextManifest, remoteIdentity],
+      };
+    }
+  } catch {
+    return blockedWithoutState(frozen[0]!.taskId, request.sourceEnvironment, "Approved successor bootstrap identity could not be prepared; no durable successor was created");
+  }
+  const successor: TaskState = { ...prepared, routingDisposition: "ROUTABLE", taskCharter: charter, taskCharterConfirmation: confirmationEvent, durableContext: null };
+  try {
+    const registration = await dependencies.store.registerProjectSuccessorContender(successor, expectedProjectIdentity, charterDigest);
+    if (registration === "conflict") {
+      return blockedWithoutState(frozen[0]!.taskId, request.sourceEnvironment, "A competing approved charter or owner binding is durably registered; explicit conflict resolution is required");
+    }
+    const manifest = await dependencies.store.createSuccessorIfAbsent(successor, expectedProjectIdentity, charterDigest);
+    const persisted = await dependencies.store.load(successor.taskId);
+    if (persisted === null || persisted.durableContext === null || persisted.taskCharter === undefined
+      || taskCharterContentDigest(persisted.taskCharter) !== charterDigest
+      || await dependencies.store.hasProjectSuccessorConflict(expectedProjectIdentity)) {
+      return blockedWithoutState(successor.taskId, request.sourceEnvironment, "Successor failed final durable read-back or project-conflict verification");
+    }
+    const finalDiscovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+    if (finalDiscovery.kind !== "available"
+      || finalDiscovery.allWorkspaceCandidates.filter((state) => electionProjectIdentity(state) === expectedProjectIdentity && !isLegacyFrozen(state) && state.stage !== "close").length !== 1) {
+      return blockedWithoutState(successor.taskId, request.sourceEnvironment, "Successor final workspace discovery was ambiguous; project routing remains blocked");
+    }
+    return response({ ...persisted, durableContext: manifest }, "accepted", `Established approved successor ${successor.taskId}. Initial next action: ${charter.initialNextAction}`);
+  } catch (error: unknown) {
+    return blockedWithoutState(frozen[0]!.taskId, request.sourceEnvironment,
+      error instanceof TaskOwnershipError
+        ? "Successor publication lost the durable project election; conflict resolution is required"
+        : "Successor publication failed closed; no completion claim is made");
+  }
 }
 
 type ProjectIdentityValidation =
@@ -1801,6 +2007,8 @@ async function resolveCurationTaskIdentity(
     if (isLegacyFrozen(state)) return { kind: "blocked", taskId: state.taskId, message: "Legacy-frozen tasks are available only for read-only inspection and recovery" };
     const identity = await validateCurrentProjectIdentity(state, dependencies);
     if (identity.kind === "blocked") return { kind: "blocked", taskId: state.taskId, message: `Curation task validation failed: ${identity.message}` };
+    const conflict = await projectSuccessorConflictMessage(state, dependencies.store);
+    if (conflict !== null) return { kind: "blocked", taskId: state.taskId, message: `Curation task validation failed: ${conflict}` };
     return { kind: "resolved", knownProjectTaskId: state.taskId };
   }
 
@@ -1941,7 +2149,7 @@ async function selectExplicitLocalOnlyTask(
     return response(candidate, "accepted", `Reused the existing active task ${candidate.taskId}; repeated establish created no duplicate task`);
   }
   if (discovery.allWorkspaceCandidates.length > 0 && workspaceRoutingCandidates.length === 0) {
-    return blockedWithoutState(discovery.allWorkspaceCandidates[0]!.taskId, request.sourceEnvironment, "Only legacy-frozen tasks match this workspace; successor creation is outside this routing-disposition slice");
+    return blockedWithoutState(discovery.allWorkspaceCandidates[0]!.taskId, request.sourceEnvironment, "Only legacy-frozen tasks match this workspace; successor establishment requires an explicitly approved task charter");
   }
   if (discovery.mode === "repository") return null;
   if (routingCandidates.length === 0) return null;
@@ -1981,6 +2189,8 @@ async function continueTaskExclusive(
     registry.forget(state.taskId);
     return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
+  const projectConflict = await projectSuccessorConflictMessage(state, dependencies.store);
+  if (projectConflict !== null) return response(state, "blocked", projectConflict);
   const owner = registry.owner(state.taskId);
   if (registry.isBlocked(state.taskId) || (owner !== null && owner !== state.environment)) {
     return response(state, "blocked", `Task ${state.taskId} ownership changed while continue was loading durable state`);
@@ -2166,6 +2376,8 @@ async function rollbackActiveTaskExclusive(
     registry.forget(taskId);
     return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
+  const projectConflict = await projectSuccessorConflictMessage(state, dependencies.store);
+  if (projectConflict !== null) return response(state, "blocked", projectConflict);
   if (state.recoveryPoint === null) {
     return response(state, "blocked", "Rollback requires a persisted recovery point");
   }
@@ -2339,6 +2551,8 @@ async function handoffTaskExclusive(
     registry.forget(taskId);
     return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
+  const projectConflict = await projectSuccessorConflictMessage(state, dependencies.store);
+  if (projectConflict !== null) return response(state, "blocked", projectConflict);
   if (state.handoffState !== "none") {
     return response(state, "blocked", `Task ${state.taskId} cannot hand off from state ${state.handoffState}`);
   }
@@ -2465,6 +2679,8 @@ async function completeHandoffExclusive(
     registry.forget(taskId);
     return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
+  const projectConflict = await projectSuccessorConflictMessage(state, dependencies.store);
+  if (projectConflict !== null) return response(state, "blocked", projectConflict);
   const handoffStatus = await connectorOutcome(
     () => Promise.resolve(dependencies.adapters[request.sourceEnvironment].status(command.handoffId)),
     completionConnectorFailure,
@@ -2614,6 +2830,8 @@ async function closeActiveTaskExclusive(
     registry.forget(taskId);
     return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
+  const projectConflict = await projectSuccessorConflictMessage(state, dependencies.store);
+  if (projectConflict !== null) return response(state, "blocked", projectConflict);
   if (state.stage !== "verify") {
     return response(state, "blocked", `Task ${state.taskId} must reach verify before close; current stage is ${state.stage}`);
   }
@@ -2760,6 +2978,12 @@ async function selectExplicitDurableTask(
     if (request.command.kind === "status") return response(state, "accepted", `Read-only historical inspection of LEGACY_FROZEN task ${state.taskId}; not selected as current`);
     return response(state, "blocked", "Legacy-frozen tasks are available only for read-only inspection and recovery");
   }
+  const electionIdentity = electionProjectIdentity(state);
+  if (request.command.kind !== "status" && electionIdentity !== null
+    && dependencies.store.hasProjectSuccessorConflict !== undefined
+    && await dependencies.store.hasProjectSuccessorConflict(electionIdentity)) {
+    return response(state, "blocked", `Project ${electionIdentity} has a durable successor charter or owner-binding conflict requiring explicit resolution`);
+  }
   if (state.stage === "close") {
     return response(state, "blocked", `Task ${state.taskId} is not active; current stage is close`);
   }
@@ -2827,6 +3051,10 @@ async function selectDiscoveredDurableTask(
     for (const candidate of discovered.value) if (isLegacyFrozen(candidate)) registry.forget(candidate.taskId);
     if (discovered.value.some((candidate) => projectIdentityMode(candidate) === null)) {
       return blockedWithoutState("ambiguous", request.sourceEnvironment, "An active task has malformed project identity; workspace task selection is blocked without writes");
+    }
+    for (const candidate of discovered.value) {
+      const conflict = await projectSuccessorConflictMessage(candidate, dependencies.store);
+      if (conflict !== null) return response(candidate, "blocked", conflict);
     }
     candidates = [...discovered.value];
   }
@@ -3032,6 +3260,15 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
   const registry = createRuntimeTaskRegistry();
   return async (externalRequest: ExternalDAIRequest): Promise<DAIResponse> => {
     const request = validateRequest(externalRequest);
+  if (request.taskCharter === undefined && request.confirmedTaskCharterDigest !== undefined) {
+      return blockedWithoutState("unassigned", request.sourceEnvironment, "Task-charter digest confirmation requires a matching task charter");
+    }
+    if (request.taskCharter !== undefined && (request.command.kind !== "intent" || !isExplicitNewTaskIntent(request.command.text))) {
+      return blockedWithoutState("unassigned", request.sourceEnvironment, "An approved task charter is accepted only with an explicit @D-AI establish command");
+    }
+    if (request.taskCharter !== undefined && request.confirmedTaskCharterDigest !== taskCharterContentDigest(request.taskCharter)) {
+      return blockedWithoutState("unassigned", request.sourceEnvironment, "The explicit operator confirmation digest does not match the exact approved task charter");
+    }
     if (request.command.kind === "curate") {
       if (request.curationSourceWindow !== undefined) {
         if (dependencies.curateSourceWindow === undefined) return curationPipelineResponse(request, {
@@ -3198,6 +3435,12 @@ export function createDAIRuntime(dependencies: DAIRuntimeDependencies): (request
     }
     if (request.command.kind === "intent") {
       const intentCommand = request.command;
+      if (request.taskCharter !== undefined) {
+        return registry.serializeMutation(
+          dependencies.workspacePath === null ? "successor:unassigned" : await workspaceMutationKey(dependencies.workspacePath),
+          () => establishApprovedSuccessor(request, dependencies),
+        );
+      }
       const runIntent = async (): Promise<DAIResponse> => {
         const explicitLocalSelection = await selectExplicitLocalOnlyTask(request, dependencies);
         if (explicitLocalSelection !== null) return explicitLocalSelection;

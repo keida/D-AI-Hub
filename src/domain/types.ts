@@ -149,6 +149,38 @@ export interface CloseVerdict {
 
 export type TaskRoutingDisposition = "ROUTABLE" | "PAUSED_RESUMABLE" | "LEGACY_FROZEN";
 
+export interface TaskCharterApproval {
+  readonly confirmation: "I_APPROVE_THIS_TASK_CHARTER";
+  readonly approvedBy: string;
+  readonly approvedAt: string;
+  readonly approvalReference: string;
+  readonly projectIdentity: string;
+  readonly approvedCharterDigest: string;
+}
+
+export interface TaskCharter {
+  readonly schemaVersion: 1;
+  readonly charterId: string;
+  readonly charterVersion: string;
+  readonly projectIdentity: string;
+  readonly objective: string;
+  readonly ownedScope: readonly string[];
+  readonly excludedScope: readonly string[];
+  readonly completionCriteria: readonly string[];
+  readonly terminationCondition: string;
+  readonly initialPhase?: string | undefined;
+  readonly initialNextAction: string;
+  readonly approval: TaskCharterApproval;
+}
+
+export interface TaskCharterConfirmationEvent {
+  readonly confirmationId: string;
+  readonly confirmedAt: string;
+  readonly projectIdentity: string;
+  readonly confirmedCharterDigest: string;
+  readonly channel: "explicit-task-charter-digest";
+}
+
 export interface TaskState {
   readonly taskId: string;
   readonly goal: string;
@@ -156,6 +188,8 @@ export interface TaskState {
   readonly environment: Environment;
   readonly stage: Stage;
   readonly routingDisposition?: TaskRoutingDisposition | undefined;
+  readonly taskCharter?: TaskCharter | undefined;
+  readonly taskCharterConfirmation?: TaskCharterConfirmationEvent | undefined;
   readonly role: Role;
   readonly routingDecision: RoutingDecision | null;
   readonly selectedCapabilities: readonly string[];

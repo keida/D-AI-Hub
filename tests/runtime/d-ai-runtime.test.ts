@@ -9,7 +9,7 @@ import { WorkEnvironmentAdapter } from "../../src/adapters/environments/work-ada
 import { bootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
 import { closeTask } from "../../src/close/close-service.js";
 import { CloseBlockedError, InvalidTaskStateError, TaskOwnershipError } from "../../src/domain/errors.js";
-import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, TaskState, VerificationEvidence } from "../../src/domain/types.js";
+import type { CloseCandidate, CloseVerdict, DurableContextManifest, Environment, RecoveryPoint, RecoverySnapshot, TaskCharter, TaskState, VerificationEvidence } from "../../src/domain/types.js";
 import { parseDAICommand } from "../../src/entry/command-parser.js";
 import { createCodexActivation } from "../../src/entry/codex-activation.js";
 import { InMemoryHandoffPersistence, PersistentHandoffService, type HandoffPersistenceRecord, type HandoffService, type HandoffStatus } from "../../src/handoff/handoff-service.js";
@@ -44,6 +44,7 @@ import type {
   TaskOwnershipTransitionAuthorizer,
 } from "../../src/state/durable-context-store.js";
 import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
+import { taskCharterContentDigest, taskCharterTaskId } from "../../src/state/task-charter.js";
 import { evaluateHardGates, type GateResult, type HardGateInput } from "../../src/verification/gates.js";
 
 const skillRoot = join(process.cwd(), "tests", "fixtures", "skills");
@@ -436,6 +437,33 @@ async function seedProjectState(runtimeHarness: RuntimeHarness, projectName = "D
 }
 
 const noOverrides: DAIRequest["overrides"] = { model: null, role: null, environment: null };
+
+function approvedCharter(projectIdentity: string, objective: string): TaskCharter {
+  const content = {
+    schemaVersion: 1 as const,
+    charterId: "runtime-successor-test",
+    charterVersion: "1",
+    projectIdentity,
+    objective,
+    ownedScope: ["successor routing behavior"],
+    excludedScope: ["unrelated task state"],
+    completionCriteria: ["runtime successor is discoverable"],
+    terminationCondition: "Stop after focused runtime checks pass.",
+    initialNextAction: "Inspect the canonical project and report the first safe action.",
+  };
+  const digest = taskCharterContentDigest(content);
+  return {
+    ...content,
+    approval: {
+      confirmation: "I_APPROVE_THIS_TASK_CHARTER",
+      approvedBy: "runtime-test-operator",
+      approvedAt: "2026-09-26T00:00:00.000Z",
+      approvalReference: "temporary runtime test approval",
+      projectIdentity,
+      approvedCharterDigest: digest,
+    },
+  };
+}
 
 const stageMatrixPolicies: readonly ModelPolicy[] = [
   ...policies,
@@ -2910,5 +2938,148 @@ describe("D-AI runtime", () => {
 
     await expect(createDAIRuntime(runtimeHarness.dependencies)(malformed)).rejects.toThrow(InvalidTaskStateError);
     expect(runtimeHarness.executed).toEqual([]);
+  });
+
+  it("rejects conflicting local-project owner identities instead of selecting the first frozen history", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const base = await seedProjectState(runtimeHarness);
+    const firstIdentity = "local-project:11111111-1111-4111-8111-111111111111";
+    const secondIdentity = "local-project:22222222-2222-4222-8222-222222222222";
+    const commonContext = base.contextManifest.filter((entry) => !entry.startsWith("remote-repository:") && !entry.startsWith("local-project:"));
+    const first: TaskState = { ...base, taskId: "task-111111111111111111111111", contextManifest: [...commonContext, firstIdentity], routingDisposition: "LEGACY_FROZEN" };
+    const second: TaskState = { ...base, taskId: "task-222222222222222222222222", contextManifest: [...commonContext, secondIdentity], routingDisposition: "LEGACY_FROZEN" };
+    await runtimeHarness.store.save(first);
+    await runtimeHarness.store.save(second);
+    const beforeWrites = runtimeHarness.savedStates.length;
+    const result = await createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      discoverActiveTasks: async () => [first, second],
+    })({
+      command: { kind: "intent", text: "establish successor" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      taskCharter: approvedCharter(firstIdentity, "Do not choose one local owner implicitly"),
+      confirmedTaskCharterDigest: taskCharterContentDigest(approvedCharter(firstIdentity, "Do not choose one local owner implicitly")),
+    });
+    expect(result.status).toBe("blocked");
+    expect(result.message).toContain("Multiple local-project identities");
+    expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);
+  });
+
+  it("establishes a charter-bound successor and durably blocks a later competing charter while preserving historical reads", async () => {
+    const runtimeHarness = harness(completedExecution, evaluateHardGates, "YES");
+    const base = await seedProjectState(runtimeHarness);
+    const projectIdentity = "local-project:11111111-1111-4111-8111-111111111111";
+    const frozen: TaskState = {
+      ...base,
+      contextManifest: [
+        ...base.contextManifest.filter((entry) => !entry.startsWith("remote-repository:")),
+        projectIdentity,
+      ],
+      routingDisposition: "LEGACY_FROZEN",
+    };
+    await runtimeHarness.store.save(frozen);
+    let discovered: TaskState[] = [frozen];
+    const extraStates = new Map<string, TaskState>();
+    const contenders = new Map<string, string>();
+    const conflicts = new Set<string>();
+    let store: DurableContextStore;
+    store = {
+      ...runtimeHarness.store,
+      load: async (taskId) => extraStates.get(taskId) ?? runtimeHarness.store.load(taskId),
+      save: async (state, authorization) => {
+        const manifest = await runtimeHarness.store.save(state, authorization);
+        const persisted = { ...state, durableContext: manifest };
+        extraStates.set(state.taskId, persisted);
+        if (state.taskCharter !== undefined) discovered = [...discovered, persisted];
+        return manifest;
+      },
+      registerProjectSuccessorContender: async (_state, identity, digest) => {
+        const previous = contenders.get(identity);
+        if (previous !== undefined && previous !== digest) conflicts.add(identity);
+        else contenders.set(identity, digest);
+        return conflicts.has(identity) ? "conflict" : "registered";
+      },
+      hasProjectSuccessorConflict: async (identity) => conflicts.has(identity),
+      createSuccessorIfAbsent: async (state) => store.save(state),
+    };
+    const runtime = createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store,
+      discoverActiveTasks: async () => discovered,
+    });
+    const firstCharter = approvedCharter(projectIdentity, "Establish a typed successor");
+    const firstDigest = taskCharterContentDigest(firstCharter);
+    const first = await runtime({
+      command: { kind: "intent", text: "establish successor" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      taskCharter: firstCharter,
+      confirmedTaskCharterDigest: firstDigest,
+    });
+    expect(first).toMatchObject({
+      taskId: taskCharterTaskId(projectIdentity, firstDigest),
+      status: "accepted",
+      taskCharter: { initialNextAction: firstCharter.initialNextAction },
+    });
+    expect(first.stage).toBe("bootstrap");
+    expect(firstCharter.initialPhase).toBeUndefined();
+    expect((await runtimeHarness.store.load(frozen.taskId))?.routingDisposition).toBe("LEGACY_FROZEN");
+
+    const secondCharter = approvedCharter(projectIdentity, "A different successor objective");
+    const competing = await runtime({
+      command: { kind: "intent", text: "establish successor" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      taskCharter: secondCharter,
+      confirmedTaskCharterDigest: taskCharterContentDigest(secondCharter),
+    });
+    expect(competing).toMatchObject({ taskId: first.taskId, status: "blocked" });
+    expect(competing.message).toContain("conflicts with the published successor");
+    expect(conflicts.has(projectIdentity)).toBe(true);
+
+    let curationWriteCalled = false;
+    const curationAfterConflict = await createDAIRuntime({
+      ...runtimeHarness.dependencies,
+      store,
+      discoverActiveTasks: async () => discovered,
+      curateCurrentContext: async () => {
+        curationWriteCalled = true;
+        return {
+          status: "completed",
+          counts: { added: 0, updated: 0, noOp: 0, deferred: 0, rejected: 0 },
+          records: [],
+          locallyStored: true,
+          readBackVerified: true,
+          safeToDeleteOriginalChat: "NO",
+          message: "fixture curation",
+        };
+      },
+    })({
+      command: { kind: "curate" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      activeTaskId: first.taskId,
+      curationCandidates: [{ candidateId: "candidate-a", memoryId: "memory-a", fact: "Current project fact", category: "project-memory", source: "current-context", privacyRisk: "local-private" }],
+    });
+    expect(curationAfterConflict.status).toBe("blocked");
+    expect(curationAfterConflict.message).toContain("successor charter or owner-binding conflict");
+    expect(curationWriteCalled).toBe(false);
+
+    const historicalStatus = await runtime({
+      command: { kind: "status" },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      activeTaskId: first.taskId,
+    });
+    expect(historicalStatus).toMatchObject({ taskId: first.taskId, status: "accepted", taskCharter: firstCharter });
+    const continueAfterConflict = await runtime({
+      command: { kind: "continue", taskIdOrProject: first.taskId },
+      sourceEnvironment: "codex",
+      overrides: noOverrides,
+      activeTaskId: first.taskId,
+    });
+    expect(continueAfterConflict).toMatchObject({ taskId: first.taskId, status: "blocked" });
+    expect(continueAfterConflict.message).toContain("successor charter or owner-binding conflict");
   });
 });
