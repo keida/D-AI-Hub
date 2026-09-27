@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -100,11 +100,38 @@ describe("approved successor runtime integration", () => {
       expect(await readFile(join(durableRoot, frozen.taskId, "state.json"))).toEqual(frozenBytes);
 
       const successorId = taskCharterTaskId(projectIdentity, taskCharterContentDigest(proposed));
-      const concurrent = await Promise.all(Array.from({ length: 12 }, async () => {
-        const freshRuntime = createCodexActivation(createConfiguredDAIRuntime(options));
-        return freshRuntime({ rawCommand: "@D-AI establish successor", taskId: null, taskCharter: proposed, confirmedTaskCharterDigest: proposedDigest });
+      const concurrent = await Promise.all(Array.from({ length: 12 }, async (_, callerIndex) => {
+        try {
+          const freshRuntime = createCodexActivation(createConfiguredDAIRuntime(options));
+          const result = await freshRuntime({ rawCommand: "@D-AI establish successor", taskId: null, taskCharter: proposed, confirmedTaskCharterDigest: proposedDigest });
+          return { callerIndex, status: "fulfilled" as const, result };
+        } catch (error: unknown) {
+          return { callerIndex, status: "rejected" as const, error };
+        }
       }));
-      expect(concurrent.every((result) => result.status === "accepted" && result.taskId === successorId)).toBe(true);
+      const activationFailure = concurrent.find((call) => call.status === "rejected");
+      try {
+        console.info("[003B-concurrent-callers]", JSON.stringify({
+          expectedSuccessorId: successorId,
+          callers: concurrent.map((call) => call.status === "fulfilled"
+            ? {
+                callerIndex: call.callerIndex,
+                outcome: call.status,
+                status: call.result.status,
+                taskId: call.result.taskId,
+                message: call.result.message.slice(0, 240),
+              }
+            : {
+                callerIndex: call.callerIndex,
+                outcome: call.status,
+                error: (call.error instanceof Error ? call.error.message : String(call.error)).slice(0, 240),
+              }),
+        }));
+      } catch {
+        // Diagnostics must not mask the assertion or an activation failure.
+      }
+      if (activationFailure?.status === "rejected") throw activationFailure.error;
+      expect(concurrent.every((call) => call.status === "fulfilled" && call.result.status === "accepted" && call.result.taskId === successorId)).toBe(true);
       expect((await store.discoverActiveTasks(workspacePath)).filter((state) => state.routingDisposition !== "LEGACY_FROZEN")).toHaveLength(1);
       const successorBeforeConflict = await store.load(successorId);
       expect(successorBeforeConflict).toMatchObject({
@@ -181,16 +208,18 @@ describe("approved successor runtime integration", () => {
     }
   }, 120_000);
 
-  it("binds a remote successor to the actual Git root when invoked from a nested workspace", async () => {
+  async function runNestedWorkspaceSuccessor(useJunction: boolean): Promise<void> {
     const root = await mkdtemp(join(tmpdir(), "d-ai-charter-nested-root-"));
     const repositoryRoot = join(root, "repository");
-    const workspacePath = join(repositoryRoot, "packages", "nested-workspace");
+    const canonicalWorkspacePath = join(repositoryRoot, "packages", "nested-workspace");
+    const workspacePath = useJunction ? join(root, "workspace-alias") : canonicalWorkspacePath;
     const durableRoot = join(root, "durable");
     const memoryDatabasePath = join(root, "memory.sqlite");
     const store = new FileDurableContextStore(durableRoot);
     try {
-      await mkdir(workspacePath, { recursive: true });
-      await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
+      await mkdir(canonicalWorkspacePath, { recursive: true });
+      await mkdir(join(canonicalWorkspacePath, ".agents", "skills"), { recursive: true });
+      if (useJunction) await symlink(canonicalWorkspacePath, workspacePath, "junction");
       await runCommand({ command: "git", arguments: ["init", "--initial-branch=main", repositoryRoot], cwd: null });
       await writeFile(join(repositoryRoot, "fixture.txt"), "nested successor fixture\n", "utf8");
       await runCommand({ command: "git", arguments: ["config", "user.email", "d-ai@example.test"], cwd: repositoryRoot });
@@ -225,11 +254,60 @@ describe("approved successor runtime integration", () => {
       });
       expect(successor.status).toBe("accepted");
       const persisted = await store.load(successor.taskId);
-      expect(persisted?.contextManifest.some((entry) => entry.startsWith(`identity:workspace:${workspacePath}:`))).toBe(true);
-      expect(persisted?.contextManifest.some((entry) => entry.startsWith(`identity:repository:${repositoryRoot}:`))).toBe(true);
-      expect(persisted?.contextManifest).toContain(projectIdentity);
+      expect(persisted).not.toBeNull();
+      if (persisted === null) throw new Error("Accepted successor was not durably loadable");
+
+      const expectedWorkspacePath = await realpath(canonicalWorkspacePath);
+      const expectedRepositoryPath = await realpath(repositoryRoot);
+      const workspaceInputRealpath = await realpath(workspacePath);
+      const workspaceIdentityPrefix = `identity:workspace:${expectedWorkspacePath}:`;
+      const repositoryIdentityPrefix = `identity:repository:${expectedRepositoryPath}:`;
+      const workspaceIdentityEntries = persisted.contextManifest.filter((entry) => entry.startsWith("identity:workspace:"));
+      const repositoryIdentityEntries = persisted.contextManifest.filter((entry) => entry.startsWith("identity:repository:"));
+      try {
+        console.info("[003B-nested-identities]", JSON.stringify({
+          fixture: useJunction ? "windows-junction" : "nested-workspace",
+          workspacePath,
+          workspaceInputRealpath,
+          expectedWorkspacePath,
+          repositoryRoot,
+          expectedRepositoryPath,
+          projectIdentity,
+          status: successor.status,
+          taskId: successor.taskId,
+          message: successor.message.slice(0, 240),
+          workspaceIdentityEntryCount: workspaceIdentityEntries.length,
+          repositoryIdentityEntryCount: repositoryIdentityEntries.length,
+          workspaceIdentityEntrySamples: workspaceIdentityEntries.slice(0, 3).map((entry) => entry.slice(0, 512)),
+          repositoryIdentityEntrySamples: repositoryIdentityEntries.slice(0, 3).map((entry) => entry.slice(0, 512)),
+          oldRawWorkspacePrefixMatch: workspaceIdentityEntries.some((entry) => entry.startsWith(`identity:workspace:${workspacePath}:`)),
+          oldRawRepositoryPrefixMatch: repositoryIdentityEntries.some((entry) => entry.startsWith(`identity:repository:${repositoryRoot}:`)),
+          canonicalWorkspacePrefixMatch: workspaceIdentityEntries.some((entry) => entry.startsWith(workspaceIdentityPrefix)),
+          canonicalRepositoryPrefixMatch: repositoryIdentityEntries.some((entry) => entry.startsWith(repositoryIdentityPrefix)),
+        }));
+      } catch {
+        // Diagnostics must not mask the behavioral assertions.
+      }
+
+      expect(expectedWorkspacePath).not.toBe(expectedRepositoryPath);
+      expect(workspaceInputRealpath).toBe(expectedWorkspacePath);
+      if (useJunction) expect(workspacePath).not.toBe(expectedWorkspacePath);
+      expect(persisted.taskId).toBe(successor.taskId);
+      expect(workspaceIdentityEntries).toHaveLength(1);
+      expect(repositoryIdentityEntries).toHaveLength(1);
+      expect(workspaceIdentityEntries[0]?.startsWith(workspaceIdentityPrefix)).toBe(true);
+      expect(repositoryIdentityEntries[0]?.startsWith(repositoryIdentityPrefix)).toBe(true);
+      expect(persisted.contextManifest).toContain("remote-repository:github.com/acme/nested-successor");
     } finally {
       await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
     }
+  }
+
+  it("binds a remote successor to the actual Git root when invoked from a nested workspace", async () => {
+    await runNestedWorkspaceSuccessor(false);
+  }, 60_000);
+
+  it.skipIf(process.platform !== "win32")("binds a remote successor to the canonical workspace through a Windows junction", async () => {
+    await runNestedWorkspaceSuccessor(true);
   }, 60_000);
 });
