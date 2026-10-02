@@ -128,6 +128,32 @@ describe("P4R bounded limitations presentation", () => {
     }
   });
 
+  it("promotes normalized blocker anchors beyond the first 16 relevant references in prepare mode", () => {
+    for (const boundary of [" ", "\u2029"]) {
+      const blockerFact = `${"B".repeat(255)}${boundary}remaining authoritative blocker detail`;
+      const facts = [...Array.from({ length: 16 }, (_, index) => `Unrelated reference ${index}.`), blockerFact];
+      const { state, rebuilt } = fixture(facts);
+      const normalizedBlocker = projectCurrentViewText(blockerFact);
+      const normalized = { ...rebuilt, currentView: { ...rebuilt.currentView!, blockers: [normalizedBlocker] } };
+
+      const result = deriveBossRecovery("local-project:p4r", state, normalized, "prepare");
+      expect(result.decision).toBe("CONTINUE_CURRENT_BOSS");
+      expect(result.context?.blockers).toEqual([normalizedBlocker]);
+      expect(result.context?.taskAndView.relevantMemoryIds).toContain("p4r-limitation-16");
+      expect(result.context?.taskAndView.relevantMemoryIds).toHaveLength(16);
+      expect(rebuilt.records[16]?.value).toMatchObject({ fact: blockerFact });
+    }
+
+    const legacyFact = `${"L".repeat(255)}Xlegacy blocker detail`;
+    const { state, rebuilt } = fixture([...Array.from({ length: 16 }, (_, index) => `Unrelated reference ${index}.`), legacyFact]);
+    const rawLegacyBlocker = legacyFact.slice(0, 256);
+    const legacy = { ...rebuilt, currentView: { ...rebuilt.currentView!, blockers: [rawLegacyBlocker] } };
+    const legacyResult = deriveBossRecovery("local-project:p4r", state, legacy, "prepare");
+    expect(legacyResult.decision).toBe("CONTINUE_CURRENT_BOSS");
+    expect(legacyResult.context?.taskAndView.relevantMemoryIds).toContain("p4r-limitation-16");
+    expect(legacyResult.context?.taskAndView.relevantMemoryIds).toHaveLength(16);
+  });
+
   it("blocks control characters and a view that cannot be traced to authoritative records", () => {
     expect(startup(["Constraint with\ncontrol character."])).toMatchObject({ decision: "BLOCKED", context: null });
     const { state, rebuilt } = fixture(["Authoritative constraint."]);

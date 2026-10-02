@@ -154,6 +154,7 @@ export function deriveBossRecovery(
   const truncatedLimitationIds = limitationBeliefs.filter((belief) => belief.fact.length > 256).map((belief) => belief.record.memoryId);
   const anchorIds = beliefs.filter((belief) =>
     (view.nextAction !== null && belief.fact.includes(view.nextAction))
+    || view.blockers.includes(projectCurrentViewText(belief.fact))
     || view.blockers.includes(belief.fact.slice(0, 256)),
   ).map((belief) => belief.record.memoryId);
   if (mode === "prepare" && new Set(anchorIds).size > maxItems) return blocked("Canonical nextAction and blocker references exceed the bounded Boss context");
