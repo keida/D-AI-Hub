@@ -2,7 +2,7 @@ import { containsSecretShapedValue } from "../domain/manifest-id.js";
 import { parseTaskBelief } from "../memory/belief-model.js";
 import type { CurrentStateView } from "../memory/types.js";
 import type { TaskState } from "../domain/types.js";
-import type { CurationPipelineRebuild } from "../curation/current-view-pipeline.js";
+import { projectCurrentViewText, type CurationPipelineRebuild } from "../curation/current-view-pipeline.js";
 
 export type BossSessionMode = "startup" | "prepare";
 export type BossSessionDecision = "CONTINUE_CURRENT_BOSS" | "ROLLOVER_RECOMMENDED" | "ROLLOVER_PREPARED" | "BLOCKED";
@@ -83,18 +83,20 @@ function boundedList(values: readonly string[]): boolean {
   return values.length <= maxItems && values.every((value) => value !== null && boundedText(value)) && JSON.stringify(values).length <= maxGroupLength;
 }
 
-function projectLimitations(values: readonly string[], memoryIds: readonly string[]): { inline: { text: string; memoryId: string }[]; omitted: string[] } | null {
-  if (values.length !== memoryIds.length) return null;
+function projectLimitations(values: readonly string[], memoryIds: readonly string[], authoritativeFacts: readonly string[]): { inline: { text: string; memoryId: string }[]; omitted: string[] } | null {
+  if (values.length !== memoryIds.length || values.length !== authoritativeFacts.length) return null;
   const inline: { text: string; memoryId: string }[] = [];
   const omitted: string[] = [];
   for (let index = 0; index < values.length; index += 1) {
     const raw = values[index];
     const memoryId = memoryIds[index];
+    const fact = authoritativeFacts[index]!;
     if (typeof raw !== "string" || typeof memoryId !== "string" || !boundedText(memoryId) || /[\u0000-\u001f\u007f]/u.test(raw)) return null;
     // A P2 UTF-16 slice can end between surrogate halves; omit that display item and retain its recovery ID.
     if (Buffer.from(raw, "utf8").toString("utf8") !== raw) { omitted.push(memoryId); continue; }
-    // P2 may truncate a valid fact at 256 characters, leaving a harmless space at the display boundary.
-    const displayed = raw.replace(/\p{Zs}+$/u, "");
+    const rawProjection = fact.slice(0, 256);
+    const displayed = projectCurrentViewText(fact);
+    if (raw !== rawProjection && raw !== displayed) return null;
     if (!boundedText(displayed) || displayed.length === 0) return null;
     const candidate = [...inline.map((item) => item.text), displayed];
     if (candidate.length <= maxItems && Buffer.byteLength(JSON.stringify(candidate), "utf8") <= maxGroupLength) inline.push({ text: displayed, memoryId });
@@ -137,15 +139,22 @@ export function deriveBossRecovery(
   const limitationBeliefs = beliefs.filter((belief) => belief.critical && (belief.topicLabel === "workflow/process" || belief.topicLabel === "other/transient"))
     .sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
   if (!Array.isArray(view.limitations) || !Array.isArray(view.relevantMemoryIds) || view.limitations.length !== limitationBeliefs.length
-    || view.limitations.some((value, index) => value !== limitationBeliefs[index]?.fact.slice(0, 256))
+    || view.limitations.some((value, index) => {
+      const fact = limitationBeliefs[index]?.fact;
+      if (fact === undefined) return true;
+      const rawProjection = fact.slice(0, 256);
+      const normalizedProjection = projectCurrentViewText(fact);
+      return value !== rawProjection && value !== normalizedProjection;
+    })
     || new Set(view.relevantMemoryIds).size !== view.relevantMemoryIds.length
     || limitationBeliefs.some((belief) => Buffer.from(belief.fact, "utf8").toString("utf8") !== belief.fact)
     || limitationBeliefs.some((belief) => !view.relevantMemoryIds.includes(belief.record.memoryId))) return blocked("Canonical limitations cannot be traced to task-scoped authoritative records");
-  const limitations = projectLimitations(view.limitations, limitationBeliefs.map((belief) => belief.record.memoryId));
+  const limitations = projectLimitations(view.limitations, limitationBeliefs.map((belief) => belief.record.memoryId), limitationBeliefs.map((belief) => belief.fact));
   if (limitations === null) return blocked("Canonical limitations cannot be safely represented for Boss startup");
   const truncatedLimitationIds = limitationBeliefs.filter((belief) => belief.fact.length > 256).map((belief) => belief.record.memoryId);
   const anchorIds = beliefs.filter((belief) =>
     (view.nextAction !== null && belief.fact.includes(view.nextAction))
+    || view.blockers.includes(projectCurrentViewText(belief.fact))
     || view.blockers.includes(belief.fact.slice(0, 256)),
   ).map((belief) => belief.record.memoryId);
   if (mode === "prepare" && new Set(anchorIds).size > maxItems) return blocked("Canonical nextAction and blocker references exceed the bounded Boss context");

@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildCurationBoundarySha256, createCurationPipeline, extractCurationCandidates, hashCurationSourceKey, inspectRecoveryCompleteness, type CurationPipelineInput, type PipelineSourceMessage } from "../../src/curation/current-view-pipeline.js";
-import type { CurationCheckpoint } from "../../src/memory/types.js";
+import { assertCurationCandidate } from "../../src/curation/local-curation.js";
+import { deriveBossRecovery } from "../../src/runtime/boss-session-recovery.js";
+import type { CurationCheckpoint, MemoryRecord } from "../../src/memory/types.js";
+import type { TaskState } from "../../src/domain/types.js";
 import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 
 const roots: string[] = [];
@@ -25,6 +28,12 @@ function input(messages: readonly PipelineSourceMessage[], overrides: Partial<Cu
   const previousCoveredThroughMarker = overrides.previousCoveredThroughMarker ?? null;
   const previousBoundarySha256 = overrides.previousBoundarySha256 ?? null;
   return { sourceType: "conversation", sourceKey: "chat-pipeline-test", projectTaskId: "task-atlas", messages, previousCoveredThroughMarker, previousBoundarySha256, sourceStartAttested: previousCoveredThroughMarker === null, coveredThroughMarker: messages.at(-1)!.marker, boundarySha256: buildCurationBoundarySha256(previousCoveredThroughMarker, previousBoundarySha256, messages), coverageConfidence: "complete", ...overrides };
+}
+function curatedFact(record: MemoryRecord | null | undefined): string | null {
+  const value = record?.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const objectValue = value as { readonly kind?: unknown; readonly fact?: unknown };
+  return objectValue.kind === "curated-fact" && typeof objectValue.fact === "string" ? objectValue.fact : null;
 }
 async function fixture(): Promise<{ readonly root: string; readonly databasePath: string; readonly store: LocalSqliteMemoryStore }> {
   const root = await mkdtemp(join(tmpdir(), "d-ai-current-view-pipeline-"));
@@ -105,6 +114,212 @@ describe("current-state curation pipeline", () => {
       expect(rebuilt).toMatchObject({ status: "available", projectionLosses: [], recoveryCompleteness: { status: "COMPLETE", projection: "AVAILABLE", missingFields: [] } });
       expect(rebuilt.currentView?.limitations).toHaveLength(1);
       expect(rebuilt.currentView?.blockers).toEqual([]);
+    } finally { store.close(); }
+  });
+
+  it("normalizes only permitted trailing projection whitespace and recovers it for Boss", async () => {
+    const prefix = "Approved decision: ";
+    const cases = [
+      { label: "space", cutUnit: " ", projected: "trimmed", status: "completed", short: false },
+      { label: "nbsp", cutUnit: "\u00a0", projected: "trimmed", status: "completed", short: false },
+      { label: "line-separator", cutUnit: "\u2028", projected: "trimmed", status: "completed", short: false },
+      { label: "paragraph-separator", cutUnit: "\u2029", projected: "trimmed", status: "completed", short: false },
+      { label: "bom", cutUnit: "\ufeff", projected: "trimmed", status: "completed", short: false },
+      { label: "nonspace", cutUnit: "X", projected: "raw", status: "completed", short: false },
+      { label: "within-limit-separator", cutUnit: "\u2029", projected: "unchanged", status: "completed", short: true },
+      { label: "line-feed", cutUnit: "\n", projected: "blocked", status: "blocked", short: false },
+      { label: "carriage-return", cutUnit: "\r", projected: "blocked", status: "blocked", short: false },
+      { label: "tab", cutUnit: "\t", projected: "blocked", status: "blocked", short: false },
+    ] as const;
+    const runCase = async (boundaryCase: typeof cases[number]) => {
+      const { root, databasePath, store } = await fixture();
+      expect(root.toLowerCase().startsWith(tmpdir().toLowerCase())).toBe(true);
+      expect(databasePath.toLowerCase().startsWith(tmpdir().toLowerCase())).toBe(true);
+      const fact = boundaryCase.short
+        ? `${prefix}${"x".repeat(256 - prefix.length - 2)}${boundaryCase.cutUnit}X`
+        : `${prefix}${"x".repeat(255 - prefix.length)}${boundaryCase.cutUnit} tail restriction: do not migrate without review.`;
+      const sourceKey = `canonical-boundary-${boundaryCase.label}`;
+      await store.applyMutations([{ operation: "add", memoryId: "preexisting-harmless", value: { kind: "curated-fact", fact: "A pre-existing fictional control record.", category: "project-memory", topicLabel: "workflow/process", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:preexisting", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" }]);
+      try {
+        const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
+        const result = await pipeline.run(input([
+          message("m-001", "Current phase: pilot verification", { memoryId: `phase-${boundaryCase.label}`, subjectKey: "atlas:phase" }),
+          message("m-002", fact, { memoryId: `boundary-${boundaryCase.label}`, subjectKey: "atlas:boundary-decision" }),
+          message("m-003", "Workflow: verify the fictional control candidate.", { memoryId: `candidate-${boundaryCase.label}`, subjectKey: "atlas:boundary-workflow" }),
+          message("m-004", "Next action: continue the accepted fictional task.", { memoryId: `next-${boundaryCase.label}`, subjectKey: "atlas:next" }),
+        ], { sourceKey }));
+        store.close();
+        const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: root, mode: "reader", scopeId: "pipeline-scope", writerId: "pipeline-writer" });
+        try {
+          const freshPipeline = createCurationPipeline({ store: reader, workspacePath: root, canonicalProjectIdentityVerified: true });
+          const persistedRecords = await reader.listAll();
+          const checkpoint = await reader.getLatestCurationCheckpoint("conversation", "task-atlas", hashCurationSourceKey(sourceKey));
+          const recovered = await freshPipeline.recover("task-atlas", "conversation", sourceKey);
+          return { root, databasePath, fact, result, persistedRecords, checkpoint, recovered };
+        } finally { reader.close(); }
+      } catch (error) {
+        try { store.close(); } catch { /* already closed */ }
+        throw error;
+      }
+    };
+
+    for (const boundaryCase of cases) {
+      const observation = await runCase(boundaryCase);
+      const expectedProjection = boundaryCase.projected === "trimmed" ? observation.fact.slice(0, 255) : observation.fact.slice(0, 256);
+      const exactExpectedProjection = boundaryCase.projected === "unchanged" ? observation.fact : expectedProjection;
+      const persistedIds = observation.persistedRecords.map(({ memoryId }) => memoryId).sort();
+      expect.soft(observation.fact.length).toBe(boundaryCase.short ? 256 : 305);
+      expect.soft(observation.fact.trim()).toBe(observation.fact);
+      expect.soft(observation.result.status).toBe(boundaryCase.status);
+      expect.soft(observation.persistedRecords.find(({ memoryId }) => memoryId === `boundary-${boundaryCase.label}`) ? curatedFact(observation.persistedRecords.find(({ memoryId }) => memoryId === `boundary-${boundaryCase.label}`)) : null).toBe(boundaryCase.status === "completed" ? observation.fact : null);
+      expect.soft(persistedIds).toEqual(boundaryCase.status === "completed"
+        ? [`boundary-${boundaryCase.label}`, `candidate-${boundaryCase.label}`, `next-${boundaryCase.label}`, `phase-${boundaryCase.label}`, "preexisting-harmless"]
+        : ["preexisting-harmless"]);
+      expect.soft(observation.persistedRecords.find(({ memoryId }) => memoryId === "preexisting-harmless")).toMatchObject({ value: { fact: "A pre-existing fictional control record." } });
+      expect.soft(observation.checkpoint !== null).toBe(boundaryCase.status === "completed");
+      if (boundaryCase.status === "completed") {
+        expect.soft(observation.checkpoint?.currentView.confirmedDecisions).toEqual([exactExpectedProjection]);
+        expect.soft(observation.recovered).toMatchObject({ status: "available", viewFresh: true, currentView: observation.checkpoint?.currentView });
+      } else {
+        expect.soft(observation.recovered.status).toBe("empty");
+      }
+    }
+  });
+
+  it("characterizes a critical long limitation cut from currentView while canonical recovery keeps it", async () => {
+    const prefix = "Limitation: ";
+    const tailRestriction = "[explicit tail restriction: do not migrate]";
+    const longLimitation = `${prefix}${"x".repeat(255 - prefix.length)}X ${tailRestriction}`;
+    const sourceKey = "canonical-limitation-probe";
+    const { root, databasePath, store } = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
+      const result = await pipeline.run(input([
+        message("m-001", "Current phase: pilot verification", { subjectKey: "atlas:phase" }),
+        message("m-002", "Next action: continue the accepted fictional task.", { subjectKey: "atlas:next" }),
+        message("m-003", longLimitation, { memoryId: "critical-long-limitation", subjectKey: "atlas:limitation", critical: true }),
+      ], { sourceKey }));
+      const firstCheckpoint = await store.getLatestCurationCheckpoint("conversation", "task-atlas", hashCurationSourceKey(sourceKey));
+      const viewLimitation = result.currentView?.limitations[0] ?? null;
+      expect(result.status).toBe("completed");
+      expect(result).toMatchObject({ limitationsTruncation: {
+        status: "TRUNCATED", truncatedCount: 1,
+        limitations: [{ projectTaskId: "task-atlas", memoryId: "critical-long-limitation", sourceLength: 300, projectedLength: 256, maxLength: 256, lengthUnit: "utf16-code-units" }],
+      } });
+      expect(result.currentView?.limitations).toHaveLength(1);
+      expect(viewLimitation).toHaveLength(256);
+      expect(viewLimitation).not.toContain(tailRestriction);
+      expect(firstCheckpoint).not.toBeNull();
+
+      store.close();
+      const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: root, mode: "reader", scopeId: "pipeline-scope", writerId: "pipeline-writer" });
+      try {
+        const freshPipeline = createCurationPipeline({ store: reader, workspacePath: root, canonicalProjectIdentityVerified: true });
+        const rebuilt = await freshPipeline.rebuildCurrentState("task-atlas");
+        const recovered = await freshPipeline.recover("task-atlas", "conversation", sourceKey);
+        const authoritative = rebuilt.records.find(({ memoryId }) => memoryId === "critical-long-limitation");
+        const authoritativeFact = curatedFact(authoritative);
+        const taskState = { taskId: "task-atlas", stage: "route", approvalState: "none", handoffState: "none", criticalUnsavedContext: [] } as unknown as TaskState;
+        const bossRecovery = deriveBossRecovery("local-project:canonical-probe", taskState, rebuilt, "startup");
+        expect(rebuilt).toMatchObject({ status: "available", projectionLosses: [], recoveryCompleteness: { status: "COMPLETE" } });
+        expect(rebuilt.limitationsTruncation).toEqual(result.limitationsTruncation);
+        expect(recovered).toMatchObject({ status: "available", viewFresh: true });
+        expect(recovered.limitationsTruncation).toEqual(result.limitationsTruncation);
+        expect(await freshPipeline.recover("task-atlas", "conversation", sourceKey)).toMatchObject({ limitationsTruncation: result.limitationsTruncation });
+        expect(authoritativeFact).toBe(longLimitation);
+        expect(authoritativeFact).toContain(tailRestriction);
+        expect(recovered.currentView?.limitations[0]).toHaveLength(256);
+        expect(bossRecovery).toMatchObject({ decision: "CONTINUE_CURRENT_BOSS", context: { limitations: [viewLimitation], limitationsPresentation: { truncatedCount: 1, truncatedMemoryIds: ["critical-long-limitation"], inlineComplete: false } } });
+        expect(firstCheckpoint).not.toHaveProperty("limitationsTruncation");
+        expect(firstCheckpoint?.currentView).not.toHaveProperty("limitationsTruncation");
+      } finally { reader.close(); }
+    } finally {
+      // The writer may already be closed before opening a fresh reader.
+      try { store.close(); } catch { /* already closed */ }
+    }
+
+    const short = "Limitation: do not migrate until the fictional review is complete.";
+    const control = await fixture();
+    try {
+      const pipeline = createCurationPipeline({ store: control.store, workspacePath: control.root, canonicalProjectIdentityVerified: true });
+      const result = await pipeline.run(input([
+        message("m-001", "Current phase: pilot verification", { subjectKey: "atlas:phase" }),
+        message("m-002", "Next action: continue the accepted fictional task.", { subjectKey: "atlas:next" }),
+        message("m-003", short, { memoryId: "short-limitation-control", subjectKey: "atlas:limitation", critical: true }),
+      ], { sourceKey: "canonical-short-limitation-control" }));
+      expect(result.status).toBe("completed");
+      expect(result.limitationsTruncation).toMatchObject({ status: "COMPLETE", truncatedCount: 0, limitations: [] });
+      expect(result.currentView?.limitations).toEqual([short]);
+    } finally { control.store.close(); }
+  });
+
+  it("keeps source and checkpoint whitespace validation strict outside truncation projection", async () => {
+    const candidate = extractCurationCandidates([message("m-001", "Approved decision: preserve the authoritative fact.")], "task-atlas")[0]!;
+    expect(() => assertCurationCandidate({ ...candidate, fact: ` ${candidate.fact}` })).toThrow("must be non-empty and trimmed");
+    expect(() => assertCurationCandidate({ ...candidate, fact: `${candidate.fact} ` })).toThrow("must be non-empty and trimmed");
+
+    const { root, store } = await fixture();
+    try {
+      const result = await createCurationPipeline({ store, workspacePath: root }).run(input([message("m-001", "Approved decision: checkpoint baseline.", { memoryId: "strict-checkpoint-base" })]));
+      const checkpoint = result.checkpoint!;
+      for (const limitation of [` ${"x".repeat(255)}`, `${"x".repeat(255)} `]) {
+        const invalid = { ...checkpoint, currentView: { ...checkpoint.currentView, limitations: [limitation] } };
+        await expect(store.withCurationCheckpoint(invalid, async () => undefined)).rejects.toThrow("Curation view limitations must be a bounded non-secret string list");
+      }
+      await expect(store.getLatestCurationCheckpoint("conversation", "task-atlas", hashCurationSourceKey("chat-pipeline-test"))).resolves.toMatchObject({ currentView: checkpoint.currentView });
+    } finally { store.close(); }
+  });
+
+  it("scopes limitation truncation references to current task facts after supersession", async () => {
+    const { root, store } = await fixture();
+    const sourceKey = "canonical-scope-supersession";
+    const pipeline = createCurationPipeline({ store, workspacePath: root });
+    const original = `Limitation: ${"o".repeat(270)}`;
+    try {
+      const first = await pipeline.run(input([
+        message("m-001", "Current phase: pilot verification", { subjectKey: "atlas:phase" }),
+        message("m-002", "Next action: continue the accepted fictional task.", { subjectKey: "atlas:next" }),
+        message("m-003", original, { memoryId: "old-long-limitation", subjectKey: "atlas:limitation", critical: true }),
+      ], { sourceKey }));
+      expect(first.status).toBe("completed");
+      await store.applyMutations([{ operation: "add", memoryId: "other-task-long-limitation", value: { kind: "curated-fact", fact: `Limitation: ${"z".repeat(500)}`, category: "project-memory", topicLabel: "workflow/process", critical: true, projectTaskId: "task-other", taskScopeId: "task-other", subjectKey: "other:limitation", revision: 1, observedAt: "2026-09-13T00:00:03.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:03.000Z" }]);
+      const replacement = `Limitation: ${"n".repeat(330)} [revised restriction]`;
+      const second = await pipeline.run(input([
+        message("m-004", replacement, { memoryId: "new-long-limitation", subjectKey: "atlas:limitation", critical: true, revision: 2, supersedesMemoryIds: ["old-long-limitation"] }),
+      ], { sourceKey, previousCoveredThroughMarker: first.checkpoint!.coveredThroughMarker, previousBoundarySha256: first.checkpoint!.boundarySha256 }));
+      expect(second.status).toBe("completed");
+      expect(second.currentView?.limitations).toEqual([replacement.slice(0, 256)]);
+      expect(second.limitationsTruncation).toMatchObject({ status: "TRUNCATED", truncatedCount: 1, limitations: [{ projectTaskId: "task-atlas", memoryId: "new-long-limitation", sourceLength: replacement.length }] });
+      expect(second.limitationsTruncation?.limitations.map(({ memoryId }) => memoryId)).not.toContain("old-long-limitation");
+      expect(second.limitationsTruncation?.limitations.map(({ memoryId }) => memoryId)).not.toContain("other-task-long-limitation");
+      expect(second.currentView?.relevantMemoryIds).not.toContain("old-long-limitation");
+      expect(second.currentView?.relevantMemoryIds).not.toContain("other-task-long-limitation");
+      await expect(pipeline.recover("task-atlas", "conversation", sourceKey)).resolves.toMatchObject({ status: "available", limitationsTruncation: second.limitationsTruncation });
+    } finally { store.close(); }
+  });
+
+  it("marks fallback limitation metadata unavailable when a same-prefix successor is outside the returned view", async () => {
+    const { root, store } = await fixture();
+    const sourceKey = "canonical-fallback-truncation-ref";
+    const pipeline = createCurationPipeline({ store, workspacePath: root });
+    const prefix = `Limitation: ${"p".repeat(256 - "Limitation: ".length)}`;
+    const original = `${prefix} original restriction`;
+    const replacement = `${prefix} revised restriction ${"r".repeat(100)}`;
+    expect(replacement.length).toBeGreaterThan(original.length);
+    try {
+      const first = await pipeline.run(input([
+        message("m-001", "Current phase: pilot verification", { subjectKey: "atlas:phase" }),
+        message("m-002", "Next action: continue the accepted fictional task.", { subjectKey: "atlas:next" }),
+        message("m-003", original, { memoryId: "fallback-old-limitation", subjectKey: "atlas:limitation", critical: true }),
+      ], { sourceKey }));
+      expect(first.status).toBe("completed");
+      expect(first.currentView?.limitations).toEqual([prefix]);
+      const fallback = await pipeline.run(input([
+        message("m-004", replacement, { memoryId: "fallback-new-limitation", subjectKey: "atlas:limitation", critical: true, revision: 2, supersedesMemoryIds: ["fallback-old-limitation"] }),
+      ], { sourceKey, previousCoveredThroughMarker: first.checkpoint!.coveredThroughMarker, previousBoundarySha256: first.checkpoint!.boundarySha256, coverageConfidence: "partial" }));
+      expect(fallback).toMatchObject({ status: "completed", mode: "bounded-fallback", currentView: first.currentView, limitationsTruncation: { status: "UNAVAILABLE", truncatedCount: null, limitations: [] } });
+      const rebuilt = await pipeline.rebuildCurrentState("task-atlas");
+      expect(rebuilt.limitationsTruncation).toMatchObject({ status: "TRUNCATED", truncatedCount: 1, limitations: [{ projectTaskId: "task-atlas", memoryId: "fallback-new-limitation", sourceLength: replacement.length }] });
     } finally { store.close(); }
   });
 

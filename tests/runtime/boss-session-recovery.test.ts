@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deriveBossRecovery } from "../../src/runtime/boss-session-recovery.js";
 import type { TaskState } from "../../src/domain/types.js";
-import type { CurationPipelineRebuild } from "../../src/curation/current-view-pipeline.js";
+import { projectCurrentViewText, type CurationPipelineRebuild } from "../../src/curation/current-view-pipeline.js";
 import type { MemoryRecord } from "../../src/memory/types.js";
 
 const taskId = "task-p4r-boundary";
@@ -19,7 +19,7 @@ function fixture(facts: readonly string[]): { state: TaskState; rebuilt: Curatio
   const state = { taskId, stage: "route", approvalState: "none", handoffState: "none", criticalUnsavedContext: [] } as unknown as TaskState;
   const rebuilt: CurationPipelineRebuild = {
     status: "available", projectTaskId: taskId, checkpoint: null, viewFresh: true, records, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO",
-    currentView: { identity: taskId, phase: "route", milestones: [], currentWork: [], confirmedDecisions: [], blockers: [], limitations: facts.map((fact) => fact.slice(0, 256)), nextAction: "resume canonical work.", verificationStatus: "verified", relevantMemoryIds: records.map((record) => record.memoryId), checkpointReference: null },
+    currentView: { identity: taskId, phase: "route", milestones: [], currentWork: [], confirmedDecisions: [], blockers: [], limitations: facts.map(projectCurrentViewText), nextAction: "resume canonical work.", verificationStatus: "verified", relevantMemoryIds: records.map((record) => record.memoryId), checkpointReference: null },
   };
   return { state, rebuilt };
 }
@@ -97,14 +97,61 @@ describe("P4R bounded limitations presentation", () => {
     expect(Buffer.byteLength(JSON.stringify(result.context), "utf8")).toBeLessThanOrEqual(8192);
   });
 
-  it("normalizes only harmless projected trailing spaces and leaves authoritative facts unchanged", () => {
-    const fact = `${"L".repeat(255)} continuation`;
-    const { state, rebuilt } = fixture([fact]);
-    const result = deriveBossRecovery("local-project:p4r", state, rebuilt, "startup");
-    expect(result.decision).toBe("CONTINUE_CURRENT_BOSS");
-    expect(result.context?.limitations).toEqual(["L".repeat(255)]);
-    expect(rebuilt.currentView?.limitations).toEqual([`${"L".repeat(255)} `]);
-    expect(rebuilt.records[0]?.value).toMatchObject({ fact });
+  it("shares the producer projection rule while accepting matching legacy raw slices", () => {
+    const cases = [
+      { label: "space", cutUnit: " ", accepted: true, short: false },
+      { label: "nbsp", cutUnit: "\u00a0", accepted: true, short: false },
+      { label: "line separator", cutUnit: "\u2028", accepted: true, short: false },
+      { label: "paragraph separator", cutUnit: "\u2029", accepted: true, short: false },
+      { label: "BOM", cutUnit: "\ufeff", accepted: true, short: false },
+      { label: "nonspace", cutUnit: "X", accepted: true, short: false },
+      { label: "within-limit separator", cutUnit: "\u2029", accepted: true, short: true },
+      { label: "line feed", cutUnit: "\n", accepted: false, short: false },
+      { label: "carriage return", cutUnit: "\r", accepted: false, short: false },
+      { label: "tab", cutUnit: "\t", accepted: false, short: false },
+    ];
+    for (const boundaryCase of cases) {
+      const fact = boundaryCase.short ? `${"L".repeat(254)}${boundaryCase.cutUnit}X` : `${"L".repeat(255)}${boundaryCase.cutUnit} continuation`;
+      const { state, rebuilt } = fixture([fact]);
+      const expectedProjection = boundaryCase.short ? fact : boundaryCase.accepted && boundaryCase.cutUnit.trim() === "" ? "L".repeat(255) : fact.slice(0, 256);
+      expect(rebuilt.currentView?.limitations).toEqual([expectedProjection]);
+      expect(rebuilt.records[0]?.value).toMatchObject({ fact });
+
+      const normalizedResult = deriveBossRecovery("local-project:p4r", state, rebuilt, "startup");
+      expect(normalizedResult.decision).toBe(boundaryCase.accepted ? "CONTINUE_CURRENT_BOSS" : "BLOCKED");
+      if (boundaryCase.accepted) expect(normalizedResult.context?.limitations).toEqual([expectedProjection]);
+
+      const legacyRaw = { ...rebuilt, currentView: { ...rebuilt.currentView!, limitations: [fact.slice(0, 256)] } };
+      const legacyResult = deriveBossRecovery("local-project:p4r", state, legacyRaw, "startup");
+      expect(legacyResult.decision).toBe(boundaryCase.accepted ? "CONTINUE_CURRENT_BOSS" : "BLOCKED");
+      if (boundaryCase.accepted) expect(legacyResult.context?.limitations).toEqual([expectedProjection]);
+    }
+  });
+
+  it("promotes normalized blocker anchors beyond the first 16 relevant references in prepare mode", () => {
+    for (const boundary of [" ", "\u2029"]) {
+      const blockerFact = `${"B".repeat(255)}${boundary}remaining authoritative blocker detail`;
+      const facts = [...Array.from({ length: 16 }, (_, index) => `Unrelated reference ${index}.`), blockerFact];
+      const { state, rebuilt } = fixture(facts);
+      const normalizedBlocker = projectCurrentViewText(blockerFact);
+      const normalized = { ...rebuilt, currentView: { ...rebuilt.currentView!, blockers: [normalizedBlocker] } };
+
+      const result = deriveBossRecovery("local-project:p4r", state, normalized, "prepare");
+      expect(result.decision).toBe("CONTINUE_CURRENT_BOSS");
+      expect(result.context?.blockers).toEqual([normalizedBlocker]);
+      expect(result.context?.taskAndView.relevantMemoryIds).toContain("p4r-limitation-16");
+      expect(result.context?.taskAndView.relevantMemoryIds).toHaveLength(16);
+      expect(rebuilt.records[16]?.value).toMatchObject({ fact: blockerFact });
+    }
+
+    const legacyFact = `${"L".repeat(255)}Xlegacy blocker detail`;
+    const { state, rebuilt } = fixture([...Array.from({ length: 16 }, (_, index) => `Unrelated reference ${index}.`), legacyFact]);
+    const rawLegacyBlocker = legacyFact.slice(0, 256);
+    const legacy = { ...rebuilt, currentView: { ...rebuilt.currentView!, blockers: [rawLegacyBlocker] } };
+    const legacyResult = deriveBossRecovery("local-project:p4r", state, legacy, "prepare");
+    expect(legacyResult.decision).toBe("CONTINUE_CURRENT_BOSS");
+    expect(legacyResult.context?.taskAndView.relevantMemoryIds).toContain("p4r-limitation-16");
+    expect(legacyResult.context?.taskAndView.relevantMemoryIds).toHaveLength(16);
   });
 
   it("blocks control characters and a view that cannot be traced to authoritative records", () => {

@@ -39,6 +39,7 @@ export interface CurationPipelineRecovery {
   readonly projectTaskId: string;
   readonly checkpoint: CurationCheckpoint | null;
   readonly currentView: CurrentStateView | null;
+  readonly limitationsTruncation?: CurrentViewLimitationsTruncation;
   readonly viewFresh: boolean;
   readonly records: readonly MemoryRecord[];
   readonly reason?: string;
@@ -59,6 +60,7 @@ export interface CurationPipelineRebuild {
   readonly projectTaskId: string;
   readonly checkpoint: CurationCheckpointMetadata | null;
   readonly currentView: CurrentStateView | null;
+  readonly limitationsTruncation?: CurrentViewLimitationsTruncation;
   readonly viewFresh: boolean;
   readonly records: readonly MemoryRecord[];
   readonly sourceCoverage: "unknown";
@@ -86,6 +88,7 @@ export interface CurationPipelineResult {
   readonly curation: CurationResult | null;
   readonly checkpoint: CurationCheckpoint | null;
   readonly currentView: CurrentStateView | null;
+  readonly limitationsTruncation?: CurrentViewLimitationsTruncation;
   readonly checkpointAdvanced: boolean;
   readonly checkpointRecorded: boolean;
   readonly coverageAdvanced: boolean;
@@ -95,6 +98,19 @@ export interface CurationPipelineResult {
   readonly safeToDeleteSourceChat: "YES" | "NO";
   readonly finalization: CurationFinalizationEvidence;
   readonly message: string;
+}
+
+export interface CurrentViewLimitationsTruncation {
+  readonly status: "COMPLETE" | "TRUNCATED" | "UNAVAILABLE";
+  readonly truncatedCount: number | null;
+  readonly limitations: readonly {
+    readonly projectTaskId: string;
+    readonly memoryId: string;
+    readonly sourceLength: number;
+    readonly projectedLength: number;
+    readonly maxLength: 256;
+    readonly lengthUnit: "utf16-code-units";
+  }[];
 }
 
 export interface CurationPipelineOptions {
@@ -264,6 +280,47 @@ function storedViewFacts(records: readonly MemoryRecord[], projectTaskId: string
   }));
 }
 
+const unavailableLimitationsPresentation: CurrentViewLimitationsTruncation = { status: "UNAVAILABLE", truncatedCount: null, limitations: [] };
+
+export function projectCurrentViewText(fact: string): string {
+  const projected = fact.slice(0, 256);
+  return fact.length > 256 ? projected.replace(/[\p{Z}\uFEFF]+$/u, "") : projected;
+}
+
+function selectedViewFacts(current: readonly StoredViewFact[], projectionOnly: boolean): readonly StoredViewFact[] {
+  return current.filter(({ fact, topicLabel, critical }) => projectionOnly
+    ? critical && (topicLabel === "workflow/process" || topicLabel === "other/transient")
+    : topicLabel === "other/transient" && /limitation|constraint|cannot|not verified|限制/iu.test(fact));
+}
+
+function currentViewPresentationTruncation(
+  records: readonly MemoryRecord[],
+  projectTaskId: string,
+  currentView: CurrentStateView | null,
+  projectionOnly = false,
+  currentOnly = false,
+): CurrentViewLimitationsTruncation {
+  if (currentView === null) return unavailableLimitationsPresentation;
+  const current = [...storedViewFacts(records, projectTaskId, currentOnly)].sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
+  const selected = selectedViewFacts(current, projectionOnly);
+  const projectionMatches = selected.length === currentView.limitations.length && selected.every(({ fact, record }, index) => {
+    const rawLegacyProjection = fact.slice(0, 256);
+    const normalizedProjection = projectCurrentViewText(fact);
+    return currentView.relevantMemoryIds.includes(record.memoryId)
+      && (currentView.limitations[index] === rawLegacyProjection || currentView.limitations[index] === normalizedProjection);
+  });
+  if (!projectionMatches) return unavailableLimitationsPresentation;
+  const limitations = selected.flatMap(({ fact, record }, index) => fact.length > 256 ? [{
+    projectTaskId,
+    memoryId: record.memoryId,
+    sourceLength: fact.length,
+    projectedLength: currentView.limitations[index]!.length,
+    maxLength: 256 as const,
+    lengthUnit: "utf16-code-units" as const,
+  }] : []);
+  return { status: limitations.length === 0 ? "COMPLETE" : "TRUNCATED", truncatedCount: limitations.length, limitations };
+}
+
 function currentViewProjectionLosses(records: readonly MemoryRecord[], projectTaskId: string): readonly ("phase" | "nextAction" | "blocker")[] {
   const losses = new Set<"phase" | "nextAction" | "blocker">();
   for (const { fact, topicLabel } of storedViewFacts(records, projectTaskId, true)) {
@@ -312,7 +369,7 @@ function blockedRecoveryCompleteness(reason: string): RecoveryCompleteness {
 function buildCurrentView(records: readonly MemoryRecord[], projectTaskId: string, reference: string | null, version: number, verificationStatus: CurrentStateView["verificationStatus"], projectionOnly = false, currentOnly = false): CurrentStateView {
   const facts = storedViewFacts(records, projectTaskId, currentOnly);
   const current = [...facts].sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
-  const texts = (predicate: (fact: StoredViewFact) => boolean): readonly string[] => current.filter(predicate).map(({ fact }) => fact.slice(0, 256));
+  const texts = (predicate: (fact: StoredViewFact) => boolean): readonly string[] => current.filter(predicate).map(({ fact }) => projectCurrentViewText(fact));
   const phases = [...new Set(current.map(({ fact }) => explicitPhase(fact)).filter((phase): phase is string => phase !== null))];
   if (phases.length > 1) throw new InvalidTaskStateError("Current-state view has conflicting phases");
   const nextActions = [...new Set(current.map(({ fact }) => explicitNextAction(fact)).filter((candidate): candidate is string => candidate !== null))];
@@ -330,7 +387,7 @@ function buildCurrentView(records: readonly MemoryRecord[], projectTaskId: strin
     currentWork: projectionOnly ? [] : texts(({ fact }) => /current work|working|in progress|当前工作/iu.test(fact)),
     confirmedDecisions: texts(({ fact, topicLabel: label }) => projectionOnly ? label === "architecture/decision" : label === "architecture/decision" || /decision|approved|approval|决定/iu.test(fact)),
     blockers: texts(({ fact, topicLabel: label }) => projectionOnly ? label === "bug/root-cause" : label === "bug/root-cause" || /blocker|blocked|failure|阻塞/iu.test(fact)),
-    limitations: projectionOnly ? texts(({ topicLabel: label, critical }) => critical && (label === "workflow/process" || label === "other/transient")) : texts(({ fact, topicLabel: label }) => label === "other/transient" && /limitation|constraint|cannot|not verified|限制/iu.test(fact)),
+    limitations: selectedViewFacts(current, projectionOnly).map(({ fact }) => projectCurrentViewText(fact)),
     nextAction: nextActions[0] ?? null,
     verificationStatus,
     relevantMemoryIds: current.map(({ record }) => record.memoryId),
@@ -423,8 +480,8 @@ function finalizationEvidence(checkpoint: CurationCheckpoint | null, requested: 
   };
 }
 
-function blockedResult(message: string, curation: CurationResult | null = null, checkpoint: CurationCheckpoint | null = null, requested = false, overrides: { readonly uncuratedTailCount?: number; readonly currentViewFresh?: boolean; readonly freshRecovery?: boolean } = {}): CurationPipelineResult {
-  return { status: "blocked", mode: "bounded-fallback", curation, checkpoint, currentView: checkpoint?.currentView ?? null, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: [], safeToDeleteSuppliedContent: "NO", safeToDeleteSourceChat: "NO", finalization: finalizationEvidence(checkpoint, requested, { ...overrides, reason: message }), message };
+function blockedResult(message: string, curation: CurationResult | null = null, checkpoint: CurationCheckpoint | null = null, requested = false, overrides: { readonly uncuratedTailCount?: number; readonly currentViewFresh?: boolean; readonly freshRecovery?: boolean } = {}, limitationsTruncation = unavailableLimitationsPresentation): CurationPipelineResult {
+  return { status: "blocked", mode: "bounded-fallback", curation, checkpoint, currentView: checkpoint?.currentView ?? null, limitationsTruncation, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: [], safeToDeleteSuppliedContent: "NO", safeToDeleteSourceChat: "NO", finalization: finalizationEvidence(checkpoint, requested, { ...overrides, reason: message }), message };
 }
 
 export function createCurationPipeline(options: CurationPipelineOptions) {
@@ -432,6 +489,14 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
   const loopOptions = { store: options.store, workspacePath: options.workspacePath, repositoryPath: options.repositoryPath ?? null, maxSnapshotRecords: 256 };
   const loop: KnowledgeQualityLoop = createKnowledgeQualityLoop(options.now === undefined ? loopOptions : { ...loopOptions, now: options.now });
   const windowLimit = options.maxWindowMessages ?? defaultWindowLimit;
+
+  async function limitationsTruncationForView(projectTaskId: string, currentView: CurrentStateView | null): Promise<CurrentViewLimitationsTruncation> {
+    if (currentView === null) return unavailableLimitationsPresentation;
+    try {
+      const records = await options.store.listTaskScoped(projectTaskId, defaultRebuildRecordLimit);
+      return currentViewPresentationTruncation(records, projectTaskId, currentView);
+    } catch { return unavailableLimitationsPresentation; }
+  }
 
   async function relatedContext(candidates: readonly CurationCandidate[], projectTaskId: string): Promise<{ readonly candidates: readonly CurationCandidate[]; readonly ids: readonly string[] }> {
     const union = new Set<string>();
@@ -462,7 +527,8 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
         const context = await relatedContext(candidates, input.projectTaskId);
         const curation = await loop.curate(context.candidates, { knownProjectTaskId: input.projectTaskId, taskScopeId: input.projectTaskId, recordedAt: now() });
         if (curation.status === "blocked") throw new Error(curation.message);
-        return { status: "completed", mode: "bounded-fallback", curation, checkpoint: latest, currentView: latest?.currentView ?? null, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: context.ids, safeToDeleteSuppliedContent: safeSupplied(curation), safeToDeleteSourceChat: "NO", finalization: finalizationEvidence(latest, requested, { uncuratedTailCount: tailCount, reason }), message: `${reason}; partial content curated without changing verified coverage; source-chat deletion remains NO` };
+        const limitationsTruncation = await limitationsTruncationForView(input.projectTaskId, latest?.currentView ?? null);
+        return { status: "completed", mode: "bounded-fallback", curation, checkpoint: latest, currentView: latest?.currentView ?? null, limitationsTruncation, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: context.ids, safeToDeleteSuppliedContent: safeSupplied(curation), safeToDeleteSourceChat: "NO", finalization: finalizationEvidence(latest, requested, { uncuratedTailCount: tailCount, reason }), message: `${reason}; partial content curated without changing verified coverage; source-chat deletion remains NO` };
       } catch (error) {
         return blockedResult(`${reason}; partial handling failed closed: ${error instanceof Error ? error.message : String(error)}`, null, latest, requested, { uncuratedTailCount: tailCount });
       }
@@ -470,15 +536,16 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     try {
       const context = await relatedContext(candidates, input.projectTaskId);
       const curationWithContext = await loop.curate(context.candidates, { knownProjectTaskId: input.projectTaskId, taskScopeId: input.projectTaskId, recordedAt: now() });
-      return { status: curationWithContext.status, mode: "bounded-fallback", curation: curationWithContext, checkpoint: latest, currentView: latest?.currentView ?? null, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: context.ids, safeToDeleteSuppliedContent: safeSupplied(curationWithContext), safeToDeleteSourceChat: "NO", finalization: finalizationEvidence(latest, requested, { uncuratedTailCount: tailCount, reason }), message: `${reason}; bounded supplied-window handling only; source-chat deletion remains NO` };
+      const limitationsTruncation = await limitationsTruncationForView(input.projectTaskId, latest?.currentView ?? null);
+      return { status: curationWithContext.status, mode: "bounded-fallback", curation: curationWithContext, checkpoint: latest, currentView: latest?.currentView ?? null, limitationsTruncation, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: context.ids, safeToDeleteSuppliedContent: safeSupplied(curationWithContext), safeToDeleteSourceChat: "NO", finalization: finalizationEvidence(latest, requested, { uncuratedTailCount: tailCount, reason }), message: `${reason}; bounded supplied-window handling only; source-chat deletion remains NO` };
     } catch (error) {
       return blockedResult(`${reason}; bounded handling failed closed: ${error instanceof Error ? error.message : String(error)}`, null, latest, requested, { uncuratedTailCount: tailCount });
     }
   }
 
   async function rebuildCurrentState(projectTaskId: string, sourceType: "conversation" = "conversation", sourceKey?: string): Promise<CurationPipelineRebuild> {
-    if (!validIdentifier(projectTaskId)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness("Exact project task identity is required for current-state rebuild"), reason: "Exact project task identity is required for current-state rebuild" };
-    if (sourceKey !== undefined && !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness("Exact source identity is invalid for current-state rebuild"), reason: "Exact source identity is invalid for current-state rebuild" };
+    if (!validIdentifier(projectTaskId)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness("Exact project task identity is required for current-state rebuild"), reason: "Exact project task identity is required for current-state rebuild" };
+    if (sourceKey !== undefined && !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness("Exact source identity is invalid for current-state rebuild"), reason: "Exact source identity is invalid for current-state rebuild" };
     let checkpoint: CurationCheckpointMetadata | null = null;
     let checkpointReason: string | undefined;
     if (sourceKey !== undefined) {
@@ -499,10 +566,10 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
       const checkpointStale = checkpoint !== null && (checkpoint.lastCommittedMemorySequence !== authoritativeSequence || canonicalJson(checkpoint.relevantMemoryIds) !== canonicalJson(currentView.relevantMemoryIds));
       const diagnosticReason = checkpointStale ? "Checkpoint metadata is stale; in-memory current state was rebuilt from authoritative records" : checkpointReason;
       const recoveryCompleteness = inspectRecoveryCompleteness(projectTaskId, currentView, currentRecords, projectionLosses, options.canonicalProjectIdentityVerified ?? false);
-      return { status: currentRecords.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView, viewFresh: true, records: currentRecords, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", projectionLosses, recoveryCompleteness, ...(diagnosticReason === undefined ? {} : { reason: diagnosticReason }) };
+      return { status: currentRecords.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView, limitationsTruncation: currentViewPresentationTruncation(records, projectTaskId, currentView, true, true), viewFresh: true, records: currentRecords, sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", projectionLosses, recoveryCompleteness, ...(diagnosticReason === undefined ? {} : { reason: diagnosticReason }) };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      return { status: "blocked", projectTaskId, checkpoint, currentView: null, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness(reason), reason };
+      return { status: "blocked", projectTaskId, checkpoint, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], sourceCoverage: "unknown", safeToDeleteSourceChat: "NO", recoveryCompleteness: blockedRecoveryCompleteness(reason), reason };
     }
   }
 
@@ -523,21 +590,22 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     const sourceHash = hashCurationSourceKey(input.sourceKey);
     let latest: CurationCheckpoint | null = null;
     try { latest = await options.store.getLatestCurationCheckpoint(input.sourceType, input.projectTaskId, sourceHash); } catch (error) { return boundedFallback(input, candidates, `Curation checkpoint read failed: ${error instanceof Error ? error.message : String(error)}`, null); }
+    const latestLimitationsTruncation = await limitationsTruncationForView(input.projectTaskId, latest?.currentView ?? null);
     if (latest !== null) {
       const markerOrder = compareMarkers(input.coveredThroughMarker, latest.coveredThroughMarker);
       if (markerOrder === 0 && input.boundarySha256 === latest.boundarySha256 && latest.coverageConfidence === "complete" && latest.currentView.verificationStatus === "verified") {
         const recovered = requested ? await recover(input.projectTaskId, input.sourceType, input.sourceKey) : null;
         const recoveryReason = recoveryFinalizationReason(recovered);
         const finalization = finalizationEvidence(latest, requested, { uncuratedTailCount: 0, currentViewFresh: recovered?.viewFresh === true, freshRecovery: recovered?.status === "available" && recovered.viewFresh, ...(recoveryReason === undefined ? {} : { reason: recoveryReason }) });
-        return { status: "completed", mode: "noop", curation: null, checkpoint: latest, currentView: latest.currentView, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: [], safeToDeleteSuppliedContent: latest.unresolvedCriticalIds.length === 0 ? "YES" : "NO", safeToDeleteSourceChat: finalization.safeToDeleteSourceChat, finalization, message: `Curation repeat window is a verified NOOP; no memory or checkpoint change; ${finalization.reason}` };
+        return { status: "completed", mode: "noop", curation: null, checkpoint: latest, currentView: latest.currentView, limitationsTruncation: latestLimitationsTruncation, checkpointAdvanced: false, checkpointRecorded: false, coverageAdvanced: false, consolidated: false, relatedMemoryIds: [], safeToDeleteSuppliedContent: latest.unresolvedCriticalIds.length === 0 ? "YES" : "NO", safeToDeleteSourceChat: finalization.safeToDeleteSourceChat, finalization, message: `Curation repeat window is a verified NOOP; no memory or checkpoint change; ${finalization.reason}` };
       }
-      if (markerOrder === 0) return blockedResult("Curation same-marker window has a different verified boundary; no source content was deleted", null, latest);
+      if (markerOrder === 0) return blockedResult("Curation same-marker window has a different verified boundary; no source content was deleted", null, latest, false, {}, latestLimitationsTruncation);
     }
     if (latest === null && input.previousCoveredThroughMarker !== null) return blockedResult("Curation previous linkage has no matching verified checkpoint; no source content was deleted");
-    if (latest !== null && (input.previousCoveredThroughMarker !== latest.coveredThroughMarker || input.previousBoundarySha256 !== latest.boundarySha256)) return blockedResult("Curation previous marker/boundary does not match the latest verified checkpoint; no source content was deleted", null, latest, requested, { uncuratedTailCount: uncuratedTailCount(input, latest) });
+    if (latest !== null && (input.previousCoveredThroughMarker !== latest.coveredThroughMarker || input.previousBoundarySha256 !== latest.boundarySha256)) return blockedResult("Curation previous marker/boundary does not match the latest verified checkpoint; no source content was deleted", null, latest, requested, { uncuratedTailCount: uncuratedTailCount(input, latest) }, latestLimitationsTruncation);
     if (latest === null && markerRank(input.messages[0]!.marker).numeric !== null && markerRank(input.messages[0]!.marker).numeric !== 1) return blockedResult("Curation first numeric marker does not attest source start; no source content was deleted", null, null, requested, { uncuratedTailCount: input.messages.length });
-    if (latest !== null && compareMarkers(input.messages[0]!.marker, latest.coveredThroughMarker) > 0 && numericMarkerGap(latest.coveredThroughMarker, input.messages[0]!.marker)) return blockedResult("Curation source marker gap detected; no source content was deleted", null, latest, requested, { uncuratedTailCount: uncuratedTailCount(input, latest) });
-    if (latest !== null && compareMarkers(input.coveredThroughMarker, latest.coveredThroughMarker) < 0) return blockedResult("Curation source marker rollback detected; no source content was deleted", null, latest, requested, { uncuratedTailCount: 0 });
+    if (latest !== null && compareMarkers(input.messages[0]!.marker, latest.coveredThroughMarker) > 0 && numericMarkerGap(latest.coveredThroughMarker, input.messages[0]!.marker)) return blockedResult("Curation source marker gap detected; no source content was deleted", null, latest, requested, { uncuratedTailCount: uncuratedTailCount(input, latest) }, latestLimitationsTruncation);
+    if (latest !== null && compareMarkers(input.coveredThroughMarker, latest.coveredThroughMarker) < 0) return blockedResult("Curation source marker rollback detected; no source content was deleted", null, latest, requested, { uncuratedTailCount: 0 }, latestLimitationsTruncation);
     if (latest !== null && latest.coverageConfidence !== "complete") return boundedFallback(input, candidates, `Curation checkpoint coverage is ${latest.coverageConfidence}; whole-source coverage failed closed`, latest);
     if (input.coverageConfidence !== "complete") return boundedFallback(input, candidates, `Curation coverage is ${input.coverageConfidence}; bounded supplied-window handling only`, latest);
     const newMessages = latest === null ? input.messages : input.messages.filter(({ marker }) => compareMarkers(marker, latest!.coveredThroughMarker) > 0);
@@ -547,6 +615,7 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
     let curation: CurationResult | null = null;
     let consolidated = false;
     let recovered: MemoryRecoverySnapshot | null = null;
+    let committedLimitationsTruncation = unavailableLimitationsPresentation;
     try {
       const context = await relatedContext(newCandidates, input.projectTaskId);
       const relatedMemoryIds = context.ids;
@@ -568,6 +637,7 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
         const id = checkpointId(options.store, input, sourceHash);
         const viewVersion = refreshView ? (latest?.currentViewVersion ?? 0) + 1 : latest!.currentViewVersion;
         const view = refreshView ? buildCurrentView(records, input.projectTaskId, id, viewVersion, unresolved.length === 0 ? "verified" : "unverified") : latest!.currentView;
+        committedLimitationsTruncation = currentViewPresentationTruncation(records, input.projectTaskId, view);
         const sequence = records.reduce((maximum, record) => Math.max(maximum, record.sequence), 0);
         const trustedStart = latest === null && input.sourceStartAttested && input.previousCoveredThroughMarker === null && input.previousBoundarySha256 === null && input.coverageConfidence === "complete";
         pendingCheckpoint = { checkpointId: id, scopeId: options.store.scopeId, sourceType: input.sourceType, sourceKeySha256: sourceHash, coveredThroughMarker: input.coveredThroughMarker, boundarySha256: input.boundarySha256, lastCuratedAt: now(), lastCandidateIds: newCandidates.map(({ memoryId }) => memoryId), unresolvedCriticalIds: unresolved, relevantMemoryIds: view.relevantMemoryIds, projectTaskId: input.projectTaskId, coverageConfidence: input.coverageConfidence, lastCommittedMemorySequence: sequence, currentViewVersion: viewVersion, newRetainedSinceConsolidation: consolidateNow ? 0 : newlyRetainedCount, currentView: view, currentViewSha256: "", checkpointSha256: "", earliestTrustedMarker: trustedStart ? input.coveredThroughMarker : latest?.earliestTrustedMarker ?? null, earliestTrustedBoundarySha256: trustedStart ? input.boundarySha256 : latest?.earliestTrustedBoundarySha256 ?? null, coverageChainComplete: trustedStart ? true : latest?.coverageChainComplete ?? false };
@@ -579,34 +649,34 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
       const freshRecovery = requested ? await recover(input.projectTaskId, input.sourceType, input.sourceKey) : null;
       const recoveryReason = recoveryFinalizationReason(freshRecovery);
       const finalization = finalizationEvidence(checkpoint, requested, { uncuratedTailCount: 0, currentViewFresh: freshRecovery?.viewFresh === true, freshRecovery: freshRecovery?.status === "available" && freshRecovery.viewFresh, ...(recoveryReason === undefined ? {} : { reason: recoveryReason }) });
-      return { status: "completed", mode: "incremental", curation: committedCuration, checkpoint, currentView: checkpoint.currentView, checkpointAdvanced: true, checkpointRecorded: true, coverageAdvanced: true, consolidated, relatedMemoryIds, safeToDeleteSuppliedContent: safeSupplied(committedCuration), safeToDeleteSourceChat: finalization.safeToDeleteSourceChat, finalization, message: `Curation pipeline committed memory and checkpoint atomically; related-context=${relatedMemoryIds.length}; consolidated=${consolidated ? "YES" : "NO"}; SAFE TO DELETE SUPPLIED CONTENT: ${safeSupplied(committedCuration)}; SAFE TO DELETE SOURCE CHAT: ${finalization.safeToDeleteSourceChat}; ${finalization.reason}` };
+      return { status: "completed", mode: "incremental", curation: committedCuration, checkpoint, currentView: checkpoint.currentView, limitationsTruncation: committedLimitationsTruncation, checkpointAdvanced: true, checkpointRecorded: true, coverageAdvanced: true, consolidated, relatedMemoryIds, safeToDeleteSuppliedContent: safeSupplied(committedCuration), safeToDeleteSourceChat: finalization.safeToDeleteSourceChat, finalization, message: `Curation pipeline committed memory and checkpoint atomically; related-context=${relatedMemoryIds.length}; consolidated=${consolidated ? "YES" : "NO"}; SAFE TO DELETE SUPPLIED CONTENT: ${safeSupplied(committedCuration)}; SAFE TO DELETE SOURCE CHAT: ${finalization.safeToDeleteSourceChat}; ${finalization.reason}` };
     } catch (error) {
-      return blockedResult(`Curation atomic unit failed closed; checkpoint did not advance: ${error instanceof Error ? error.message : String(error)}`, curation, latest, requested, { uncuratedTailCount: uncuratedTailCount(input, latest) });
+      return blockedResult(`Curation atomic unit failed closed; checkpoint did not advance: ${error instanceof Error ? error.message : String(error)}`, curation, latest, requested, { uncuratedTailCount: uncuratedTailCount(input, latest) }, latestLimitationsTruncation);
     }
   }
 
   async function recover(projectTaskId: string, sourceType: "conversation" = "conversation", sourceKey?: string): Promise<CurationPipelineRecovery> {
-    if (sourceKey === undefined || !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], reason: "Exact source identity is required for current-state recovery" };
+    if (sourceKey === undefined || !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: "Exact source identity is required for current-state recovery" };
     let checkpoint: CurationCheckpoint | null;
-    try { checkpoint = await options.store.getLatestCurationCheckpoint(sourceType, projectTaskId, hashCurationSourceKey(sourceKey)); } catch (error) { return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
-    if (checkpoint === null) return { status: "empty", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [] };
+    try { checkpoint = await options.store.getLatestCurationCheckpoint(sourceType, projectTaskId, hashCurationSourceKey(sourceKey)); } catch (error) { return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
+    if (checkpoint === null) return { status: "empty", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [] };
     const viewFresh = sha256(canonicalJson(checkpoint.currentView)) === checkpoint.currentViewSha256 && checkpoint.currentView.verificationStatus === "verified";
-    if (!viewFresh) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: "Current-state view hash is stale or unverified" };
+    if (!viewFresh) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: "Current-state view hash is stale or unverified" };
     try {
       const taskRecords = await options.store.listTaskScoped(projectTaskId, defaultRebuildRecordLimit);
       const records = taskRecords.filter((record) => checkpoint.relevantMemoryIds.includes(record.memoryId));
-      if (records.length !== checkpoint.relevantMemoryIds.length) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: "Current-state view references missing or cross-project memory" };
+      if (records.length !== checkpoint.relevantMemoryIds.length) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: "Current-state view references missing or cross-project memory" };
       const regenerated = buildCurrentView(taskRecords, projectTaskId, checkpoint.checkpointId, checkpoint.currentViewVersion, "verified");
-      if (canonicalJson(regenerated) !== canonicalJson(checkpoint.currentView)) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: "Current-state view content is stale relative to relevant memory" };
-      return { status: records.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: true, records };
-    } catch (error) { return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
+      if (canonicalJson(regenerated) !== canonicalJson(checkpoint.currentView)) return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: "Current-state view content is stale relative to relevant memory" };
+      return { status: records.length === 0 ? "empty" : "available", projectTaskId, checkpoint, currentView: checkpoint.currentView, limitationsTruncation: currentViewPresentationTruncation(taskRecords, projectTaskId, checkpoint.currentView), viewFresh: true, records };
+    } catch (error) { return { status: "blocked", projectTaskId, checkpoint, currentView: checkpoint.currentView, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
   }
 
   async function refreshView(projectTaskId: string, sourceType: "conversation" = "conversation", sourceKey?: string): Promise<CurationPipelineRecovery> {
-    if (sourceKey === undefined || !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], reason: "Exact source identity is required for current-state view refresh" };
+    if (sourceKey === undefined || !validSourceKey(sourceKey)) return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: "Exact source identity is required for current-state view refresh" };
     let before: CurationCheckpoint | null;
-    try { before = await options.store.getCurationCheckpointForViewRefresh(sourceType, projectTaskId, hashCurationSourceKey(sourceKey)); } catch (error) { return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
-    if (before === null) return { status: "empty", projectTaskId, checkpoint: null, currentView: null, viewFresh: false, records: [] };
+    try { before = await options.store.getCurationCheckpointForViewRefresh(sourceType, projectTaskId, hashCurationSourceKey(sourceKey)); } catch (error) { return { status: "blocked", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
+    if (before === null) return { status: "empty", projectTaskId, checkpoint: null, currentView: null, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [] };
     let pending: CurationCheckpoint | null = null;
     try {
       const snapshot = await loop.recover(projectTaskId);
@@ -623,7 +693,7 @@ export function createCurationPipeline(options: CurationPipelineOptions) {
         if (pending === null) throw new Error("Current-state view refresh was not prepared");
         return pending;
       }, async () => undefined);
-    } catch (error) { return { status: "blocked", projectTaskId, checkpoint: before, currentView: before.currentView, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
+    } catch (error) { return { status: "blocked", projectTaskId, checkpoint: before, currentView: before.currentView, limitationsTruncation: unavailableLimitationsPresentation, viewFresh: false, records: [], reason: error instanceof Error ? error.message : String(error) }; }
     return recover(projectTaskId, sourceType, sourceKey);
   }
 
