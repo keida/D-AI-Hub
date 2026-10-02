@@ -282,9 +282,9 @@ function storedViewFacts(records: readonly MemoryRecord[], projectTaskId: string
 
 const unavailableLimitationsPresentation: CurrentViewLimitationsTruncation = { status: "UNAVAILABLE", truncatedCount: null, limitations: [] };
 
-function projectCurrentViewText(fact: string): string {
+export function projectCurrentViewText(fact: string): string {
   const projected = fact.slice(0, 256);
-  return fact.length > 256 ? projected.replace(/\p{Zs}+$/u, "") : projected;
+  return fact.length > 256 ? projected.replace(/[\p{Z}\uFEFF]+$/u, "") : projected;
 }
 
 function selectedViewFacts(current: readonly StoredViewFact[], projectionOnly: boolean): readonly StoredViewFact[] {

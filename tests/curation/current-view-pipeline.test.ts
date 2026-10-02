@@ -117,57 +117,73 @@ describe("current-state curation pipeline", () => {
     } finally { store.close(); }
   });
 
-  it("reproduces a whitespace cut at UTF-16 unit 256 and compares an equal-length control", async () => {
+  it("normalizes only permitted trailing projection whitespace and recovers it for Boss", async () => {
     const prefix = "Approved decision: ";
-    const makeFact = (cutUnit: string) => `${prefix}${"x".repeat(255 - prefix.length)}${cutUnit} tail restriction: do not migrate without review.`;
-    const sourceKey = "canonical-boundary-probe";
-    const runCase = async (cutUnit: string) => {
+    const cases = [
+      { label: "space", cutUnit: " ", projected: "trimmed", status: "completed", short: false },
+      { label: "nbsp", cutUnit: "\u00a0", projected: "trimmed", status: "completed", short: false },
+      { label: "line-separator", cutUnit: "\u2028", projected: "trimmed", status: "completed", short: false },
+      { label: "paragraph-separator", cutUnit: "\u2029", projected: "trimmed", status: "completed", short: false },
+      { label: "bom", cutUnit: "\ufeff", projected: "trimmed", status: "completed", short: false },
+      { label: "nonspace", cutUnit: "X", projected: "raw", status: "completed", short: false },
+      { label: "within-limit-separator", cutUnit: "\u2029", projected: "unchanged", status: "completed", short: true },
+      { label: "line-feed", cutUnit: "\n", projected: "blocked", status: "blocked", short: false },
+      { label: "carriage-return", cutUnit: "\r", projected: "blocked", status: "blocked", short: false },
+      { label: "tab", cutUnit: "\t", projected: "blocked", status: "blocked", short: false },
+    ] as const;
+    const runCase = async (boundaryCase: typeof cases[number]) => {
       const { root, databasePath, store } = await fixture();
-      const fact = makeFact(cutUnit);
-      const cutAt256 = fact[255];
+      expect(root.toLowerCase().startsWith(tmpdir().toLowerCase())).toBe(true);
+      expect(databasePath.toLowerCase().startsWith(tmpdir().toLowerCase())).toBe(true);
+      const fact = boundaryCase.short
+        ? `${prefix}${"x".repeat(256 - prefix.length - 2)}${boundaryCase.cutUnit}X`
+        : `${prefix}${"x".repeat(255 - prefix.length)}${boundaryCase.cutUnit} tail restriction: do not migrate without review.`;
+      const sourceKey = `canonical-boundary-${boundaryCase.label}`;
       await store.applyMutations([{ operation: "add", memoryId: "preexisting-harmless", value: { kind: "curated-fact", fact: "A pre-existing fictional control record.", category: "project-memory", topicLabel: "workflow/process", critical: false, projectTaskId: "task-atlas", taskScopeId: "task-atlas", subjectKey: "atlas:preexisting", revision: 1, observedAt: "2026-09-13T00:00:00.000Z", supersedesMemoryIds: [], evidenceRefs: [], assetRefs: [] }, recordedAt: "2026-09-13T00:00:00.000Z" }]);
       try {
-        const pipeline = createCurationPipeline({ store, workspacePath: root });
+        const pipeline = createCurationPipeline({ store, workspacePath: root, canonicalProjectIdentityVerified: true });
         const result = await pipeline.run(input([
-          message("m-001", fact, { memoryId: `boundary-${cutUnit === " " ? "space" : "control"}`, subjectKey: "atlas:boundary-decision" }),
-          message("m-002", "Workflow: verify the fictional control candidate.", { memoryId: `candidate-${cutUnit === " " ? "space" : "control"}`, subjectKey: "atlas:boundary-workflow" }),
+          message("m-001", "Current phase: pilot verification", { memoryId: `phase-${boundaryCase.label}`, subjectKey: "atlas:phase" }),
+          message("m-002", fact, { memoryId: `boundary-${boundaryCase.label}`, subjectKey: "atlas:boundary-decision" }),
+          message("m-003", "Workflow: verify the fictional control candidate.", { memoryId: `candidate-${boundaryCase.label}`, subjectKey: "atlas:boundary-workflow" }),
+          message("m-004", "Next action: continue the accepted fictional task.", { memoryId: `next-${boundaryCase.label}`, subjectKey: "atlas:next" }),
         ], { sourceKey }));
-        const persisted = (await store.listAll()).map(({ memoryId }) => memoryId).sort();
-        const checkpoint = await store.getLatestCurationCheckpoint("conversation", "task-atlas", hashCurationSourceKey(sourceKey));
-        return { root, databasePath, store, pipeline, fact, result, persisted, checkpoint };
-      } catch (error) {
         store.close();
+        const reader = new LocalSqliteMemoryStore({ databasePath, workspacePath: root, mode: "reader", scopeId: "pipeline-scope", writerId: "pipeline-writer" });
+        try {
+          const freshPipeline = createCurationPipeline({ store: reader, workspacePath: root, canonicalProjectIdentityVerified: true });
+          const persistedRecords = await reader.listAll();
+          const checkpoint = await reader.getLatestCurationCheckpoint("conversation", "task-atlas", hashCurationSourceKey(sourceKey));
+          const recovered = await freshPipeline.recover("task-atlas", "conversation", sourceKey);
+          return { root, databasePath, fact, result, persistedRecords, checkpoint, recovered };
+        } finally { reader.close(); }
+      } catch (error) {
+        try { store.close(); } catch { /* already closed */ }
         throw error;
       }
     };
 
-    const space = await runCase(" ");
-    try {
-      expect.soft(space.result.status, "space-at-256 must not reject the entire curation transaction").toBe("completed");
-      expect.soft(space.persisted).toContain("boundary-space");
-      expect.soft(space.persisted).toContain("candidate-space");
-      expect.soft(space.checkpoint).not.toBeNull();
-      expect(space.persisted).toContain("preexisting-harmless");
-      const saved = await space.store.get("boundary-space");
-      expect(curatedFact(saved)).toBe(space.fact);
-      expect(space.checkpoint?.currentView.confirmedDecisions).toEqual([space.fact.slice(0, 256).replace(/\p{Zs}+$/u, "")]);
-      await expect(space.pipeline.recover("task-atlas", "conversation", sourceKey)).resolves.toMatchObject({ status: "available", viewFresh: true, currentView: space.checkpoint?.currentView });
-    } finally { space.store.close(); }
-
-    const control = await runCase("X");
-    try {
-      expect(control.result.status).toBe("completed");
-      expect(control.persisted).toContain("boundary-control");
-      expect(control.persisted).toContain("candidate-control");
-      expect(control.checkpoint).not.toBeNull();
-    } finally { control.store.close(); }
-
-    const controlCharacter = await runCase("\n");
-    try {
-      expect(controlCharacter.result.status).toBe("blocked");
-      expect(controlCharacter.persisted).toEqual(["preexisting-harmless"]);
-      expect(controlCharacter.checkpoint).toBeNull();
-    } finally { controlCharacter.store.close(); }
+    for (const boundaryCase of cases) {
+      const observation = await runCase(boundaryCase);
+      const expectedProjection = boundaryCase.projected === "trimmed" ? observation.fact.slice(0, 255) : observation.fact.slice(0, 256);
+      const exactExpectedProjection = boundaryCase.projected === "unchanged" ? observation.fact : expectedProjection;
+      const persistedIds = observation.persistedRecords.map(({ memoryId }) => memoryId).sort();
+      expect.soft(observation.fact.length).toBe(boundaryCase.short ? 256 : 305);
+      expect.soft(observation.fact.trim()).toBe(observation.fact);
+      expect.soft(observation.result.status).toBe(boundaryCase.status);
+      expect.soft(observation.persistedRecords.find(({ memoryId }) => memoryId === `boundary-${boundaryCase.label}`) ? curatedFact(observation.persistedRecords.find(({ memoryId }) => memoryId === `boundary-${boundaryCase.label}`)) : null).toBe(boundaryCase.status === "completed" ? observation.fact : null);
+      expect.soft(persistedIds).toEqual(boundaryCase.status === "completed"
+        ? [`boundary-${boundaryCase.label}`, `candidate-${boundaryCase.label}`, `next-${boundaryCase.label}`, `phase-${boundaryCase.label}`, "preexisting-harmless"]
+        : ["preexisting-harmless"]);
+      expect.soft(observation.persistedRecords.find(({ memoryId }) => memoryId === "preexisting-harmless")).toMatchObject({ value: { fact: "A pre-existing fictional control record." } });
+      expect.soft(observation.checkpoint !== null).toBe(boundaryCase.status === "completed");
+      if (boundaryCase.status === "completed") {
+        expect.soft(observation.checkpoint?.currentView.confirmedDecisions).toEqual([exactExpectedProjection]);
+        expect.soft(observation.recovered).toMatchObject({ status: "available", viewFresh: true, currentView: observation.checkpoint?.currentView });
+      } else {
+        expect.soft(observation.recovered.status).toBe("empty");
+      }
+    }
   });
 
   it("characterizes a critical long limitation cut from currentView while canonical recovery keeps it", async () => {
