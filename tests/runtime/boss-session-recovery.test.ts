@@ -107,6 +107,16 @@ describe("P4R bounded limitations presentation", () => {
     expect(rebuilt.records[0]?.value).toMatchObject({ fact });
   });
 
+  it("accepts the canonical producer's normalized 256-unit limitation projection", () => {
+    const fact = `${"L".repeat(255)} continuation`;
+    const { state, rebuilt } = fixture([fact]);
+    const normalized = { ...rebuilt, currentView: { ...rebuilt.currentView!, limitations: ["L".repeat(255)] } };
+    const result = deriveBossRecovery("local-project:p4r", state, normalized, "startup");
+    expect(result.decision).toBe("CONTINUE_CURRENT_BOSS");
+    expect(result.context?.limitations).toEqual(["L".repeat(255)]);
+    expect(normalized.records[0]?.value).toMatchObject({ fact });
+  });
+
   it("blocks control characters and a view that cannot be traced to authoritative records", () => {
     expect(startup(["Constraint with\ncontrol character."])).toMatchObject({ decision: "BLOCKED", context: null });
     const { state, rebuilt } = fixture(["Authoritative constraint."]);

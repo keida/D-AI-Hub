@@ -137,7 +137,13 @@ export function deriveBossRecovery(
   const limitationBeliefs = beliefs.filter((belief) => belief.critical && (belief.topicLabel === "workflow/process" || belief.topicLabel === "other/transient"))
     .sort((left, right) => left.record.sequence - right.record.sequence || left.record.memoryId.localeCompare(right.record.memoryId));
   if (!Array.isArray(view.limitations) || !Array.isArray(view.relevantMemoryIds) || view.limitations.length !== limitationBeliefs.length
-    || view.limitations.some((value, index) => value !== limitationBeliefs[index]?.fact.slice(0, 256))
+    || view.limitations.some((value, index) => {
+      const fact = limitationBeliefs[index]?.fact;
+      if (fact === undefined) return true;
+      const rawProjection = fact.slice(0, 256);
+      const normalizedProjection = fact.length > 256 ? rawProjection.replace(/\p{Zs}+$/u, "") : rawProjection;
+      return value !== rawProjection && value !== normalizedProjection;
+    })
     || new Set(view.relevantMemoryIds).size !== view.relevantMemoryIds.length
     || limitationBeliefs.some((belief) => Buffer.from(belief.fact, "utf8").toString("utf8") !== belief.fact)
     || limitationBeliefs.some((belief) => !view.relevantMemoryIds.includes(belief.record.memoryId))) return blocked("Canonical limitations cannot be traced to task-scoped authoritative records");
