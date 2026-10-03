@@ -7,6 +7,35 @@ import { resolveDefaultMemoryDatabasePath, resolveLocalMemoryScopeId } from "../
 import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 
 describe("Codex D-AI CLI", () => {
+  it.each(["@D-AI establish ignored window", "@D-AI status", "@D-AI continue", "fix the project"])("rejects source-window paired with non-curation command %s before task creation", async (command) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-source-window-command-"));
+    const databasePath = join(root, "memory.sqlite");
+    const workspacePath = join(root, "workspace");
+    try {
+      await import("node:fs/promises").then(({ mkdir }) => mkdir(workspacePath));
+      const path = join(root, "window.json");
+      await writeFile(path, JSON.stringify({ version: 1, sourceWindow: {} }));
+      await expect(runCodexCLI(["--workspace", workspacePath, "--command", command, "--curation-source-window", path, "--memory-database", databasePath])).rejects.toThrow(/requires a curation command|continue requires a task or project name/);
+      await expect(access(join(workspacePath, ".d-ai"))).rejects.toThrow();
+      await expect(access(databasePath)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects combined or duplicate source-window options before any runtime work", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-source-window-flags-"));
+    try {
+      const path = join(root, "window.json");
+      const args = ["--workspace", root, "--command", "@D-AI 整理", "--curation-source-window", path];
+      await expect(runCodexCLI([...args, "--curation-payload", path])).rejects.toThrow(/cannot be combined/);
+      await expect(runCodexCLI([...args, "--curation-source-window", path])).rejects.toThrow(/duplicate/);
+      await expect(access(join(root, ".d-ai"))).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(process.platform !== "win32")("resolves the canonical Windows memory workflow path used by curation defaults", () => {
     const localAppData = "C:\\Users\\Canonical\\AppData\\Local";
     const expectedCanonicalPath = "C:\\Users\\Canonical\\AppData\\Local\\D-AI-Hub\\memory\\memory.sqlite";

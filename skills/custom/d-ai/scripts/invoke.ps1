@@ -13,6 +13,9 @@ param(
   [string]$CurationPayloadPath,
 
   [Parameter(Mandatory = $false)]
+  [string]$CurationSourceWindowPath,
+
+  [Parameter(Mandatory = $false)]
   [string]$MemoryDatabasePath,
 
   [Parameter(Mandatory = $false)]
@@ -54,12 +57,23 @@ function Resolve-Directory([string]$Path, [string]$Label) {
 }
 
 function Assert-CurationInputs {
+  if (-not [string]::IsNullOrWhiteSpace($CurationPayloadPath) -and -not [string]::IsNullOrWhiteSpace($CurationSourceWindowPath)) {
+    throw 'Curation payload and source-window paths cannot be combined'
+  }
   if (-not [string]::IsNullOrWhiteSpace($CurationPayloadPath)) {
     Assert-FullyQualifiedPath $CurationPayloadPath 'Curation payload path'
     if (-not (Test-Path -LiteralPath $CurationPayloadPath -PathType Leaf)) {
       throw 'Curation payload is not readable'
     }
     Get-Content -LiteralPath $CurationPayloadPath -Raw -ErrorAction Stop | Out-Null
+  }
+  if (-not [string]::IsNullOrWhiteSpace($CurationSourceWindowPath)) {
+    Assert-FullyQualifiedPath $CurationSourceWindowPath 'Curation source-window path'
+    if (-not (Test-Path -LiteralPath $CurationSourceWindowPath -PathType Leaf)) {
+      throw 'Curation source-window is not readable'
+    }
+    $sourceFile = [System.IO.File]::Open($CurationSourceWindowPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $sourceFile.Dispose()
   }
   if (-not [string]::IsNullOrWhiteSpace($MemoryDatabasePath)) {
     Assert-FullyQualifiedPath $MemoryDatabasePath 'Memory database path'
@@ -158,6 +172,9 @@ if (-not [string]::IsNullOrWhiteSpace($TaskId)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($CurationPayloadPath)) {
   $arguments += @('--curation-payload', $CurationPayloadPath)
+}
+if (-not [string]::IsNullOrWhiteSpace($CurationSourceWindowPath)) {
+  $arguments += @('--curation-source-window', $CurationSourceWindowPath)
 }
 if (-not [string]::IsNullOrWhiteSpace($MemoryDatabasePath)) {
   $arguments += @('--memory-database', $MemoryDatabasePath)

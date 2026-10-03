@@ -3,18 +3,22 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { redactSensitiveText } from "../adapters/command-runner.js";
 import { createCodexExecutionBoundary } from "../automation/delivery.js";
-import { readCurationPayload } from "../curation/curation-payload.js";
+import { classifyUserIntent } from "../automation/user-intent.js";
+import { readCurationPayload, readCurationSourceWindow } from "../curation/curation-payload.js";
+import type { CurationPipelineInput } from "../curation/current-view-pipeline.js";
 import { InvalidTaskStateError } from "../domain/errors.js";
 import { parseApprovedTaskCharter } from "../state/task-charter.js";
 import type { TaskCharter } from "../domain/types.js";
 import { createCodexActivation, type CodexActivationResponse } from "./codex-activation.js";
 import { createConfiguredDAIRuntime } from "../runtime/d-ai-runtime.js";
+import { parseDAICommand } from "./command-parser.js";
 
 interface ParsedCLIArguments {
   readonly workspacePath: string;
   readonly rawCommand: string;
   readonly taskId: string | null;
   readonly curationPayloadPath: string | null;
+  readonly curationSourceWindowPath: string | null;
   readonly memoryDatabasePath: string | null;
   readonly taskCharterPath: string | null;
   readonly confirmedTaskCharterDigest: string | null;
@@ -30,7 +34,7 @@ function parseCLIArguments(arguments_: readonly string[]): ParsedCLIArguments {
   for (let index = 0; index < arguments_.length; index += 2) {
     const flag = arguments_[index];
     const value = arguments_[index + 1];
-    if (flag === undefined || value === undefined || !["--workspace", "--command", "--task", "--curation-payload", "--memory-database", "--task-charter-file", "--approve-task-charter"].includes(flag)) {
+    if (flag === undefined || value === undefined || !["--workspace", "--command", "--task", "--curation-payload", "--curation-source-window", "--memory-database", "--task-charter-file", "--approve-task-charter"].includes(flag)) {
       throw new InvalidTaskStateError("D-AI Codex entry requires --workspace <path> --command <logical-command> and optional --task <task-id>");
     }
     if (values.has(flag)) throw new InvalidTaskStateError(`D-AI Codex entry received duplicate ${flag}`);
@@ -43,11 +47,25 @@ function parseCLIArguments(arguments_: readonly string[]): ParsedCLIArguments {
     throw new InvalidTaskStateError("D-AI Codex entry requires --workspace <path> and --command <logical-command>");
   }
   const curationPayloadPath = values.get("--curation-payload") ?? null;
+  const curationSourceWindowPath = values.get("--curation-source-window") ?? null;
+  if (curationPayloadPath !== null && curationSourceWindowPath !== null) {
+    throw new InvalidTaskStateError("Curation payload and source-window paths cannot be combined");
+  }
+  if (curationSourceWindowPath !== null) {
+    const command = rawCommand.trim();
+    const isCuration = command.startsWith("@D-AI")
+      ? parseDAICommand(command).kind === "curate"
+      : classifyUserIntent(command).intent === "curate";
+    if (!isCuration) throw new InvalidTaskStateError("Curation source-window input requires a curation command");
+  }
   const memoryDatabasePath = values.get("--memory-database") ?? null;
   const taskCharterPath = values.get("--task-charter-file") ?? null;
   const confirmedTaskCharterDigest = values.get("--approve-task-charter") ?? null;
   if (curationPayloadPath !== null && !isAbsolute(curationPayloadPath)) {
     throw new InvalidTaskStateError("Curation payload path must be absolute");
+  }
+  if (curationSourceWindowPath !== null && !isAbsolute(curationSourceWindowPath)) {
+    throw new InvalidTaskStateError("Curation source-window path must be absolute");
   }
   if (memoryDatabasePath !== null && !isAbsolute(memoryDatabasePath)) {
     throw new InvalidTaskStateError("Memory database path must be absolute");
@@ -66,6 +84,7 @@ function parseCLIArguments(arguments_: readonly string[]): ParsedCLIArguments {
     rawCommand,
     taskId: values.get("--task") ?? null,
     curationPayloadPath,
+    curationSourceWindowPath,
     memoryDatabasePath,
     taskCharterPath,
     confirmedTaskCharterDigest,
@@ -89,6 +108,7 @@ function blockedCLIResult(taskId: string | null, message: string): CodexCLIResul
 export async function runCodexCLI(arguments_: readonly string[]): Promise<CodexCLIResult> {
   const input = parseCLIArguments(arguments_);
   let curationCandidates;
+  let curationSourceWindow: unknown;
   let taskCharter: TaskCharter | undefined;
   if (input.taskCharterPath !== null) {
     try {
@@ -107,6 +127,13 @@ export async function runCodexCLI(arguments_: readonly string[]): Promise<CodexC
       return blockedCLIResult(input.taskId, error instanceof Error ? error.message : "Curation payload could not be read");
     }
   }
+  if (input.curationSourceWindowPath !== null) {
+    try {
+      curationSourceWindow = await readCurationSourceWindow(input.curationSourceWindowPath);
+    } catch (error: unknown) {
+      return blockedCLIResult(input.taskId, error instanceof Error ? error.message : "Curation source-window could not be read");
+    }
+  }
   const activate = createCodexActivation(createConfiguredDAIRuntime({
     workspacePath: input.workspacePath,
     ...(input.memoryDatabasePath === null ? {} : { memoryDatabasePath: input.memoryDatabasePath }),
@@ -117,6 +144,8 @@ export async function runCodexCLI(arguments_: readonly string[]): Promise<CodexC
     rawCommand: input.rawCommand,
     taskId: input.taskId,
     ...(curationCandidates === undefined ? {} : { currentContext: curationCandidates }),
+    // The existing runtime request schema validates this parsed, untrusted JSON.
+    ...(curationSourceWindow === undefined ? {} : { curationSourceWindow: curationSourceWindow as CurationPipelineInput }),
     ...(taskCharter === undefined ? {} : { taskCharter }),
     ...(input.confirmedTaskCharterDigest === null ? {} : { confirmedTaskCharterDigest: input.confirmedTaskCharterDigest }),
   });

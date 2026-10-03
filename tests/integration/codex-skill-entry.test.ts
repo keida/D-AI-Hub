@@ -1,13 +1,18 @@
 import { spawn } from "node:child_process";
-import { access, copyFile, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 import { resolveLocalMemoryScopeId } from "../../src/memory/local-memory-path.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
 import { describe, expect, it } from "vitest";
+import { runCodexCLI } from "../../src/entry/codex-cli.js";
+import type { CodexActivationResponse } from "../../src/entry/codex-activation.js";
+import { buildCurationBoundarySha256, createCurationPipeline, hashCurationSourceKey, type CurationPipelineInput } from "../../src/curation/current-view-pipeline.js";
 
 const repositoryRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -26,7 +31,18 @@ function runPowerShell(scriptPath: string, workspacePath: string, commandText: s
   ]);
 }
 
-function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], pathPrefix?: string): Promise<ProcessResult> {
+async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], pathPrefix?: string): Promise<ProcessResult> {
+  const environmentRoot = join(cwdPath, ".test-environment");
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "SystemDrive", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  for (const [key, directory] of Object.entries({ HOME: "home", USERPROFILE: "home", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp", XDG_DATA_HOME: "xdg-data", NPM_CONFIG_CACHE: "npm-cache" })) {
+    env[key] = join(environmentRoot, directory);
+    await mkdir(env[key], { recursive: true });
+  }
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(environmentRoot, "empty-git-config"), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", NPM_CONFIG_USERCONFIG: join(environmentRoot, "empty-npm-user-config"), NPM_CONFIG_GLOBALCONFIG: join(environmentRoot, "empty-npm-global-config") });
+  if (pathPrefix !== undefined) env.PATH = `${pathPrefix};${env.PATH ?? ""}`;
   return new Promise((resolve, reject) => {
     const child = spawn("powershell.exe", [
       "-NoProfile",
@@ -38,7 +54,7 @@ function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsLi
     ], {
       cwd: cwdPath,
       windowsHide: true,
-      ...(pathPrefix === undefined ? {} : { env: { ...process.env, PATH: `${pathPrefix};${process.env.PATH ?? ""}` } }),
+      env,
     });
     let stdout = "";
     let stderr = "";
@@ -89,6 +105,190 @@ async function createInstalledSkill(root: string): Promise<string> {
 
 async function runGit(workspacePath: string, argumentsList: readonly string[]): Promise<void> {
   await runCommand({ command: "git", arguments: argumentsList, cwd: workspacePath });
+}
+
+describe.skipIf(process.platform !== "win32")("source-window Skill compatibility", { timeout: 30_000 }, () => {
+  it.each(["complete", "partial", "continuation"] as const)("preserves %s windows through Skill, CLI, runtime and fresh recovery", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-skill-source-positive-"));
+    try {
+      const fixture = await sourceWindowFixture(root);
+      const durableBefore = await durableContent(join(fixture.workspacePath, ".d-ai"));
+      let input = fixture.input;
+      if (mode === "continuation") {
+        await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: input }));
+        const first = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture));
+        expect(first.exitCode, first.stderr + first.stdout).toBe(0);
+        expect(processResponse(first).curationPipeline).toMatchObject({ checkpointAdvanced: true, finalization: { latestCheckpoint: { coveredThroughMarker: "m-004" } } });
+        const messages = [{ marker: "m-005", text: "Milestone: continuation verified.", observedAt: "2026-10-03T00:00:04.000Z", memoryId: "window-continuation", subjectKey: "window:continuation" }];
+        input = { ...input, messages, sourceStartAttested: false, previousCoveredThroughMarker: input.coveredThroughMarker, previousBoundarySha256: input.boundarySha256, coveredThroughMarker: "m-005", boundarySha256: buildCurationBoundarySha256(input.coveredThroughMarker, input.boundarySha256, messages) };
+      } else if (mode === "partial") {
+        input = { ...input, coverageConfidence: "partial" };
+      }
+      await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: input }));
+      const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture, fixture.path, mode === "partial" ? "整理一下" : "@D-AI 整理"));
+      expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+      expect(processResponse(result)).toMatchObject({ taskId: fixture.taskId, status: "completed", curationPipeline: { checkpointAdvanced: mode !== "partial", checkpointRecorded: mode !== "partial", safeToDeleteSourceChat: mode === "partial" ? "NO" : "YES" } });
+
+      const reader = new LocalSqliteMemoryStore({ databasePath: fixture.databasePath, workspacePath: dirname(fixture.databasePath), mode: "reader", scopeId: resolveLocalMemoryScopeId(fixture.databasePath), writerId: "primary-device" });
+      try {
+        const sequences: number[] = [];
+        for (const message of input.messages) {
+          const record = await reader.get(message.memoryId!);
+          expect(record).toMatchObject({ value: { fact: message.text, projectTaskId: fixture.taskId, provenance: { sourceCheckpoint: input.boundarySha256 } } });
+          sequences.push(record!.sequence);
+        }
+        expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+        const recovery = await createCurationPipeline({ store: reader, workspacePath: dirname(fixture.databasePath), repositoryPath: fixture.workspacePath }).recover(fixture.taskId, input.sourceType, input.sourceKey);
+        if (mode === "partial") {
+          expect(recovery).toMatchObject({ status: "empty", checkpoint: null, currentView: null, viewFresh: false });
+        } else {
+          expect(recovery).toMatchObject({ status: "available", viewFresh: true, projectTaskId: fixture.taskId, checkpoint: { sourceType: input.sourceType, sourceKeySha256: hashCurationSourceKey(input.sourceKey), coveredThroughMarker: input.coveredThroughMarker, boundarySha256: input.boundarySha256, coverageConfidence: input.coverageConfidence, projectTaskId: fixture.taskId }, currentView: { verificationStatus: "verified" } });
+          for (const message of input.messages) expect(recovery.currentView?.relevantMemoryIds).toContain(message.memoryId);
+        }
+      } finally { reader.close(); }
+
+      const status = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, ["-WorkspacePath", fixture.workspacePath, "-CommandText", "@D-AI status", "-TaskId", fixture.taskId, "-MemoryDatabasePath", fixture.databasePath]);
+      expect(status.exitCode, status.stderr + status.stdout).toBe(0);
+      expect(processResponse(status)).toMatchObject({ taskId: fixture.taskId, memorySnapshot: { status: "available" } });
+      if (mode !== "partial") {
+        const continued = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, ["-WorkspacePath", fixture.workspacePath, "-CommandText", "@D-AI continue", "-TaskId", fixture.taskId, "-MemoryDatabasePath", fixture.databasePath]);
+        expect(continued.exitCode, continued.stderr + continued.stdout).toBe(0);
+        expect(processResponse(continued)).toMatchObject({ taskId: fixture.taskId, bossSession: { recoveryCompleteness: { status: "COMPLETE" } } });
+      }
+      expect(await durableContent(join(fixture.workspacePath, ".d-ai"))).toEqual(durableBefore);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["missing", "relative", "unreadable", "oversize", "UTF8", "JSON", "envelope", "extra-envelope-key", "structure", "empty-messages", "too-many-messages", "marker", "previous-boundary", "boundary-format", "digest", "order", "task", "message-task", "coverage", "combined", "fresh-digest", "fresh-order"])("rejects %s without changing memory, checkpoint or durable-task content", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-skill-source-negative-"));
+    try {
+      const fixture = await sourceWindowFixture(root);
+      await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: fixture.input }));
+      if (!kind.startsWith("fresh-") && kind !== "extra-envelope-key") {
+        const seed = await runCodexCLI(["--workspace", fixture.workspacePath, "--command", "@D-AI 整理", "--task", fixture.taskId, "--curation-source-window", fixture.path, "--memory-database", fixture.databasePath]);
+        expect(seed.exitCode, JSON.stringify(seed.response)).toBe(0);
+      }
+      const before = await curationContent(fixture.workspacePath, fixture.databasePath);
+      let windowPath = fixture.path;
+      let entryPath = fixture.entryPath;
+      let sourceWindow: unknown = fixture.input;
+      switch (kind) {
+        case "missing": windowPath = join(root, "missing.json"); break;
+        case "relative": windowPath = "source-window.json"; break;
+        case "unreadable": {
+          entryPath = join(root, "locked-entry.ps1");
+          const quote = (value: string) => "'" + value.replaceAll("'", "''") + "'";
+          await writeFile(entryPath, "$held = [System.IO.File]::Open(" + quote(fixture.path) + ", [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)\ntry { & " + quote(fixture.entryPath) + " @args; exit $LASTEXITCODE } finally { $held.Dispose() }\n");
+          break;
+        }
+        case "oversize": await writeFile(fixture.path, Buffer.alloc(1024 * 1024 + 1, 32)); break;
+        case "UTF8": await writeFile(fixture.path, Buffer.from([0xc3, 0x28])); break;
+        case "JSON": await writeFile(fixture.path, "{PRIVATE-FIXTURE-CONTENT"); break;
+        case "envelope": await writeFile(fixture.path, '{"version":2,"sourceWindow":{}}'); break;
+        case "extra-envelope-key": await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: fixture.input, extra: true })); break;
+        case "structure": sourceWindow = { ...fixture.input, messages: "not-an-array" }; break;
+        case "empty-messages": sourceWindow = { ...fixture.input, messages: [] }; break;
+        case "too-many-messages": sourceWindow = { ...fixture.input, messages: Array.from({ length: 65 }, () => fixture.input.messages[0]) }; break;
+        case "marker": sourceWindow = { ...fixture.input, messages: [{ ...fixture.input.messages[0], marker: "" }] }; break;
+        case "previous-boundary": sourceWindow = { ...fixture.input, previousBoundarySha256: "0".repeat(64) }; break;
+        case "boundary-format": sourceWindow = { ...fixture.input, boundarySha256: "invalid" }; break;
+        case "digest": case "fresh-digest": sourceWindow = { ...fixture.input, boundarySha256: "0".repeat(64) }; break;
+        case "order": case "fresh-order": {
+          const messages = [...fixture.input.messages].reverse();
+          sourceWindow = { ...fixture.input, messages, coveredThroughMarker: messages.at(-1)!.marker, boundarySha256: buildCurationBoundarySha256(null, null, messages) };
+          break;
+        }
+        case "task": sourceWindow = { ...fixture.input, projectTaskId: "task-other-project" }; break;
+        case "message-task": {
+          const messages = [{ ...fixture.input.messages[0]!, projectTaskId: "task-other-project" }];
+          sourceWindow = { ...fixture.input, messages, coveredThroughMarker: messages[0]!.marker, boundarySha256: buildCurationBoundarySha256(null, null, messages) };
+          break;
+        }
+        case "coverage": sourceWindow = { ...fixture.input, coverageConfidence: "invalid" }; break;
+      }
+      if (sourceWindow !== fixture.input) await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow }));
+      const args = sourceWindowArguments(fixture, windowPath);
+      if (kind === "combined") {
+        const payload = join(root, "payload.json");
+        await writeFile(payload, JSON.stringify({ version: 1, candidates: [] }));
+        args.push("-CurationPayloadPath", payload);
+      }
+      const result = await runPowerShellArguments(entryPath, fixture.workspacePath, args);
+      const after = await curationContent(fixture.workspacePath, fixture.databasePath);
+      expect(after).toEqual(before);
+      expect(result.exitCode, result.stderr + result.stdout).toBe(2);
+      const response = processResponse(result);
+      expect(response.status).toBe("blocked");
+      expect(result.stdout + result.stderr).not.toContain("PRIVATE-FIXTURE-CONTENT");
+      if (kind.endsWith("digest") || kind.endsWith("order")) {
+        expect(response.curationPipeline).toMatchObject({ status: "blocked", checkpointAdvanced: false, checkpointRecorded: false, checkpoint: null, currentView: null, relatedMemoryCount: 0, finalization: { reason: "Source-chat finalization is blocked; source chat deletion remains NO" } });
+      }
+      if (kind === "extra-envelope-key") expect(await pathExists(fixture.databasePath)).toBe(false);
+      if (kind.startsWith("fresh-")) {
+        const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+        try {
+          expect(database.prepare("SELECT count(*) AS n FROM memory_scopes").get()?.n).toBe(1);
+        } finally { database.close(); }
+        expect(after.records).toHaveLength(0);
+        expect(after.checkpoints).toHaveLength(0);
+      }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+function sourceWindowFor(taskId: string): CurationPipelineInput {
+  const messages = [
+    { marker: "m-001", text: "Milestone: source-window adapter verified.", observedAt: "2026-10-03T00:00:00.000Z", memoryId: "window-milestone", subjectKey: "window:milestone" },
+    { marker: "m-002", text: "Current blocker: synthetic dependency unavailable.", observedAt: "2026-10-03T00:00:01.000Z", memoryId: "window-blocker", subjectKey: "window:blocker" },
+    { marker: "m-003", text: "Next action: review the adapter.", observedAt: "2026-10-03T00:00:02.000Z", memoryId: "window-next", subjectKey: "window:next" },
+    { marker: "m-004", text: "Current phase: compatibility verification", observedAt: "2026-10-03T00:00:03.000Z", memoryId: "window-phase", subjectKey: "window:phase" },
+  ];
+  return { sourceType: "conversation", sourceKey: "skill-source-window", projectTaskId: taskId, messages, previousCoveredThroughMarker: null, previousBoundarySha256: null, sourceStartAttested: true, coveredThroughMarker: "m-004", boundarySha256: buildCurationBoundarySha256(null, null, messages), coverageConfidence: "complete", finalWindow: true, trigger: "source-delete-check" };
+}
+
+async function durableContent(root: string): Promise<Record<string, string>> {
+  const result: Record<string, string> = {};
+  if (!await pathExists(root)) return result;
+  async function walk(path: string, prefix: string): Promise<void> {
+    for (const entry of await readdir(path, { withFileTypes: true })) {
+      const key = `${prefix}${entry.name}`;
+      if (entry.isDirectory()) await walk(join(path, entry.name), `${key}/`);
+      else result[key] = createHash("sha256").update(await readFile(join(path, entry.name))).digest("hex");
+    }
+  }
+  await walk(root, "");
+  return result;
+}
+
+async function curationContent(workspacePath: string, databasePath: string) {
+  const durable = await durableContent(join(workspacePath, ".d-ai"));
+  if (!await pathExists(databasePath)) return { durable, records: [], checkpoints: [] };
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    // Initialization metadata is permitted; compare all persisted fact and checkpoint content.
+    return { durable, records: database.prepare("SELECT * FROM memory_records ORDER BY 1").all(), checkpoints: database.prepare("SELECT * FROM curation_checkpoints ORDER BY 1").all() };
+  } finally { database.close(); }
+}
+
+async function sourceWindowFixture(root: string) {
+  const workspacePath = join(root, "workspace");
+  const databasePath = join(root, "memory.sqlite");
+  await mkdir(workspacePath);
+  const entryPath = join(await createBoundInstalledSkill(root, repositoryRoot), "scripts", "invoke.ps1");
+  const established = await runCodexCLI(["--workspace", workspacePath, "--command", "@D-AI establish source-window fixture", "--memory-database", databasePath]);
+  expect(established.response.status).toBe("accepted");
+  const taskId = established.response.taskId;
+  expect((await new FileDurableContextStore(join(workspacePath, ".d-ai")).load(taskId))?.taskId).toBe(taskId);
+  const path = join(root, "source-window.json");
+  return { workspacePath, databasePath, entryPath, taskId, path, input: sourceWindowFor(taskId) };
+}
+
+function sourceWindowArguments(fixture: Awaited<ReturnType<typeof sourceWindowFixture>>, path = fixture.path, command = "@D-AI 整理"): string[] {
+  return ["-WorkspacePath", fixture.workspacePath, "-CommandText", command, "-TaskId", fixture.taskId, "-CurationSourceWindowPath", path, "-MemoryDatabasePath", fixture.databasePath];
+}
+
+function processResponse(result: ProcessResult): CodexActivationResponse {
+  return JSON.parse(result.stdout.trim() || result.stderr.trim()) as CodexActivationResponse;
 }
 
 describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell product boundary", { timeout: 20_000 }, () => {
