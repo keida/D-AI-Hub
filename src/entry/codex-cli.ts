@@ -140,15 +140,23 @@ export async function runCodexCLI(arguments_: readonly string[]): Promise<CodexC
   }), {
     deliver: createCodexExecutionBoundary(),
   });
-  const response = await activate({
-    rawCommand: input.rawCommand,
-    taskId: input.taskId,
-    ...(curationCandidates === undefined ? {} : { currentContext: curationCandidates }),
-    // The existing runtime request schema validates this parsed, untrusted JSON.
-    ...(curationSourceWindow === undefined ? {} : { curationSourceWindow: curationSourceWindow as CurationPipelineInput }),
-    ...(taskCharter === undefined ? {} : { taskCharter }),
-    ...(input.confirmedTaskCharterDigest === null ? {} : { confirmedTaskCharterDigest: input.confirmedTaskCharterDigest }),
-  });
+  let response: CodexActivationResponse;
+  try {
+    response = await activate({
+      rawCommand: input.rawCommand,
+      taskId: input.taskId,
+      ...(curationCandidates === undefined ? {} : { currentContext: curationCandidates }),
+      // The existing runtime request schema validates this parsed, untrusted JSON.
+      ...(curationSourceWindow === undefined ? {} : { curationSourceWindow: curationSourceWindow as CurationPipelineInput }),
+      ...(taskCharter === undefined ? {} : { taskCharter }),
+      ...(input.confirmedTaskCharterDigest === null ? {} : { confirmedTaskCharterDigest: input.confirmedTaskCharterDigest }),
+    });
+  } catch (error: unknown) {
+    if (error instanceof InvalidTaskStateError) {
+      return blockedCLIResult(input.taskId, error.message);
+    }
+    throw error;
+  }
   return { exitCode: response.status === "blocked" ? 2 : 0, response };
 }
 

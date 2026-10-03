@@ -1,15 +1,16 @@
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { runCommand } from "../../src/adapters/command-runner.js";
+import { CommandExecutionError, runCommand } from "../../src/adapters/command-runner.js";
 import { LocalSqliteMemoryStore } from "../../src/memory/local-sqlite-memory-store.js";
 import { resolveLocalMemoryScopeId } from "../../src/memory/local-memory-path.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
-import { describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { runCodexCLI } from "../../src/entry/codex-cli.js";
 import type { CodexActivationResponse } from "../../src/entry/codex-activation.js";
 import { buildCurationBoundarySha256, createCurationPipeline, hashCurationSourceKey, type CurationPipelineInput } from "../../src/curation/current-view-pipeline.js";
@@ -20,19 +21,90 @@ interface ProcessResult {
   readonly exitCode: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  readonly npmLog: string;
+  readonly timedOut: boolean;
 }
 
-function runPowerShell(scriptPath: string, workspacePath: string, commandText: string): Promise<ProcessResult> {
+const integrationFileStartedAt = performance.now();
+let powershellLaunchCount = 0;
+let npmCommandAttemptCount = 0;
+let npmPathSearchMs = 0;
+let runtimeNpmCmd: string | undefined;
+let maximumInheritedPathLength = 0;
+const activeTreeStops = new Set<() => Promise<void>>();
+const activeEnvironmentRoots = new Set<string>();
+let maximumEnvironmentPathLength = 0;
+let maximumNpmLogPathLength = 0;
+
+afterEach(async () => {
+  const cleanupResults = await Promise.allSettled([...activeTreeStops].map((stop) => stop()));
+  activeTreeStops.clear();
+  await Promise.all([...activeEnvironmentRoots].map((root) => rm(root, { recursive: true, force: true })));
+  activeEnvironmentRoots.clear();
+  const cleanupFailure = cleanupResults.find((result) => result.status === "rejected");
+  if (cleanupFailure?.status === "rejected") throw cleanupFailure.reason;
+});
+
+afterAll(() => {
+  console.log(`SKILL_ENTRY_FILE_METRICS ${JSON.stringify({
+    elapsedMs: Math.round(performance.now() - integrationFileStartedAt),
+    powershellLaunches: powershellLaunchCount,
+    npmShimEntries: npmCommandAttemptCount,
+    npmPathSearchMs: Math.round(npmPathSearchMs),
+    maximumInheritedPathLength,
+    maximumEnvironmentPathLength,
+    maximumNpmLogPathLength,
+  })}`);
+});
+
+function runPowerShell(scriptPath: string, workspacePath: string, commandText: string, signal: AbortSignal): Promise<ProcessResult> {
   return runPowerShellArguments(scriptPath, workspacePath, [
     "-WorkspacePath",
     workspacePath,
     "-CommandText",
     commandText,
-  ]);
+  ], signal);
 }
 
-async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], pathPrefix?: string): Promise<ProcessResult> {
-  const environmentRoot = join(cwdPath, ".test-environment");
+async function terminateProcessTree(processId: number): Promise<void> {
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-processId, "SIGKILL");
+    } catch (error: unknown) {
+      if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+    }
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const killer = spawn("taskkill.exe", ["/PID", String(processId), "/T", "/F"], { windowsHide: true });
+    let stderr = "";
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timeout = setTimeout(() => {
+      killer.kill();
+      finish(new Error(`Timed out terminating PowerShell process tree ${processId}`));
+    }, 1_500);
+    killer.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    killer.once("error", (error) => finish(error));
+    killer.once("close", (exitCode) => {
+      if (exitCode === 0) finish();
+      else if (/not found|does not exist/iu.test(stderr) && !isProcessRunning(processId)) finish();
+      else finish(new Error(`taskkill failed for process tree ${processId} (${exitCode}): ${stderr.slice(0, 2_000)}`));
+    });
+  });
+}
+
+async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], signal: AbortSignal, pathPrefix?: string, timeoutMs?: number): Promise<ProcessResult> {
+  if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
+  const environmentRoot = join(tmpdir(), `e-${randomUUID()}`);
+  activeEnvironmentRoots.add(environmentRoot);
+  maximumEnvironmentPathLength = Math.max(maximumEnvironmentPathLength, environmentRoot.length);
   const env: NodeJS.ProcessEnv = {};
   for (const key of ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "SystemDrive", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
@@ -40,9 +112,27 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
   for (const [key, directory] of Object.entries({ HOME: "home", USERPROFILE: "home", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp", XDG_DATA_HOME: "xdg-data", NPM_CONFIG_CACHE: "npm-cache" })) {
     env[key] = join(environmentRoot, directory);
     await mkdir(env[key], { recursive: true });
+    if (signal?.aborted) throw new Error("The Vitest test was aborted while preparing an isolated PowerShell environment");
   }
-  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(environmentRoot, "empty-git-config"), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", NPM_CONFIG_USERCONFIG: join(environmentRoot, "empty-npm-user-config"), NPM_CONFIG_GLOBALCONFIG: join(environmentRoot, "empty-npm-global-config") });
+  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(environmentRoot, "empty-git-config"), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", NO_UPDATE_NOTIFIER: "1", NPM_CONFIG_USERCONFIG: join(environmentRoot, "empty-npm-user-config"), NPM_CONFIG_GLOBALCONFIG: join(environmentRoot, "empty-npm-global-config") });
+  let npmMarkerPath: string | null = null;
+  const tracksRuntimeNpm = pathPrefix === undefined && process.platform === "win32" && /(?:\\scripts\\invoke|\\locked-entry)\.ps1$/iu.test(scriptPath);
+  if (tracksRuntimeNpm) {
+    maximumInheritedPathLength = Math.max(maximumInheritedPathLength, (env.PATH ?? "").length);
+    if (runtimeNpmCmd === undefined) {
+      const startedAt = performance.now();
+      runtimeNpmCmd = (env.PATH ?? "").split(";").map((directory) => directory.trim().replace(/^"|"$/gu, "")).filter(Boolean).map((directory) => join(directory, "npm.cmd")).find((candidate) => existsSync(candidate));
+      npmPathSearchMs += performance.now() - startedAt;
+    }
+    if (runtimeNpmCmd === undefined) throw new Error("Could not locate the real npm.cmd in the inherited PATH for launch counting");
+    const trackerBin = join(environmentRoot, "npm-tracker");
+    npmMarkerPath = join(environmentRoot, "npm-launch.marker");
+    await mkdir(trackerBin, { recursive: true });
+    await writeFile(join(trackerBin, "npm.cmd"), `@echo off\r\n>>"${npmMarkerPath}" echo invoked\r\ncall "${runtimeNpmCmd}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
+    env.PATH = `${trackerBin};${env.PATH ?? ""}`;
+  }
   if (pathPrefix !== undefined) env.PATH = `${pathPrefix};${env.PATH ?? ""}`;
+  if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
   return new Promise((resolve, reject) => {
     const child = spawn("powershell.exe", [
       "-NoProfile",
@@ -54,15 +144,115 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
     ], {
       cwd: cwdPath,
       windowsHide: true,
+      detached: process.platform !== "win32",
       env,
     });
+    child.stdin.end();
     let stdout = "";
     let stderr = "";
+    let npmLog = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (exitCode) => resolve({ exitCode, stdout, stderr }));
+    let timeout: NodeJS.Timeout | undefined;
+    let closeCode: number | null = null;
+    let closed = false;
+    let closeProcessed = false;
+    let timedOut = false;
+    let cleanupFinished = false;
+    let settled = false;
+    let cleanupPromise: Promise<void> | null = null;
+    let closeWaiter: { readonly resolve: () => void; readonly reject: (error: Error) => void } | null = null;
+    const clearProcessState = () => {
+      if (timeout !== undefined) clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+      activeTreeStops.delete(stopTree);
+    };
+    const finish = () => {
+      if (settled || !closeProcessed || (timedOut && !cleanupFinished)) return;
+      settled = true;
+      clearProcessState();
+      if (signal?.aborted) reject(new Error("The Vitest test ended while a PowerShell invocation was active"));
+      else resolve({ exitCode: closeCode, stdout, stderr, npmLog, timedOut });
+    };
+    const waitForClose = () => {
+      if (closeProcessed) return Promise.resolve();
+      return new Promise<void>((resolveClose, rejectClose) => {
+        const timer = setTimeout(() => {
+          closeWaiter = null;
+          rejectClose(new Error(`PowerShell process ${child.pid ?? "unknown"} did not close after bounded tree termination`));
+        }, 1_500);
+        closeWaiter = {
+          resolve: () => { clearTimeout(timer); closeWaiter = null; resolveClose(); },
+          reject: (error) => { clearTimeout(timer); closeWaiter = null; rejectClose(error); },
+        };
+        if (closeProcessed) closeWaiter.resolve();
+      });
+    };
+    const stopTree = (): Promise<void> => {
+      if (cleanupPromise !== null) return cleanupPromise;
+      if (child.pid === undefined) return Promise.reject(new Error("PowerShell process did not expose a PID for bounded tree cleanup"));
+      timedOut = !signal?.aborted;
+      cleanupPromise = (async () => {
+        await terminateProcessTree(child.pid!);
+        await waitForClose();
+        cleanupFinished = true;
+        finish();
+      })();
+      return cleanupPromise;
+    };
+    const failCleanup = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearProcessState();
+      reject(error);
+    };
+    const onAbort = () => { void stopTree().catch(failCleanup); };
+    child.once("spawn", () => {
+      powershellLaunchCount += 1;
+      if (signal?.aborted) {
+        void stopTree().catch(failCleanup);
+        return;
+      }
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+      activeTreeStops.add(stopTree);
+      if (timeoutMs !== undefined) {
+        timeout = setTimeout(() => {
+          if (!closed) void stopTree().catch(failCleanup);
+        }, timeoutMs);
+      }
+    });
+    child.once("error", (error) => {
+      settled = true;
+      clearProcessState();
+      reject(error);
+    });
+    child.once("close", async (exitCode) => {
+      closeCode = exitCode;
+      closed = true;
+      if (npmMarkerPath !== null) {
+        const marker = await readFile(npmMarkerPath, "utf8").catch(() => "");
+        npmCommandAttemptCount += marker.split(/\r?\n/u).filter((line) => line === "invoked").length;
+      }
+      const npmLogDirectory = join(environmentRoot, "npm-cache", "_logs");
+      maximumNpmLogPathLength = Math.max(maximumNpmLogPathLength, join(npmLogDirectory, "2026-10-03T00_00_00_000Z-debug-0.log").length);
+      const npmLogNames = (await readdir(npmLogDirectory).catch(() => [])).filter((name) => name.endsWith(".log")).sort();
+      npmLog = npmLogNames.length === 0 ? "" : (await readFile(join(npmLogDirectory, npmLogNames.at(-1)!), "utf8").catch(() => "")).slice(-4_000);
+      closeProcessed = true;
+      closeWaiter?.resolve();
+      if (!timedOut) cleanupFinished = true;
+      finish();
+    });
   });
+}
+
+function isProcessRunning(processId: number): boolean {
+  const result = spawnSync("tasklist.exe", ["/FI", `PID eq ${processId}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true });
+  if (result.error) throw result.error;
+  return result.stdout.includes(`,\"${processId}\"`);
+}
+
+function processFailure(result: ProcessResult): string {
+  return `timedOut=${result.timedOut}\nexitCode=${result.exitCode}\nstdout=${result.stdout}\nstderr=${result.stderr}\nnpmLog=${result.npmLog}`;
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -104,11 +294,16 @@ async function createInstalledSkill(root: string): Promise<string> {
 }
 
 async function runGit(workspacePath: string, argumentsList: readonly string[]): Promise<void> {
-  await runCommand({ command: "git", arguments: argumentsList, cwd: workspacePath });
+  try {
+    await runCommand({ command: "git", arguments: argumentsList, cwd: workspacePath });
+  } catch (error: unknown) {
+    if (error instanceof CommandExecutionError) throw new Error(`${error.message}: ${JSON.stringify(error.result)}`);
+    throw error;
+  }
 }
 
 describe.skipIf(process.platform !== "win32")("source-window Skill compatibility", { timeout: 30_000 }, () => {
-  it.each(["complete", "partial", "continuation"] as const)("preserves %s windows through Skill, CLI, runtime and fresh recovery", async (mode) => {
+  it.for(["complete", "partial", "continuation"] as const)("preserves %s windows through Skill, CLI, runtime and fresh recovery", async (mode, { signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-skill-source-positive-"));
     try {
       const fixture = await sourceWindowFixture(root);
@@ -116,18 +311,27 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
       let input = fixture.input;
       if (mode === "continuation") {
         await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: input }));
-        const first = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture));
-        expect(first.exitCode, first.stderr + first.stdout).toBe(0);
-        expect(processResponse(first).curationPipeline).toMatchObject({ checkpointAdvanced: true, finalization: { latestCheckpoint: { coveredThroughMarker: "m-004" } } });
+        const first = await runCodexCLI(sourceWindowCLIArguments(fixture));
+        expect(first.exitCode).toBe(0);
+        expect(first.response.curationPipeline).toMatchObject({ checkpointAdvanced: true, finalization: { latestCheckpoint: { coveredThroughMarker: "m-004" } } });
         const messages = [{ marker: "m-005", text: "Milestone: continuation verified.", observedAt: "2026-10-03T00:00:04.000Z", memoryId: "window-continuation", subjectKey: "window:continuation" }];
         input = { ...input, messages, sourceStartAttested: false, previousCoveredThroughMarker: input.coveredThroughMarker, previousBoundarySha256: input.boundarySha256, coveredThroughMarker: "m-005", boundarySha256: buildCurationBoundarySha256(input.coveredThroughMarker, input.boundarySha256, messages) };
       } else if (mode === "partial") {
         input = { ...input, coverageConfidence: "partial" };
       }
       await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: input }));
-      const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture, fixture.path, mode === "partial" ? "整理一下" : "@D-AI 整理"));
-      expect(result.exitCode, result.stderr + result.stdout).toBe(0);
-      expect(processResponse(result)).toMatchObject({ taskId: fixture.taskId, status: "completed", curationPipeline: { checkpointAdvanced: mode !== "partial", checkpointRecorded: mode !== "partial", safeToDeleteSourceChat: mode === "partial" ? "NO" : "YES" } });
+      let response: CodexActivationResponse;
+      if (mode === "complete") {
+        const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture, fixture.path), signal);
+        expect(result.timedOut).toBe(false);
+        expect(result.exitCode, result.stderr + result.stdout).toBe(0);
+        response = JSON.parse(result.stdout.trim()) as CodexActivationResponse;
+      } else {
+        const result = await runCodexCLI(sourceWindowCLIArguments(fixture, fixture.path, mode === "partial" ? "整理一下" : "@D-AI 整理"));
+        expect(result.exitCode).toBe(0);
+        response = result.response;
+      }
+      expect(response).toMatchObject({ taskId: fixture.taskId, status: "completed", curationPipeline: { checkpointAdvanced: mode !== "partial", checkpointRecorded: mode !== "partial", safeToDeleteSourceChat: mode === "partial" ? "NO" : "YES" } });
 
       const reader = new LocalSqliteMemoryStore({ databasePath: fixture.databasePath, workspacePath: dirname(fixture.databasePath), mode: "reader", scopeId: resolveLocalMemoryScopeId(fixture.databasePath), writerId: "primary-device" });
       try {
@@ -147,19 +351,19 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
         }
       } finally { reader.close(); }
 
-      const status = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, ["-WorkspacePath", fixture.workspacePath, "-CommandText", "@D-AI status", "-TaskId", fixture.taskId, "-MemoryDatabasePath", fixture.databasePath]);
-      expect(status.exitCode, status.stderr + status.stdout).toBe(0);
-      expect(processResponse(status)).toMatchObject({ taskId: fixture.taskId, memorySnapshot: { status: "available" } });
+      const status = await runCodexCLI(["--workspace", fixture.workspacePath, "--command", "@D-AI status", "--task", fixture.taskId, "--memory-database", fixture.databasePath]);
+      expect(status.exitCode).toBe(0);
+      expect(status.response).toMatchObject({ taskId: fixture.taskId, memorySnapshot: { status: "available" } });
       if (mode !== "partial") {
-        const continued = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, ["-WorkspacePath", fixture.workspacePath, "-CommandText", "@D-AI continue", "-TaskId", fixture.taskId, "-MemoryDatabasePath", fixture.databasePath]);
-        expect(continued.exitCode, continued.stderr + continued.stdout).toBe(0);
-        expect(processResponse(continued)).toMatchObject({ taskId: fixture.taskId, bossSession: { recoveryCompleteness: { status: "COMPLETE" } } });
+        const continued = await runCodexCLI(["--workspace", fixture.workspacePath, "--command", "@D-AI continue", "--task", fixture.taskId, "--memory-database", fixture.databasePath]);
+        expect(continued.exitCode).toBe(0);
+        expect(continued.response).toMatchObject({ taskId: fixture.taskId, bossSession: { recoveryCompleteness: { status: "COMPLETE" } } });
       }
       expect(await durableContent(join(fixture.workspacePath, ".d-ai"))).toEqual(durableBefore);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  it.each(["missing", "relative", "unreadable", "oversize", "UTF8", "JSON", "envelope", "extra-envelope-key", "structure", "empty-messages", "too-many-messages", "marker", "previous-boundary", "boundary-format", "digest", "order", "task", "message-task", "coverage", "combined", "fresh-digest", "fresh-order"])("rejects %s without changing memory, checkpoint or durable-task content", async (kind) => {
+  it.for(["missing", "relative", "unreadable", "oversize", "UTF8", "JSON", "envelope", "extra-envelope-key", "structure", "empty-messages", "too-many-messages", "marker", "previous-boundary", "boundary-format", "digest", "order", "task", "message-task", "coverage", "combined", "fresh-digest", "fresh-order"])("rejects %s without changing memory, checkpoint or durable-task content", async (kind, { signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-skill-source-negative-"));
     try {
       const fixture = await sourceWindowFixture(root);
@@ -207,20 +411,45 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
         case "coverage": sourceWindow = { ...fixture.input, coverageConfidence: "invalid" }; break;
       }
       if (sourceWindow !== fixture.input) await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow }));
-      const args = sourceWindowArguments(fixture, windowPath);
+      const cliArgs = sourceWindowCLIArguments(fixture, windowPath);
+      const skillArgs = sourceWindowArguments(fixture, windowPath);
       if (kind === "combined") {
         const payload = join(root, "payload.json");
         await writeFile(payload, JSON.stringify({ version: 1, candidates: [] }));
-        args.push("-CurationPayloadPath", payload);
+        skillArgs.push("-CurationPayloadPath", payload);
       }
-      const result = await runPowerShellArguments(entryPath, fixture.workspacePath, args);
+      let response: CodexActivationResponse | null = null;
+      if (kind === "combined") {
+        const { binPath, markerPath } = await createInvocationMarker(root);
+        const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, skillArgs, signal, binPath);
+        expect(result.timedOut).toBe(false);
+        expect(result.exitCode, result.stderr + result.stdout).toBe(2);
+        response = parseSkillStdout(result);
+        expect(await pathExists(markerPath)).toBe(false);
+      } else if (kind === "structure") {
+        const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, skillArgs, signal);
+        expect(result.timedOut).toBe(false);
+        expect(result.exitCode, result.stderr + result.stdout).toBe(2);
+        expect(result.stdout.trim()).not.toBe("");
+        console.log(`SKILL_SOURCE_STRUCTURE_STREAMS ${JSON.stringify({ stdout: result.stdout, stderr: result.stderr })}`);
+        response = parseSkillStdout(result);
+        expect(result.stderr).not.toContain("PRIVATE-FIXTURE-CONTENT");
+      } else if (kind === "unreadable") {
+        const result = await runPowerShellArguments(entryPath, fixture.workspacePath, skillArgs, signal);
+        expect(result.timedOut).toBe(false);
+        expect(result.exitCode, result.stderr + result.stdout).toBe(2);
+        response = parseSkillStdout(result);
+      } else if (kind === "relative") {
+        await expect(runCodexCLI(cliArgs)).rejects.toThrow(/source-window path must be absolute/i);
+      } else {
+        const result = await runCodexCLI(cliArgs);
+        expect(result.exitCode).toBe(2);
+        response = result.response;
+      }
       const after = await curationContent(fixture.workspacePath, fixture.databasePath);
       expect(after).toEqual(before);
-      expect(result.exitCode, result.stderr + result.stdout).toBe(2);
-      const response = processResponse(result);
-      expect(response.status).toBe("blocked");
-      expect(result.stdout + result.stderr).not.toContain("PRIVATE-FIXTURE-CONTENT");
-      if (kind.endsWith("digest") || kind.endsWith("order")) {
+      if (response !== null) expect(response.status).toBe("blocked");
+      if (response !== null && (kind.endsWith("digest") || kind.endsWith("order"))) {
         expect(response.curationPipeline).toMatchObject({ status: "blocked", checkpointAdvanced: false, checkpointRecorded: false, checkpoint: null, currentView: null, relatedMemoryCount: 0, finalization: { reason: "Source-chat finalization is blocked; source chat deletion remains NO" } });
       }
       if (kind === "extra-envelope-key") expect(await pathExists(fixture.databasePath)).toBe(false);
@@ -233,6 +462,37 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
         expect(after.checkpoints).toHaveLength(0);
       }
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+describe.skipIf(process.platform !== "win32")("test-only PowerShell process cleanup", () => {
+  it("rejects an invocation already cancelled by its owning test without spawning PowerShell", async ({ signal }) => {
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const launchesBefore = powershellLaunchCount;
+    await expect(runPowerShellArguments("not-started.ps1", process.cwd(), [], cancelled.signal)).rejects.toThrow(/aborted before starting/i);
+    expect(powershellLaunchCount).toBe(launchesBefore);
+    expect(signal.aborted).toBe(false);
+  });
+
+  it("terminates a controlled descendant tree before returning a timed-out invocation", { timeout: 10_000 }, async ({ signal }) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-process-tree-cleanup-"));
+    const scriptPath = join(root, "wait-tree.ps1");
+    await writeFile(scriptPath, [
+      "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 60' -PassThru -WindowStyle Hidden",
+      'Write-Output "TEST_CHILD_PID=$($child.Id)"',
+      "Wait-Process -Id $child.Id",
+    ].join("\r\n"), "utf8");
+    try {
+      const result = await runPowerShellArguments(scriptPath, root, [], signal, undefined, 5_000);
+      expect(result.timedOut).toBe(true);
+      const childPid = Number(result.stdout.match(/TEST_CHILD_PID=(\d+)/u)?.[1]);
+      expect(Number.isInteger(childPid), `${result.stdout}\n${result.stderr}`).toBe(true);
+      expect(childPid).toBeGreaterThan(0);
+      expect(isProcessRunning(childPid)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -287,12 +547,16 @@ function sourceWindowArguments(fixture: Awaited<ReturnType<typeof sourceWindowFi
   return ["-WorkspacePath", fixture.workspacePath, "-CommandText", command, "-TaskId", fixture.taskId, "-CurationSourceWindowPath", path, "-MemoryDatabasePath", fixture.databasePath];
 }
 
-function processResponse(result: ProcessResult): CodexActivationResponse {
-  return JSON.parse(result.stdout.trim() || result.stderr.trim()) as CodexActivationResponse;
+function sourceWindowCLIArguments(fixture: Awaited<ReturnType<typeof sourceWindowFixture>>, path = fixture.path, command = "@D-AI 整理"): string[] {
+  return ["--workspace", fixture.workspacePath, "--command", command, "--task", fixture.taskId, "--curation-source-window", path, "--memory-database", fixture.databasePath];
+}
+
+function parseSkillStdout(result: ProcessResult): CodexActivationResponse {
+  return JSON.parse(result.stdout.trim()) as CodexActivationResponse;
 }
 
 describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell product boundary", { timeout: 20_000 }, () => {
-  it("uses the explicit binding from D-AI-Hub, Quote Float-like, and unrelated CWDs", async () => {
+  it("uses the explicit binding from D-AI-Hub, Quote Float-like, and unrelated CWDs", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-cwds-"));
     const installedSkillPath = await createBoundInstalledSkill(root);
     const dAiHubCwd = join(root, "D-AI-Hub");
@@ -303,8 +567,8 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       const cwdWorkspacePairs: readonly (readonly [string, string])[] = [[dAiHubCwd, dAiHubCwd], [quoteFloatCwd, quoteFloatCwd], [unrelatedCwd, unrelatedCwd]];
       for (const [cwd, workspacePath] of cwdWorkspacePairs) {
         const args = ["-WorkspacePath", workspacePath, "-CommandText", "@D-AI close"];
-        const result = await runPowerShellArguments(join(installedSkillPath, "scripts", "invoke.ps1"), cwd, args);
-        expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
+        const result = await runPowerShellArguments(join(installedSkillPath, "scripts", "invoke.ps1"), cwd, args, signal);
+        expect(result.exitCode, processFailure(result)).toBe(2);
         const response = JSON.parse(result.stdout) as Record<string, unknown>;
         expect(response.message).toMatch(/No active D-AI task matches this workspace/i);
         expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
@@ -314,7 +578,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("fails closed before runtime invocation for missing, stale, invalid, relative, and drive-relative bindings", async () => {
+  it("fails closed before runtime invocation for missing, stale, invalid, relative, and drive-relative bindings", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-binding-failure-"));
     const installedSkillPath = await createInstalledSkill(root);
     const workspacePath = join(root, "workspace");
@@ -330,7 +594,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
         } else {
           await writeFile(join(installedSkillPath, ".runtime-root"), `${binding}\n`, "utf8");
         }
-        const result = await runPowerShellArguments(join(installedSkillPath, "scripts", "invoke.ps1"), workspacePath, ["-WorkspacePath", workspacePath, "-CommandText", "@D-AI status"], binPath);
+        const result = await runPowerShellArguments(join(installedSkillPath, "scripts", "invoke.ps1"), workspacePath, ["-WorkspacePath", workspacePath, "-CommandText", "@D-AI status"], signal, binPath);
         expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
         const response = JSON.parse(result.stdout) as Record<string, unknown>;
         expect(response).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked", stage: "bootstrap" });
@@ -344,7 +608,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   }, 60_000);
 
-  it("creates, idempotently preserves, and updates a validated runtime binding", async () => {
+  it("creates, idempotently preserves, and updates a validated runtime binding", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-binding-tool-"));
     const installedSkillPath = await createInstalledSkill(root);
     const runtimeRoot = process.cwd();
@@ -354,7 +618,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       await copyFile(join(runtimeRoot, "package.json"), join(secondRuntimeRoot, "package.json"));
       await copyFile(join(runtimeRoot, "src", "entry", "codex-cli.ts"), join(secondRuntimeRoot, "src", "entry", "codex-cli.ts"));
       const setScript = join(installedSkillPath, "scripts", "set-runtime-binding.ps1");
-      const invoke = (target: string) => runPowerShellArguments(setScript, root, ["-SkillRoot", installedSkillPath, "-RuntimeRoot", target]);
+      const invoke = (target: string) => runPowerShellArguments(setScript, root, ["-SkillRoot", installedSkillPath, "-RuntimeRoot", target], signal);
 
       const created = await invoke(runtimeRoot);
       expect(created.exitCode, `${created.stderr}\n${created.stdout}`).toBe(0);
@@ -372,7 +636,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
 
       for (const mistypedSkillRoot of [join(root, "Quote Float"), join(root, "user-workspace")]) {
         await mkdir(mistypedSkillRoot);
-        const result = await runPowerShellArguments(setScript, root, ["-SkillRoot", mistypedSkillRoot, "-RuntimeRoot", secondRuntimeRoot]);
+        const result = await runPowerShellArguments(setScript, root, ["-SkillRoot", mistypedSkillRoot, "-RuntimeRoot", secondRuntimeRoot], signal);
         expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(1);
         expect(result.stderr).toMatch(/Installed D-AI Skill root|SKILL\.md/i);
         expect(await pathExists(join(mistypedSkillRoot, ".runtime-root"))).toBe(false);
@@ -389,16 +653,16 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("discovers the Skill and sends a raw close command into the configured runtime from an unrelated workspace", async () => {
+  it("discovers the Skill and sends a raw close command into the configured runtime from an unrelated workspace", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-e2e-"));
     const workspacePath = join(root, "unrelated-workspace");
     try {
       await mkdir(workspacePath);
       const entryPath = join(await createBoundInstalledSkill(root), "scripts", "invoke.ps1");
 
-      const result = await runPowerShell(entryPath, workspacePath, "@D-AI close");
+      const result = await runPowerShell(entryPath, workspacePath, "@D-AI close", signal);
 
-      expect(result.exitCode, result.stderr).toBe(2);
+      expect(result.exitCode, processFailure(result)).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
       expect(response).toMatchObject({ taskId: "unassigned", environment: "codex", status: "blocked" });
       expect(response.message).toMatch(/No active D-AI task matches this workspace.*--task <task-id>/i);
@@ -407,7 +671,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("keeps generic intent read-only when a configured Codex workspace is local-only", async () => {
+  it("keeps generic intent read-only when a configured Codex workspace is local-only", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-connector-"));
     const workspacePath = join(root, "unrelated-workspace");
     const executionSkillPath = join(repositoryRoot, "tests", "fixtures", "skills", "typescript-execution");
@@ -417,7 +681,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       await symlink(executionSkillPath, join(workspacePath, ".agents", "skills", "typescript-execution"), "junction");
       const entryPath = join(await createBoundInstalledSkill(root), "scripts", "invoke.ps1");
 
-      const result = await runPowerShell(entryPath, workspacePath, "@D-AI implement typescript");
+      const result = await runPowerShell(entryPath, workspacePath, "@D-AI implement typescript", signal);
 
       expect(result.exitCode, result.stderr).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -428,7 +692,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("blocks a generic explicit verify intent through the public Skill when no active task exists", async () => {
+  it("blocks a generic explicit verify intent through the public Skill when no active task exists", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-real-execution-"));
     const workspacePath = join(root, "workspace");
     const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
@@ -445,7 +709,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       await runGit(workspacePath, ["remote", "add", "origin", "https://github.com/acme/d-ai.git"]);
 
       const entryPath = join(await createBoundInstalledSkill(root), "scripts", "invoke.ps1");
-      const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace");
+      const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace", signal);
 
       expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -457,7 +721,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("blocks unsupported remotes at the public Skill execution boundary", async () => {
+  it("blocks unsupported remotes at the public Skill execution boundary", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-unsupported-remote-"));
     const workspacePath = join(root, "workspace");
     const verificationSkillPath = join(workspacePath, ".agents", "skills", "verify-local");
@@ -475,7 +739,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       await runGit(bareRemotePath, ["init", "--bare"]);
       await runGit(workspacePath, ["remote", "add", "origin", bareRemotePath]);
       const entryPath = join(await createBoundInstalledSkill(root), "scripts", "invoke.ps1");
-      const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace");
+      const result = await runPowerShell(entryPath, workspacePath, "@D-AI verify local workspace", signal);
 
       expect(result.exitCode, `${result.stderr}\n${result.stdout}`).toBe(2);
       const response = JSON.parse(result.stdout) as Record<string, unknown>;
@@ -486,7 +750,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 
-  it("uses the actual installed Skill curation seam with an isolated database and SAFE NO without a payload", async () => {
+  it("uses the actual installed Skill curation seam with an isolated database and SAFE NO without a payload", async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-codex-skill-curation-"));
     const workspacePath = join(root, "workspace");
     const payloadPath = join(root, "curation.json");
@@ -510,7 +774,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
         "-CommandText", "整理一下",
         "-CurationPayloadPath", payloadPath,
         "-MemoryDatabasePath", databasePath,
-      ]);
+      ], signal);
       expect(stored.exitCode, `${stored.stderr}\n${stored.stdout}`).toBe(0);
       expect(JSON.parse(stored.stdout)).toMatchObject({ status: "completed" });
       expect(stored.stdout).toMatch(/Added=1|locally stored=YES/i);
@@ -526,7 +790,7 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
       const safeNo = await runPowerShellArguments(installedEntry, workspacePath, [
         "-WorkspacePath", workspacePath,
         "-CommandText", "@D-AI 整理",
-      ]);
+      ], signal);
       expect(safeNo.exitCode, `${safeNo.stderr}\n${safeNo.stdout}`).toBe(2);
       expect(JSON.parse(safeNo.stdout)).toMatchObject({ status: "blocked" });
       expect(safeNo.stdout).toMatch(/SAFE TO DELETE ORIGINAL CHAT: NO|not captured/i);
