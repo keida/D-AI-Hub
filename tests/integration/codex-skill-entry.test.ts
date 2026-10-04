@@ -1181,3 +1181,242 @@ describe.skipIf(process.platform !== "win32")("D-AI Codex Skill PowerShell produ
     }
   });
 });
+
+describe("PR64 minimal PowerShell differential candidate", () => {
+  const pairRoot = join(tmpdir(), `d-ai-pr64-minimal-differential-${randomUUID()}`);
+  const workspacePath = join(pairRoot, "workspace");
+  const payloadPath = join(pairRoot, "synthetic-payload.json");
+  const sourceWindowPath = join(pairRoot, "synthetic-source-window.json");
+  const memoryDatabasePath = join(pairRoot, "synthetic-memory.sqlite");
+  const fakeNpmBinPath = join(pairRoot, "fake-npm-bin");
+  const businessArguments = [
+    "-WorkspacePath", workspacePath,
+    "-CommandText", "@D-AI differential control",
+    "-CurationPayloadPath", payloadPath,
+    "-CurationSourceWindowPath", sourceWindowPath,
+    "-MemoryDatabasePath", memoryDatabasePath,
+  ];
+  const directControlOutput = '{"status":"direct-control"}';
+  const blockedWrapperOutput = '{"status":"blocked","taskId":"unassigned","environment":"codex","stage":"bootstrap","message":"Curation payload and source-window paths cannot be combined"}';
+  const fixedHeadInvokeNormalizedSha256 = "05e6fdc9379d20c3c08f166f1a8ca755b3af6d29ff145ad024df9919ae748bd4";
+  const controlMetadata = {
+    owningTestTimeoutMs: 30_000,
+    helperTimeoutMs: null,
+    order: "after existing file cases; not a cold-start benchmark",
+    comparisonScope: "same harness policy; not original CI byte identity",
+    afterEachTimingScope: "body-end to onTestFinished lifecycle boundary; not isolated hook duration",
+    npmSentinelLimit: "marker absence is an observation only; it does not alone prove this sentinel or npm was never invoked",
+  };
+  const directControlScript = [
+    "[CmdletBinding()]",
+    "param(",
+    "  [Parameter(Mandatory = $true)]",
+    "  [string]$CommandText,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$TaskId,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$WorkspacePath,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$CurationPayloadPath,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$CurationSourceWindowPath,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$MemoryDatabasePath,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$TaskCharterFile,",
+    "  [Parameter(Mandatory = $false)]",
+    "  [string]$ApproveTaskCharterDigest",
+    ")",
+    "[Console]::Out.WriteLine('{\"status\":\"direct-control\"}')",
+    "exit 0",
+    "",
+  ].join("\r\n");
+  let firstCaseGateOpen = false;
+  let firstCaseGateReason = "first direct control has not completed its test lifecycle";
+  let firstCaseTask: { readonly result?: { readonly state?: string } } | undefined;
+
+  it("runs the direct no-data control", { timeout: 30_000, retry: 0, repeats: 0 }, async (context) => {
+    if (process.platform !== "win32" || process.version !== "v26.7.0") {
+      const reason = process.platform !== "win32" ? `platform=${process.platform}` : `node=${process.version}`;
+      console.log(`PR64_MINIMAL_DIFFERENTIAL_NOT_APPLICABLE ${JSON.stringify({ case: "direct", reason })}`);
+      context.skip(`NOT APPLICABLE: requires Windows and Node v26.7.0; ${reason}`);
+    }
+
+    let preparationMs: number | null = null;
+    let invocationMs: number | null = null;
+    let fixtureCleanupMs: number | null = null;
+    let bodyEndedAt: number | null = null;
+    let fixtureCleanupCompleted = false;
+    let directCallVerified = false;
+    let fixtureRootCreated = false;
+    context.onTestFinished(({ task }) => {
+      firstCaseTask = task;
+      const taskState = task.result?.state ?? "unknown";
+      firstCaseGateOpen = directCallVerified && fixtureCleanupCompleted && !context.signal.aborted && taskState === "pass";
+      firstCaseGateReason = firstCaseGateOpen
+        ? "direct control, capture, fixture cleanup, and applicable afterEach lifecycle passed"
+        : `gate closed: task=${taskState}; callVerified=${directCallVerified}; fixtureCleanup=${fixtureCleanupCompleted}; signalAborted=${context.signal.aborted}`;
+      console.log(`PR64_MINIMAL_DIFFERENTIAL_DIAGNOSTIC ${JSON.stringify({
+        case: "direct",
+        taskState,
+        status: firstCaseGateOpen ? "PASS" : "GATE_CLOSED",
+        preparationMs,
+        invocationMs,
+        fixtureCleanupMs,
+        bodyEndToTestFinishedBoundaryMs: bodyEndedAt === null ? null : Math.round(performance.now() - bodyEndedAt),
+        afterEachLifecycle: taskState === "pass" ? "PASSED" : "FAILED_OR_UNVERIFIED",
+        gateReason: firstCaseGateReason,
+        control: controlMetadata,
+      })}`);
+    });
+
+    try {
+      const preparationStartedAt = performance.now();
+      let marker: Awaited<ReturnType<typeof createInvocationMarker>>;
+      try {
+        await mkdir(pairRoot);
+        fixtureRootCreated = true;
+        await mkdir(workspacePath);
+        marker = await createInvocationMarker(pairRoot);
+        expect(marker.binPath).toBe(fakeNpmBinPath);
+        await writeFile(join(pairRoot, "direct-control.ps1"), directControlScript, "utf8");
+      } finally {
+        preparationMs = Math.round(performance.now() - preparationStartedAt);
+      }
+
+      const invocationStartedAt = performance.now();
+      let result: ProcessResult;
+      try {
+        result = await runPowerShellArguments(join(pairRoot, "direct-control.ps1"), workspacePath, businessArguments, context.signal, marker.binPath, undefined, "pr64-minimal-differential");
+      } finally {
+        invocationMs = Math.round(performance.now() - invocationStartedAt);
+      }
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(directControlOutput);
+      expect(result.stderr).toBe("");
+      expect(result.stdoutBytes).toBeGreaterThan(0);
+      expect(result.stderrBytes).toBe(0);
+      expect(result.stdoutPreview.length).toBe(result.stdoutBytes);
+      expect(result.stderrPreview.length).toBe(result.stderrBytes);
+      expect(result.stdoutEnded).toBe(true);
+      expect(result.stderrEnded).toBe(true);
+      expect(context.signal.aborted).toBe(false);
+      expect(await pathExists(marker.markerPath)).toBe(false);
+      expect(await pathExists(payloadPath)).toBe(false);
+      expect(await pathExists(sourceWindowPath)).toBe(false);
+      expect(await pathExists(memoryDatabasePath)).toBe(false);
+      expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
+      expect(await pathExists(join(pairRoot, "installed-skill", ".runtime-root"))).toBe(false);
+      directCallVerified = true;
+    } finally {
+      const cleanupStartedAt = performance.now();
+      try {
+        if (fixtureRootCreated) await rm(pairRoot, { recursive: true, force: true });
+        fixtureCleanupCompleted = true;
+      } finally {
+        fixtureCleanupMs = Math.round(performance.now() - cleanupStartedAt);
+        bodyEndedAt = performance.now();
+      }
+    }
+  });
+
+  it("rejects simultaneous synthetic inputs through the unchanged public wrapper", { timeout: 30_000, retry: 0, repeats: 0 }, async (context) => {
+    if (process.platform !== "win32" || process.version !== "v26.7.0") {
+      const reason = process.platform !== "win32" ? `platform=${process.platform}` : `node=${process.version}`;
+      console.log(`PR64_MINIMAL_DIFFERENTIAL_NOT_APPLICABLE ${JSON.stringify({ case: "wrapper", reason })}`);
+      context.skip(`NOT APPLICABLE: requires Windows and Node v26.7.0; ${reason}`);
+    }
+    if (!firstCaseGateOpen || firstCaseTask?.result?.state !== "pass") {
+      const reason = firstCaseTask?.result?.state === "pass" ? firstCaseGateReason : `${firstCaseGateReason}; final first-task state=${firstCaseTask?.result?.state ?? "NOT OBSERVED"}`;
+      console.log(`PR64_MINIMAL_DIFFERENTIAL_NOTRUN ${JSON.stringify({ case: "wrapper", reason })}`);
+      context.skip(`NOT RUN: ${reason}`);
+    }
+
+    let preparationMs: number | null = null;
+    let invocationMs: number | null = null;
+    let fixtureCleanupMs: number | null = null;
+    let bodyEndedAt: number | null = null;
+    let fixtureCleanupCompleted = false;
+    let wrapperCallVerified = false;
+    let fixtureRootCreated = false;
+    context.onTestFinished(({ task }) => {
+      const taskState = task.result?.state ?? "unknown";
+      console.log(`PR64_MINIMAL_DIFFERENTIAL_DIAGNOSTIC ${JSON.stringify({
+        case: "wrapper",
+        taskState,
+        status: wrapperCallVerified && fixtureCleanupCompleted && !context.signal.aborted && taskState === "pass" ? "PASS" : "FAILED_OR_UNVERIFIED",
+        preparationMs,
+        invocationMs,
+        fixtureCleanupMs,
+        bodyEndToTestFinishedBoundaryMs: bodyEndedAt === null ? null : Math.round(performance.now() - bodyEndedAt),
+        afterEachLifecycle: taskState === "pass" ? "PASSED" : "FAILED_OR_UNVERIFIED",
+        signalAborted: context.signal.aborted,
+        fixtureCleanupCompleted,
+        control: controlMetadata,
+      })}`);
+    });
+
+    try {
+      const preparationStartedAt = performance.now();
+      let marker: Awaited<ReturnType<typeof createInvocationMarker>>;
+      const installedEntry = join(pairRoot, "installed-skill", "scripts", "invoke.ps1");
+      try {
+        await mkdir(pairRoot);
+        fixtureRootCreated = true;
+        await mkdir(workspacePath);
+        marker = await createInvocationMarker(pairRoot);
+        expect(marker.binPath).toBe(fakeNpmBinPath);
+        const sourcePath = join(repositoryRoot, "skills", "custom", "d-ai", "scripts", "invoke.ps1");
+        await mkdir(dirname(installedEntry), { recursive: true });
+        const sourceContent = await readFile(sourcePath);
+        await copyFile(sourcePath, installedEntry);
+        const copiedContent = await readFile(installedEntry);
+        const sourceCopySha256 = createHash("sha256").update(sourceContent).digest("hex");
+        const copiedSha256 = createHash("sha256").update(copiedContent).digest("hex");
+        const normalizedSourceSha256 = createHash("sha256").update(sourceContent.toString("utf8").replace(/\r\n/gu, "\n")).digest("hex");
+        const normalizedCopySha256 = createHash("sha256").update(copiedContent.toString("utf8").replace(/\r\n/gu, "\n")).digest("hex");
+        expect(copiedSha256).toBe(sourceCopySha256);
+        expect(normalizedSourceSha256).toBe(fixedHeadInvokeNormalizedSha256);
+        expect(normalizedCopySha256).toBe(fixedHeadInvokeNormalizedSha256);
+      } finally {
+        preparationMs = Math.round(performance.now() - preparationStartedAt);
+      }
+
+      const invocationStartedAt = performance.now();
+      let result: ProcessResult;
+      try {
+        result = await runPowerShellArguments(installedEntry, workspacePath, businessArguments, context.signal, marker.binPath, undefined, "pr64-minimal-differential");
+      } finally {
+        invocationMs = Math.round(performance.now() - invocationStartedAt);
+      }
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(2);
+      expect(result.stdout.trim()).toBe(blockedWrapperOutput);
+      expect(result.stderr).toBe("");
+      expect(result.stdoutBytes).toBeGreaterThan(0);
+      expect(result.stderrBytes).toBe(0);
+      expect(result.stdoutPreview.length).toBe(result.stdoutBytes);
+      expect(result.stderrPreview.length).toBe(result.stderrBytes);
+      expect(result.stdoutEnded).toBe(true);
+      expect(result.stderrEnded).toBe(true);
+      expect(context.signal.aborted).toBe(false);
+      expect(await pathExists(marker.markerPath)).toBe(false);
+      expect(await pathExists(payloadPath)).toBe(false);
+      expect(await pathExists(sourceWindowPath)).toBe(false);
+      expect(await pathExists(memoryDatabasePath)).toBe(false);
+      expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
+      expect(await pathExists(join(pairRoot, "installed-skill", ".runtime-root"))).toBe(false);
+      wrapperCallVerified = true;
+    } finally {
+      const cleanupStartedAt = performance.now();
+      try {
+        if (fixtureRootCreated) await rm(pairRoot, { recursive: true, force: true });
+        fixtureCleanupCompleted = true;
+      } finally {
+        fixtureCleanupMs = Math.round(performance.now() - cleanupStartedAt);
+        bodyEndedAt = performance.now();
+      }
+    }
+  });
+});
