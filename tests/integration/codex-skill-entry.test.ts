@@ -1,9 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { CommandExecutionError, runCommand } from "../../src/adapters/command-runner.js";
@@ -18,11 +19,81 @@ import { buildCurationBoundarySha256, createCurationPipeline, hashCurationSource
 const repositoryRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 interface ProcessResult {
+  readonly diagnosticId: string;
   readonly exitCode: number | null;
   readonly stdout: string;
   readonly stderr: string;
   readonly npmLog: string;
+  readonly stdoutBytes: number;
+  readonly stderrBytes: number;
+  readonly stdoutPreview: Buffer<ArrayBufferLike>;
+  readonly stderrPreview: Buffer<ArrayBufferLike>;
+  readonly stdoutEnded: boolean;
+  readonly stderrEnded: boolean;
+  readonly npmLogBytes: number;
+  readonly npmLogPreview: Buffer<ArrayBufferLike>;
+  readonly npmLogCaptured: boolean;
+  readonly npmLogCaptureReason: string | null;
   readonly timedOut: boolean;
+}
+
+const diagnosticStreamLimit = 8 * 1024;
+
+function emitProcessDiagnostic(diagnostic: Readonly<Record<string, unknown>>): void {
+  try { process.stderr.write(`POWERSHELL_INVOCATION_DIAGNOSTIC ${JSON.stringify(diagnostic)}\n`); } catch { /* Diagnostics must not change invocation control. */ }
+}
+
+function capturedStreamDiagnostic(bytes: number, preview: Buffer, ended: boolean, byteCountBasis = "original-child-stream-buffer-bytes"): Readonly<Record<string, unknown>> {
+  const retainedBytes = preview.length;
+  return {
+    status: bytes > 0 && ended ? "CAPTURED" : bytes === 0 && ended ? "CAPTURED_EMPTY" : "NOT_CAPTURED",
+    byteCountBasis,
+    totalOriginalBytes: bytes,
+    streamEnded: ended,
+    partialCapture: bytes > 0 && !ended,
+    truncated: bytes > retainedBytes,
+    retainedRange: retainedBytes === 0 ? null : { startByteInclusive: 0, endByteExclusive: retainedBytes },
+    retainedPrefixBase64: retainedBytes === 0 ? null : preview.toString("base64"),
+  };
+}
+
+function boundedDiagnosticText(value: string, maxCharacters = 2_000): Readonly<Record<string, unknown>> {
+  const retainedText = value.slice(0, maxCharacters);
+  return {
+    text: retainedText,
+    originalCharacters: value.length,
+    characterCountBasis: "JavaScript string characters",
+    retainedRange: { startCharacterInclusive: 0, endCharacterExclusive: retainedText.length },
+    retainedUtf8Bytes: Buffer.byteLength(retainedText, "utf8"),
+    retainedUtf8ByteCountBasis: "UTF-8 encoding of retained JavaScript string; not original stream bytes",
+    truncated: value.length > maxCharacters,
+  };
+}
+
+function boundedDiagnosticError(error: unknown): Readonly<Record<string, unknown>> {
+  return error instanceof Error
+    ? { name: boundedDiagnosticText(error.name, 128), ...boundedDiagnosticText(error.message) }
+    : boundedDiagnosticText(String(error));
+}
+
+function observedAt(value: Readonly<Record<string, unknown>> | null): Readonly<Record<string, unknown>> {
+  return value === null ? { status: "NOT OBSERVED" } : { status: "OBSERVED", ...value };
+}
+
+interface TreeStopObservation {
+  readonly processId: number;
+  readonly status: string;
+  readonly startedAt: string;
+  readonly completedAt: string;
+  readonly durationMs: number;
+  readonly taskkillExitCode: number | null;
+  readonly taskkillTimedOut: boolean;
+  readonly taskkillStdoutStatus: "NOT_CAPTURED";
+  readonly taskkillStderrText: string;
+  readonly taskkillStderrRawBytes: number;
+  readonly taskkillStderrRetainedCharacters: number;
+  readonly taskkillStderrTruncated: boolean;
+  readonly taskkillStderrRetainedRange: { readonly startCharacterInclusive: number; readonly endCharacterExclusive: number } | null;
 }
 
 const integrationFileStartedAt = performance.now();
@@ -66,18 +137,46 @@ function runPowerShell(scriptPath: string, workspacePath: string, commandText: s
   ], signal);
 }
 
-async function terminateProcessTree(processId: number): Promise<void> {
+async function terminateProcessTree(processId: number, observe?: (observation: TreeStopObservation) => void): Promise<void> {
+  const started = performance.now();
+  const startedAt = new Date().toISOString();
+  let observationSent = false;
+  const report = (status: string, taskkillExitCode: number | null, taskkillTimedOut: boolean, stderr: string, stderrBytes: number) => {
+    if (observationSent) return;
+    observationSent = true;
+    try {
+      observe?.({
+        processId,
+        status,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        durationMs: Math.round(performance.now() - started),
+        taskkillExitCode,
+        taskkillTimedOut,
+        taskkillStdoutStatus: "NOT_CAPTURED",
+        taskkillStderrText: stderr.slice(0, diagnosticStreamLimit),
+        taskkillStderrRawBytes: stderrBytes,
+        taskkillStderrRetainedCharacters: Math.min(stderr.length, diagnosticStreamLimit),
+        taskkillStderrTruncated: stderr.length > diagnosticStreamLimit,
+        taskkillStderrRetainedRange: stderr.length === 0 ? null : { startCharacterInclusive: 0, endCharacterExclusive: Math.min(stderr.length, diagnosticStreamLimit) },
+      });
+    } catch { /* Observability cannot change process-tree termination. */ }
+  };
   if (process.platform !== "win32") {
     try {
       process.kill(-processId, "SIGKILL");
+      report("SIGKILL_REQUESTED", null, false, "", 0);
     } catch (error: unknown) {
-      if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+      if (error instanceof Error && "code" in error && error.code === "ESRCH") report("PROCESS_GROUP_ALREADY_ABSENT", null, false, "", 0);
+      else { report("SIGKILL_FAILED", null, false, "", 0); throw error; }
     }
     return;
   }
   await new Promise<void>((resolve, reject) => {
     const killer = spawn("taskkill.exe", ["/PID", String(processId), "/T", "/F"], { windowsHide: true });
     let stderr = "";
+    let stderrBytes = 0;
+    const stderrDecoder = new StringDecoder("utf8");
     let settled = false;
     const finish = (error?: Error) => {
       if (settled) return;
@@ -88,80 +187,234 @@ async function terminateProcessTree(processId: number): Promise<void> {
     };
     const timeout = setTimeout(() => {
       killer.kill();
+      stderr += stderrDecoder.end();
+      report("TASKKILL_TIMEOUT", null, true, stderr, stderrBytes);
       finish(new Error(`Timed out terminating PowerShell process tree ${processId}`));
     }, 1_500);
-    killer.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-    killer.once("error", (error) => finish(error));
+    killer.stderr.on("data", (chunk: Buffer) => { stderrBytes += chunk.length; stderr += stderrDecoder.write(chunk); });
+    killer.once("error", (error) => { stderr += stderrDecoder.end(); report("TASKKILL_SPAWN_ERROR", null, false, stderr, stderrBytes); finish(error); });
     killer.once("close", (exitCode) => {
-      if (exitCode === 0) finish();
-      else if (/not found|does not exist/iu.test(stderr) && !isProcessRunning(processId)) finish();
-      else finish(new Error(`taskkill failed for process tree ${processId} (${exitCode}): ${stderr.slice(0, 2_000)}`));
+      stderr += stderrDecoder.end();
+      if (exitCode === 0) { report("TASKKILL_EXIT_ZERO", exitCode, false, stderr, stderrBytes); finish(); }
+      else if (/not found|does not exist/iu.test(stderr) && !isProcessRunning(processId)) { report("TASKKILL_NOT_FOUND_PARENT_ABSENT", exitCode, false, stderr, stderrBytes); finish(); }
+      else { report("TASKKILL_FAILED", exitCode, false, stderr, stderrBytes); finish(new Error(`taskkill failed for process tree ${processId} (${exitCode}): ${stderr.slice(0, 2_000)}`)); }
     });
   });
 }
 
-async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], signal: AbortSignal, pathPrefix?: string, timeoutMs?: number): Promise<ProcessResult> {
-  if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
-  const environmentRoot = join(tmpdir(), `e-${randomUUID()}`);
-  activeEnvironmentRoots.add(environmentRoot);
-  maximumEnvironmentPathLength = Math.max(maximumEnvironmentPathLength, environmentRoot.length);
-  const env: NodeJS.ProcessEnv = {};
-  for (const key of ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "SystemDrive", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]) {
-    if (process.env[key] !== undefined) env[key] = process.env[key];
-  }
-  for (const [key, directory] of Object.entries({ HOME: "home", USERPROFILE: "home", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp", XDG_DATA_HOME: "xdg-data", NPM_CONFIG_CACHE: "npm-cache" })) {
-    env[key] = join(environmentRoot, directory);
-    await mkdir(env[key], { recursive: true });
-    if (signal?.aborted) throw new Error("The Vitest test was aborted while preparing an isolated PowerShell environment");
-  }
-  Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(environmentRoot, "empty-git-config"), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", NO_UPDATE_NOTIFIER: "1", NPM_CONFIG_USERCONFIG: join(environmentRoot, "empty-npm-user-config"), NPM_CONFIG_GLOBALCONFIG: join(environmentRoot, "empty-npm-global-config") });
+async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], signal: AbortSignal, pathPrefix?: string, timeoutMs?: number, diagnosticLabel?: string): Promise<ProcessResult> {
+  const invocationId = randomUUID();
+  const started = performance.now();
+  const startedAt = new Date().toISOString();
+  const stage = diagnosticLabel ?? "powershell-invocation";
+  let environmentRoot: string | null = null;
   let npmMarkerPath: string | null = null;
-  const tracksRuntimeNpm = pathPrefix === undefined && process.platform === "win32" && /(?:\\scripts\\invoke|\\locked-entry)\.ps1$/iu.test(scriptPath);
-  if (tracksRuntimeNpm) {
-    maximumInheritedPathLength = Math.max(maximumInheritedPathLength, (env.PATH ?? "").length);
-    if (runtimeNpmCmd === undefined) {
-      const startedAt = performance.now();
-      runtimeNpmCmd = (env.PATH ?? "").split(";").map((directory) => directory.trim().replace(/^"|"$/gu, "")).filter(Boolean).map((directory) => join(directory, "npm.cmd")).find((candidate) => existsSync(candidate));
-      npmPathSearchMs += performance.now() - startedAt;
-    }
-    if (runtimeNpmCmd === undefined) throw new Error("Could not locate the real npm.cmd in the inherited PATH for launch counting");
-    const trackerBin = join(environmentRoot, "npm-tracker");
-    npmMarkerPath = join(environmentRoot, "npm-launch.marker");
-    await mkdir(trackerBin, { recursive: true });
-    await writeFile(join(trackerBin, "npm.cmd"), `@echo off\r\n>>"${npmMarkerPath}" echo invoked\r\ncall "${runtimeNpmCmd}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
-    env.PATH = `${trackerBin};${env.PATH ?? ""}`;
+  let envReadyAt: Readonly<Record<string, unknown>> | null = null;
+  const notCaptured = capturedStreamDiagnostic(0, Buffer.alloc(0), false);
+  const emitBeforeSpawn = (event: string, error: unknown, abortOrigin: string | null) => emitProcessDiagnostic({
+    schemaVersion: 1, invocationId, stage, event, startedAt, eventAt: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started),
+    command: {
+      program: "powershell.exe",
+      arguments: { totalCount: argumentsList.length + 5, retained: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...argumentsList].slice(0, 32).map((argument) => boundedDiagnosticText(argument, 512)), truncated: argumentsList.length + 5 > 32 },
+      cwd: boundedDiagnosticText(cwdPath),
+      timeoutMs: timeoutMs ?? null,
+    },
+    environmentPrepared: envReadyAt !== null, envReadyAt: observedAt(envReadyAt), abortOrigin: abortOrigin ?? "NOT OBSERVED",
+    spawnedAt: { status: "NOT OBSERVED" },
+    rootProcessId: { status: "NOT OBSERVED" },
+    firstStdoutAt: { status: "NOT OBSERVED" },
+    firstStderrAt: { status: "NOT OBSERVED" },
+    exit: { observedAt: { status: "NOT OBSERVED" }, code: "NOT OBSERVED", signal: "NOT OBSERVED" },
+    close: { observedAt: { status: "NOT OBSERVED" }, code: "NOT OBSERVED", eventObserved: false, processingComplete: false },
+    stopRequest: { origin: "NOT OBSERVED", at: { status: "NOT OBSERVED" } },
+    cleanup: {
+      stopOutcome: "NOT OBSERVED",
+      stopStartedAt: { status: "NOT OBSERVED" },
+      stopCompletedAt: { status: "NOT OBSERVED" },
+      treeStopObservation: { status: "NOT OBSERVED" },
+      closeWaitStartedAt: { status: "NOT OBSERVED" },
+      closeWaitOutcome: "NOT OBSERVED",
+      rootCloseEventObserved: false,
+      error: { status: "NOT OBSERVED" },
+    },
+    failure: error instanceof Error ? { name: boundedDiagnosticText(error.name, 128), ...boundedDiagnosticText(error.message) } : error === null ? { status: "NOT OBSERVED" } : boundedDiagnosticText(String(error)),
+    streams: { stdout: notCaptured, stderr: notCaptured },
+    npmMarker: npmMarkerPath === null ? { status: "NOT_APPLICABLE", reason: "runtime npm tracking shim was not configured" } : npmMarkerSnapshot(npmMarkerPath),
+  });
+  if (signal?.aborted) {
+    const error = new Error("The Vitest test was aborted before starting a PowerShell invocation");
+    emitBeforeSpawn("rejected-before-spawn", error, "owning-test-cancellation");
+    throw error;
   }
-  if (pathPrefix !== undefined) env.PATH = `${pathPrefix};${env.PATH ?? ""}`;
-  if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
+
+  const env: NodeJS.ProcessEnv = {};
+  try {
+    environmentRoot = join(tmpdir(), `e-${randomUUID()}`);
+    activeEnvironmentRoots.add(environmentRoot);
+    maximumEnvironmentPathLength = Math.max(maximumEnvironmentPathLength, environmentRoot.length);
+    for (const key of ["PATH", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "SystemDrive", "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"]) {
+      if (process.env[key] !== undefined) env[key] = process.env[key];
+    }
+    for (const [key, directory] of Object.entries({ HOME: "home", USERPROFILE: "home", APPDATA: "appdata", LOCALAPPDATA: "localappdata", TEMP: "tmp", TMP: "tmp", TMPDIR: "tmp", XDG_DATA_HOME: "xdg-data", NPM_CONFIG_CACHE: "npm-cache" })) {
+      env[key] = join(environmentRoot, directory);
+      await mkdir(env[key], { recursive: true });
+      if (signal?.aborted) throw new Error("The Vitest test was aborted while preparing an isolated PowerShell environment");
+    }
+    Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(environmentRoot, "empty-git-config"), GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never", NO_UPDATE_NOTIFIER: "1", NPM_CONFIG_USERCONFIG: join(environmentRoot, "empty-npm-user-config"), NPM_CONFIG_GLOBALCONFIG: join(environmentRoot, "empty-npm-global-config") });
+    const tracksRuntimeNpm = pathPrefix === undefined && process.platform === "win32" && /(?:\\scripts\\invoke|\\locked-entry)\.ps1$/iu.test(scriptPath);
+    if (tracksRuntimeNpm) {
+      maximumInheritedPathLength = Math.max(maximumInheritedPathLength, (env.PATH ?? "").length);
+      if (runtimeNpmCmd === undefined) {
+        const pathSearchStarted = performance.now();
+        runtimeNpmCmd = (env.PATH ?? "").split(";").map((directory) => directory.trim().replace(/^"|"$/gu, "")).filter(Boolean).map((directory) => join(directory, "npm.cmd")).find((candidate) => existsSync(candidate));
+        npmPathSearchMs += performance.now() - pathSearchStarted;
+      }
+      if (runtimeNpmCmd === undefined) throw new Error("Could not locate the real npm.cmd in the inherited PATH for launch counting");
+      const trackerBin = join(environmentRoot, "npm-tracker");
+      npmMarkerPath = join(environmentRoot, "npm-launch.marker");
+      await mkdir(trackerBin, { recursive: true });
+      await writeFile(join(trackerBin, "npm.cmd"), `@echo off\r\n>>"${npmMarkerPath}" echo invoked\r\ncall "${runtimeNpmCmd}" %*\r\nexit /b %ERRORLEVEL%\r\n`, "utf8");
+      env.PATH = `${trackerBin};${env.PATH ?? ""}`;
+    }
+    if (pathPrefix !== undefined) env.PATH = `${pathPrefix};${env.PATH ?? ""}`;
+    envReadyAt = { at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started) };
+    if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
+  } catch (error: unknown) {
+    emitBeforeSpawn("pre-spawn-error", error, signal?.aborted ? "owning-test-cancellation" : null);
+    throw error;
+  }
+
+  const commandArguments = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...argumentsList];
   return new Promise((resolve, reject) => {
-    const child = spawn("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      scriptPath,
-      ...argumentsList,
-    ], {
-      cwd: cwdPath,
-      windowsHide: true,
-      detached: process.platform !== "win32",
-      env,
-    });
+    const spawnChild = () => {
+      try {
+        return spawn("powershell.exe", commandArguments, {
+          cwd: cwdPath,
+          windowsHide: true,
+          detached: process.platform !== "win32",
+          env,
+        });
+      } catch (error: unknown) {
+        emitBeforeSpawn("spawn-threw", error, null);
+        throw error;
+      }
+    };
+    const child = spawnChild();
     child.stdin.end();
     let stdout = "";
     let stderr = "";
     let npmLog = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    let npmLogBytes = 0;
+    let npmLogPreview: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let npmLogCaptured = false;
+    let npmLogCaptureReason: string | null = null;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let stdoutBytes = 0, stderrBytes = 0;
+    let stdoutPreview: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stderrPreview: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let stdoutEnded = false, stderrEnded = false;
+    let stdoutObserved = false, stderrObserved = false;
+    let firstStdoutAt: Readonly<Record<string, unknown>> | null = null;
+    let firstStderrAt: Readonly<Record<string, unknown>> | null = null;
     let timeout: NodeJS.Timeout | undefined;
     let closeCode: number | null = null;
     let closed = false;
     let closeProcessed = false;
+    let exitObservedAt: Readonly<Record<string, unknown>> | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
     let timedOut = false;
     let cleanupFinished = false;
     let settled = false;
     let cleanupPromise: Promise<void> | null = null;
     let closeWaiter: { readonly resolve: () => void; readonly reject: (error: Error) => void } | null = null;
+    let stopOrigin: string | null = null;
+    let stopStartedAt: Readonly<Record<string, unknown>> | null = null;
+    let stopCompletedAt: Readonly<Record<string, unknown>> | null = null;
+    let stopOutcome: string | null = null;
+    let stopError: string | null = null;
+    let treeStopObservation: TreeStopObservation | null = null;
+    let closeWaitStartedAt: Readonly<Record<string, unknown>> | null = null;
+    let closeWaitOutcome: string | null = null;
+    let finalDiagnosticEmitted = false;
+    let childError: string | null = null;
+    const stamp = () => ({ at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started) });
+    const previewChunk = (previous: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => previous.length >= diagnosticStreamLimit
+      ? previous
+      : Buffer.concat([previous, chunk.subarray(0, diagnosticStreamLimit - previous.length)]);
+    const currentNpmMarkerSnapshot = () => npmMarkerPath === null
+      ? { status: "NOT_APPLICABLE", reason: "runtime npm tracking shim was not configured" }
+      : npmMarkerSnapshot(npmMarkerPath);
+    const diagnosticRecord = (event: string, extra: Readonly<Record<string, unknown>> = {}) => ({
+      schemaVersion: 1,
+      invocationId,
+      stage,
+      event,
+      startedAt,
+      eventAt: new Date().toISOString(),
+      elapsedMs: Math.round(performance.now() - started),
+      command: {
+        program: "powershell.exe",
+        arguments: { totalCount: commandArguments.length, retained: commandArguments.slice(0, 32).map((argument) => boundedDiagnosticText(argument, 512)), truncated: commandArguments.length > 32 },
+        cwd: boundedDiagnosticText(cwdPath),
+        timeoutMs: timeoutMs ?? null,
+      },
+      environmentPrepared: envReadyAt !== null,
+      envReadyAt: observedAt(envReadyAt),
+      spawnedAt: observedAt(launchAt),
+      rootProcessId: child.pid === undefined ? { status: "NOT OBSERVED" } : { status: "OBSERVED", value: child.pid },
+      firstStdoutAt: observedAt(firstStdoutAt),
+      firstStderrAt: observedAt(firstStderrAt),
+      exit: { observedAt: observedAt(exitObservedAt), code: exitObservedAt === null ? "NOT OBSERVED" : observedExitCode, signal: exitObservedAt === null ? "NOT OBSERVED" : exitSignal },
+      close: { observedAt: observedAt(closeAt), code: closed ? closeCode : "NOT OBSERVED", eventObserved: closed, processingComplete: closeProcessed },
+      stopRequest: { origin: stopOrigin ?? "NOT OBSERVED", at: observedAt(stopStartedAt) },
+      cleanup: {
+        stopOutcome: stopOutcome ?? "NOT OBSERVED",
+        stopStartedAt: observedAt(stopStartedAt),
+        stopCompletedAt: observedAt(stopCompletedAt),
+        treeStopObservation: treeStopObservation ?? { status: "NOT OBSERVED" },
+        closeWaitStartedAt: observedAt(closeWaitStartedAt),
+        closeWaitOutcome: closeWaitOutcome ?? "NOT OBSERVED",
+        rootCloseEventObserved: closed,
+        error: stopError === null ? { status: "NOT OBSERVED" } : boundedDiagnosticText(stopError),
+      },
+      owningTestSignalAborted: signal?.aborted ?? false,
+      stdout: capturedStreamDiagnostic(stdoutBytes, stdoutPreview, stdoutEnded),
+      stderr: capturedStreamDiagnostic(stderrBytes, stderrPreview, stderrEnded),
+      npmMarker: currentNpmMarkerSnapshot(),
+      childError: childError === null ? { status: "NOT OBSERVED" } : boundedDiagnosticText(childError),
+      npmLog: npmLogCaptured ? {
+        ...capturedStreamDiagnostic(npmLogBytes, npmLogPreview, true, "original-npm-debug-log-file-buffer-bytes"),
+        retainedRange: npmLogPreview.length === 0 ? null : { startByteInclusive: npmLogBytes - npmLogPreview.length, endByteExclusive: npmLogBytes },
+        retainedSelection: "tail",
+  } : { status: "NOT_CAPTURED", totalOriginalBytes: "NOT OBSERVED", reason: npmLogCaptureReason ?? "NOT OBSERVED" },
+      ...extra,
+    });
+    const emit = (event: string, extra: Readonly<Record<string, unknown>> = {}) => emitProcessDiagnostic(diagnosticRecord(event, extra));
+    const emitFinal = (event: string, extra: Readonly<Record<string, unknown>> = {}) => {
+      if (finalDiagnosticEmitted) return;
+      finalDiagnosticEmitted = true;
+      emit(event, extra);
+    };
+    let launchAt: Readonly<Record<string, unknown>> | null = null;
+    let closeAt: Readonly<Record<string, unknown>> | null = null;
+    let observedExitCode: number | null = null;
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutObserved = true;
+      stdoutBytes += chunk.length;
+      stdoutPreview = previewChunk(stdoutPreview, chunk);
+      if (firstStdoutAt === null) firstStdoutAt = stamp();
+      stdout += stdoutDecoder.write(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderrObserved = true;
+      stderrBytes += chunk.length;
+      stderrPreview = previewChunk(stderrPreview, chunk);
+      if (firstStderrAt === null) firstStderrAt = stamp();
+      stderr += stderrDecoder.write(chunk);
+    });
+    child.stdout.once("end", () => { stdout += stdoutDecoder.end(); stdoutEnded = true; });
+    child.stderr.once("end", () => { stderr += stderrDecoder.end(); stderrEnded = true; });
     const clearProcessState = () => {
       if (timeout !== undefined) clearTimeout(timeout);
       signal?.removeEventListener("abort", onAbort);
@@ -171,78 +424,155 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
       if (settled || !closeProcessed || (timedOut && !cleanupFinished)) return;
       settled = true;
       clearProcessState();
-      if (signal?.aborted) reject(new Error("The Vitest test ended while a PowerShell invocation was active"));
-      else resolve({ exitCode: closeCode, stdout, stderr, npmLog, timedOut });
+      if (signal?.aborted) {
+        const error = new Error("The Vitest test ended while a PowerShell invocation was active");
+        emitFinal("final-rejected-after-owning-test-cancellation", { returnedExitCode: closeCode, timedOut, failure: { name: error.name, ...boundedDiagnosticText(error.message) } });
+        reject(error);
+      } else {
+        emitFinal("final-return", { returnedExitCode: closeCode, timedOut });
+        resolve({ diagnosticId: invocationId, exitCode: closeCode, stdout, stderr, npmLog, stdoutBytes, stderrBytes, stdoutPreview, stderrPreview, stdoutEnded, stderrEnded, npmLogBytes, npmLogPreview, npmLogCaptured, npmLogCaptureReason, timedOut });
+      }
     };
     const waitForClose = () => {
-      if (closeProcessed) return Promise.resolve();
+      if (closeProcessed) { closeWaitOutcome = "ROOT_CLOSE_ALREADY_OBSERVED"; return Promise.resolve(); }
+      closeWaitStartedAt = stamp();
       return new Promise<void>((resolveClose, rejectClose) => {
         const timer = setTimeout(() => {
           closeWaiter = null;
+          closeWaitOutcome = "ROOT_CLOSE_WAIT_TIMED_OUT";
           rejectClose(new Error(`PowerShell process ${child.pid ?? "unknown"} did not close after bounded tree termination`));
         }, 1_500);
         closeWaiter = {
-          resolve: () => { clearTimeout(timer); closeWaiter = null; resolveClose(); },
-          reject: (error) => { clearTimeout(timer); closeWaiter = null; rejectClose(error); },
+          resolve: () => { clearTimeout(timer); closeWaiter = null; closeWaitOutcome = "ROOT_CLOSE_OBSERVED"; resolveClose(); },
+          reject: (error) => { clearTimeout(timer); closeWaiter = null; closeWaitOutcome = "ROOT_CLOSE_WAIT_REJECTED"; rejectClose(error); },
         };
         if (closeProcessed) closeWaiter.resolve();
       });
     };
-    const stopTree = (): Promise<void> => {
+    const stopTree = (origin: "owning-test-cancellation" | "owned-timeout" | "afterEach" = "afterEach"): Promise<void> => {
       if (cleanupPromise !== null) return cleanupPromise;
-      if (child.pid === undefined) return Promise.reject(new Error("PowerShell process did not expose a PID for bounded tree cleanup"));
+      if (child.pid === undefined) {
+        const error = new Error("PowerShell process did not expose a PID for bounded tree cleanup");
+        stopOrigin = signal?.aborted ? "owning-test-cancellation" : origin;
+        stopStartedAt = stamp(); stopOutcome = "ROOT_PID_UNAVAILABLE"; stopError = error.message;
+        emit("cleanup-final", { status: "FAILED", outcome: stopOutcome, failure: { name: error.name, ...boundedDiagnosticText(error.message) } });
+        emitFinal("final-cleanup-rejected", { failure: { name: boundedDiagnosticText(error.name, 128), ...boundedDiagnosticText(error.message) } });
+        return Promise.reject(error);
+      }
       timedOut = !signal?.aborted;
+      stopOrigin = signal?.aborted ? "owning-test-cancellation" : origin;
+      stopStartedAt = stamp();
+      emit("stop-requested", { reason: stopOrigin });
       cleanupPromise = (async () => {
-        await terminateProcessTree(child.pid!);
+        await terminateProcessTree(child.pid!, (observation) => {
+          treeStopObservation = observation;
+          emit("tree-stop-command-observed", { reason: stopOrigin });
+        });
         await waitForClose();
+        stopCompletedAt = stamp();
+        stopOutcome = closeProcessed ? "TREE_STOP_AND_ROOT_CLOSE_OBSERVED" : "TREE_STOP_RETURNED_ROOT_CLOSE_UNOBSERVED";
         cleanupFinished = true;
+        emit("cleanup-final", { status: "COMPLETED", outcome: stopOutcome });
         finish();
       })();
+      void cleanupPromise.catch((error: unknown) => {
+        stopCompletedAt = stamp();
+        stopOutcome ??= "TREE_STOP_OR_ROOT_CLOSE_FAILED";
+        stopError = error instanceof Error ? error.message : String(error);
+        emit("cleanup-final", { status: "FAILED", failure: error instanceof Error ? { name: boundedDiagnosticText(error.name, 128), ...boundedDiagnosticText(error.message) } : boundedDiagnosticText(String(error)) });
+      });
       return cleanupPromise;
     };
     const failCleanup = (error: unknown) => {
       if (settled) return;
       settled = true;
+      stopError = error instanceof Error ? error.message : String(error);
+      stopOutcome ??= "TREE_STOP_OR_ROOT_CLOSE_FAILED";
       clearProcessState();
+      emitFinal("final-cleanup-rejected", { failure: error instanceof Error ? { name: boundedDiagnosticText(error.name, 128), ...boundedDiagnosticText(error.message) } : boundedDiagnosticText(String(error)) });
       reject(error);
     };
-    const onAbort = () => { void stopTree().catch(failCleanup); };
+    const onAbort = () => { void stopTree("owning-test-cancellation").catch(failCleanup); };
     child.once("spawn", () => {
+      launchAt = stamp();
       powershellLaunchCount += 1;
       if (signal?.aborted) {
-        void stopTree().catch(failCleanup);
+        void stopTree("owning-test-cancellation").catch(failCleanup);
         return;
       }
       if (signal) signal.addEventListener("abort", onAbort, { once: true });
       activeTreeStops.add(stopTree);
       if (timeoutMs !== undefined) {
         timeout = setTimeout(() => {
-          if (!closed) void stopTree().catch(failCleanup);
+          if (!closed) void stopTree("owned-timeout").catch(failCleanup);
         }, timeoutMs);
       }
     });
+    child.once("exit", (code, childSignal) => {
+      exitObservedAt = stamp(); observedExitCode = code; exitSignal = childSignal;
+    });
     child.once("error", (error) => {
+      childError = error.message;
       settled = true;
       clearProcessState();
+      emitFinal("final-child-error", { failure: { name: boundedDiagnosticText(error.name, 128), ...boundedDiagnosticText(error.message) } });
       reject(error);
     });
     child.once("close", async (exitCode) => {
+      closeAt = stamp();
       closeCode = exitCode;
       closed = true;
+      const wasAlreadySettled = settled;
       if (npmMarkerPath !== null) {
         const marker = await readFile(npmMarkerPath, "utf8").catch(() => "");
         npmCommandAttemptCount += marker.split(/\r?\n/u).filter((line) => line === "invoked").length;
       }
-      const npmLogDirectory = join(environmentRoot, "npm-cache", "_logs");
+      const npmLogDirectory = join(environmentRoot!, "npm-cache", "_logs");
       maximumNpmLogPathLength = Math.max(maximumNpmLogPathLength, join(npmLogDirectory, "2026-10-03T00_00_00_000Z-debug-0.log").length);
-      const npmLogNames = (await readdir(npmLogDirectory).catch(() => [])).filter((name) => name.endsWith(".log")).sort();
-      npmLog = npmLogNames.length === 0 ? "" : (await readFile(join(npmLogDirectory, npmLogNames.at(-1)!), "utf8").catch(() => "")).slice(-4_000);
+      let npmLogNames: string[] = [];
+      try { npmLogNames = (await readdir(npmLogDirectory)).filter((name) => name.endsWith(".log")).sort(); }
+      catch { npmLogCaptureReason = "npm debug log directory could not be read"; }
+      if (npmLogNames.length > 0) {
+        try {
+          const npmLogBuffer = await readFile(join(npmLogDirectory, npmLogNames.at(-1)!));
+          npmLogCaptured = true;
+          npmLogBytes = npmLogBuffer.length;
+          npmLogPreview = npmLogBuffer.subarray(Math.max(0, npmLogBuffer.length - diagnosticStreamLimit));
+          npmLog = npmLogBuffer.toString("utf8").slice(-4_000);
+        } catch { npmLogCaptureReason = "npm debug log read failed"; }
+      } else npmLogCaptureReason ??= "no matching npm debug log file found";
       closeProcessed = true;
       closeWaiter?.resolve();
       if (!timedOut) cleanupFinished = true;
-      finish();
+      if (wasAlreadySettled) emit("late-close-after-rejection", { returnedExitCode: closeCode, timedOut });
+      else finish();
     });
   });
+}
+
+function npmMarkerSnapshot(path: string): Readonly<Record<string, unknown>> {
+  let descriptor: number | null = null;
+  try {
+    descriptor = openSync(path, "r");
+    const totalOriginalBytes = fstatSync(descriptor).size;
+    const retainedBuffer = Buffer.alloc(Math.min(totalOriginalBytes, diagnosticStreamLimit));
+    const bytesRead = readSync(descriptor, retainedBuffer, 0, retainedBuffer.length, 0);
+    const retained = retainedBuffer.subarray(0, bytesRead);
+    return {
+      status: totalOriginalBytes === 0 ? "CAPTURED_EMPTY" : "CAPTURED",
+      byteCountBasis: "original-marker-file-buffer-bytes",
+      totalOriginalBytes,
+      truncated: totalOriginalBytes > retained.length,
+      retainedRange: retained.length === 0 ? null : { startByteInclusive: 0, endByteExclusive: retained.length },
+      retainedPrefixBase64: retained.length === 0 ? null : retained.toString("base64"),
+      interpretation: "snapshot only; an unavailable/empty marker is not proof npm was not invoked",
+    };
+  } catch (error: unknown) {
+    const code = error instanceof Error && "code" in error && typeof error.code === "string" ? error.code : null;
+    return { status: "NOT_CAPTURED", errorCode: code === null ? "NOT OBSERVED" : boundedDiagnosticText(code, 128), interpretation: "read failure is not evidence npm was not invoked" };
+  } finally {
+    if (descriptor !== null) { try { closeSync(descriptor); } catch { /* Snapshot cleanup must not affect invocation control. */ } }
+  }
 }
 
 function isProcessRunning(processId: number): boolean {
@@ -252,7 +582,11 @@ function isProcessRunning(processId: number): boolean {
 }
 
 function processFailure(result: ProcessResult): string {
-  return `timedOut=${result.timedOut}\nexitCode=${result.exitCode}\nstdout=${result.stdout}\nstderr=${result.stderr}\nnpmLog=${result.npmLog}`;
+  return `diagnosticId=${result.diagnosticId}\ntimedOut=${result.timedOut}\nexitCode=${result.exitCode}\nstdout=${JSON.stringify(capturedStreamDiagnostic(result.stdoutBytes, result.stdoutPreview, result.stdoutEnded))}\nstderr=${JSON.stringify(capturedStreamDiagnostic(result.stderrBytes, result.stderrPreview, result.stderrEnded))}\nnpmLog=${JSON.stringify(result.npmLogCaptured ? { ...capturedStreamDiagnostic(result.npmLogBytes, result.npmLogPreview, true, "original-npm-debug-log-file-buffer-bytes"), retainedRange: result.npmLogPreview.length === 0 ? null : { startByteInclusive: result.npmLogBytes - result.npmLogPreview.length, endByteExclusive: result.npmLogBytes }, retainedSelection: "tail" } : { status: "NOT_CAPTURED", totalOriginalBytes: "NOT OBSERVED", reason: result.npmLogCaptureReason ?? "NOT OBSERVED" })}`;
+}
+
+function emitCompleteWindowPhase(phase: string, detail: Readonly<Record<string, unknown>> = {}): boolean {
+  try { process.stderr.write(`COMPLETE_WINDOW_PHASE ${JSON.stringify({ schemaVersion: 1, phase, at: new Date().toISOString(), ...detail })}\n`); return true; } catch { return false; /* Phase evidence must not alter the test. */ }
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -304,9 +638,35 @@ async function runGit(workspacePath: string, argumentsList: readonly string[]): 
 
 describe.skipIf(process.platform !== "win32")("source-window Skill compatibility", { timeout: 30_000 }, () => {
   it.for(["complete", "partial", "continuation"] as const)("preserves %s windows through Skill, CLI, runtime and fresh recovery", async (mode, { signal }) => {
-    const root = await mkdtemp(join(tmpdir(), "d-ai-skill-source-positive-"));
+    const testStarted = performance.now();
+    const expectedCompletePhases = ["teststart", "fixturestart", "fixtureend", "inputready", "skillstart", "skillreturn", "persistedcheckstart", "persistedcheckend", "recoverycheckstart", "recoverycheckend", "statusstart", "statusend", "continuestart", "continueend", "fixturecleanupstart", "fixturecleanupend"];
+    const observedCompletePhases: string[] = [];
+    const phase = (name: string, detail: Readonly<Record<string, unknown>> = {}) => {
+      if (mode === "complete" && emitCompleteWindowPhase(name, { elapsedMs: Math.round(performance.now() - testStarted), ...detail })) observedCompletePhases.push(name);
+    };
+    const emitPhaseSummary = () => {
+      if (mode === "complete") emitCompleteWindowPhase("testsummary", {
+        elapsedMs: Math.round(performance.now() - testStarted),
+        phases: {
+          observed: observedCompletePhases,
+          missing: expectedCompletePhases.filter((name) => !observedCompletePhases.includes(name)).map((name) => ({ phase: name, status: "NOT OBSERVED" })),
+          expectedCount: expectedCompletePhases.length,
+          observedCount: observedCompletePhases.length,
+        },
+      });
+    };
+    phase("teststart");
+    phase("fixturestart");
+    let root: string;
+    try { root = await mkdtemp(join(tmpdir(), "d-ai-skill-source-positive-")); }
+    catch (error: unknown) {
+      phase("fixturecreatefailed", { failure: boundedDiagnosticError(error) });
+      emitPhaseSummary();
+      throw error;
+    }
     try {
       const fixture = await sourceWindowFixture(root);
+      phase("fixtureend", { taskId: fixture.taskId });
       const durableBefore = await durableContent(join(fixture.workspacePath, ".d-ai"));
       let input = fixture.input;
       if (mode === "continuation") {
@@ -320,9 +680,12 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
         input = { ...input, coverageConfidence: "partial" };
       }
       await writeFile(fixture.path, JSON.stringify({ version: 1, sourceWindow: input }));
+      phase("inputready", { taskId: fixture.taskId });
       let response: CodexActivationResponse;
       if (mode === "complete") {
-        const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture, fixture.path), signal);
+        phase("skillstart", { taskId: fixture.taskId });
+        const result = await runPowerShellArguments(fixture.entryPath, fixture.workspacePath, sourceWindowArguments(fixture, fixture.path), signal, undefined, undefined, "complete-window-skill-entry");
+        phase("skillreturn", { taskId: fixture.taskId, diagnosticId: result.diagnosticId, timedOut: result.timedOut, exitCode: result.exitCode });
         expect(result.timedOut).toBe(false);
         expect(result.exitCode, result.stderr + result.stdout).toBe(0);
         response = JSON.parse(result.stdout.trim()) as CodexActivationResponse;
@@ -335,6 +698,7 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
 
       const reader = new LocalSqliteMemoryStore({ databasePath: fixture.databasePath, workspacePath: dirname(fixture.databasePath), mode: "reader", scopeId: resolveLocalMemoryScopeId(fixture.databasePath), writerId: "primary-device" });
       try {
+        phase("persistedcheckstart", { taskId: fixture.taskId });
         const sequences: number[] = [];
         for (const message of input.messages) {
           const record = await reader.get(message.memoryId!);
@@ -342,6 +706,8 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
           sequences.push(record!.sequence);
         }
         expect(sequences).toEqual([...sequences].sort((a, b) => a - b));
+        phase("persistedcheckend", { taskId: fixture.taskId });
+        phase("recoverycheckstart", { taskId: fixture.taskId });
         const recovery = await createCurationPipeline({ store: reader, workspacePath: dirname(fixture.databasePath), repositoryPath: fixture.workspacePath }).recover(fixture.taskId, input.sourceType, input.sourceKey);
         if (mode === "partial") {
           expect(recovery).toMatchObject({ status: "empty", checkpoint: null, currentView: null, viewFresh: false });
@@ -349,18 +715,33 @@ describe.skipIf(process.platform !== "win32")("source-window Skill compatibility
           expect(recovery).toMatchObject({ status: "available", viewFresh: true, projectTaskId: fixture.taskId, checkpoint: { sourceType: input.sourceType, sourceKeySha256: hashCurationSourceKey(input.sourceKey), coveredThroughMarker: input.coveredThroughMarker, boundarySha256: input.boundarySha256, coverageConfidence: input.coverageConfidence, projectTaskId: fixture.taskId }, currentView: { verificationStatus: "verified" } });
           for (const message of input.messages) expect(recovery.currentView?.relevantMemoryIds).toContain(message.memoryId);
         }
+        phase("recoverycheckend", { taskId: fixture.taskId });
       } finally { reader.close(); }
 
+      phase("statusstart", { taskId: fixture.taskId });
       const status = await runCodexCLI(["--workspace", fixture.workspacePath, "--command", "@D-AI status", "--task", fixture.taskId, "--memory-database", fixture.databasePath]);
       expect(status.exitCode).toBe(0);
       expect(status.response).toMatchObject({ taskId: fixture.taskId, memorySnapshot: { status: "available" } });
+      phase("statusend", { taskId: fixture.taskId, exitCode: status.exitCode });
       if (mode !== "partial") {
+        phase("continuestart", { taskId: fixture.taskId });
         const continued = await runCodexCLI(["--workspace", fixture.workspacePath, "--command", "@D-AI continue", "--task", fixture.taskId, "--memory-database", fixture.databasePath]);
         expect(continued.exitCode).toBe(0);
         expect(continued.response).toMatchObject({ taskId: fixture.taskId, bossSession: { recoveryCompleteness: { status: "COMPLETE" } } });
+        phase("continueend", { taskId: fixture.taskId, exitCode: continued.exitCode });
       }
       expect(await durableContent(join(fixture.workspacePath, ".d-ai"))).toEqual(durableBefore);
-    } finally { await rm(root, { recursive: true, force: true }); }
+    } finally {
+      phase("fixturecleanupstart");
+      let cleanupOutcome = "NOT OBSERVED";
+      let cleanupFailure: Readonly<Record<string, unknown>> | null = null;
+      try { await rm(root, { recursive: true, force: true }); cleanupOutcome = "COMPLETED"; }
+      catch (error: unknown) { cleanupOutcome = "FAILED"; cleanupFailure = boundedDiagnosticError(error); throw error; }
+      finally {
+        phase("fixturecleanupend", { outcome: cleanupOutcome, ...(cleanupFailure === null ? {} : { failure: cleanupFailure }) });
+        emitPhaseSummary();
+      }
+    }
   });
 
   it.for(["missing", "relative", "unreadable", "oversize", "UTF8", "JSON", "envelope", "extra-envelope-key", "structure", "empty-messages", "too-many-messages", "marker", "previous-boundary", "boundary-format", "digest", "order", "task", "message-task", "coverage", "combined", "fresh-digest", "fresh-order"])("rejects %s without changing memory, checkpoint or durable-task content", async (kind, { signal }) => {
