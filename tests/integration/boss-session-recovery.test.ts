@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runCommand } from "../../src/adapters/command-runner.js";
 import { prepareBootstrapTask } from "../../src/bootstrap/bootstrap-task.js";
@@ -41,6 +41,39 @@ async function gitWorkspace(root: string, remote: boolean): Promise<void> {
   await runCommand({ command: "git", arguments: ["add", "fixture.txt"], cwd: root });
   await runCommand({ command: "git", arguments: ["commit", "-m", "fixture"], cwd: root });
   if (remote) await runCommand({ command: "git", arguments: ["remote", "add", "origin", "https://github.com/acme/d-ai.git"], cwd: root });
+}
+
+async function detachedRemoteWorkspace(workspacePath: string): Promise<void> {
+  await mkdir(workspacePath, { recursive: true });
+  await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
+  await gitWorkspace(workspacePath, true);
+  await runCommand({ command: "git", arguments: ["checkout", "--detach", "HEAD"], cwd: workspacePath });
+}
+
+async function seedRemoteTask(store: FileDurableContextStore, taskId: string, workspacePath: string, environment: "codex" | "work" = "codex") {
+  const seeded = await prepareBootstrapTask({ taskId, goal: `Seed ${taskId}`, environment, workspacePath, repositoryPath: workspacePath }, store);
+  const state = { ...seeded, contextManifest: [...seeded.contextManifest.filter((entry) => !entry.startsWith("remote-repository:")), "remote-repository:github.com/acme/d-ai"] };
+  await store.createIfAbsent!(state);
+  return state;
+}
+
+async function logicalTaskSnapshot(store: FileDurableContextStore, durableRoot: string): Promise<{
+  readonly taskIds: readonly string[];
+  readonly taskStates: readonly { taskId: string; state: unknown }[];
+  readonly durableFiles: Readonly<Record<string, string>>;
+}> {
+  const taskIds = (await readdir(durableRoot)).filter((entry) => entry.startsWith("task-")).sort();
+  const taskStates = await Promise.all(taskIds.map(async (taskId) => ({ taskId, state: await store.load(taskId) })));
+  const durableFiles: Record<string, string> = {};
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of (await readdir(directory, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name))) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile()) durableFiles[relative(durableRoot, path)] = (await readFile(path)).toString("base64");
+    }
+  };
+  await visit(durableRoot);
+  return { taskIds, taskStates, durableFiles };
 }
 
 describe("P4 Boss startup and rollover", () => {
@@ -109,6 +142,250 @@ describe("P4 Boss startup and rollover", () => {
       expect(await readFile(join(durableRoot, taskId, "state.json"))).toEqual(before);
       expect((await readdir(durableRoot)).filter((entry) => entry.startsWith("task-"))).toEqual([taskId]);
       expect(await new FileDurableContextStore(durableRoot).discoverActiveTasks(workspacePath)).toHaveLength(1);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("keeps configured repository identity and Boss recovery available after detaching the synthetic worktree", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-identity-baseline-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    try {
+      await mkdir(workspacePath, { recursive: true });
+      await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
+      await gitWorkspace(workspacePath, true);
+      const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot, memoryDatabasePath }));
+      const taskId = "task-p4-detached-identity";
+      const store = new FileDurableContextStore(durableRoot);
+      const seeded = await prepareBootstrapTask({ taskId, goal: "Seed detached identity fixture", environment: "codex", workspacePath, repositoryPath: workspacePath }, store);
+      await store.createIfAbsent!({ ...seeded, contextManifest: [...seeded.contextManifest.filter((entry) => !entry.startsWith("remote-repository:")), "remote-repository:github.com/acme/d-ai"] });
+      const curated = await activate({ rawCommand: "@D-AI 整理", taskId, curationSourceWindow: windowFor(taskId) });
+      expect(curated.status, curated.message).toBe("completed");
+
+      const attachedStatus = await activate({
+        rawCommand: "@D-AI status",
+        taskId,
+        bossSession: { mode: "prepare", signals: { acceptedTicketCount: 0 } },
+      });
+      expect(attachedStatus.status).toBe("accepted");
+      expect(attachedStatus.bossSession?.project).toBe("github.com/acme/d-ai");
+
+      await runCommand({ command: "git", arguments: ["checkout", "--detach", "HEAD"], cwd: workspacePath });
+      const detachedStatus = await activate({
+        rawCommand: "@D-AI status",
+        taskId,
+        bossSession: { mode: "prepare", signals: { acceptedTicketCount: 0 } },
+      });
+      const detachedRollover = await activate({
+        rawCommand: "@D-AI rollover",
+        taskId,
+        bossSession: { mode: "prepare", sourceKey: "boss-source" },
+      });
+
+      expect({ detachedStatus, detachedRollover }).toMatchObject({
+        detachedStatus: { status: "accepted", bossSession: { project: "github.com/acme/d-ai" } },
+        detachedRollover: { status: "accepted", bossSession: { decision: "ROLLOVER_PREPARED" } },
+      });
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("routes ordinary status and rollover by repository identity from a linked detached workspace without task or fact resubmission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-linked-detached-ordinary-routing-"));
+    const sourcePath = join(root, "source");
+    const workspacePath = join(root, "linked-workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    const taskId = "task-p4-linked-detached-ordinary";
+    try {
+      await mkdir(sourcePath, { recursive: true });
+      await gitWorkspace(sourcePath, true);
+      await runCommand({ command: "git", arguments: ["worktree", "add", "--detach", workspacePath, "HEAD"], cwd: sourcePath });
+      await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
+      const store = new FileDurableContextStore(durableRoot);
+      const seeded = await prepareBootstrapTask({ taskId, goal: "Seed linked detached ordinary routing", environment: "codex", workspacePath, repositoryPath: workspacePath }, store);
+      await store.createIfAbsent!({ ...seeded, contextManifest: [...seeded.contextManifest.filter((entry) => !entry.startsWith("remote-repository:")), "remote-repository:github.com/acme/d-ai"] });
+      const options = { workspacePath, durableRoot, memoryDatabasePath };
+      const activate = createCodexActivation(createConfiguredDAIRuntime(options));
+      const curated = await activate({ rawCommand: "@D-AI 整理", taskId, curationSourceWindow: windowFor(taskId) });
+      expect(curated.status, curated.message).toBe("completed");
+
+      const ordinaryStatus = await activate({ rawCommand: "@D-AI status", taskId: null });
+
+      expect(ordinaryStatus).toMatchObject({ status: "accepted", taskId, environment: "codex" });
+      const durableBeforeRollover = await logicalTaskSnapshot(store, durableRoot);
+      const freshActivation = createCodexActivation(createConfiguredDAIRuntime(options));
+      const ordinaryRollover = await freshActivation({ rawCommand: "@D-AI rollover", taskId: null });
+
+      expect(ordinaryRollover).toMatchObject({
+        status: "accepted",
+        taskId,
+        bossSession: { decision: "ROLLOVER_PREPARED", project: "github.com/acme/d-ai", handoff: { taskId } },
+      });
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(durableBeforeRollover);
+    } finally {
+      await runCommand({ command: "git", arguments: ["worktree", "remove", "--force", workspacePath], cwd: sourcePath }).catch(() => {});
+      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("does not create or select a task for an otherwise valid detached remote workspace with no task", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-no-task-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      await detachedRemoteWorkspace(workspacePath);
+      await mkdir(durableRoot, { recursive: true });
+      const store = new FileDurableContextStore(durableRoot);
+      const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }));
+      const before = await logicalTaskSnapshot(store, durableRoot);
+
+      const result = await activate({ rawCommand: "@D-AI continue", taskId: null });
+
+      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED", recoveryCompleteness: { status: "BLOCKED", projection: "UNAVAILABLE" } } });
+      expect(result.message).toMatch(/task|canonical|workspace/i);
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("keeps a linked sibling workspace isolated even when its detached remote resolves to the same repository", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-sibling-"));
+    const sourcePath = join(root, "source");
+    const taskWorkspace = join(root, "task-worktree");
+    const siblingWorkspace = join(root, "sibling-worktree");
+    const durableRoot = join(root, "durable");
+    try {
+      await mkdir(sourcePath, { recursive: true });
+      await gitWorkspace(sourcePath, true);
+      await runCommand({ command: "git", arguments: ["worktree", "add", "--detach", taskWorkspace, "HEAD"], cwd: sourcePath });
+      await runCommand({ command: "git", arguments: ["worktree", "add", "--detach", siblingWorkspace, "HEAD"], cwd: sourcePath });
+      await mkdir(join(taskWorkspace, ".agents", "skills"), { recursive: true });
+      await mkdir(join(siblingWorkspace, ".agents", "skills"), { recursive: true });
+      const store = new FileDurableContextStore(durableRoot);
+      const taskId = "task-p4-sibling-worktree-owner";
+      await seedRemoteTask(store, taskId, taskWorkspace);
+      const before = await logicalTaskSnapshot(store, durableRoot);
+      const siblingIdentity = await runCommand({ command: "git", arguments: ["remote", "get-url", "origin"], cwd: siblingWorkspace });
+      expect(siblingIdentity.stdout.trim()).toBe("https://github.com/acme/d-ai.git");
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath: siblingWorkspace, durableRoot }))({ rawCommand: "@D-AI status", taskId });
+
+      expect(result).toMatchObject({ status: "blocked", taskId, message: expect.stringMatching(/different workspace/i) });
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
+    } finally {
+      await runCommand({ command: "git", arguments: ["worktree", "remove", "--force", taskWorkspace], cwd: sourcePath }).catch(() => {});
+      await runCommand({ command: "git", arguments: ["worktree", "remove", "--force", siblingWorkspace], cwd: sourcePath }).catch(() => {});
+      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("blocks detached-remote recovery across environment ownership without changing task records", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-environment-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      await detachedRemoteWorkspace(workspacePath);
+      const store = new FileDurableContextStore(durableRoot);
+      const taskId = "task-p4-detached-other-environment";
+      await seedRemoteTask(store, taskId, workspacePath, "work");
+      const before = await logicalTaskSnapshot(store, durableRoot);
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({ rawCommand: "@D-AI continue", taskId: null });
+
+      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("blocks multiple matching detached-remote tasks without choosing, mutating, or creating one", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-ambiguous-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      await detachedRemoteWorkspace(workspacePath);
+      const store = new FileDurableContextStore(durableRoot);
+      await seedRemoteTask(store, "task-p4-detached-duplicate-a", workspacePath);
+      await seedRemoteTask(store, "task-p4-detached-duplicate-b", workspacePath);
+      const before = await logicalTaskSnapshot(store, durableRoot);
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({ rawCommand: "@D-AI continue", taskId: null });
+
+      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED", recoveryCompleteness: { missingFields: [] } } });
+      expect(result.message).toMatch(/exactly one|identity conflicts/i);
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("preserves historical-only and incomplete recovery semantics on a detached configured remote", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-dispositions-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      await detachedRemoteWorkspace(workspacePath);
+      const store = new FileDurableContextStore(durableRoot);
+      const frozenTaskId = "task-p4-detached-frozen-only";
+      const frozen = { ...await seedRemoteTask(store, frozenTaskId, workspacePath), routingDisposition: "LEGACY_FROZEN" as const };
+      await store.withTaskOwnership(frozenTaskId, "codex", (lease) => store.save(frozen, lease));
+      const before = await logicalTaskSnapshot(store, durableRoot);
+      const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }));
+
+      const current = await activate({ rawCommand: "@D-AI continue", taskId: null });
+      const historical = await activate({ rawCommand: "@D-AI status", taskId: frozenTaskId });
+
+      expect(current).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+      expect(historical).toMatchObject({ status: "accepted", taskId: frozenTaskId });
+      expect(historical.message).toMatch(/LEGACY_FROZEN|historical/i);
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("reports incomplete detached-remote recovery without inventing projection or handoff data", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-incomplete-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    const memoryDatabasePath = join(root, "memory.sqlite");
+    try {
+      await detachedRemoteWorkspace(workspacePath);
+      const store = new FileDurableContextStore(durableRoot);
+      const taskId = "task-p4-detached-incomplete";
+      await seedRemoteTask(store, taskId, workspacePath);
+      const activate = createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot, memoryDatabasePath }));
+      const source = windowFor(taskId);
+      const messages = source.messages.slice(0, 2);
+      await activate({ rawCommand: "@D-AI 整理", taskId, curationSourceWindow: {
+        ...source,
+        messages,
+        coveredThroughMarker: messages.at(-1)!.marker,
+        boundarySha256: buildCurationBoundarySha256(null, null, messages),
+      } });
+      const before = await logicalTaskSnapshot(store, durableRoot);
+
+      const result = await activate({ rawCommand: "@D-AI continue", taskId: null });
+
+      expect(result).toMatchObject({
+        status: "blocked",
+        taskId,
+        bossSession: { decision: "BLOCKED", project: null, handoff: null, recoveryCompleteness: { status: "INCOMPLETE", projection: "UNAVAILABLE", diagnosticReason: expect.stringContaining("missing fields") } },
+      });
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
+  });
+
+  it("fails closed for an unsupported configured remote URL without changing the canonical task", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-unsupported-url-"));
+    const workspacePath = join(root, "workspace");
+    const durableRoot = join(root, "durable");
+    try {
+      await detachedRemoteWorkspace(workspacePath);
+      const store = new FileDurableContextStore(durableRoot);
+      const taskId = "task-p4-detached-unsupported-url";
+      await seedRemoteTask(store, taskId, workspacePath);
+      await runCommand({ command: "git", arguments: ["config", "remote.origin.url", "file:///tmp/not-a-github-repository"], cwd: workspacePath });
+      const before = await logicalTaskSnapshot(store, durableRoot);
+
+      const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({ rawCommand: "@D-AI continue", taskId: null });
+
+      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED", recoveryCompleteness: { status: "BLOCKED", projection: "UNAVAILABLE" } } });
+      expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
 

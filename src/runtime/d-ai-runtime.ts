@@ -8,7 +8,7 @@ import { ChatEnvironmentAdapter } from "../adapters/environments/chat-adapter.js
 import { CodexEnvironmentAdapter } from "../adapters/environments/codex-adapter.js";
 import { createCodexExecutionAdapter, createCodexRecoveryPointCapture } from "../adapters/codex-local.js";
 import { WorkEnvironmentAdapter } from "../adapters/environments/work-adapter.js";
-import { inspectConfiguredGitRemotes, inspectCurrentGitState, inspectGitRepositoryHealth, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
+import { inspectConfiguredGitRemotes, inspectConfiguredGitRepositoryIdentity, inspectCurrentGitState, inspectGitRepositoryHealth, inspectLocalGitState, isValidGitBranchName, isValidGitTargetRef, resolveGitRepositoryRoot } from "../adapters/git.js";
 import { GitHubCliAdapter, resolveGitHubRepository, type GitHubAdapter } from "../adapters/github.js";
 import { bootstrapTask, createLocalOnlyTaskReservationId, inspectGitMetadataMarkers, prepareBootstrapTask, type BootstrapInput } from "../bootstrap/bootstrap-task.js";
 import { closeTask, type CloseMode } from "../close/close-service.js";
@@ -3567,7 +3567,7 @@ function createDefaultDependencies(options: ConfiguredDAIRuntimeOptions): DAIRun
   const resolveConfiguredRepositoryIdentity = async (repositoryPath: string): Promise<string> => {
     const configuredRemotes = await inspectConfiguredGitRemotes(repositoryPath);
     if (configuredRemotes.length === 0) throw new InvalidTaskStateError("Configured Git repository has no remote identity");
-    const origin = await inspectCurrentGitState(repositoryPath, "origin");
+    const origin = await inspectConfiguredGitRepositoryIdentity(repositoryPath, "origin");
     return resolveGitHubRepository(origin.remoteUrl, enterpriseHost).repository;
   };
   const prepareConfiguredLocalOnlyTask = async (input: BootstrapInput, configuredStore: DurableContextStore): Promise<TaskState> => {
