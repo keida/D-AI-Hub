@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -269,7 +269,9 @@ describe("inspectLocalGitState", () => {
         remoteUrl: originalIdentity.remoteUrl,
         pushUrl: originalIdentity.pushUrl,
       });
-      expect(linkedIdentity.repositoryPath.toLowerCase()).toBe(linked.toLowerCase());
+      const [repositoryPath, linkedPath] = await Promise.all([realpath(linkedIdentity.repositoryPath), realpath(linked)]);
+      expect(process.platform === "win32" ? repositoryPath.toLowerCase() : repositoryPath)
+        .toBe(process.platform === "win32" ? linkedPath.toLowerCase() : linkedPath);
       expect(before.symbolicRef.exitCode).toBe(1);
       expect(before.stagedDiff).toContain("staged bytes");
       expect(before.unstagedDiff).toContain("unstaged tracked bytes");
@@ -312,9 +314,10 @@ describe("inspectLocalGitState", () => {
       await git(root, ["commit", "-m", "test: large identity index"]);
       await git(root, ["remote", "add", "origin", "https://github.com/example/d-ai.git"]);
       const blob = (await runCommand({ command: "git", arguments: ["rev-parse", "HEAD:tracked.txt"], cwd: root })).stdout.trim();
-      const entries = Array.from({ length: 25_000 }, (_, index) => `100644 ${blob}\tvirtual/entry-${String(index).padStart(5, "0")}.txt\n`).join("");
+      const virtualPaths = Array.from({ length: 25_000 }, (_, index) => `virtual/entry-${String(index).padStart(5, "0")}.txt`);
+      const entries = virtualPaths.map((path) => `100644 ${blob}\t${path}\n`).join("");
       await gitWithInput(root, ["update-index", "--index-info"], entries);
-      await git(root, ["update-index", "--skip-worktree", "--", ":(top,glob)virtual/entry-*.txt"]);
+      await gitWithInput(root, ["update-index", "--skip-worktree", "-z", "--stdin"], `${virtualPaths.join("\0")}\0`);
       await expect(inspectCurrentGitState(root, "origin")).resolves.toMatchObject({ remoteUrl: "https://github.com/example/d-ai.git" });
 
       await expect(inspectConfiguredGitRepositoryIdentity(root)).resolves.toMatchObject({ remoteUrl: "https://github.com/example/d-ai.git" });
