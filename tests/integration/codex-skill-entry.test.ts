@@ -1421,235 +1421,372 @@ describe("PR64 minimal PowerShell differential candidate", () => {
   });
 });
 
-describe("PR64 wrapper path localization candidate", () => {
-  it("localizes the fixed-HEAD wrapper's no-data blocked path with stderr-only timing markers", { timeout: 30_000, retry: 0, repeats: 0 }, async (context) => {
-    if (process.platform !== "win32" || process.version !== "v26.7.0") {
-      const reason = process.platform !== "win32" ? `platform=${process.platform}` : `node=${process.version}`;
-      console.log(`PR64_WRAPPER_LOCALIZATION_NOT_APPLICABLE ${JSON.stringify({ reason })}`);
-      context.skip(`NOT APPLICABLE: requires Windows and Node v26.7.0; ${reason}`);
-    }
+describe("PR64 module search path differential", () => {
+  const cases = [
+    { name: "baseline", setsPsModulePath: false },
+    { name: "treatment", setsPsModulePath: true },
+  ] as const;
+  const fixedHeadInvokeNormalizedSha256 = "05e6fdc9379d20c3c08f166f1a8ca755b3af6d29ff145ad024df9919ae748bd4";
+  const blockedWrapperOutput = '{"status":"blocked","taskId":"unassigned","environment":"codex","stage":"bootstrap","message":"Curation payload and source-window paths cannot be combined"}';
+  const expectedBlockedOutput = `${blockedWrapperOutput}\r\n`;
+  const expectedMarkerLabels = [
+    "script-entry",
+    "split-parent-before",
+    "split-parent-after",
+    "curation-before",
+    "bootstrap-catch",
+    "json-serialization-before",
+    "json-serialization-after",
+  ];
+  let baselineGateOpen = false;
+  let baselineGateReason = "baseline case has not completed";
+  let baselineSetup: { readonly before: string; readonly after: string; readonly psHome: string; readonly target: string } | undefined;
+  let baselineModule: { readonly command: string; readonly source: string; readonly name: string; readonly path: string } | undefined;
+  let baselineComparableScript: string | undefined;
+  let evidenceRoot: string | undefined;
 
-    const root = join(tmpdir(), `d-ai-pr64-wrapper-localization-${randomUUID()}`);
-    const workspacePath = join(root, "workspace");
-    const payloadPath = join(root, "synthetic-payload.json");
-    const sourceWindowPath = join(root, "synthetic-source-window.json");
-    const memoryDatabasePath = join(root, "synthetic-memory.sqlite");
-    const fixedHeadInvokeNormalizedSha256 = "05e6fdc9379d20c3c08f166f1a8ca755b3af6d29ff145ad024df9919ae748bd4";
-    const blockedWrapperOutput = '{"status":"blocked","taskId":"unassigned","environment":"codex","stage":"bootstrap","message":"Curation payload and source-window paths cannot be combined"}';
-    const businessArguments = [
-      "-WorkspacePath", workspacePath,
-      "-CommandText", "@D-AI differential control",
-      "-CurationPayloadPath", payloadPath,
-      "-CurationSourceWindowPath", sourceWindowPath,
-      "-MemoryDatabasePath", memoryDatabasePath,
-    ];
-    const expectedBlockedOutput = `${blockedWrapperOutput}\r\n`;
-    const expectedLabels = [
-      "script-entry",
-      "split-parent-before",
-      "split-parent-after",
-      "curation-before",
-      "bootstrap-catch",
-      "json-serialization-before",
-      "json-serialization-after",
-    ];
-    let fixtureRootCreated = false;
-    let evidenceRootCreated = false;
-    let evidenceRoot = "NOT CREATED";
-
-    const marker = (label: string) => `[Console]::Error.WriteLine('PR64_WRAPPER_PATH_MARKER ${label} {0} {1} {2}', $__pr64PathClock.ElapsedTicks, [System.Diagnostics.Stopwatch]::Frequency, [System.DateTimeOffset]::UtcNow.ToString('O'))`;
-    const replacements: Array<{ readonly label: string; readonly needle: string; readonly replacement: string }> = [
-      {
-        label: "stopwatch-start",
-        needle: "$ErrorActionPreference = 'Stop'",
-        replacement: `$__pr64PathClock = [System.Diagnostics.Stopwatch]::StartNew()\n${marker("script-entry")}\n$ErrorActionPreference = 'Stop'`,
-      },
-      {
-        label: "split-parent-before",
-        needle: "$skillRoot = Split-Path -Parent $PSScriptRoot",
-        replacement: `${marker("split-parent-before")}\n$skillRoot = Split-Path -Parent $PSScriptRoot`,
-      },
-      {
-        label: "split-parent-after",
-        needle: "$repositoryRoot = $null",
-        replacement: `${marker("split-parent-after")}\n$repositoryRoot = $null`,
-      },
-      {
-        label: "curation-before",
-        needle: "  Assert-CurationInputs",
-        replacement: `  ${marker("curation-before")}\n  Assert-CurationInputs`,
-      },
-      {
-        label: "bootstrap-catch",
-        needle: "  Write-Blocked $_.Exception.Message",
-        replacement: `  ${marker("bootstrap-catch")}\n  Write-Blocked $_.Exception.Message`,
-      },
-      {
-        label: "blocked-json-serialization-boundaries",
-        needle: [
-          "function Write-Blocked([string]$Message) {",
-          "  [Console]::Out.WriteLine((([ordered]@{",
-          "        status = 'blocked'",
-          "        taskId = 'unassigned'",
-          "        environment = 'codex'",
-          "        stage = 'bootstrap'",
-          "        message = $Message",
-          "      } | ConvertTo-Json -Compress)))",
-          "}",
-        ].join("\n"),
-        replacement: [
-          "function Write-Blocked([string]$Message) {",
-          `  ${marker("json-serialization-before")}`,
-          "  $__pr64BlockedJson = (([ordered]@{",
-          "        status = 'blocked'",
-          "        taskId = 'unassigned'",
-          "        environment = 'codex'",
-          "        stage = 'bootstrap'",
-          "        message = $Message",
-          "      } | ConvertTo-Json -Compress))",
-          `  ${marker("json-serialization-after")}`,
-          "  [Console]::Out.WriteLine($__pr64BlockedJson)",
-          "}",
-        ].join("\n"),
-      },
-    ];
-
-    context.onTestFinished(({ task }) => {
-      console.log(`PR64_WRAPPER_LOCALIZATION_DIAGNOSTIC ${JSON.stringify({
-        taskState: task.result?.state ?? "unknown",
-        fixtureCleanupCompleted: !fixtureRootCreated,
-        evidenceRoot: evidenceRootCreated ? evidenceRoot : "NOT CREATED",
-      })}`);
-    });
-
-    try {
-      await mkdir(root);
-      fixtureRootCreated = true;
-      await mkdir(workspacePath);
-      const configuredEvidenceRoot = process.env.PR64_WRAPPER_LOCALIZATION_EVIDENCE_ROOT;
-      if (configuredEvidenceRoot !== undefined) {
-        if (await pathExists(configuredEvidenceRoot)) throw new Error(`Evidence folder already exists; refusing overwrite: ${configuredEvidenceRoot}`);
-        evidenceRoot = configuredEvidenceRoot;
-        await mkdir(evidenceRoot);
-      } else {
-        evidenceRoot = await mkdtemp(join(tmpdir(), "pr64-wrapper-localization-"));
+  for (const localizationCase of cases) {
+    it(`${localizationCase.name} preserves the no-data blocked path and captures the module-search differential`, { timeout: 30_000, retry: 0, repeats: 0 }, async (context) => {
+      if (process.platform !== "win32" || process.version !== "v26.7.0") {
+        const reason = process.platform !== "win32" ? `platform=${process.platform}` : `node=${process.version}`;
+        console.log(`PR64_MODULE_DIFFERENTIAL_NOT_APPLICABLE ${JSON.stringify({ case: localizationCase.name, reason })}`);
+        context.skip(`NOT APPLICABLE: requires Windows and Node v26.7.0; ${reason}`);
       }
-      evidenceRootCreated = true;
-
-      const sourcePath = join(repositoryRoot, "skills", "custom", "d-ai", "scripts", "invoke.ps1");
-      const sourceBytes = await readFile(sourcePath);
-      const sourceText = sourceBytes.toString("utf8");
-      const normalizedSource = sourceText.replace(/\r\n/gu, "\n");
-      const sourceNormalizedSha256 = createHash("sha256").update(normalizedSource).digest("hex");
-      expect(sourceNormalizedSha256).toBe(fixedHeadInvokeNormalizedSha256);
-
-      let instrumented = normalizedSource;
-      const diffSections: string[] = [];
-      for (const replacement of replacements) {
-        const occurrences = instrumented.split(replacement.needle).length - 1;
-        expect(occurrences, `instrumentation needle count for ${replacement.label}`).toBe(1);
-        instrumented = instrumented.replace(replacement.needle, replacement.replacement);
-        diffSections.push(`@@ ${replacement.label} @@\n-${replacement.needle}\n+${replacement.replacement}`);
+      if (localizationCase.setsPsModulePath && !baselineGateOpen) {
+        console.log(`PR64_MODULE_DIFFERENTIAL_NOTRUN ${JSON.stringify({ case: localizationCase.name, reason: baselineGateReason })}`);
+        context.skip(`NOT RUN: ${baselineGateReason}`);
       }
-      const newline = sourceText.includes("\r\n") ? "\r\n" : "\n";
-      const instrumentedText = instrumented.replace(/\n/gu, newline);
-      const instrumentedSha256 = createHash("sha256").update(instrumentedText, "utf8").digest("hex");
-      const installedEntry = join(root, "installed-skill", "scripts", "invoke.ps1");
-      await mkdir(dirname(installedEntry), { recursive: true });
-      await writeFile(installedEntry, instrumentedText, "utf8");
 
-      await writeFile(join(evidenceRoot, "generated-wrapper.diff"), `${diffSections.join("\n\n")}\n`, { encoding: "utf8", flag: "wx" });
-      await writeFile(join(evidenceRoot, "instrumented-invoke.ps1"), instrumentedText, { encoding: "utf8", flag: "wx" });
+      const root = join(tmpdir(), `d-ai-pr64-module-differential-${localizationCase.name}-${randomUUID()}`);
+      const workspacePath = join(root, "workspace");
+      const payloadPath = join(root, "synthetic-payload.json");
+      const sourceWindowPath = join(root, "synthetic-source-window.json");
+      const memoryDatabasePath = join(root, "synthetic-memory.sqlite");
+      const businessArguments = [
+        "-WorkspacePath", workspacePath,
+        "-CommandText", "@D-AI differential control",
+        "-CurationPayloadPath", payloadPath,
+        "-CurationSourceWindowPath", sourceWindowPath,
+        "-MemoryDatabasePath", memoryDatabasePath,
+      ];
+      let fixtureRootCreated = false;
+      let fixtureCleanupCompleted = false;
+      let evidenceCaseRoot = "NOT CREATED";
+      let callVerified = false;
 
-      const invocationMarker = await createInvocationMarker(root);
-      expect(invocationMarker.binPath).toBe(join(root, "fake-npm-bin"));
-      const helperCallStartedAtUtc = new Date().toISOString();
-      const result = await runPowerShellArguments(
-        installedEntry,
-        workspacePath,
-        businessArguments,
-        context.signal,
-        invocationMarker.binPath,
-        undefined,
-        "pr64-wrapper-localization",
-      );
-      const helperCallCompletedAtUtc = new Date().toISOString();
+      const marker = (label: string) => `[Console]::Error.WriteLine('PR64_WRAPPER_PATH_MARKER ${label} {0} {1} {2}', $__pr64PathClock.ElapsedTicks, [System.Diagnostics.Stopwatch]::Frequency, [System.DateTimeOffset]::UtcNow.ToString('O'))`;
+      const prelude = [
+        `$__pr64ApplyModulePathTreatment = ${localizationCase.setsPsModulePath ? "$true" : "$false"}`,
+        "$__pr64ModulePathBefore = [string]$env:PSModulePath",
+        "$__pr64PowerShellHome = [string]$PSHOME",
+        "$__pr64PshomeModules = [System.IO.Path]::Combine($__pr64PowerShellHome, 'Modules')",
+        "$__pr64PshomeModulesExists = [System.IO.Directory]::Exists($__pr64PshomeModules)",
+        "if (-not $__pr64PshomeModulesExists) { throw 'PowerShell system Modules directory is missing' }",
+        "if ($__pr64ApplyModulePathTreatment) { $env:PSModulePath = $__pr64PshomeModules }",
+        "$__pr64ModulePathAfter = [string]$env:PSModulePath",
+        "$__pr64ModulePathBeforeToken = if ([string]::IsNullOrEmpty($__pr64ModulePathBefore)) { '-' } else { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__pr64ModulePathBefore)) }",
+        "$__pr64ModulePathAfterToken = if ([string]::IsNullOrEmpty($__pr64ModulePathAfter)) { '-' } else { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__pr64ModulePathAfter)) }",
+        "$__pr64PowerShellHomeToken = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__pr64PowerShellHome))",
+        "$__pr64PshomeModulesToken = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__pr64PshomeModules))",
+        "$__pr64PshomeModulesExistsText = if ($__pr64PshomeModulesExists) { 'true' } else { 'false' }",
+        "[System.Console]::Error.WriteLine('PR64_MODULE_CONTEXT setup {0} {1} {2} {3} {4}', $__pr64ModulePathBeforeToken, $__pr64ModulePathAfterToken, $__pr64PowerShellHomeToken, $__pr64PshomeModulesToken, $__pr64PshomeModulesExistsText)",
+      ].join("\n");
+      const moduleObserver = [
+        "  try {",
+        "    $__pr64SplitCommand = Get-Command Split-Path -ErrorAction Stop",
+        "    $__pr64SplitModuleName = [string]$__pr64SplitCommand.ModuleName",
+        "    $__pr64SplitModule = Get-Module -Name $__pr64SplitModuleName",
+        "    $__pr64SplitModulePath = if ($null -eq $__pr64SplitModule) { '' } else { [string]$__pr64SplitModule.Path }",
+        "    $__pr64SplitCommandToken = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$__pr64SplitCommand.Name))",
+        "    $__pr64SplitSourceToken = if ([string]::IsNullOrEmpty([string]$__pr64SplitCommand.Source)) { '-' } else { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$__pr64SplitCommand.Source)) }",
+        "    $__pr64SplitModuleNameToken = if ([string]::IsNullOrEmpty($__pr64SplitModuleName)) { '-' } else { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__pr64SplitModuleName)) }",
+        "    $__pr64SplitModulePathToken = if ([string]::IsNullOrEmpty($__pr64SplitModulePath)) { '-' } else { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($__pr64SplitModulePath)) }",
+        "    $__pr64SplitModuleLoaded = if ($null -eq $__pr64SplitModule) { 'false' } else { 'true' }",
+        "    [System.Console]::Error.WriteLine('PR64_MODULE_CONTEXT module {0} {1} {2} {3} {4}', $__pr64SplitCommandToken, $__pr64SplitSourceToken, $__pr64SplitModuleNameToken, $__pr64SplitModulePathToken, $__pr64SplitModuleLoaded)",
+        "  } catch {",
+        "    $__pr64ModuleObserverError = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($_.Exception.Message))",
+        "    [System.Console]::Error.WriteLine('PR64_MODULE_CONTEXT observer-error {0}', $__pr64ModuleObserverError)",
+        "  }",
+      ].join("\n");
+      const replacements: Array<{ readonly label: string; readonly needle: string; readonly replacement: string }> = [
+        {
+          label: "process-local-module-path-preamble-and-stopwatch-start",
+          needle: "$ErrorActionPreference = 'Stop'",
+          replacement: `${prelude}\n$__pr64PathClock = [System.Diagnostics.Stopwatch]::StartNew()\n${marker("script-entry")}\n$ErrorActionPreference = 'Stop'`,
+        },
+        {
+          label: "split-parent-before",
+          needle: "$skillRoot = Split-Path -Parent $PSScriptRoot",
+          replacement: `${marker("split-parent-before")}\n$skillRoot = Split-Path -Parent $PSScriptRoot`,
+        },
+        {
+          label: "split-parent-after",
+          needle: "$repositoryRoot = $null",
+          replacement: `${marker("split-parent-after")}\n$repositoryRoot = $null`,
+        },
+        {
+          label: "curation-before",
+          needle: "  Assert-CurationInputs",
+          replacement: `  ${marker("curation-before")}\n  Assert-CurationInputs`,
+        },
+        {
+          label: "bootstrap-catch",
+          needle: "  Write-Blocked $_.Exception.Message",
+          replacement: `  ${marker("bootstrap-catch")}\n  Write-Blocked $_.Exception.Message`,
+        },
+        {
+          label: "blocked-json-serialization-boundaries",
+          needle: [
+            "function Write-Blocked([string]$Message) {",
+            "  [Console]::Out.WriteLine((([ordered]@{",
+            "        status = 'blocked'",
+            "        taskId = 'unassigned'",
+            "        environment = 'codex'",
+            "        stage = 'bootstrap'",
+            "        message = $Message",
+            "      } | ConvertTo-Json -Compress)))",
+            "}",
+          ].join("\n"),
+          replacement: [
+            "function Write-Blocked([string]$Message) {",
+            `  ${marker("json-serialization-before")}`,
+            "  $__pr64BlockedJson = (([ordered]@{",
+            "        status = 'blocked'",
+            "        taskId = 'unassigned'",
+            "        environment = 'codex'",
+            "        stage = 'bootstrap'",
+            "        message = $Message",
+            "      } | ConvertTo-Json -Compress))",
+            `  ${marker("json-serialization-after")}`,
+            "  [Console]::Out.WriteLine($__pr64BlockedJson)",
+            "}",
+          ].join("\n"),
+        },
+        {
+          label: "post-marker-module-source-observer",
+          needle: "  exit 2",
+          replacement: `${moduleObserver}\n  exit 2`,
+        },
+      ];
 
-      await writeFile(join(evidenceRoot, "stdout.raw.log"), result.stdout, { encoding: "utf8", flag: "wx" });
-      await writeFile(join(evidenceRoot, "stderr.raw.log"), result.stderr, { encoding: "utf8", flag: "wx" });
-      const stderrLines = result.stderr.replace(/\r?\n$/u, "").split(/\r?\n/u);
-      const observedMarkers = stderrLines.map((line) => {
-        const match = /^PR64_WRAPPER_PATH_MARKER ([a-z-]+) ([0-9]+) ([0-9]+) (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}(?:Z|\+00:00))$/u.exec(line);
-        expect(match, `unexpected wrapper stderr line: ${line}`).not.toBeNull();
-        return { label: match![1], elapsedTicks: Number(match![2]), frequency: Number(match![3]), utc: match![4] };
+      context.onTestFinished(({ task }) => {
+        if (localizationCase.name === "baseline") {
+          baselineGateOpen = callVerified && fixtureCleanupCompleted && !context.signal.aborted && task.result?.state === "pass";
+          baselineGateReason = baselineGateOpen
+            ? "baseline call, exact output/context, fixture cleanup, and applicable afterEach lifecycle passed"
+            : `baseline gate closed: task=${task.result?.state ?? "unknown"}; callVerified=${callVerified}; fixtureCleanup=${fixtureCleanupCompleted}; signalAborted=${context.signal.aborted}`;
+        }
+        console.log(`PR64_MODULE_DIFFERENTIAL_DIAGNOSTIC ${JSON.stringify({
+          case: localizationCase.name,
+          taskState: task.result?.state ?? "unknown",
+          status: localizationCase.name === "baseline" ? (baselineGateOpen ? "PASS" : "GATE_CLOSED") : (callVerified && fixtureCleanupCompleted && task.result?.state === "pass" ? "PASS" : "FAILED_OR_UNVERIFIED"),
+          fixtureCleanupCompleted,
+          evidenceRoot: evidenceCaseRoot,
+          baselineGateReason: localizationCase.name === "baseline" ? baselineGateReason : undefined,
+        })}`);
       });
-      expect(observedMarkers.map(({ label }) => label)).toEqual(expectedLabels);
-      expect(observedMarkers.every(({ frequency }) => frequency === observedMarkers[0]?.frequency && frequency > 0)).toBe(true);
-      expect(observedMarkers.every(({ elapsedTicks }, index) => Number.isSafeInteger(elapsedTicks) && (index === 0 || elapsedTicks >= observedMarkers[index - 1]!.elapsedTicks))).toBe(true);
 
-      const intervalMs = (from: string, to: string) => {
-        const start = observedMarkers.find((item) => item.label === from)!;
-        const end = observedMarkers.find((item) => item.label === to)!;
-        return Math.round(((end.elapsedTicks - start.elapsedTicks) * 1_000 / start.frequency) * 1000) / 1000;
-      };
-      const evidence = {
-        schemaVersion: 1,
-        fixedHead: "242106564eac8fc00d54efbde6e8bdd8c578de11",
-        sourceNormalizedSha256,
-        instrumentedSha256,
-        instrumentationNeedleOccurrences: replacements.map(({ label }) => ({ label, count: 1 })),
-        invocation: {
-          diagnosticId: result.diagnosticId,
-          helperCallStartedAtUtc,
-          helperCallCompletedAtUtc,
-          platform: process.platform,
-          node: process.version,
-          owningTimeoutMs: 30_000,
-          helperTimeoutMs: null,
-          retry: 0,
-          repeats: 0,
-          exitCode: result.exitCode,
-          timedOut: result.timedOut,
-          stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
-          stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
-          expectedStdoutBytes: Buffer.byteLength(expectedBlockedOutput, "utf8"),
-          stdoutEnded: result.stdoutEnded,
-          stderrEnded: result.stderrEnded,
-        },
-        markers: observedMarkers,
-        intervalsMs: {
-          scriptEntryToSplitPath: intervalMs("script-entry", "split-parent-before"),
-          splitPathParent: intervalMs("split-parent-before", "split-parent-after"),
-          curationGuardToCatch: intervalMs("curation-before", "bootstrap-catch"),
-          jsonSerialization: intervalMs("json-serialization-before", "json-serialization-after"),
-        },
-        timingLimits: [
-          "UTC is sampled while emitting each marker and is not the child-stderr arrival time.",
-          "Stopwatch deltas begin at the first script-body marker, after parameter binding and process launch.",
-          "Helper call timestamps bracket the helper call and are not substitutes for its spawnedAt diagnostic event.",
-        ],
-      };
-      await writeFile(join(evidenceRoot, "invocation-evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+      try {
+        await mkdir(root);
+        fixtureRootCreated = true;
+        await mkdir(workspacePath);
+        if (evidenceRoot === undefined) {
+          const configuredEvidenceRoot = process.env.PR64_WRAPPER_LOCALIZATION_EVIDENCE_ROOT;
+          if (configuredEvidenceRoot !== undefined) {
+            if (await pathExists(configuredEvidenceRoot)) throw new Error(`Evidence folder already exists; refusing overwrite: ${configuredEvidenceRoot}`);
+            evidenceRoot = configuredEvidenceRoot;
+            await mkdir(evidenceRoot);
+          } else {
+            evidenceRoot = await mkdtemp(join(tmpdir(), "pr64-module-differential-"));
+          }
+        }
+        evidenceCaseRoot = join(evidenceRoot, localizationCase.name);
+        await mkdir(evidenceCaseRoot);
 
-      expect(result.timedOut).toBe(false);
-      expect(result.exitCode).toBe(2);
-      expect(result.stdout).toBe(expectedBlockedOutput);
-      expect(Buffer.byteLength(result.stdout, "utf8")).toBe(158);
-      expect(result.stderrBytes).toBeGreaterThan(0);
-      expect(result.stdoutEnded).toBe(true);
-      expect(result.stderrEnded).toBe(true);
-      expect(context.signal.aborted).toBe(false);
-      expect(await pathExists(invocationMarker.markerPath)).toBe(false);
-      expect(await pathExists(payloadPath)).toBe(false);
-      expect(await pathExists(sourceWindowPath)).toBe(false);
-      expect(await pathExists(memoryDatabasePath)).toBe(false);
-      expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
-      expect(await pathExists(join(dirname(dirname(installedEntry)), ".runtime-root"))).toBe(false);
-    } finally {
-      if (fixtureRootCreated) {
-        await rm(root, { recursive: true, force: true });
-        fixtureRootCreated = false;
+        const sourcePath = join(repositoryRoot, "skills", "custom", "d-ai", "scripts", "invoke.ps1");
+        const sourceBytes = await readFile(sourcePath);
+        const sourceText = sourceBytes.toString("utf8");
+        const normalizedSource = sourceText.replace(/\r\n/gu, "\n");
+        const sourceNormalizedSha256 = createHash("sha256").update(normalizedSource).digest("hex");
+        expect(sourceNormalizedSha256).toBe(fixedHeadInvokeNormalizedSha256);
+
+        let instrumented = normalizedSource;
+        const diffSections: string[] = [];
+        for (const replacement of replacements) {
+          const occurrences = instrumented.split(replacement.needle).length - 1;
+          expect(occurrences, `instrumentation needle count for ${replacement.label}`).toBe(1);
+          instrumented = instrumented.replace(replacement.needle, replacement.replacement);
+          diffSections.push(`@@ ${replacement.label} @@\n-${replacement.needle}\n+${replacement.replacement}`);
+        }
+        const newline = sourceText.includes("\r\n") ? "\r\n" : "\n";
+        const instrumentedText = instrumented.replace(/\n/gu, newline);
+        const instrumentedSha256 = createHash("sha256").update(instrumentedText, "utf8").digest("hex");
+        const comparableScript = instrumentedText.replace(
+          `$__pr64ApplyModulePathTreatment = ${localizationCase.setsPsModulePath ? "$true" : "$false"}`,
+          "$__pr64ApplyModulePathTreatment = <TREATMENT_FLAG>",
+        );
+        if (localizationCase.name === "baseline") baselineComparableScript = comparableScript;
+        else expect(comparableScript).toBe(baselineComparableScript);
+        const installedEntry = join(root, "installed-skill", "scripts", "invoke.ps1");
+        await mkdir(dirname(installedEntry), { recursive: true });
+        await writeFile(installedEntry, instrumentedText, "utf8");
+        await writeFile(join(evidenceCaseRoot, "generated-wrapper.diff"), `${diffSections.join("\n\n")}\n`, { encoding: "utf8", flag: "wx" });
+        await writeFile(join(evidenceCaseRoot, "instrumented-invoke.ps1"), instrumentedText, { encoding: "utf8", flag: "wx" });
+
+        const invocationMarker = await createInvocationMarker(root);
+        expect(invocationMarker.binPath).toBe(join(root, "fake-npm-bin"));
+        const helperCallStartedAtUtc = new Date().toISOString();
+        const result = await runPowerShellArguments(
+          installedEntry,
+          workspacePath,
+          businessArguments,
+          context.signal,
+          invocationMarker.binPath,
+          undefined,
+          `pr64-module-differential-${localizationCase.name}`,
+        );
+        const helperCallCompletedAtUtc = new Date().toISOString();
+
+        await writeFile(join(evidenceCaseRoot, "stdout.raw.log"), result.stdout, { encoding: "utf8", flag: "wx" });
+        await writeFile(join(evidenceCaseRoot, "stderr.raw.log"), result.stderr, { encoding: "utf8", flag: "wx" });
+        const stderrLines = result.stderr.replace(/\r?\n$/u, "").split(/\r?\n/u);
+        expect(stderrLines).toHaveLength(expectedMarkerLabels.length + 2);
+        const setupMatch = /^PR64_MODULE_CONTEXT setup (\S+) (\S+) (\S+) (\S+) (true|false)$/u.exec(stderrLines[0]!);
+        expect(setupMatch, `unexpected setup context line: ${stderrLines[0]}`).not.toBeNull();
+        const decodeContextToken = (token: string) => {
+          if (token === "-") return "";
+          const value = Buffer.from(token, "base64");
+          expect(value.toString("base64")).toBe(token);
+          return value.toString("utf8");
+        };
+        const setupContext = {
+          before: decodeContextToken(setupMatch![1]!),
+          after: decodeContextToken(setupMatch![2]!),
+          psHome: decodeContextToken(setupMatch![3]!),
+          target: decodeContextToken(setupMatch![4]!),
+          targetExists: setupMatch![5] === "true",
+        };
+        expect(setupContext.targetExists).toBe(true);
+        expect(setupContext.psHome).not.toBe("");
+        expect(setupContext.target).not.toBe("");
+        expect(setupContext.target.toLowerCase()).toBe(join(setupContext.psHome, "Modules").toLowerCase());
+        expect(setupContext.after).toBe(localizationCase.setsPsModulePath ? setupContext.target : setupContext.before);
+        if (localizationCase.setsPsModulePath) {
+          expect(setupContext.after).not.toBe(setupContext.before);
+          expect(baselineSetup?.psHome.toLowerCase()).toBe(setupContext.psHome.toLowerCase());
+          expect(baselineSetup?.target.toLowerCase()).toBe(setupContext.target.toLowerCase());
+        } else {
+          expect(setupContext.after).toBe(setupContext.before);
+        }
+
+        const observedMarkers = stderrLines.slice(1, expectedMarkerLabels.length + 1).map((line) => {
+          const match = /^PR64_WRAPPER_PATH_MARKER ([a-z-]+) ([0-9]+) ([0-9]+) (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}(?:Z|\+00:00))$/u.exec(line);
+          expect(match, `unexpected wrapper stderr line: ${line}`).not.toBeNull();
+          return { label: match![1]!, elapsedTicks: Number(match![2]), frequency: Number(match![3]), utc: match![4]! };
+        });
+        expect(observedMarkers.map(({ label }) => label)).toEqual(expectedMarkerLabels);
+        expect(observedMarkers.every(({ frequency }) => frequency === observedMarkers[0]?.frequency && frequency > 0)).toBe(true);
+        expect(observedMarkers.every(({ elapsedTicks }, index) => Number.isSafeInteger(elapsedTicks) && (index === 0 || elapsedTicks >= observedMarkers[index - 1]!.elapsedTicks))).toBe(true);
+
+        const moduleMatch = /^PR64_MODULE_CONTEXT module (\S+) (\S+) (\S+) (\S+) (true|false)$/u.exec(stderrLines[stderrLines.length - 1]!);
+        expect(moduleMatch, `unexpected module context line: ${stderrLines[stderrLines.length - 1]}`).not.toBeNull();
+        const moduleContext = {
+          command: decodeContextToken(moduleMatch![1]!),
+          source: decodeContextToken(moduleMatch![2]!),
+          name: decodeContextToken(moduleMatch![3]!),
+          path: decodeContextToken(moduleMatch![4]!),
+          loaded: moduleMatch![5] === "true",
+        };
+        expect(moduleContext).toMatchObject({ command: "Split-Path", source: "Microsoft.PowerShell.Management", name: "Microsoft.PowerShell.Management", loaded: true });
+        const moduleRootPrefix = `${setupContext.target.replace(/[\\/]+$/gu, "").replace(/\\/gu, "/").toLowerCase()}/`;
+        expect(moduleContext.path.replace(/\\/gu, "/").toLowerCase().startsWith(moduleRootPrefix)).toBe(true);
+        if (localizationCase.name === "baseline") {
+          baselineSetup = setupContext;
+          baselineModule = moduleContext;
+        } else {
+          expect(baselineModule?.source).toBe(moduleContext.source);
+          expect(baselineModule?.name).toBe(moduleContext.name);
+          expect(baselineModule?.path.toLowerCase()).toBe(moduleContext.path.toLowerCase());
+        }
+
+        const intervalMs = (from: string, to: string) => {
+          const start = observedMarkers.find((item) => item.label === from)!;
+          const end = observedMarkers.find((item) => item.label === to)!;
+          return Math.round(((end.elapsedTicks - start.elapsedTicks) * 1_000 / start.frequency) * 1000) / 1000;
+        };
+        const evidence = {
+          schemaVersion: 1,
+          case: localizationCase.name,
+          manipulatedVariable: "child-process PSModulePath only; treatment assigns PSHOME\\Modules when Directory.Exists is true",
+          fixedHead: "1587f1f62c09649afd308cc65dcab97e189a645f",
+          sourceNormalizedSha256,
+          instrumentedSha256,
+          scriptsDifferOnlyByTreatmentFlag: localizationCase.name === "baseline" || comparableScript === baselineComparableScript,
+          instrumentationNeedleOccurrences: replacements.map(({ label }) => ({ label, count: 1 })),
+          processModuleContext: {
+            setsPsModulePath: localizationCase.setsPsModulePath,
+            before: setupContext.before,
+            after: setupContext.after,
+            psHome: setupContext.psHome,
+            target: setupContext.target,
+            targetExists: setupContext.targetExists,
+          },
+          splitPathModuleAfterMeasurement: moduleContext,
+          invocation: {
+            diagnosticId: result.diagnosticId,
+            helperCallStartedAtUtc,
+            helperCallCompletedAtUtc,
+            platform: process.platform,
+            node: process.version,
+            owningTimeoutMs: 30_000,
+            helperTimeoutMs: null,
+            retry: 0,
+            repeats: 0,
+            exitCode: result.exitCode,
+            timedOut: result.timedOut,
+            stdoutBytes: Buffer.byteLength(result.stdout, "utf8"),
+            stderrBytes: Buffer.byteLength(result.stderr, "utf8"),
+            expectedStdoutBytes: Buffer.byteLength(expectedBlockedOutput, "utf8"),
+            stdoutEnded: result.stdoutEnded,
+            stderrEnded: result.stderrEnded,
+          },
+          markers: observedMarkers,
+          intervalsMs: {
+            scriptEntryToSplitPath: intervalMs("script-entry", "split-parent-before"),
+            splitPathParent: intervalMs("split-parent-before", "split-parent-after"),
+            curationGuardToCatch: intervalMs("curation-before", "bootstrap-catch"),
+            jsonSerialization: intervalMs("json-serialization-before", "json-serialization-after"),
+          },
+          timingLimits: [
+            "UTC is sampled while emitting each marker and is not the child-stderr arrival time.",
+            "Stopwatch deltas begin after parameter binding and the .NET-only module-path context preamble.",
+            "The module-source observer runs only after all seven timed markers.",
+            "Marker formatting and stderr writes contribute overhead to neighboring intervals.",
+          ],
+        };
+        await writeFile(join(evidenceCaseRoot, "invocation-evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+
+        expect(result.timedOut).toBe(false);
+        expect(result.exitCode).toBe(2);
+        expect(result.stdout).toBe(expectedBlockedOutput);
+        expect(Buffer.byteLength(result.stdout, "utf8")).toBe(158);
+        expect(result.stdoutEnded).toBe(true);
+        expect(result.stderrEnded).toBe(true);
+        expect(context.signal.aborted).toBe(false);
+        expect(await pathExists(invocationMarker.markerPath)).toBe(false);
+        expect(await pathExists(payloadPath)).toBe(false);
+        expect(await pathExists(sourceWindowPath)).toBe(false);
+        expect(await pathExists(memoryDatabasePath)).toBe(false);
+        expect(await pathExists(join(workspacePath, ".d-ai"))).toBe(false);
+        expect(await pathExists(join(dirname(dirname(installedEntry)), ".runtime-root"))).toBe(false);
+        callVerified = true;
+      } finally {
+        if (fixtureRootCreated) {
+          await rm(root, { recursive: true, force: true });
+          fixtureRootCreated = false;
+          fixtureCleanupCompleted = true;
+        }
       }
-    }
-  });
+    });
+  }
 });
