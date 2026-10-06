@@ -37,9 +37,20 @@ interface ProcessResult {
   readonly timedOut: boolean;
   readonly powerShellExecutablePath: string;
   readonly modulePathStrategy: "powershell-home-modules" | "legacy-unset";
+  readonly invocationMode: "in-process-bootstrap" | "legacy-direct-file";
+  readonly moduleBootstrapEvidence: ModuleBootstrapEvidence | null;
   readonly parentPSModulePathStatus: "NOT_PROVIDED" | "PROVIDED";
   readonly parentPSModulePathSha256: string | null;
   readonly childPSModulePath: string | null;
+}
+
+interface ModuleBootstrapEvidence {
+  readonly diagnosticId: string;
+  readonly invocationMode: "in-process-call-operator";
+  readonly modulePathBefore: string | null;
+  readonly modulePathAfter: string;
+  readonly expectedModulePath: string;
+  readonly verification: "MATCH";
 }
 
 const diagnosticStreamLimit = 8 * 1024;
@@ -112,6 +123,56 @@ const activeEnvironmentRoots = new Set<string>();
 let maximumEnvironmentPathLength = 0;
 let maximumNpmLogPathLength = 0;
 const powerShellExecutableCache = new Map<string, string>();
+const inProcessModuleBootstrap = [
+  "[CmdletBinding()]",
+  "param(",
+  "  [Parameter(Mandatory = $true)][string]$DiagnosticId,",
+  "  [Parameter(Mandatory = $true)][string]$BootstrapEvidencePath,",
+  "  [Parameter(Mandatory = $true)][string]$BootstrapArgumentsPath,",
+  "  [Parameter(Mandatory = $true)][string]$TargetParameterContract",
+  ")",
+  "$powerShellHome = [string]$PSHOME",
+  "$expectedModulePath = [System.IO.Path]::Combine($powerShellHome, 'Modules')",
+  "if (-not [System.IO.Directory]::Exists($expectedModulePath)) { [System.Console]::Error.WriteLine('PowerShell system Modules directory is missing'); exit 1 }",
+  "$modulePathBefore = [System.Environment]::GetEnvironmentVariable('PSModulePath', 'Process')",
+  "[System.Environment]::SetEnvironmentVariable('PSModulePath', $expectedModulePath, 'Process')",
+  "$modulePathAfter = [System.Environment]::GetEnvironmentVariable('PSModulePath', 'Process')",
+  "if ([string]::Compare($modulePathAfter, $expectedModulePath, [System.StringComparison]::OrdinalIgnoreCase) -ne 0) { [System.Console]::Error.WriteLine('Effective PSModulePath does not match PSHOME\\Modules'); exit 1 }",
+  "$modulePathBeforeStatus = if ($null -eq $modulePathBefore) { 'NOT_PROVIDED' } else { 'PROVIDED' }",
+  "$bootstrapEvidenceLines = [string[]]@('v1', $DiagnosticId, 'in-process-call-operator', $modulePathBeforeStatus, [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$modulePathBefore)), [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($modulePathAfter)), [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($expectedModulePath)), 'MATCH')",
+  "[System.IO.File]::WriteAllText($BootstrapEvidencePath, [string]::Join([System.Environment]::NewLine, $bootstrapEvidenceLines), [System.Text.UTF8Encoding]::new($false))",
+  "$bootstrapArguments = [System.IO.File]::ReadAllLines($BootstrapArgumentsPath)",
+  "if ($bootstrapArguments.Length -lt 2) { throw 'Bootstrap argument record is incomplete' }",
+  "$decodeArgument = { param([string]$Value) [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value)) }",
+  "$targetScriptPath = & $decodeArgument $bootstrapArguments[0]",
+  "$targetWorkingDirectory = & $decodeArgument $bootstrapArguments[1]",
+  "Set-Location -LiteralPath $targetWorkingDirectory",
+  "$targetParameterNames = switch ($TargetParameterContract) {",
+  "  'invoke' { @('CommandText', 'TaskId', 'WorkspacePath', 'CurationPayloadPath', 'CurationSourceWindowPath', 'MemoryDatabasePath', 'TaskCharterFile', 'ApproveTaskCharterDigest'); break }",
+  "  'set-runtime-binding' { @('SkillRoot', 'RuntimeRoot'); break }",
+  "  'none' { @(); break }",
+  "  default { throw 'Unsupported test-only PowerShell parameter contract' }",
+  "}",
+  "$targetParameters = @{}",
+  "for ($index = 2; $index -lt $bootstrapArguments.Length; $index += 2) {",
+  "  $parameterName = & $decodeArgument $bootstrapArguments[$index]",
+  "  if (-not $parameterName.StartsWith('-') -or $index + 1 -ge $bootstrapArguments.Length) { throw 'Bootstrap argument record has an invalid parameter pair' }",
+  "  $name = $parameterName.Substring(1)",
+  "  if ($targetParameterNames -notcontains $name) { throw 'Bootstrap argument record contains a parameter outside its contract' }",
+  "  $targetParameters[$name] = & $decodeArgument $bootstrapArguments[$index + 1]",
+  "}",
+  "$global:LASTEXITCODE = $null",
+  "try {",
+  "  & $targetScriptPath @targetParameters",
+  "  $targetSucceeded = $?",
+  "  $targetExitCode = $global:LASTEXITCODE",
+  "  if (-not $targetSucceeded) { if ($null -ne $targetExitCode) { exit ([int]$targetExitCode) }; exit 1 }",
+  "  exit 0",
+  "} catch {",
+  "  [System.Console]::Error.WriteLine($_.ToString())",
+  "  exit 1",
+  "}",
+].join("\r\n");
 
 function resolvePowerShellExecutable(environment: NodeJS.ProcessEnv): string {
   const systemRoot = environment.SystemRoot;
@@ -231,13 +292,19 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
   const started = performance.now();
   const startedAt = new Date().toISOString();
   const stage = diagnosticLabel ?? "powershell-invocation";
+  const invocationMode = modulePathStrategy === "legacy-unset" ? "legacy-direct-file" : "in-process-bootstrap";
   const parentPSModulePath = process.env.PSModulePath;
   const parentPSModulePathStatus = parentPSModulePath === undefined ? "NOT_PROVIDED" : "PROVIDED";
   const parentPSModulePathSha256 = parentPSModulePath === undefined ? null : createHash("sha256").update(parentPSModulePath, "utf8").digest("hex");
   let environmentRoot: string | null = null;
   let powerShellExecutablePath: string | null = null;
+  let expectedModulePath: string | null = null;
+  let bootstrapEvidencePath: string | null = null;
+  let bootstrapArgumentsPath: string | null = null;
+  let bootstrapScriptPath: string | null = null;
   let npmMarkerPath: string | null = null;
   let envReadyAt: Readonly<Record<string, unknown>> | null = null;
+  let commandArguments = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...argumentsList];
   const notCaptured = capturedStreamDiagnostic(0, Buffer.alloc(0), false);
   const emitBeforeSpawn = (event: string, error: unknown, abortOrigin: string | null) => emitProcessDiagnostic({
     schemaVersion: 1, invocationId, stage, event, startedAt, eventAt: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started),
@@ -250,8 +317,10 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
     environmentPrepared: envReadyAt !== null, envReadyAt: observedAt(envReadyAt), abortOrigin: abortOrigin ?? "NOT OBSERVED",
     moduleEnvironment: {
       strategy: modulePathStrategy,
+      invocationMode,
       parentPSModulePath: { status: parentPSModulePathStatus, sha256: parentPSModulePathSha256 },
       childPSModulePath: { status: "NOT OBSERVED" },
+      bootstrapEvidence: { status: "NOT OBSERVED" },
       resolvedPowerShellExecutable: powerShellExecutablePath === null ? { status: "NOT OBSERVED" } : { status: "RESOLVED", path: powerShellExecutablePath },
     },
     spawnedAt: { status: "NOT OBSERVED" },
@@ -313,12 +382,14 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
     if (pathPrefix !== undefined) env.PATH = `${pathPrefix};${env.PATH ?? ""}`;
     powerShellExecutablePath = resolvePowerShellExecutable(env);
     if (modulePathStrategy === "powershell-home-modules") {
-      const modulesPath = join(dirname(powerShellExecutablePath), "Modules");
-      if (!existsSync(modulesPath)) throw new Error(`PowerShell system Modules directory is missing for ${powerShellExecutablePath}`);
-      env.PSModulePath = modulesPath;
-    }
-    if (modulePathStrategy === "powershell-home-modules" && env.PSModulePath !== join(dirname(powerShellExecutablePath), "Modules")) {
-      throw new Error("Child PSModulePath does not match the resolved powershell.exe Modules directory");
+      expectedModulePath = join(dirname(powerShellExecutablePath), "Modules");
+      if (!existsSync(expectedModulePath)) throw new Error(`PowerShell system Modules directory is missing for ${powerShellExecutablePath}`);
+      bootstrapScriptPath = join(environmentRoot, "invoke-with-module-bootstrap.ps1");
+      bootstrapEvidencePath = join(environmentRoot, "module-bootstrap-evidence.txt");
+      bootstrapArgumentsPath = join(environmentRoot, "bootstrap-arguments.txt");
+      await writeFile(bootstrapArgumentsPath, [scriptPath, cwdPath, ...argumentsList]
+        .map((value) => Buffer.from(value, "utf8").toString("base64")).join("\r\n"), "ascii");
+      await writeFile(bootstrapScriptPath, inProcessModuleBootstrap, "utf8");
     }
     envReadyAt = { at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started) };
     if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
@@ -327,7 +398,44 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
     throw error;
   }
 
-  const commandArguments = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...argumentsList];
+  if (modulePathStrategy === "powershell-home-modules") {
+    const normalizedScriptPath = scriptPath.replaceAll("/", "\\").toLowerCase();
+    const targetParameterContract = normalizedScriptPath.endsWith("\\set-runtime-binding.ps1")
+      ? "set-runtime-binding"
+      : normalizedScriptPath.endsWith("\\wait-tree.ps1") ? "none" : "invoke";
+    commandArguments = [
+      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", bootstrapScriptPath!,
+      "-DiagnosticId", invocationId,
+      "-BootstrapEvidencePath", bootstrapEvidencePath!,
+      "-BootstrapArgumentsPath", bootstrapArgumentsPath!,
+      "-TargetParameterContract", targetParameterContract,
+    ];
+  }
+
+  const readBootstrapEvidence = (): ModuleBootstrapEvidence | null => {
+    if (bootstrapEvidencePath === null || expectedModulePath === null) return null;
+    try {
+      const lines = readFileSync(bootstrapEvidencePath, "utf8").split(/\r?\n/);
+      if (lines.length !== 8 || lines[0] !== "v1" || lines[1] !== invocationId
+        || lines[2] !== "in-process-call-operator" || !["NOT_PROVIDED", "PROVIDED"].includes(lines[3] ?? "")
+        || lines[7] !== "MATCH") return null;
+      const decode = (value: string | undefined) => Buffer.from(value ?? "", "base64").toString("utf8");
+      const modulePathAfter = decode(lines[5]);
+      const evidenceExpectedPath = decode(lines[6]);
+      if (modulePathAfter.toLowerCase() !== expectedModulePath.toLowerCase()
+        || evidenceExpectedPath.toLowerCase() !== expectedModulePath.toLowerCase()) return null;
+      return {
+        diagnosticId: lines[1],
+        invocationMode: "in-process-call-operator",
+        modulePathBefore: lines[3] === "NOT_PROVIDED" ? null : decode(lines[4]),
+        modulePathAfter,
+        expectedModulePath: evidenceExpectedPath,
+        verification: "MATCH",
+      };
+    } catch {
+      return null;
+    }
+  };
   return new Promise((resolve, reject) => {
     const spawnChild = () => {
       try {
@@ -404,12 +512,19 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
       },
       environmentPrepared: envReadyAt !== null,
       envReadyAt: observedAt(envReadyAt),
-      moduleEnvironment: {
+      moduleEnvironment: (() => {
+        const moduleBootstrapEvidence = readBootstrapEvidence();
+        return {
         strategy: modulePathStrategy,
+        invocationMode,
         parentPSModulePath: { status: parentPSModulePathStatus, sha256: parentPSModulePathSha256 },
-        childPSModulePath: env.PSModulePath === undefined ? { status: "NOT_PROVIDED" } : { status: "PROVIDED", path: env.PSModulePath },
+        childPSModulePath: moduleBootstrapEvidence === null
+          ? env.PSModulePath === undefined ? { status: "NOT_PROVIDED" } : { status: "PROVIDED", path: env.PSModulePath }
+          : { status: "PROVIDED", path: moduleBootstrapEvidence.modulePathAfter },
+        bootstrapEvidence: moduleBootstrapEvidence ?? { status: "NOT_CAPTURED" },
         resolvedPowerShellExecutable: powerShellExecutablePath === null ? { status: "NOT_OBSERVED" } : { status: "RESOLVED", path: powerShellExecutablePath },
-      },
+      };
+      })(),
       spawnedAt: observedAt(launchAt),
       rootProcessId: child.pid === undefined ? { status: "NOT OBSERVED" } : { status: "OBSERVED", value: child.pid },
       firstStdoutAt: observedAt(firstStdoutAt),
@@ -479,7 +594,8 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
         reject(error);
       } else {
         emitFinal("final-return", { returnedExitCode: closeCode, timedOut });
-        resolve({ diagnosticId: invocationId, exitCode: closeCode, stdout, stderr, npmLog, stdoutBytes, stderrBytes, stdoutPreview, stderrPreview, stdoutEnded, stderrEnded, npmLogBytes, npmLogPreview, npmLogCaptured, npmLogCaptureReason, timedOut, powerShellExecutablePath: powerShellExecutablePath!, modulePathStrategy, parentPSModulePathStatus, parentPSModulePathSha256, childPSModulePath: env.PSModulePath ?? null });
+        const moduleBootstrapEvidence = readBootstrapEvidence();
+        resolve({ diagnosticId: invocationId, exitCode: closeCode, stdout, stderr, npmLog, stdoutBytes, stderrBytes, stdoutPreview, stderrPreview, stdoutEnded, stderrEnded, npmLogBytes, npmLogPreview, npmLogCaptured, npmLogCaptureReason, timedOut, powerShellExecutablePath: powerShellExecutablePath!, modulePathStrategy, invocationMode, moduleBootstrapEvidence, parentPSModulePathStatus, parentPSModulePathSha256, childPSModulePath: moduleBootstrapEvidence?.modulePathAfter ?? env.PSModulePath ?? null });
       }
     };
     const waitForClose = () => {
@@ -1047,6 +1163,109 @@ describe.skipIf(process.platform !== "win32")("test-only PowerShell process clea
       expect(normalizedPath(actualPowerShellHome!)).toBe(normalizedPath(dirname(actualExecutable!)));
       const actualModuleEntries = actualPSModulePath!.split(";").map((entry) => normalizedPath(entry.trim())).filter(Boolean);
       expect(actualModuleEntries).toContain(normalizedPath(result.childPSModulePath!));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(process.platform !== "win32")("normal PowerShell in-process module bootstrap", { timeout: 30_000 }, () => {
+  it("preserves the Skill string-parameter contract, script context, module evidence, and target exit outcomes", async ({ signal }) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-powershell-bootstrap-contract-"));
+    const scriptDirectory = join(root, "target path 中文 'quoted' & $semi; [x]");
+    const workspacePath = join(root, "workspace 空格 中文 'single' & $semi; [x]");
+    const cwdPath = join(root, "cwd 空格 中文 'single' & $semi; [x]");
+    const scriptPath = join(scriptDirectory, "invoke.ps1");
+    const injectionMarker = join(root, "must-not-be-created.txt");
+    const sourceInvokePath = join(repositoryRoot, "skills", "custom", "d-ai", "scripts", "invoke.ps1");
+    const sourceInvokeSha256Before = createHash("sha256").update(await readFile(sourceInvokePath)).digest("hex");
+    const commandText = `literal data: spaces 中文 "double" 'single' $env:PATH ; & | ^ \`n [System.IO.File]::WriteAllText('${injectionMarker.replaceAll("'", "''")}', 'executed')`;
+    const namedArguments = [
+      "-CommandText", commandText,
+      "-TaskId", `task 中文 "double" 'single' $x; & | ^`,
+      "-WorkspacePath", workspacePath,
+      "-CurationPayloadPath", join(root, "payload path 中文 'single' & $semi;.json"),
+      "-CurationSourceWindowPath", join(root, "source path 中文 'single' & $semi;.json"),
+      "-MemoryDatabasePath", join(root, "database path 中文 'single' & $semi;.sqlite"),
+      "-TaskCharterFile", join(root, "charter path 中文 'single' & $semi;.json"),
+      "-ApproveTaskCharterDigest", "digest 中文 \"quoted\" 'single' $x; & | ^",
+    ];
+    const fixtureScript = [
+      "[CmdletBinding()]",
+      "param(",
+      "  [Parameter(Mandatory = $true)][string]$CommandText,",
+      "  [Parameter(Mandatory = $false)][string]$TaskId,",
+      "  [Parameter(Mandatory = $false)][string]$WorkspacePath = (Get-Location).Path,",
+      "  [Parameter(Mandatory = $false)][string]$CurationPayloadPath,",
+      "  [Parameter(Mandatory = $false)][string]$CurationSourceWindowPath,",
+      "  [Parameter(Mandatory = $false)][string]$MemoryDatabasePath,",
+      "  [Parameter(Mandatory = $false)][string]$TaskCharterFile,",
+      "  [Parameter(Mandatory = $false)][string]$ApproveTaskCharterDigest",
+      ")",
+      "if ($CommandText -eq '__EXIT_ZERO__') { exit 0 }",
+      "if ($CommandText -eq '__EXIT_TWO__') { exit 2 }",
+      "if ($CommandText -eq '__THROW__') { throw 'bootstrap contract fixture failure' }",
+      "if ($CommandText -eq '__NATURAL_STALE_EXIT__') { $global:LASTEXITCODE = 73 }",
+      "if ($CommandText -eq '__STDERR__') { [System.Console]::Error.WriteLine('bootstrap stderr contract marker') }",
+      "if ($CommandText -eq '__WARNING__') { Write-Warning 'bootstrap unfiltered warning contract marker' }",
+      "[Console]::Out.WriteLine([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(([ordered]@{ commandText = $CommandText; taskId = $TaskId; workspacePath = $WorkspacePath; curationPayloadPath = $CurationPayloadPath; curationSourceWindowPath = $CurationSourceWindowPath; memoryDatabasePath = $MemoryDatabasePath; taskCharterFile = $TaskCharterFile; approveTaskCharterDigest = $ApproveTaskCharterDigest; workingDirectory = (Get-Location).Path; scriptRoot = $PSScriptRoot } | ConvertTo-Json -Compress))))",
+    ].join("\r\n");
+
+    try {
+      await Promise.all([mkdir(scriptDirectory), mkdir(workspacePath), mkdir(cwdPath)]);
+      await writeFile(scriptPath, fixtureScript, "utf8");
+      const fixtureSha256 = createHash("sha256").update(await readFile(scriptPath)).digest("hex");
+      const result = await runPowerShellArguments(scriptPath, cwdPath, namedArguments, signal);
+      expect(result.exitCode, processFailure(result)).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.invocationMode).toBe("in-process-bootstrap");
+      expect(result.moduleBootstrapEvidence).toMatchObject({
+        diagnosticId: result.diagnosticId,
+        invocationMode: "in-process-call-operator",
+        modulePathAfter: join(dirname(result.powerShellExecutablePath), "Modules"),
+        expectedModulePath: join(dirname(result.powerShellExecutablePath), "Modules"),
+        verification: "MATCH",
+      });
+      expect(result.childPSModulePath).toBe(result.moduleBootstrapEvidence?.modulePathAfter);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(Buffer.from(result.stdout.trim(), "base64").toString("utf8"))).toEqual({
+        commandText,
+        taskId: namedArguments[3],
+        workspacePath,
+        curationPayloadPath: namedArguments[7],
+        curationSourceWindowPath: namedArguments[9],
+        memoryDatabasePath: namedArguments[11],
+        taskCharterFile: namedArguments[13],
+        approveTaskCharterDigest: namedArguments[15],
+        workingDirectory: cwdPath,
+        scriptRoot: scriptDirectory,
+      });
+      expect(await pathExists(injectionMarker)).toBe(false);
+      expect(createHash("sha256").update(await readFile(scriptPath)).digest("hex")).toBe(fixtureSha256);
+      expect(createHash("sha256").update(await readFile(sourceInvokePath)).digest("hex")).toBe(sourceInvokeSha256Before);
+
+      for (const outcome of [
+        { commandText: "__EXIT_ZERO__", expectedExitCode: 0, expectedStderr: "" },
+        { commandText: "__EXIT_TWO__", expectedExitCode: 2, expectedStderr: "" },
+        { commandText: "__NATURAL_STALE_EXIT__", expectedExitCode: 0, expectedStderr: "" },
+        { commandText: "__STDERR__", expectedExitCode: 0, expectedStderr: /bootstrap stderr contract marker/, expectedStdoutAbsent: "bootstrap stderr contract marker" },
+        { commandText: "__WARNING__", expectedExitCode: 0, expectedStderr: "", expectedStreamMarker: "bootstrap unfiltered warning contract marker" },
+        { commandText: "__THROW__", expectedExitCode: 1, expectedStderr: /bootstrap contract fixture failure/ },
+      ]) {
+        const outcomeResult = await runPowerShellArguments(scriptPath, cwdPath, ["-CommandText", outcome.commandText], signal);
+        expect(outcomeResult.exitCode, processFailure(outcomeResult)).toBe(outcome.expectedExitCode);
+        expect(outcomeResult.timedOut).toBe(false);
+        expect(outcomeResult.invocationMode).toBe("in-process-bootstrap");
+        expect(outcomeResult.moduleBootstrapEvidence).toMatchObject({
+          diagnosticId: outcomeResult.diagnosticId,
+          invocationMode: "in-process-call-operator",
+          verification: "MATCH",
+        });
+        if (typeof outcome.expectedStderr === "string") expect(outcomeResult.stderr).toBe(outcome.expectedStderr);
+        else expect(outcomeResult.stderr).toMatch(outcome.expectedStderr);
+        if ("expectedStdoutAbsent" in outcome) expect(outcomeResult.stdout).not.toContain(outcome.expectedStdoutAbsent);
+        if ("expectedStreamMarker" in outcome) expect(`${outcomeResult.stdout}\n${outcomeResult.stderr}`).toContain(outcome.expectedStreamMarker);
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }
