@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
-import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -1228,7 +1228,8 @@ describe.skipIf(process.platform !== "win32")("normal PowerShell in-process modu
       });
       expect(result.childPSModulePath).toBe(result.moduleBootstrapEvidence?.modulePathAfter);
       expect(result.stderr).toBe("");
-      expect(JSON.parse(Buffer.from(result.stdout.trim(), "base64").toString("utf8"))).toEqual({
+      const { workingDirectory, scriptRoot, ...returnedArguments } = JSON.parse(Buffer.from(result.stdout.trim(), "base64").toString("utf8"));
+      expect(returnedArguments).toEqual({
         commandText,
         taskId: namedArguments[3],
         workspacePath,
@@ -1237,9 +1238,16 @@ describe.skipIf(process.platform !== "win32")("normal PowerShell in-process modu
         memoryDatabasePath: namedArguments[11],
         taskCharterFile: namedArguments[13],
         approveTaskCharterDigest: namedArguments[15],
-        workingDirectory: cwdPath,
-        scriptRoot: scriptDirectory,
       });
+      // Parameter strings are literal data; script context identifies existing directories.
+      expect(typeof workingDirectory).toBe("string");
+      expect(typeof scriptRoot).toBe("string");
+      const canonicalPath = async (value: string): Promise<string> => {
+        const resolved = await realpath(value);
+        return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+      };
+      expect(await canonicalPath(workingDirectory)).toBe(await canonicalPath(cwdPath));
+      expect(await canonicalPath(scriptRoot)).toBe(await canonicalPath(scriptDirectory));
       expect(await pathExists(injectionMarker)).toBe(false);
       expect(createHash("sha256").update(await readFile(scriptPath)).digest("hex")).toBe(fixtureSha256);
       expect(createHash("sha256").update(await readFile(sourceInvokePath)).digest("hex")).toBe(sourceInvokeSha256Before);
