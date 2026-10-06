@@ -35,6 +35,11 @@ interface ProcessResult {
   readonly npmLogCaptured: boolean;
   readonly npmLogCaptureReason: string | null;
   readonly timedOut: boolean;
+  readonly powerShellExecutablePath: string;
+  readonly modulePathStrategy: "powershell-home-modules" | "legacy-unset";
+  readonly parentPSModulePathStatus: "NOT_PROVIDED" | "PROVIDED";
+  readonly parentPSModulePathSha256: string | null;
+  readonly childPSModulePath: string | null;
 }
 
 const diagnosticStreamLimit = 8 * 1024;
@@ -106,6 +111,25 @@ const activeTreeStops = new Set<() => Promise<void>>();
 const activeEnvironmentRoots = new Set<string>();
 let maximumEnvironmentPathLength = 0;
 let maximumNpmLogPathLength = 0;
+const powerShellExecutableCache = new Map<string, string>();
+
+function resolvePowerShellExecutable(environment: NodeJS.ProcessEnv): string {
+  const systemRoot = environment.SystemRoot;
+  if (systemRoot === undefined) throw new Error("SystemRoot is required to resolve powershell.exe");
+  const cacheKey = `${systemRoot}\0${environment.PATH ?? ""}\0${environment.PATHEXT ?? ""}`;
+  const cached = powerShellExecutableCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const lookup = spawnSync(join(systemRoot, "System32", "where.exe"), ["powershell.exe"], { encoding: "utf8", windowsHide: true, env: environment });
+  if (lookup.error) throw lookup.error;
+  const executable = lookup.stdout.split(/\r?\n/u).map((candidate) => candidate.trim()).find(Boolean);
+  if (lookup.status !== 0 || executable === undefined || !existsSync(executable)) {
+    throw new Error(`Could not resolve powershell.exe from the invocation PATH (where exit ${lookup.status ?? "unknown"})`);
+  }
+  const resolved = executable;
+  powerShellExecutableCache.set(cacheKey, resolved);
+  return resolved;
+}
 
 afterEach(async () => {
   const cleanupResults = await Promise.allSettled([...activeTreeStops].map((stop) => stop()));
@@ -202,12 +226,16 @@ async function terminateProcessTree(processId: number, observe?: (observation: T
   });
 }
 
-async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], signal: AbortSignal, pathPrefix?: string, timeoutMs?: number, diagnosticLabel?: string): Promise<ProcessResult> {
+async function runPowerShellArguments(scriptPath: string, cwdPath: string, argumentsList: readonly string[], signal: AbortSignal, pathPrefix?: string, timeoutMs?: number, diagnosticLabel?: string, modulePathStrategy: ProcessResult["modulePathStrategy"] = "powershell-home-modules"): Promise<ProcessResult> {
   const invocationId = randomUUID();
   const started = performance.now();
   const startedAt = new Date().toISOString();
   const stage = diagnosticLabel ?? "powershell-invocation";
+  const parentPSModulePath = process.env.PSModulePath;
+  const parentPSModulePathStatus = parentPSModulePath === undefined ? "NOT_PROVIDED" : "PROVIDED";
+  const parentPSModulePathSha256 = parentPSModulePath === undefined ? null : createHash("sha256").update(parentPSModulePath, "utf8").digest("hex");
   let environmentRoot: string | null = null;
+  let powerShellExecutablePath: string | null = null;
   let npmMarkerPath: string | null = null;
   let envReadyAt: Readonly<Record<string, unknown>> | null = null;
   const notCaptured = capturedStreamDiagnostic(0, Buffer.alloc(0), false);
@@ -220,6 +248,12 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
       timeoutMs: timeoutMs ?? null,
     },
     environmentPrepared: envReadyAt !== null, envReadyAt: observedAt(envReadyAt), abortOrigin: abortOrigin ?? "NOT OBSERVED",
+    moduleEnvironment: {
+      strategy: modulePathStrategy,
+      parentPSModulePath: { status: parentPSModulePathStatus, sha256: parentPSModulePathSha256 },
+      childPSModulePath: { status: "NOT OBSERVED" },
+      resolvedPowerShellExecutable: powerShellExecutablePath === null ? { status: "NOT OBSERVED" } : { status: "RESOLVED", path: powerShellExecutablePath },
+    },
     spawnedAt: { status: "NOT OBSERVED" },
     rootProcessId: { status: "NOT OBSERVED" },
     firstStdoutAt: { status: "NOT OBSERVED" },
@@ -277,6 +311,15 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
       env.PATH = `${trackerBin};${env.PATH ?? ""}`;
     }
     if (pathPrefix !== undefined) env.PATH = `${pathPrefix};${env.PATH ?? ""}`;
+    powerShellExecutablePath = resolvePowerShellExecutable(env);
+    if (modulePathStrategy === "powershell-home-modules") {
+      const modulesPath = join(dirname(powerShellExecutablePath), "Modules");
+      if (!existsSync(modulesPath)) throw new Error(`PowerShell system Modules directory is missing for ${powerShellExecutablePath}`);
+      env.PSModulePath = modulesPath;
+    }
+    if (modulePathStrategy === "powershell-home-modules" && env.PSModulePath !== join(dirname(powerShellExecutablePath), "Modules")) {
+      throw new Error("Child PSModulePath does not match the resolved powershell.exe Modules directory");
+    }
     envReadyAt = { at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - started) };
     if (signal?.aborted) throw new Error("The Vitest test was aborted before starting a PowerShell invocation");
   } catch (error: unknown) {
@@ -361,6 +404,12 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
       },
       environmentPrepared: envReadyAt !== null,
       envReadyAt: observedAt(envReadyAt),
+      moduleEnvironment: {
+        strategy: modulePathStrategy,
+        parentPSModulePath: { status: parentPSModulePathStatus, sha256: parentPSModulePathSha256 },
+        childPSModulePath: env.PSModulePath === undefined ? { status: "NOT_PROVIDED" } : { status: "PROVIDED", path: env.PSModulePath },
+        resolvedPowerShellExecutable: powerShellExecutablePath === null ? { status: "NOT_OBSERVED" } : { status: "RESOLVED", path: powerShellExecutablePath },
+      },
       spawnedAt: observedAt(launchAt),
       rootProcessId: child.pid === undefined ? { status: "NOT OBSERVED" } : { status: "OBSERVED", value: child.pid },
       firstStdoutAt: observedAt(firstStdoutAt),
@@ -430,7 +479,7 @@ async function runPowerShellArguments(scriptPath: string, cwdPath: string, argum
         reject(error);
       } else {
         emitFinal("final-return", { returnedExitCode: closeCode, timedOut });
-        resolve({ diagnosticId: invocationId, exitCode: closeCode, stdout, stderr, npmLog, stdoutBytes, stderrBytes, stdoutPreview, stderrPreview, stdoutEnded, stderrEnded, npmLogBytes, npmLogPreview, npmLogCaptured, npmLogCaptureReason, timedOut });
+        resolve({ diagnosticId: invocationId, exitCode: closeCode, stdout, stderr, npmLog, stdoutBytes, stderrBytes, stdoutPreview, stderrPreview, stdoutEnded, stderrEnded, npmLogBytes, npmLogPreview, npmLogCaptured, npmLogCaptureReason, timedOut, powerShellExecutablePath: powerShellExecutablePath!, modulePathStrategy, parentPSModulePathStatus, parentPSModulePathSha256, childPSModulePath: env.PSModulePath ?? null });
       }
     };
     const waitForClose = () => {
@@ -859,7 +908,10 @@ describe.skipIf(process.platform !== "win32")("test-only PowerShell process clea
   it("terminates a controlled descendant tree before returning a timed-out invocation", { timeout: 10_000 }, async ({ signal }) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-process-tree-cleanup-"));
     const scriptPath = join(root, "wait-tree.ps1");
+    const moduleEnvironmentPath = join(root, "module-environment.txt");
+    const quotedModuleEnvironmentPath = moduleEnvironmentPath.replace(/'/gu, "''");
     await writeFile(scriptPath, [
+      `[System.IO.File]::WriteAllLines('${quotedModuleEnvironmentPath}', [string[]]@([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName, $PSHOME, $env:PSModulePath), [System.Text.UTF8Encoding]::new($false))`,
       "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 60' -PassThru -WindowStyle Hidden",
       'Write-Output "TEST_CHILD_PID=$($child.Id)"',
       "Wait-Process -Id $child.Id",
@@ -871,6 +923,23 @@ describe.skipIf(process.platform !== "win32")("test-only PowerShell process clea
       expect(Number.isInteger(childPid), `${result.stdout}\n${result.stderr}`).toBe(true);
       expect(childPid).toBeGreaterThan(0);
       expect(isProcessRunning(childPid)).toBe(false);
+      const [actualExecutable, actualPowerShellHome, actualPSModulePath] = (await readFile(moduleEnvironmentPath, "utf8")).split(/\r?\n/u);
+      const normalizedPath = (value: string) => value.replace(/[\\/]+$/gu, "").replace(/\//gu, "\\").toLowerCase();
+      expect(actualExecutable).toBeDefined();
+      expect(actualPowerShellHome).toBeDefined();
+      expect(actualPSModulePath).toBeDefined();
+      expect(normalizedPath(actualExecutable!)).toBe(normalizedPath(result.powerShellExecutablePath));
+      expect(normalizedPath(actualPowerShellHome!)).toBe(normalizedPath(dirname(actualExecutable!)));
+      const actualModuleEntries = actualPSModulePath!.split(";").map((entry) => normalizedPath(entry.trim())).filter(Boolean);
+      expect(actualModuleEntries).toContain(normalizedPath(result.childPSModulePath!));
+      console.log(`PR64_NORMAL_POWERSHELL_MODULE_ENV ${JSON.stringify({
+        strategy: result.modulePathStrategy,
+        parentPSModulePath: { status: result.parentPSModulePathStatus, sha256: result.parentPSModulePathSha256 },
+        childProvidedPSModulePath: result.childPSModulePath,
+        childExecutable: actualExecutable,
+        childPSHOME: actualPowerShellHome,
+        childActualPSModulePath: actualPSModulePath,
+      })}`);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1287,11 +1356,13 @@ describe("PR64 minimal PowerShell differential candidate", () => {
       const invocationStartedAt = performance.now();
       let result: ProcessResult;
       try {
-        result = await runPowerShellArguments(join(pairRoot, "direct-control.ps1"), workspacePath, businessArguments, context.signal, marker.binPath, undefined, "pr64-minimal-differential");
+        result = await runPowerShellArguments(join(pairRoot, "direct-control.ps1"), workspacePath, businessArguments, context.signal, marker.binPath, undefined, "pr64-minimal-differential", "legacy-unset");
       } finally {
         invocationMs = Math.round(performance.now() - invocationStartedAt);
       }
       expect(result.timedOut).toBe(false);
+      expect(result.modulePathStrategy).toBe("legacy-unset");
+      expect(result.childPSModulePath).toBeNull();
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim()).toBe(directControlOutput);
       expect(result.stderr).toBe("");
@@ -1386,11 +1457,13 @@ describe("PR64 minimal PowerShell differential candidate", () => {
       const invocationStartedAt = performance.now();
       let result: ProcessResult;
       try {
-        result = await runPowerShellArguments(installedEntry, workspacePath, businessArguments, context.signal, marker.binPath, undefined, "pr64-minimal-differential");
+        result = await runPowerShellArguments(installedEntry, workspacePath, businessArguments, context.signal, marker.binPath, undefined, "pr64-minimal-differential", "legacy-unset");
       } finally {
         invocationMs = Math.round(performance.now() - invocationStartedAt);
       }
       expect(result.timedOut).toBe(false);
+      expect(result.modulePathStrategy).toBe("legacy-unset");
+      expect(result.childPSModulePath).toBeNull();
       expect(result.exitCode).toBe(2);
       expect(result.stdout.trim()).toBe(blockedWrapperOutput);
       expect(result.stderr).toBe("");
@@ -1644,6 +1717,7 @@ describe("PR64 module search path differential", () => {
           invocationMarker.binPath,
           undefined,
           `pr64-module-differential-${localizationCase.name}`,
+          "legacy-unset",
         );
         const helperCallCompletedAtUtc = new Date().toISOString();
 
@@ -1670,6 +1744,9 @@ describe("PR64 module search path differential", () => {
         expect(setupContext.psHome).not.toBe("");
         expect(setupContext.target).not.toBe("");
         expect(setupContext.target.toLowerCase()).toBe(join(setupContext.psHome, "Modules").toLowerCase());
+        expect(result.modulePathStrategy).toBe("legacy-unset");
+        expect(result.childPSModulePath).toBeNull();
+        expect(setupContext.psHome.toLowerCase()).toBe(dirname(result.powerShellExecutablePath).toLowerCase());
         expect(setupContext.after).toBe(localizationCase.setsPsModulePath ? setupContext.target : setupContext.before);
         if (localizationCase.setsPsModulePath) {
           expect(setupContext.after).not.toBe(setupContext.before);
@@ -1725,6 +1802,10 @@ describe("PR64 module search path differential", () => {
           instrumentationNeedleOccurrences: replacements.map(({ label }) => ({ label, count: 1 })),
           processModuleContext: {
             setsPsModulePath: localizationCase.setsPsModulePath,
+            parentProcessPSModulePath: { status: result.parentPSModulePathStatus, sha256: result.parentPSModulePathSha256 },
+            childSpawnPSModulePath: result.childPSModulePath,
+            resolvedPowerShellExecutable: result.powerShellExecutablePath,
+            childObservedPowerShellHome: setupContext.psHome,
             before: setupContext.before,
             after: setupContext.after,
             psHome: setupContext.psHome,
