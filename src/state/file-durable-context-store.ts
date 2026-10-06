@@ -307,9 +307,44 @@ function assertTaskId(taskId: string): void {
   }
 }
 
-function assertNoCredentialLikeFields(value: unknown, targetPath: string, fieldPath: string): void {
+type CredentialScanSchema = "task-state" | "close-candidate";
+
+function isTypedHashMapPath(schema: CredentialScanSchema, schemaPath: readonly string[]): boolean {
+  const paths = schema === "task-state"
+    ? [
+      ["durableContext", "hashes"],
+      ["recoveryPoint", "hashes"],
+      ["recoverySnapshot", "stateManifest", "hashes"],
+      ["recoverySnapshot", "durableArtifacts"],
+      ["closeCandidate", "durableContext", "hashes"],
+    ]
+    : [["durableContext", "hashes"]];
+  return paths.some((path) => path.length === schemaPath.length && path.every((segment, index) => segment === schemaPath[index]));
+}
+
+function assertPathKeyedHashes(value: unknown, targetPath: string): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new InvalidTaskStateError(`Invalid path-keyed hash map for target path ${targetPath}`);
+  }
+  for (const [pathKey, digest] of Object.entries(value)) {
+    if (containsSecretShapedValue(pathKey)) {
+      throw new InvalidTaskStateError(`Secret-like path key rejected for target path ${targetPath}: durable context must be redacted`);
+    }
+    if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) {
+      throw new InvalidTaskStateError(`Invalid SHA-256 value in path-keyed hash map for target path ${targetPath}`);
+    }
+  }
+}
+
+function assertNoCredentialLikeFields(
+  value: unknown,
+  targetPath: string,
+  fieldPath: string,
+  schema: CredentialScanSchema,
+  schemaPath: readonly string[] = [],
+): void {
   if (Array.isArray(value)) {
-    value.forEach((item, index) => assertNoCredentialLikeFields(item, targetPath, `${fieldPath}[${index}]`));
+    value.forEach((item, index) => assertNoCredentialLikeFields(item, targetPath, `${fieldPath}[${index}]`, schema, [...schemaPath, "[]"]));
     return;
   }
 
@@ -323,6 +358,11 @@ function assertNoCredentialLikeFields(value: unknown, targetPath: string, fieldP
     return;
   }
 
+  if (isTypedHashMapPath(schema, schemaPath)) {
+    assertPathKeyedHashes(value, targetPath);
+    return;
+  }
+
   for (const [fieldName, fieldValue] of Object.entries(value)) {
     const nestedFieldPath = `${fieldPath}.${fieldName}`;
     if (credentialFieldPattern.test(fieldName)) {
@@ -330,7 +370,7 @@ function assertNoCredentialLikeFields(value: unknown, targetPath: string, fieldP
         `Credential-like field ${nestedFieldPath} rejected for target path ${targetPath}: durable context must be redacted`,
       );
     }
-    assertNoCredentialLikeFields(fieldValue, targetPath, nestedFieldPath);
+    assertNoCredentialLikeFields(fieldValue, targetPath, nestedFieldPath, schema, [...schemaPath, fieldName]);
   }
 }
 
@@ -732,7 +772,7 @@ async function verifyRebasedStagedSuccessor(stagingRoot: string, finalRoot: stri
   if (stateHash === undefined) throw new InvalidTaskStateError(`Rebased successor ${taskId} is missing state hash`);
   const stateContent = await readRequiredContent(taskId, statePath, stateHash);
   const state = parseTaskState(parseJson(stateContent, taskId, statePath), statePath);
-  assertNoCredentialLikeFields(state, statePath, "state");
+  assertNoCredentialLikeFields(state, statePath, "state", "task-state");
   if (createHashForContent(createCanonicalStateContent(state)) !== stateHash
     || state.durableContext === null || JSON.stringify(state.durableContext) !== JSON.stringify(manifest)) {
     throw new InvalidTaskStateError(`Rebased successor ${taskId} state does not match its final-root manifest`);
@@ -986,7 +1026,7 @@ export class FileDurableContextStore implements DurableContextStore {
       throwIntegrityError(taskId, generationManifestPath, manifestHash, "manifest identity mismatch", "generation manifest does not match active manifest");
     }
     const activeState = parseTaskState(parseJson(stateContent, taskId, paths.state), paths.state);
-    assertNoCredentialLikeFields(activeState, paths.state, "state");
+    assertNoCredentialLikeFields(activeState, paths.state, "state", "task-state");
     const observedActiveStateHash = createHashForContent(createCanonicalStateContent(activeState));
     if (observedActiveStateHash !== stateHash) {
       throwIntegrityError(taskId, paths.state, stateHash, observedActiveStateHash, "canonical state hash mismatch");
@@ -994,7 +1034,7 @@ export class FileDurableContextStore implements DurableContextStore {
     const generationStatePath = generationPath(paths, manifest.manifestId, paths.state);
     const generationStateContent = await readRequiredContent(taskId, generationStatePath, stateHash);
     const state = parseTaskState(parseJson(generationStateContent, taskId, generationStatePath), generationStatePath);
-    assertNoCredentialLikeFields(state, paths.state, "state");
+    assertNoCredentialLikeFields(state, paths.state, "state", "task-state");
     const observedStateHash = createHashForContent(createCanonicalStateContent(state));
     if (observedStateHash !== stateHash) {
       throwIntegrityError(taskId, generationStatePath, stateHash, observedStateHash, "canonical state hash mismatch");
@@ -1206,7 +1246,7 @@ export class FileDurableContextStore implements DurableContextStore {
       }
       await this.assertCurrentTaskOwnership(ownedLease);
     }
-    assertNoCredentialLikeFields(state, paths.state, "state");
+    assertNoCredentialLikeFields(state, paths.state, "state", "task-state");
     const validatedState = parseTaskState(state, paths.state);
     await mkdir(paths.taskRoot, { recursive: true });
 
@@ -1297,7 +1337,7 @@ export class FileDurableContextStore implements DurableContextStore {
     }
     await this.assertCurrentTaskOwnership(lease);
     const paths = createSnapshotPaths(this.rootPath, candidate.taskId);
-    assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate");
+    assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate", "close-candidate");
     const validatedCandidate = parseCloseCandidate(candidate, candidate.taskId, paths.closeCandidate);
     assertSafeManifestId(validatedCandidate.durableContext.manifestId, "Close candidate durable manifest id");
     if (validatedCandidate.durableContext.taskId !== validatedCandidate.taskId) {
@@ -1329,7 +1369,7 @@ export class FileDurableContextStore implements DurableContextStore {
       throw new InvalidTaskStateError(`Invalid persisted close candidate for task ${taskId} at ${paths.closeCandidate}: ${reason}`);
     }
     const candidate = parseCloseCandidate(parsedRecord.data.candidate, taskId, paths.closeCandidate);
-    assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate");
+    assertNoCredentialLikeFields(candidate, paths.closeCandidate, "closeCandidate", "close-candidate");
     const observedHash = createHashForContent(createCanonicalCloseCandidateContent(candidate));
     if (observedHash !== parsedRecord.data.hash) {
       throwIntegrityError(taskId, paths.closeCandidate, parsedRecord.data.hash, observedHash, "close candidate content hash mismatch");
@@ -1360,7 +1400,7 @@ export class FileDurableContextStore implements DurableContextStore {
       const artifact = await readRequiredContent(taskId, targetPath, expectedHash);
       if (activePath === paths.state) {
         const state = parseTaskState(parseJson(artifact, taskId, targetPath), targetPath);
-        assertNoCredentialLikeFields(state, targetPath, "state");
+        assertNoCredentialLikeFields(state, targetPath, "state", "task-state");
         const observedStateHash = createHashForContent(createCanonicalStateContent(state));
         if (observedStateHash !== expectedHash) throwIntegrityError(taskId, targetPath, expectedHash, observedStateHash, "canonical generation state hash mismatch");
       } else if (activePath === paths.manifest) {

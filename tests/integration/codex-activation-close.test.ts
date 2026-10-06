@@ -657,7 +657,7 @@ describe("Codex activation close acceptance", { timeout: 20_000 }, () => {
   });
 
   it("fails closed for a multi-word unknown project without throwing", async () => {
-    const fixture = await createActivationFixture("d-ai-codex-project-unknown-words-");
+    const fixture = await createActivationFixture("d-ai-codex-project-unknown-words-U4AUth-");
     try {
       const result = await createCodexActivation(createConfiguredDAIRuntime({
         workspacePath: fixture.repositoryPath,

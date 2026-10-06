@@ -349,6 +349,196 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("round-trips path-keyed SHA-256 maps beneath their exact typed schema fields", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "d-ai-context-U4AUth-path-map-"));
+    const store = new FileDurableContextStore(rootPath);
+    const taskId = "task-path-map-allowlist";
+    const digest = "b".repeat(64);
+    const pathKey = join(rootPath, "ordinary-auth", "authorization.json");
+    const manifest = {
+      manifestId: "00000000-0000-4000-8000-000000000002",
+      taskId,
+      stage: "execute" as const,
+      environment: "work" as const,
+      role: "implementer" as const,
+      durablePaths: [pathKey],
+      hashes: { [pathKey]: digest },
+      recoveryPointId: "recovery-path-map",
+      recordedAt: "2026-08-21T00:00:00.000Z",
+    };
+    const recoveryPoint = {
+      recoveryPointId: "recovery-path-map",
+      taskId,
+      stage: "execute" as const,
+      environment: "work" as const,
+      role: "implementer" as const,
+      durablePaths: [pathKey],
+      hashes: { [pathKey]: digest },
+      restorationInstructions: "Restore the captured state",
+      createdAt: "2026-08-21T00:00:00.000Z",
+    };
+    const snapshot = createRecoverySnapshot(taskId);
+    const state: TaskState = {
+      ...createState(taskId, "Preserve path-keyed hash maps"),
+      recoveryPoint,
+      recoverySnapshot: {
+        ...snapshot,
+        stateManifest: { ...manifest, hashes: { [pathKey]: digest } },
+        durableArtifacts: { [pathKey]: digest },
+      },
+      durableContext: manifest,
+      closeCandidate: {
+        taskId,
+        durableContext: manifest,
+        contextManifest: [pathKey],
+        repositoryPath: rootPath,
+        remote: "origin",
+        ref: "refs/heads/main",
+        commitSha: "c".repeat(40),
+        criticalUnsavedContext: [],
+        recordedAt: "2026-08-21T00:00:00.000Z",
+      },
+    };
+
+    try {
+      const firstManifest = await store.save(state);
+      const reloadedStore = new FileDurableContextStore(rootPath);
+      const recovered = await reloadedStore.load(taskId);
+      expect(recovered).not.toBeNull();
+      expect(recovered?.recoveryPoint?.hashes).toEqual({ [pathKey]: digest });
+      expect(recovered?.recoverySnapshot?.stateManifest.hashes).toEqual({ [pathKey]: digest });
+      expect(recovered?.recoverySnapshot?.durableArtifacts).toEqual({ [pathKey]: digest });
+      expect(recovered?.closeCandidate?.durableContext.hashes).toEqual({ [pathKey]: digest });
+      expect(firstManifest.hashes).toEqual(expect.objectContaining({
+        [join(rootPath, taskId, "state.json")]: expect.stringMatching(/^[a-f0-9]{64}$/),
+        [join(rootPath, taskId, "manifest.json")]: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }));
+      if (recovered === null) throw new Error("Expected recovered task state");
+      if (recovered.durableContext === null) throw new Error("Expected recovered durable context");
+      const rootCandidate = {
+        taskId,
+        durableContext: { ...recovered.durableContext, hashes: { [pathKey]: digest } },
+        contextManifest: [pathKey],
+        repositoryPath: rootPath,
+        remote: "origin",
+        ref: "refs/heads/main",
+        commitSha: "c".repeat(40),
+        criticalUnsavedContext: [],
+        recordedAt: "2026-08-21T00:00:00.000Z",
+      };
+      await reloadedStore.withTaskOwnership(taskId, "work", async (lease) => reloadedStore.saveCloseCandidate(rootCandidate, lease));
+      const recoveredCandidate = await new FileDurableContextStore(rootPath).loadCloseCandidate(taskId);
+      expect(recoveredCandidate?.durableContext.hashes).toEqual({ [pathKey]: digest });
+      const secretCandidatePath = "C:/synthetic/ghp_123456789012345678901234567890/context.json";
+      let candidateRejection: unknown;
+      try {
+        await reloadedStore.withTaskOwnership(taskId, "work", async (lease) => reloadedStore.saveCloseCandidate({
+          ...rootCandidate,
+          durableContext: { ...rootCandidate.durableContext, hashes: { [secretCandidatePath]: digest } },
+        }, lease));
+      } catch (error: unknown) {
+        candidateRejection = error;
+      }
+      expect(candidateRejection).toBeInstanceOf(InvalidTaskStateError);
+      expect(String(candidateRejection)).not.toContain(secretCandidatePath);
+      await expect(new FileDurableContextStore(rootPath).loadCloseCandidate(taskId)).resolves.toEqual(recoveredCandidate);
+      await reloadedStore.withTaskOwnership(taskId, "work", async (lease) => reloadedStore.save(recovered, lease));
+      await expect(new FileDurableContextStore(rootPath).load(taskId)).resolves.toMatchObject({
+        goal: state.goal,
+        constraints: state.constraints,
+        contextManifest: state.contextManifest,
+        recoveryPoint: { hashes: { [pathKey]: digest } },
+        recoverySnapshot: {
+          stateManifest: { hashes: { [pathKey]: digest } },
+          durableArtifacts: { [pathKey]: digest },
+        },
+        closeCandidate: { durableContext: { hashes: { [pathKey]: digest } } },
+      });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects secret-shaped path keys without exposing them or changing the active snapshot", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "d-ai-context-U4AUth-secret-path-"));
+    const store = new FileDurableContextStore(rootPath);
+    const taskId = "task-secret-path-key";
+    const state = {
+      ...createState(taskId, "Keep the current snapshot on rejection"),
+      recoveryPoint: {
+        recoveryPointId: "recovery-secret-path",
+        taskId,
+        stage: "execute" as const,
+        environment: "work" as const,
+        role: "implementer" as const,
+        durablePaths: ["context.json"],
+        hashes: { "context.json": "d".repeat(64) },
+        restorationInstructions: "Restore the captured state",
+        createdAt: "2026-08-21T00:00:00.000Z",
+      },
+    } satisfies TaskState;
+    const secretPath = "C:/synthetic/ghp_123456789012345678901234567890/context.json";
+
+    try {
+      await store.save(state);
+      const statePath = join(rootPath, taskId, "state.json");
+      const beforeState = await readFile(statePath, "utf8");
+      const before = await store.load(taskId);
+      if (before?.recoveryPoint === null || before?.recoveryPoint === undefined) throw new Error("Expected active recovery point");
+      const invalidState: TaskState = {
+        ...before,
+        recoveryPoint: { ...before.recoveryPoint, hashes: { [secretPath]: "e".repeat(64) } },
+      };
+
+      let rejection: unknown;
+      try {
+        await store.withTaskOwnership(taskId, "work", async (lease) => store.save(invalidState, lease));
+      } catch (error: unknown) {
+        rejection = error;
+      }
+      expect(rejection).toBeInstanceOf(InvalidTaskStateError);
+      expect(String(rejection)).not.toContain(secretPath);
+      expect(await readFile(statePath, "utf8")).toBe(beforeState);
+      await expect(store.load(taskId)).resolves.toMatchObject({
+        goal: state.goal,
+        recoveryPoint: before.recoveryPoint,
+        durableContext: before.durableContext,
+      });
+
+      const ordinaryPath = "C:/ordinary-auth/context.json";
+      const malformedInputs = [
+        { ...before, recoveryPoint: { ...before.recoveryPoint, hashes: { [ordinaryPath]: "not-a-digest" } } },
+        { ...before, recoveryPoint: { ...before.recoveryPoint, hashes: { [ordinaryPath]: { nested: "value" } } } },
+        { ...before, recoveryPoint: { ...before.recoveryPoint, unexpectedSibling: true } },
+        { ...before, hashes: { [ordinaryPath]: "f".repeat(64) } },
+        { ...before, "recoveryPoint.hashes": { [ordinaryPath]: "f".repeat(64) } },
+        { ...before, "recoveryPoint/hashes": { [ordinaryPath]: "f".repeat(64) } },
+        { ...before, recoveryPoint: [{ ...before.recoveryPoint, hashes: { [ordinaryPath]: "f".repeat(64) } }] },
+        {
+          ...before,
+          routingDecision: {
+            stage: "execute" as const,
+            environment: "work" as const,
+            role: "implementer" as const,
+            selectedModel: "model",
+            selectedCapabilities: [],
+            reason: "synthetic invalid credential field",
+            overrideSource: "default" as const,
+            authorization: "synthetic-secret",
+          },
+        },
+      ] as unknown as TaskState[];
+      for (const malformed of malformedInputs) {
+        await expect(store.withTaskOwnership(taskId, "work", async (lease) => store.save(malformed, lease)))
+          .rejects.toBeInstanceOf(InvalidTaskStateError);
+        expect(await readFile(statePath, "utf8")).toBe(beforeState);
+      }
+      await expect(store.load(taskId)).resolves.toEqual(before);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true });
+    }
+  });
+
   it("atomically replaces a prior durable snapshot", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);
