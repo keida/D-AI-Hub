@@ -2,9 +2,64 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseCurationPayloadText, readCurationPayload } from "../../src/curation/curation-payload.js";
+import { parseCurationPayloadText, readCurationPayload, readCurationSourceWindow } from "../../src/curation/curation-payload.js";
 
 describe("curation payload seam", () => {
+  it("passes source-window JSON unchanged for authoritative runtime validation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-source-window-file-"));
+    try {
+      const path = join(root, "window.json");
+      const input = { sourceType: "conversation", sourceKey: "selected-window", messages: [{ marker: "m-001", text: "Selected fact." }] };
+      await writeFile(path, JSON.stringify({ version: 1, sourceWindow: input }), "utf8");
+      await expect(readCurationSourceWindow(path)).resolves.toEqual(input);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts exactly 1 MiB and rejects a larger source-window file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-source-window-size-"));
+    try {
+      const path = join(root, "window.json");
+      const text = JSON.stringify({ version: 1, sourceWindow: {} });
+      await writeFile(path, text.padEnd(1024 * 1024, " "));
+      await expect(readCurationSourceWindow(path)).resolves.toEqual({});
+      await writeFile(path, text.padEnd(1024 * 1024 + 1, " "));
+      await expect(readCurationSourceWindow(path)).rejects.toThrow(/1 MiB/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { bytes: Buffer.from([0xc3, 0x28]), reason: /UTF-8/ },
+    { bytes: Buffer.from("{private-input-content"), reason: /JSON/ },
+    { bytes: Buffer.from('{"version":2,"sourceWindow":{}}'), reason: /envelope/ },
+    { bytes: Buffer.from('{"version":1}'), reason: /envelope/ },
+    { bytes: Buffer.from('{"version":1,"sourceWindow":{},"extra":true}'), reason: /envelope/ },
+  ])("rejects malformed source-window bytes or envelopes ($reason)", async ({ bytes, reason }) => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-source-window-invalid-"));
+    try {
+      const path = join(root, "window.json");
+      await writeFile(path, bytes);
+      await expect(readCurationSourceWindow(path)).rejects.toThrow(reason);
+      await expect(readCurationSourceWindow(path)).rejects.not.toThrow(/private-input-content/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("requires an absolute regular source-window file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-source-window-path-"));
+    try {
+      await expect(readCurationSourceWindow("relative.json")).rejects.toThrow(/absolute/);
+      await expect(readCurationSourceWindow(join(root, "missing.json"))).rejects.toThrow(/readable/);
+      await expect(readCurationSourceWindow(root)).rejects.toThrow(/readable file/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("accepts only the versioned structured current-context shape", () => {
     expect(parseCurationPayloadText(JSON.stringify({
       version: 1,
