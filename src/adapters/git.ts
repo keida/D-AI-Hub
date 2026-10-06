@@ -14,6 +14,14 @@ export interface LocalGitState {
   readonly ref: string;
 }
 
+export interface ConfiguredGitRepositoryIdentity {
+  readonly repositoryPath: string;
+  readonly head: string;
+  readonly remote: string;
+  readonly remoteUrl: string;
+  readonly pushUrl: string;
+}
+
 export type GitFailureCategory =
   | "authentication"
   | "permission"
@@ -319,6 +327,30 @@ export async function inspectConfiguredGitRemotes(repositoryPath: string): Promi
   }
   lines.pop();
   return lines.map((remote) => assertRemoteName(remote));
+}
+
+export async function inspectConfiguredGitRepositoryIdentity(repositoryPath: string, remote = "origin"): Promise<ConfiguredGitRepositoryIdentity> {
+  const normalizedRemote = assertRemoteName(remote);
+  const root = await resolveGitRepositoryRoot(repositoryPath);
+  const head = outputValue(await runGitRead(root, ["rev-parse", "--verify", "HEAD^{commit}"], "rev-parse --verify HEAD^{commit}"), "Git HEAD commit");
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(head)) {
+    throw new GitLocalStateError("ambiguous", `Git HEAD is not a full commit object id: ${head}`);
+  }
+  await runGitRead(root, ["ls-files", "--stage", "--", ":(top,exclude)**"], "ls-files --stage (index validation)");
+  const remoteUrls = await readGitConfigValues(root, `remote.${normalizedRemote}.url`, "Git remote URL");
+  if (remoteUrls.length !== 1) {
+    throw new GitLocalStateError("ambiguous", `Git remote URL must resolve to exactly one endpoint; observed ${remoteUrls.length}`);
+  }
+  const remoteUrl = remoteUrls[0];
+  if (remoteUrl === undefined) {
+    throw new GitLocalStateError("ambiguous", "Git remote URL did not resolve to an endpoint");
+  }
+  const pushUrls = await readGitConfigValues(root, `remote.${normalizedRemote}.pushurl`, "Git push URL");
+  if (pushUrls.length > 1) {
+    throw new GitLocalStateError("ambiguous", `Git push URL must resolve to at most one endpoint; observed ${pushUrls.length}`);
+  }
+  const pushUrl = await resolveGitEndpoint(root, pushUrls[0] ?? remoteUrl);
+  return { repositoryPath: root, head, remote: normalizedRemote, remoteUrl, pushUrl };
 }
 
 export async function inspectGitRepositoryHealth(repositoryPath: string): Promise<void> {
