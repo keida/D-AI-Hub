@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { redactSensitiveText } from "../../src/adapters/command-runner.js";
 import { TaskOwnershipError } from "../../src/domain/errors.js";
 import type { TaskCharter, TaskState } from "../../src/domain/types.js";
 import { taskCharterContentDigest, taskCharterTaskId } from "../../src/state/task-charter.js";
@@ -189,6 +190,47 @@ describe("project successor file-store election", () => {
       expect(ready.every((event) => event.registration === "registered")).toBe(true);
       for (const handle of handles) handle.child.send({ type: "publish" });
       const results = await Promise.all(handles.map((handle) => waitForEvent(handle, "result")));
+      const observeField = (event: ChildEvent | undefined, field: string, isErrorText = false): Record<string, unknown> => {
+        if (event === undefined || !Object.prototype.hasOwnProperty.call(event, field)) return { status: "NOTOBSERVED" };
+        const value = event[field];
+        if (value === null || value === undefined) return { status: "NOTPROVIDED" };
+        if (typeof value === "string") {
+          if (!isErrorText) return { status: "OBSERVED", value };
+          const redacted = redactSensitiveText(value);
+          const limit = 1024;
+          return {
+            status: "OBSERVED",
+            preview: redacted.slice(0, limit),
+            truncated: redacted.length > limit,
+            originalRedactedLength: redacted.length,
+            retainedRange: { start: 0, endExclusive: Math.min(redacted.length, limit) },
+          };
+        }
+        if (typeof value === "number" || typeof value === "boolean") return { status: "OBSERVED", value };
+        return { status: "NONSCALAR", valueType: typeof value };
+      };
+      const diagnostic = {
+        expectedPublisherCount: 12,
+        actualResultCount: results.length,
+        expectedTaskId: state.taskId,
+        publishers: results.map((event, index) => {
+          const handle = handles[index];
+          const readyEvent = ready[index];
+          return {
+            stableOrdinal: index + 1,
+            currentPID: handle?.child.pid === undefined
+              ? { status: "NOTOBSERVED" }
+              : { status: "OBSERVED", value: handle.child.pid },
+            readyRegistration: observeField(readyEvent, "registration"),
+            outcome: observeField(event, "outcome"),
+            taskId: observeField(event, "taskId"),
+            manifestId: observeField(event, "manifestId"),
+            errorName: observeField(event, "errorName", true),
+            errorMessage: observeField(event, "errorMessage", true),
+          };
+        }),
+      };
+      console.log(`[PR65-SUCCESSOR-DIAGNOSTIC] ${JSON.stringify(diagnostic)}`);
       expect(results.every((event) => event.outcome === "published")).toBe(true);
       expect(new Set(results.map((event) => event.taskId))).toEqual(new Set([state.taskId]));
       const store = new FileDurableContextStore(root);
