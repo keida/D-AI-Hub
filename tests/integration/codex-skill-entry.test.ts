@@ -910,6 +910,23 @@ describe.skipIf(process.platform !== "win32")("test-only PowerShell process clea
     const scriptPath = join(root, "wait-tree.ps1");
     const moduleEnvironmentPath = join(root, "module-environment.txt");
     const quotedModuleEnvironmentPath = moduleEnvironmentPath.replace(/'/gu, "''");
+    const moduleEnvironmentReadLimit = 4 * 1024;
+    const parentPSModulePath = process.env.PSModulePath;
+    const parentPSModulePathStatus = parentPSModulePath === undefined ? "NOT_PROVIDED" : "PROVIDED";
+    const parentPSModulePathSha256 = parentPSModulePath === undefined ? null : createHash("sha256").update(parentPSModulePath, "utf8").digest("hex");
+    let result: ProcessResult | undefined;
+    let invocationOutcome: "RETURNED" | "REJECTED" = "REJECTED";
+    let moduleEnvironmentReadState: "CAPTURED" | "MISSING" | "UNREADABLE" | "MALFORMED" | "PARTIAL" = "MISSING";
+    let moduleEnvironmentFileBytesBeforeRead: number | null = null;
+    let moduleEnvironmentFileBytesAfterRead: number | null = null;
+    let moduleEnvironmentReadBytes: number | null = null;
+    let moduleEnvironmentRetainedBytes: number | null = null;
+    let moduleEnvironmentReadComplete: boolean | null = null;
+    let moduleEnvironmentRecordComplete: boolean | null = null;
+    let moduleEnvironmentTruncated: boolean | null = null;
+    let actualExecutable: string | null = null;
+    let actualPowerShellHome: string | null = null;
+    let actualPSModulePath: string | null = null;
     await writeFile(scriptPath, [
       `[System.IO.File]::WriteAllLines('${quotedModuleEnvironmentPath}', [string[]]@([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName, $PSHOME, $env:PSModulePath), [System.Text.UTF8Encoding]::new($false))`,
       "$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -Command Start-Sleep -Seconds 60' -PassThru -WindowStyle Hidden",
@@ -917,29 +934,119 @@ describe.skipIf(process.platform !== "win32")("test-only PowerShell process clea
       "Wait-Process -Id $child.Id",
     ].join("\r\n"), "utf8");
     try {
-      const result = await runPowerShellArguments(scriptPath, root, [], signal, undefined, 5_000);
+      try {
+        result = await runPowerShellArguments(scriptPath, root, [], signal, undefined, 5_000);
+        invocationOutcome = "RETURNED";
+      } catch (error: unknown) {
+        invocationOutcome = "REJECTED";
+        throw error;
+      } finally {
+        try {
+          const descriptor = openSync(moduleEnvironmentPath, "r");
+          try {
+            moduleEnvironmentFileBytesBeforeRead = fstatSync(descriptor).size;
+            const boundedBuffer = Buffer.alloc(moduleEnvironmentReadLimit + 1);
+            moduleEnvironmentReadBytes = readSync(descriptor, boundedBuffer, 0, boundedBuffer.length, 0);
+            moduleEnvironmentFileBytesAfterRead = fstatSync(descriptor).size;
+            moduleEnvironmentRetainedBytes = Math.min(moduleEnvironmentReadBytes, moduleEnvironmentReadLimit);
+            moduleEnvironmentTruncated = moduleEnvironmentFileBytesBeforeRead > moduleEnvironmentReadLimit
+              || moduleEnvironmentFileBytesAfterRead > moduleEnvironmentReadLimit
+              || moduleEnvironmentReadBytes > moduleEnvironmentReadLimit;
+            moduleEnvironmentReadComplete = !moduleEnvironmentTruncated
+              && moduleEnvironmentFileBytesBeforeRead === moduleEnvironmentFileBytesAfterRead
+              && moduleEnvironmentReadBytes === moduleEnvironmentFileBytesAfterRead;
+
+            if (!moduleEnvironmentReadComplete) {
+              moduleEnvironmentReadState = "PARTIAL";
+              moduleEnvironmentRecordComplete = false;
+            } else {
+              moduleEnvironmentRecordComplete = false;
+              let decodedEnvironment: string | null = null;
+              try {
+                decodedEnvironment = new TextDecoder("utf-8", { fatal: true }).decode(boundedBuffer.subarray(0, moduleEnvironmentRetainedBytes));
+              } catch {
+                moduleEnvironmentReadState = "MALFORMED";
+              }
+              if (decodedEnvironment !== null) {
+                const lines = decodedEnvironment.split(/\r?\n/u);
+                const hasFinalLineTerminator = decodedEnvironment.endsWith("\n");
+                if (hasFinalLineTerminator && lines.at(-1) === "") lines.pop();
+                if (!hasFinalLineTerminator) {
+                  moduleEnvironmentReadState = "MALFORMED";
+                } else if (lines.length !== 3) {
+                  moduleEnvironmentReadState = "MALFORMED";
+                } else {
+                  actualExecutable = lines[0] ?? null;
+                  actualPowerShellHome = lines[1] ?? null;
+                  actualPSModulePath = lines[2] ?? null;
+                  if (lines.some((line) => line.trim().length === 0)) {
+                    moduleEnvironmentReadState = "MALFORMED";
+                  } else {
+                    moduleEnvironmentReadState = "CAPTURED";
+                    moduleEnvironmentRecordComplete = true;
+                  }
+                }
+              }
+            }
+          } finally {
+            closeSync(descriptor);
+          }
+        } catch (error: unknown) {
+          moduleEnvironmentReadState = (error as NodeJS.ErrnoException).code === "ENOENT" ? "MISSING" : "UNREADABLE";
+        }
+
+        try {
+          console.log(`PR64_NORMAL_POWERSHELL_MODULE_ENV ${JSON.stringify({
+            test: "controlled descendant timeout cleanup",
+            policy: "powershell-home-modules; verify executable, PSHOME, and supplied Modules entry",
+            invocation: {
+              outcome: invocationOutcome,
+              returned: result !== undefined,
+              rejected: invocationOutcome === "REJECTED",
+              diagnosticId: result === undefined ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: result.diagnosticId },
+              exitCode: result === undefined ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: result.exitCode },
+              timedOut: result === undefined ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: result.timedOut },
+              signalAborted: signal.aborted,
+            },
+            parentPSModulePath: { status: parentPSModulePathStatus, sha256: parentPSModulePathSha256 },
+            childProvidedModulesPath: result === undefined
+              ? { status: "NOT_OBSERVED" }
+              : result.childPSModulePath === null
+                ? { status: "NOT_PROVIDED" }
+                : { status: "PROVIDED", path: result.childPSModulePath },
+            moduleEnvironmentFile: {
+              readState: moduleEnvironmentReadState,
+              fileBytesBeforeRead: moduleEnvironmentFileBytesBeforeRead === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentFileBytesBeforeRead },
+              fileBytesAfterRead: moduleEnvironmentFileBytesAfterRead === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentFileBytesAfterRead },
+              readBytes: moduleEnvironmentReadBytes === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentReadBytes },
+              retainedBytes: moduleEnvironmentRetainedBytes === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentRetainedBytes },
+              allFileBytesRead: moduleEnvironmentReadComplete === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentReadComplete },
+              recordComplete: moduleEnvironmentRecordComplete === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentRecordComplete },
+              truncated: moduleEnvironmentTruncated === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: moduleEnvironmentTruncated },
+              executable: actualExecutable === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", path: actualExecutable },
+              powerShellHome: actualPowerShellHome === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", path: actualPowerShellHome },
+              actualPSModulePath: actualPSModulePath === null ? { status: "NOT_OBSERVED" } : { status: "OBSERVED", value: actualPSModulePath },
+            },
+          })}`);
+        } catch {
+          // Evidence output must not replace an invocation or cleanup error.
+        }
+      }
+      if (result === undefined) throw new Error("PowerShell helper returned without a process result");
       expect(result.timedOut).toBe(true);
       const childPid = Number(result.stdout.match(/TEST_CHILD_PID=(\d+)/u)?.[1]);
       expect(Number.isInteger(childPid), `${result.stdout}\n${result.stderr}`).toBe(true);
       expect(childPid).toBeGreaterThan(0);
       expect(isProcessRunning(childPid)).toBe(false);
-      const [actualExecutable, actualPowerShellHome, actualPSModulePath] = (await readFile(moduleEnvironmentPath, "utf8")).split(/\r?\n/u);
+      expect(moduleEnvironmentReadState).toBe("CAPTURED");
       const normalizedPath = (value: string) => value.replace(/[\\/]+$/gu, "").replace(/\//gu, "\\").toLowerCase();
-      expect(actualExecutable).toBeDefined();
-      expect(actualPowerShellHome).toBeDefined();
-      expect(actualPSModulePath).toBeDefined();
+      expect(actualExecutable).not.toBeNull();
+      expect(actualPowerShellHome).not.toBeNull();
+      expect(actualPSModulePath).not.toBeNull();
       expect(normalizedPath(actualExecutable!)).toBe(normalizedPath(result.powerShellExecutablePath));
       expect(normalizedPath(actualPowerShellHome!)).toBe(normalizedPath(dirname(actualExecutable!)));
       const actualModuleEntries = actualPSModulePath!.split(";").map((entry) => normalizedPath(entry.trim())).filter(Boolean);
       expect(actualModuleEntries).toContain(normalizedPath(result.childPSModulePath!));
-      console.log(`PR64_NORMAL_POWERSHELL_MODULE_ENV ${JSON.stringify({
-        strategy: result.modulePathStrategy,
-        parentPSModulePath: { status: result.parentPSModulePathStatus, sha256: result.parentPSModulePathSha256 },
-        childProvidedPSModulePath: result.childPSModulePath,
-        childExecutable: actualExecutable,
-        childPSHOME: actualPowerShellHome,
-        childActualPSModulePath: actualPSModulePath,
-      })}`);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
