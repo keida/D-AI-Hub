@@ -3,9 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { InvalidTaskStateError, TaskOwnershipError } from "../../src/domain/errors.js";
-import type { RecoverySnapshot, TaskState } from "../../src/domain/types.js";
+import type { RecoverySnapshot, TaskCharter, TaskState } from "../../src/domain/types.js";
 import type { TaskOwnershipTransition } from "../../src/state/durable-context-store.js";
 import { FILE_DURABLE_CONTEXT_LEASE_MS, FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
+import { taskCharterContentDigest, taskCharterTaskId } from "../../src/state/task-charter.js";
 
 function createState(taskId: string, goal: string): TaskState {
   return {
@@ -24,6 +25,47 @@ function createState(taskId: string, goal: string): TaskState {
     approvalState: "not-required",
     criticalUnsavedContext: [],
     durableContext: null,
+  };
+}
+
+const initialProjectIdentity = "remote-repository:github.com/example/initial-store-fixture";
+
+function createRepositoryState(taskId: string, goal: string, stage: TaskState["stage"] = "bootstrap"): TaskState {
+  return {
+    ...createState(taskId, goal),
+    environment: "codex",
+    stage,
+    contextManifest: [
+      `identity:workspace:C:/synthetic/workspace:${"1".repeat(64)}`,
+      `identity:repository:C:/synthetic/repository:${"2".repeat(64)}`,
+      initialProjectIdentity,
+    ],
+  };
+}
+
+function approvedCharter(projectIdentity: string, objective: string): TaskCharter {
+  const content = {
+    schemaVersion: 1 as const,
+    charterId: "initial-store-fixture",
+    charterVersion: "1",
+    projectIdentity,
+    objective,
+    ownedScope: ["one synthetic project task"],
+    excludedScope: ["other synthetic projects"],
+    completionCriteria: ["the task is durably stored"],
+    terminationCondition: "Stop after the store lifecycle check.",
+    initialNextAction: "Inspect the synthetic project.",
+  };
+  return {
+    ...content,
+    approval: {
+      confirmation: "I_APPROVE_THIS_TASK_CHARTER",
+      approvedBy: "synthetic-store-operator",
+      approvedAt: "2026-10-07T00:00:00.000Z",
+      approvalReference: "synthetic approval",
+      projectIdentity,
+      approvedCharterDigest: taskCharterContentDigest(content),
+    },
   };
 }
 
@@ -80,6 +122,252 @@ async function latestOwnershipGenerationPath(rootPath: string, taskId: string): 
 }
 
 describe("FileDurableContextStore", () => {
+  it("admits one ordinary initial project task and does not poison a later charter successor", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const initial = createRepositoryState(`task-${"a".repeat(24)}`, "establish the synthetic project");
+    try {
+      const manifest = await store.createInitialProjectTaskIfEmpty!(initial, initialProjectIdentity);
+      expect(manifest?.taskId).toBe(initial.taskId);
+      const generationsPath = join(rootPath, initial.taskId, "generations");
+      const generations = (await readdir(generationsPath, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+      expect(generations.length).toBeGreaterThan(0);
+      for (const generation of generations) {
+        const generationManifest = await store.loadGenerationManifest!(initial.taskId, generation.name);
+        expect(generationManifest.manifestId).toBe(generation.name);
+        expect(generationManifest.durablePaths).toContain(join(rootPath, initial.taskId, "state.json"));
+      }
+      expect(await store.createInitialProjectTaskIfEmpty!(initial, initialProjectIdentity)).toEqual(manifest);
+      expect(await store.hasProjectSuccessorConflict(initialProjectIdentity)).toBe(false);
+      await store.withTaskOwnership!(initial.taskId, "codex", async (_lease, transfer) => {
+        const targetLease = await transfer("work");
+        await store.save({ ...initial, environment: "work", durableContext: null }, targetLease);
+      });
+      const transferred = await store.load(initial.taskId);
+      if (transferred === null) throw new Error("Ordinary task disappeared after authorized ownership transfer");
+      expect(await store.hasProjectSuccessorConflict(initialProjectIdentity)).toBe(false);
+      const frozenInitial = { ...transferred, routingDisposition: "LEGACY_FROZEN" as const, durableContext: null };
+      await store.withTaskOwnership!(initial.taskId, "work", async (lease) => { await store.save(frozenInitial, lease); });
+
+      const charter = approvedCharter(initialProjectIdentity, "approved successor after legacy freeze");
+      const digest = taskCharterContentDigest(charter);
+      const successor = {
+        ...createRepositoryState(taskCharterTaskId(initialProjectIdentity, digest), charter.objective),
+        routingDisposition: "ROUTABLE" as const,
+        taskCharter: charter,
+        taskCharterConfirmation: {
+          confirmationId: "00000000-0000-4000-8000-000000000001",
+          confirmedAt: "2026-10-07T00:00:00.000Z",
+          projectIdentity: initialProjectIdentity,
+          confirmedCharterDigest: digest,
+          channel: "explicit-task-charter-digest" as const,
+        },
+      };
+      await expect(store.createSuccessorIfAbsent!(successor, initialProjectIdentity, digest)).resolves.toMatchObject({ taskId: successor.taskId });
+      expect(await store.hasProjectSuccessorConflict(initialProjectIdentity)).toBe(false);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("does not reclassify a closed same-id charter task as a first registration", async () => {
+    const rootPath = await createStoreRoot();
+    const store = new FileDurableContextStore(rootPath);
+    const charter = approvedCharter(initialProjectIdentity, "closed initial charter task");
+    const digest = taskCharterContentDigest(charter);
+    const proposed: TaskState = {
+      ...createRepositoryState(taskCharterTaskId(initialProjectIdentity, digest), charter.objective),
+      routingDisposition: "ROUTABLE",
+      taskCharter: charter,
+      taskCharterConfirmation: {
+        confirmationId: "00000000-0000-4000-8000-000000000003",
+        confirmedAt: "2026-10-07T00:00:00.000Z",
+        projectIdentity: initialProjectIdentity,
+        confirmedCharterDigest: digest,
+        channel: "explicit-task-charter-digest",
+      },
+    };
+    try {
+      await store.createInitialProjectTaskIfEmpty!(proposed, initialProjectIdentity);
+      const initial = await store.load(proposed.taskId);
+      if (initial === null) throw new Error("Initial charter task was not persisted");
+      await store.withTaskOwnership!(initial.taskId, initial.environment, async (lease) => {
+        await store.save({ ...initial, stage: "close", durableContext: null }, lease);
+      });
+      const closedBytes = await readFile(join(rootPath, proposed.taskId, "state.json"));
+
+      await expect(store.createInitialProjectTaskIfEmpty!(proposed, initialProjectIdentity)).resolves.toBeNull();
+      expect(await readFile(join(rootPath, proposed.taskId, "state.json"))).toEqual(closedBytes);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("records competing workspace ownership instead of publishing a second initial task", async () => {
+    const rootPath = await createStoreRoot();
+    let released!: () => void;
+    let registered = 0;
+    const bothRegistered = new Promise<void>((resolvePromise) => { released = resolvePromise; });
+    const afterProjectContenderRegistered = async (): Promise<void> => {
+      registered += 1;
+      if (registered === 2) released();
+      await bothRegistered;
+    };
+    const first = new FileDurableContextStore(rootPath, { afterProjectContenderRegistered });
+    const second = new FileDurableContextStore(rootPath, { afterProjectContenderRegistered });
+    const firstState = createRepositoryState(`task-${"f".repeat(24)}`, "workspace A initial task");
+    const secondState: TaskState = {
+      ...createRepositoryState(`task-${"9".repeat(24)}`, "workspace B initial task"),
+      contextManifest: createRepositoryState(`task-${"9".repeat(24)}`, "workspace B initial task").contextManifest.map((entry) =>
+        entry.startsWith("identity:workspace:") ? `identity:workspace:C:/other-workspace:${"3".repeat(64)}` : entry),
+    };
+    try {
+      const attempts = await Promise.allSettled([
+        first.createInitialProjectTaskIfEmpty!(firstState, initialProjectIdentity),
+        second.createInitialProjectTaskIfEmpty!(secondState, initialProjectIdentity),
+      ]);
+      expect(attempts.every((attempt) => attempt.status === "rejected" && attempt.reason instanceof TaskOwnershipError)).toBe(true);
+      expect(await first.hasProjectSuccessorConflict(initialProjectIdentity)).toBe(true);
+      expect((await readdir(rootPath)).filter((entry) => /^task-[a-f0-9]{24}$/u.test(entry))).toEqual([]);
+    } finally {
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it.each([
+    { label: "same charter and task id with a different environment", variant: "environment" },
+    { label: "same charter and task id with a different workspace", variant: "workspace" },
+    { label: "different charter content with the same owner", variant: "charter" },
+  ] as const)("fences $label during initial registration", async ({ variant }) => {
+    const rootPath = await createStoreRoot();
+    let preflightCount = 0;
+    let registrationCount = 0;
+    let releasePreflight!: () => void;
+    let releaseRegistration!: () => void;
+    const bothPreflight = new Promise<void>((resolvePromise) => { releasePreflight = resolvePromise; });
+    const bothRegistered = new Promise<void>((resolvePromise) => { releaseRegistration = resolvePromise; });
+    const hooks = {
+      beforeProjectContenderRegistered: async (): Promise<void> => {
+        preflightCount += 1;
+        if (preflightCount === 2) releasePreflight();
+        await bothPreflight;
+      },
+      afterProjectContenderRegistered: async (): Promise<void> => {
+        registrationCount += 1;
+        if (registrationCount === 2) releaseRegistration();
+        await bothRegistered;
+      },
+    };
+    const firstStore = new FileDurableContextStore(rootPath, hooks);
+    const secondStore = new FileDurableContextStore(rootPath, hooks);
+    const firstCharter = approvedCharter(initialProjectIdentity, "same approved initial charter");
+    const competingCharter = variant === "charter"
+      ? approvedCharter(initialProjectIdentity, "different competing charter content")
+      : firstCharter;
+    const toState = (taskCharter: TaskCharter, environment: TaskState["environment"], workspacePath: string): TaskState => {
+      const digest = taskCharterContentDigest(taskCharter);
+      const taskId = taskCharterTaskId(initialProjectIdentity, digest);
+      const base = createRepositoryState(taskId, taskCharter.objective);
+      return {
+        ...base,
+        environment,
+        contextManifest: base.contextManifest.map((entry) => entry.startsWith("identity:workspace:")
+          ? `identity:workspace:${workspacePath}:${"3".repeat(64)}`
+          : entry),
+        routingDisposition: "ROUTABLE",
+        taskCharter,
+        taskCharterConfirmation: {
+          confirmationId: "00000000-0000-4000-8000-000000000010",
+          confirmedAt: "2026-10-07T00:00:00.000Z",
+          projectIdentity: initialProjectIdentity,
+          confirmedCharterDigest: digest,
+          channel: "explicit-task-charter-digest",
+        },
+      };
+    };
+    const firstState = toState(firstCharter, "codex", "C:/synthetic/workspace");
+    const secondState = variant === "environment"
+      ? toState(firstCharter, "work", "C:/synthetic/workspace")
+      : variant === "workspace"
+        ? toState(firstCharter, "codex", "C:/other-synthetic/workspace")
+        : toState(competingCharter, "codex", "C:/synthetic/workspace");
+    try {
+      if (variant !== "charter") expect(secondState.taskId).toBe(firstState.taskId);
+      else expect(secondState.taskId).not.toBe(firstState.taskId);
+
+      const attempts = await Promise.allSettled([
+        firstStore.createInitialProjectTaskIfEmpty!(firstState, initialProjectIdentity),
+        secondStore.createInitialProjectTaskIfEmpty!(secondState, initialProjectIdentity),
+      ]);
+      expect(attempts.every((attempt) => attempt.status === "rejected" && attempt.reason instanceof TaskOwnershipError)).toBe(true);
+      expect(await firstStore.hasProjectSuccessorConflict(initialProjectIdentity)).toBe(true);
+      expect((await readdir(rootPath)).filter((entry) => /^task-[a-f0-9]{24}$/u.test(entry))).toEqual([]);
+    } finally {
+      releasePreflight();
+      releaseRegistration();
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("does not treat another project's contender-only root as verified history", async () => {
+    const rootPath = await createStoreRoot();
+    const otherProjectIdentity = "remote-repository:github.com/example/other-initial-store-fixture";
+    let registered!: () => void;
+    let release!: () => void;
+    const contenderReady = new Promise<void>((resolvePromise) => { registered = resolvePromise; });
+    const continueFirst = new Promise<void>((resolvePromise) => { release = resolvePromise; });
+    const firstStore = new FileDurableContextStore(rootPath, {
+      afterProjectContenderRegistered: async () => {
+        registered();
+        await continueFirst;
+      },
+    });
+    const otherStore = new FileDurableContextStore(rootPath);
+    const firstState = createRepositoryState(`task-${"e".repeat(24)}`, "first project contender");
+    const otherState = {
+      ...createRepositoryState(`task-${"1".repeat(24)}`, "other project ordinary task"),
+      contextManifest: createRepositoryState(`task-${"1".repeat(24)}`, "other project ordinary task").contextManifest
+        .map((entry) => entry === initialProjectIdentity ? otherProjectIdentity : entry),
+    };
+    try {
+      const firstAttempt = firstStore.createInitialProjectTaskIfEmpty!(firstState, initialProjectIdentity);
+      await contenderReady;
+
+      await expect(otherStore.createInitialProjectTaskIfEmpty!(otherState, otherProjectIdentity))
+        .rejects.toThrow(/without verified durable task history/u);
+      expect(await otherStore.load(otherState.taskId)).toBeNull();
+
+      release();
+      await expect(firstAttempt).resolves.toMatchObject({ taskId: firstState.taskId });
+    } finally {
+      release();
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("never treats closed, in-progress, corrupt, or unknown durable-root history as empty", async () => {
+    const closedRoot = await createStoreRoot();
+    const closedStore = new FileDurableContextStore(closedRoot);
+    const closed = createRepositoryState(`task-${"b".repeat(24)}`, "closed synthetic project", "close");
+    const candidate = createRepositoryState(`task-${"c".repeat(24)}`, "new synthetic project intent");
+    const rootsToCheck = [closedRoot, await createStoreRoot(), await createStoreRoot(), await createStoreRoot()];
+    try {
+      await closedStore.save(closed);
+      await mkdir(join(rootsToCheck[1]!, ".successor-staging-in-progress"), { recursive: true });
+      await mkdir(join(rootsToCheck[2]!, `task-${"d".repeat(24)}`), { recursive: true });
+      await writeFile(join(rootsToCheck[2]!, `task-${"d".repeat(24)}`, "state.json"), "{corrupt", "utf8");
+      await writeFile(join(rootsToCheck[3]!, "unknown-history.bin"), "synthetic", "utf8");
+
+      await expect(closedStore.createInitialProjectTaskIfEmpty!(candidate, initialProjectIdentity)).resolves.toBeNull();
+      await expect(new FileDurableContextStore(rootsToCheck[1]!).createInitialProjectTaskIfEmpty!(candidate, initialProjectIdentity)).rejects.toThrow(/in progress/u);
+      await expect(new FileDurableContextStore(rootsToCheck[2]!).createInitialProjectTaskIfEmpty!(candidate, initialProjectIdentity)).rejects.toThrow(/missing|invalid|corrupt|manifest/u);
+      await expect(new FileDurableContextStore(rootsToCheck[3]!).createInitialProjectTaskIfEmpty!(candidate, initialProjectIdentity)).rejects.toThrow(/Unknown durable task root entry/u);
+      expect(await closedStore.load(candidate.taskId)).toBeNull();
+    } finally {
+      await Promise.all(rootsToCheck.map((rootPath) => rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 })));
+    }
+  });
+
   it("round-trips a validated state with durable content hashes", async () => {
     const rootPath = await createStoreRoot();
     const store = new FileDurableContextStore(rootPath);

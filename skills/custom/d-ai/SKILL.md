@@ -59,6 +59,12 @@ User-facing explicit syntax:
 @D-AI close
 ```
 
+## Approved project charter registration
+
+An approved charter can register the first project task only when the canonical repository identity is verified and the durable task root is genuinely empty. Use the public CLI's `--task-charter-file` and matching `--approve-task-charter <digest>` inputs with an explicit `@D-AI establish` command. For this initial-charter path, existing, closed, corrupt, unknown, or in-progress durable history is not empty and must block initial registration. Ordinary `establish` keeps its existing task-selection behavior for valid history, but cannot bypass a live competing registration or uncertain/in-progress durable state.
+
+Initial registration records a bootstrap task and its approved charter only. It does not claim that facts were curated, recovery is complete, rollover occurred, or project work was completed. For an existing eligible task, preserve the established reuse and conflict rules; a new successor remains available only through the existing legacy-frozen project path and an approved charter.
+
 `--task <task-id>` is an explicit Codex option for ambiguity resolution or recovery, not the normal user-facing command. Unconfigured Chat, Work, Codex, recovery, Git, or GitHub capabilities remain `BLOCKED`.
 
 Delivery is a thin visible orchestration seam. It may read context, prepare a workspace, implement, run focused verification, typecheck, and build a local review packet. Publication, CI, and release steps occur only for an explicit milestone/publication request with authority; commit, push, and PR creation never receive implicit authorization. It never merges, auto-merges, force-pushes, deletes, resets, cleans, or performs destructive rollback. The delivery result must report stage timings and keep review/merge as a separate decision.
