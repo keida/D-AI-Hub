@@ -6,20 +6,59 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { redactSensitiveText, runCommand, terminateProcessTree, type ProcessGroupInspection } from "../../src/adapters/command-runner.js";
 
-function processIsRunning(pid: number): boolean {
+function processIsRunning(pid: number, observe?: (observation: { queryCode: string; linuxProcState: string }) => void): boolean {
   try {
     process.kill(pid, 0);
     if (process.platform === "linux") {
       try {
-        return !/\)\s+Z\s/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const isZombie = /\)\s+Z\s/.test(stat);
+        observe?.({ queryCode: "SUCCESS", linuxProcState: isZombie ? "Z" : "RUNNING" });
+        return !isZombie;
       } catch {
+        observe?.({ queryCode: "SUCCESS", linuxProcState: "UNKNOWN" });
         return true;
       }
     }
+    observe?.({ queryCode: "SUCCESS", linuxProcState: "NOT_APPLICABLE" });
     return true;
-  } catch {
+  } catch (error: unknown) {
+    const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+      ? error.code
+      : "UNKNOWN";
+    observe?.({ queryCode: code, linuxProcState: "NOT_APPLICABLE" });
     return false;
   }
+}
+
+function captureDiagnosticStream(value: string | undefined): {
+  state: "CAPTURED" | "CAPTURED_EMPTY" | "NOT_CAPTURED";
+  text: string | null;
+  originalUtf8Bytes: number | null;
+  redactedUtf8Bytes: number | null;
+  truncated: boolean;
+} {
+  if (value === undefined) {
+    return { state: "NOT_CAPTURED", text: null, originalUtf8Bytes: null, redactedUtf8Bytes: null, truncated: false };
+  }
+  const redacted = redactSensitiveText(value);
+  const originalUtf8Bytes = Buffer.byteLength(value, "utf8");
+  const redactedUtf8Bytes = Buffer.byteLength(redacted, "utf8");
+  let text = "";
+  let capturedUtf8Bytes = 0;
+  for (const character of redacted) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (capturedUtf8Bytes + characterBytes > 256) break;
+    text += character;
+    capturedUtf8Bytes += characterBytes;
+  }
+  return {
+    state: value.length === 0 ? "CAPTURED_EMPTY" : "CAPTURED",
+    text,
+    originalUtf8Bytes,
+    redactedUtf8Bytes,
+    truncated: capturedUtf8Bytes < redactedUtf8Bytes,
+  };
 }
 
 function terminateFixtureProcess(child: ChildProcess): boolean {
@@ -164,6 +203,55 @@ describe("redactSensitiveText", () => {
   it("terminates a descendant process when a command times out", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-command-timeout-"));
     const pidPath = join(root, "descendant.pid");
+    const startedAt = performance.now();
+    const diagnostic = {
+      rootPid: null as number | null,
+      terminator: {
+        entryMs: null as number | null,
+        completionMs: null as number | null,
+        outcome: "NOT_CALLED" as "NOT_CALLED" | "TRUE" | "FALSE" | "THREW",
+        thrownName: null as string | null,
+        exitEvent: "NOT OBSERVED" as "NOT OBSERVED" | { code: number | null; signal: NodeJS.Signals | null },
+        closeEvent: "NOT OBSERVED" as "NOT OBSERVED" | { code: number | null; signal: NodeJS.Signals | null },
+      },
+      commandResult: {
+        state: "NOT_OBSERVED" as "NOT_OBSERVED" | "OBSERVED",
+        errorName: null as string | null,
+        exitCodeState: "NOT_OBSERVED" as "NOT_OBSERVED" | "OBSERVED",
+        exitCode: null as number | null,
+        timeoutMarker: null as boolean | null,
+        cleanupFailureMarker: null as boolean | null,
+      },
+      stdout: captureDiagnosticStream(undefined),
+      stderr: captureDiagnosticStream(undefined),
+      descendant: {
+        pid: null as number | null,
+        pidFileRead: "NOT_OBSERVED" as "NOT_OBSERVED" | "CAPTURED",
+        pidFileValue: null as string | null,
+        running: null as boolean | null,
+        queryCode: "NOT_OBSERVED",
+        linuxProcState: "NOT_OBSERVED",
+        verifiedGone: false,
+      },
+    };
+    const fallback = {
+      pidFile: "NOT_READ" as "NOT_READ" | "READ" | "READ_ERROR",
+      descendantPid: null as number | null,
+      attempt: "NOT_STARTED" as "NOT_STARTED" | "NOT_NEEDED" | "KILL_REQUESTED" | "QUERY_UNKNOWN" | "ERROR",
+      queryCode: "NOT_OBSERVED",
+      errorName: null as string | null,
+      outputErrorName: null as string | null,
+      rootAttempt: "NOT_NEEDED" as "NOT_NEEDED" | "NOT_ATTEMPTED_UNKNOWN" | "TRUE" | "FALSE" | "ERROR",
+      rootCleanupErrorName: null as string | null,
+      rootCleanupResult: null as boolean | null,
+      residual: {
+        root: { state: "NOT_OBSERVED" as string, queryCode: "NOT_OBSERVED", linuxProcState: "NOT_OBSERVED" },
+        descendant: { state: "NOT_OBSERVED" as string, queryCode: "NOT_OBSERVED", linuxProcState: "NOT_OBSERVED" },
+      },
+    };
+    let hasOriginalFailure = false;
+    let originalFailure: unknown;
+    let fixtureRoot: ChildProcess | undefined;
     const script = [
       "const { spawn } = require('node:child_process');",
       "const { writeFileSync } = require('node:fs');",
@@ -172,16 +260,81 @@ describe("redactSensitiveText", () => {
       "setInterval(() => {}, 1000);",
     ].join(" ");
     try {
-      await expect(runCommand({
+      const commandPromise = runCommand({
         command: process.execPath,
         arguments: ["-e", script, pidPath],
         cwd: null,
         timeoutMs: 1_000,
-      })).rejects.toMatchObject({ result: expect.objectContaining({ exitCode: null }) });
+        terminateProcessTree: async (child, options) => {
+          fixtureRoot = child;
+          diagnostic.rootPid = child.pid ?? null;
+          diagnostic.terminator.entryMs = Number((performance.now() - startedAt).toFixed(3));
+          child.once("exit", (code, signal) => {
+            diagnostic.terminator.exitEvent = { code, signal };
+          });
+          child.once("close", (code, signal) => {
+            diagnostic.terminator.closeEvent = { code, signal };
+          });
+          try {
+            const result = await terminateProcessTree(child, options);
+            diagnostic.terminator.completionMs = Number((performance.now() - startedAt).toFixed(3));
+            diagnostic.terminator.outcome = result ? "TRUE" : "FALSE";
+            return result;
+          } catch (error: unknown) {
+            diagnostic.terminator.completionMs = Number((performance.now() - startedAt).toFixed(3));
+            diagnostic.terminator.outcome = "THREW";
+            diagnostic.terminator.thrownName = error instanceof Error ? error.name : typeof error;
+            throw error;
+          }
+        },
+      }).then(
+        (result) => {
+          diagnostic.commandResult.state = "OBSERVED";
+          diagnostic.commandResult.exitCodeState = "OBSERVED";
+          diagnostic.commandResult.exitCode = result.exitCode;
+          diagnostic.commandResult.timeoutMarker = result.stderr.includes("Command timed out");
+          diagnostic.commandResult.cleanupFailureMarker = result.stderr.includes("Process tree cleanup could not be established");
+          diagnostic.stdout = captureDiagnosticStream(result.stdout);
+          diagnostic.stderr = captureDiagnosticStream(result.stderr);
+          return result;
+        },
+        (error: unknown) => {
+          const errorResult = typeof error === "object" && error !== null && "result" in error
+            ? error.result
+            : undefined;
+          const commandResult = typeof errorResult === "object" && errorResult !== null
+            ? errorResult as { stdout?: string; stderr?: string; exitCode?: number | null }
+            : undefined;
+          diagnostic.commandResult.state = commandResult === undefined ? "NOT_OBSERVED" : "OBSERVED";
+          diagnostic.commandResult.errorName = typeof error === "object" && error !== null && "name" in error && typeof error.name === "string"
+            ? error.name
+            : null;
+          diagnostic.commandResult.exitCodeState = commandResult !== undefined && "exitCode" in commandResult
+            ? "OBSERVED"
+            : "NOT_OBSERVED";
+          diagnostic.commandResult.exitCode = diagnostic.commandResult.exitCodeState === "OBSERVED"
+            ? commandResult?.exitCode ?? null
+            : null;
+          diagnostic.commandResult.timeoutMarker = commandResult === undefined || commandResult.stderr === undefined
+            ? null
+            : commandResult.stderr.includes("Command timed out");
+          diagnostic.commandResult.cleanupFailureMarker = commandResult === undefined || commandResult.stderr === undefined
+            ? null
+            : commandResult.stderr.includes("Process tree cleanup could not be established");
+          diagnostic.stdout = captureDiagnosticStream(commandResult?.stdout);
+          diagnostic.stderr = captureDiagnosticStream(commandResult?.stderr);
+          throw error;
+        },
+      );
+      await expect(commandPromise).rejects.toMatchObject({ result: expect.objectContaining({ exitCode: null }) });
       let descendantPid = 0;
       for (let attempt = 0; attempt < 50; attempt += 1) {
         try {
-          descendantPid = Number(await readFile(pidPath, "utf8"));
+          const pidContents = await readFile(pidPath, "utf8");
+          diagnostic.descendant.pidFileRead = "CAPTURED";
+          diagnostic.descendant.pidFileValue = pidContents;
+          descendantPid = Number(pidContents);
+          diagnostic.descendant.pid = descendantPid;
           break;
         } catch {
           await new Promise((resolve) => setTimeout(resolve, 10));
@@ -189,16 +342,120 @@ describe("redactSensitiveText", () => {
       }
       expect(Number.isInteger(descendantPid)).toBe(true);
       expect(descendantPid).toBeGreaterThan(0);
-      expect(processIsRunning(descendantPid)).toBe(false);
+      const descendantRunning = processIsRunning(descendantPid, (observation) => {
+        diagnostic.descendant.queryCode = observation.queryCode;
+        diagnostic.descendant.linuxProcState = observation.linuxProcState;
+      });
+      diagnostic.descendant.running = descendantRunning;
+      diagnostic.descendant.verifiedGone = diagnostic.descendant.queryCode === "ESRCH"
+        || (process.platform === "linux" && diagnostic.descendant.queryCode === "SUCCESS" && diagnostic.descendant.linuxProcState === "Z");
+      expect(descendantRunning).toBe(false);
+      expect(diagnostic.descendant.verifiedGone).toBe(true);
+      expect(diagnostic.terminator.outcome).toBe("TRUE");
+    } catch (error: unknown) {
+      hasOriginalFailure = true;
+      originalFailure = error;
     } finally {
       try {
-        const descendantPid = Number(await readFile(pidPath, "utf8"));
-        if (Number.isInteger(descendantPid) && processIsRunning(descendantPid)) process.kill(descendantPid);
-      } catch {
-        // The command may have terminated before writing its child pid.
+        console.info(`[PR66-COMMAND-CLEANUP-001] ${JSON.stringify(diagnostic)}`);
+      } catch (error: unknown) {
+        fallback.outputErrorName = error instanceof Error ? error.name : typeof error;
+        if (!hasOriginalFailure) {
+          hasOriginalFailure = true;
+          originalFailure = error;
+        }
       }
-      await rm(root, { recursive: true, force: true });
+      let pidContents: string | undefined;
+      try {
+        pidContents = await readFile(pidPath, "utf8");
+        fallback.pidFile = "READ";
+      } catch (error: unknown) {
+        fallback.pidFile = "READ_ERROR";
+        fallback.attempt = "ERROR";
+        fallback.errorName = error instanceof Error ? error.name : typeof error;
+      }
+      if (pidContents !== undefined) {
+        try {
+          const descendantPid = Number(pidContents);
+          fallback.descendantPid = Number.isInteger(descendantPid) && descendantPid > 0 ? descendantPid : null;
+          if (fallback.descendantPid !== null) {
+            const fallbackRunning = processIsRunning(descendantPid, (observation) => {
+              fallback.queryCode = observation.queryCode;
+            });
+            if (fallbackRunning) {
+              process.kill(descendantPid);
+              fallback.attempt = "KILL_REQUESTED";
+            } else if (fallback.queryCode === "ESRCH" || (process.platform === "linux" && fallback.queryCode === "SUCCESS")) {
+              fallback.attempt = "NOT_NEEDED";
+            } else {
+              fallback.attempt = "QUERY_UNKNOWN";
+            }
+          } else {
+            fallback.attempt = "QUERY_UNKNOWN";
+          }
+        } catch (error: unknown) {
+          fallback.attempt = "ERROR";
+          fallback.errorName = error instanceof Error ? error.name : typeof error;
+        }
+      }
+      const observeResidual = (pid: number | null): { state: string; queryCode: string; linuxProcState: string } => {
+        if (pid === null || !Number.isInteger(pid) || pid <= 0) {
+          return { state: "NOT_OBSERVED", queryCode: "NOT_OBSERVED", linuxProcState: "NOT_OBSERVED" };
+        }
+        let queryCode = "NOT_OBSERVED";
+        let linuxProcState = "NOT_OBSERVED";
+        const running = processIsRunning(pid, (observation) => {
+          queryCode = observation.queryCode;
+          linuxProcState = observation.linuxProcState;
+        });
+        const verifiedGone = queryCode === "ESRCH"
+          || (process.platform === "linux" && queryCode === "SUCCESS" && linuxProcState === "Z");
+        return {
+          state: verifiedGone ? "VERIFIED_GONE" : running ? "RUNNING" : "UNKNOWN",
+          queryCode,
+          linuxProcState,
+        };
+      };
+      fallback.residual.root = observeResidual(diagnostic.rootPid);
+      fallback.residual.descendant = observeResidual(fallback.descendantPid ?? diagnostic.descendant.pid);
+      if (fallback.residual.root.state === "RUNNING") {
+        if (fixtureRoot?.pid !== undefined && fixtureRoot.exitCode === null && fixtureRoot.signalCode === null) {
+          try {
+            fallback.rootCleanupResult = terminateFixtureProcess(fixtureRoot);
+            fallback.rootAttempt = fallback.rootCleanupResult ? "TRUE" : "FALSE";
+          } catch (error: unknown) {
+            fallback.rootAttempt = "ERROR";
+            fallback.rootCleanupErrorName = error instanceof Error ? error.name : typeof error;
+          }
+          fallback.residual.root = observeResidual(diagnostic.rootPid);
+        } else {
+          fallback.rootAttempt = "NOT_ATTEMPTED_UNKNOWN";
+        }
+      } else if (fallback.residual.root.state === "UNKNOWN") {
+        fallback.rootAttempt = "NOT_ATTEMPTED_UNKNOWN";
+      }
+      try {
+        console.info(`[PR66-COMMAND-CLEANUP-001-POST] ${JSON.stringify(fallback)}`);
+      } catch (error: unknown) {
+        if (!hasOriginalFailure) {
+          hasOriginalFailure = true;
+          originalFailure = error;
+        }
+      }
+      if (!hasOriginalFailure && (fallback.residual.root.state !== "VERIFIED_GONE" || fallback.residual.descendant.state !== "VERIFIED_GONE")) {
+        hasOriginalFailure = true;
+        originalFailure = new Error("Fixture root or descendant residual state could not be verified gone");
+      }
+      try {
+        await rm(root, { recursive: true, force: true });
+      } catch (error: unknown) {
+        if (!hasOriginalFailure) {
+          hasOriginalFailure = true;
+          originalFailure = error;
+        }
+      }
     }
+    if (hasOriginalFailure) throw originalFailure;
   }, 15_000);
 
   it("fails closed when injected process-tree cleanup cannot establish descendant termination", async () => {
