@@ -125,6 +125,61 @@ function parseCLIResult(exitCode: number, stdout: string, stderr: string): CLIRe
   return { exitCode, response, stdout, stderr };
 }
 
+const explicitApprovalErrorMessage = "Task charter file and explicit --approve-task-charter digest must be supplied together";
+
+function parseSingleCLIErrorLine(stderr: string): Record<string, unknown> {
+  const jsonLines = stderr.split(/\r?\n/u).filter((line) => {
+    const candidate = line.trimStart();
+    if (candidate.startsWith("{")) return true;
+    if (!candidate.startsWith("[")) return false;
+    return !/^\[[A-Z][A-Z0-9_]*\]\s+[A-Za-z]*Warning:/u.test(candidate);
+  });
+  if (jsonLines.length === 0) throw new Error("CLI stderr did not contain a full-line JSON record");
+  if (jsonLines.length !== 1) throw new Error("CLI stderr contains multiple full-line JSON records");
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(jsonLines[0]!); }
+  catch { throw new Error("CLI stderr contains malformed full-line JSON"); }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("CLI error JSON has an unexpected structure");
+  }
+  if (JSON.stringify(parsed) !== jsonLines[0]) throw new Error("CLI stderr JSON record is not compact");
+
+  const response = parsed as Record<string, unknown>;
+  if (response.status !== "blocked" || response.environment !== "codex" || response.message !== explicitApprovalErrorMessage) {
+    throw new Error("CLI error JSON did not match the explicit-approval refusal contract");
+  }
+  return response;
+}
+
+const cliErrorParserCases: readonly { readonly name: string; readonly stderr: string; readonly accepted: boolean }[] = [
+  { name: "one full JSON line without a warning", stderr: `${JSON.stringify({ status: "blocked", environment: "codex", message: explicitApprovalErrorMessage })}\n`, accepted: true },
+  { name: "one full JSON line after raw Node warnings", stderr: `(node:31415) ExperimentalWarning: diagnostic {"status":"warning"}\n[MODULE_TYPELESS_PACKAGE_JSON] Warning: module type is unspecified\n${JSON.stringify({ status: "blocked", environment: "codex", message: explicitApprovalErrorMessage })}\n`, accepted: true },
+  { name: "noncompact full-line JSON", stderr: '{"status": "blocked", "environment": "codex", "message": "Task charter file and explicit --approve-task-charter digest must be supplied together"}\n', accepted: false },
+  { name: "missing JSON record", stderr: "(node:31415) ExperimentalWarning: diagnostic only\n", accepted: false },
+  { name: "malformed full-line JSON", stderr: '{"status":"blocked","environment":}\n', accepted: false },
+  { name: "duplicate full-line JSON records", stderr: `${JSON.stringify({ status: "blocked", environment: "codex", message: explicitApprovalErrorMessage })}\n${JSON.stringify({ status: "blocked", environment: "codex", message: explicitApprovalErrorMessage })}\n`, accepted: false },
+  { name: "standalone JSON array record", stderr: "[]\n", accepted: false },
+  { name: "expected object followed by JSON array record", stderr: `${JSON.stringify({ status: "blocked", environment: "codex", message: explicitApprovalErrorMessage })}\n[]\n`, accepted: false },
+  { name: "expected object followed by malformed JSON object", stderr: `${JSON.stringify({ status: "blocked", environment: "codex", message: explicitApprovalErrorMessage })}\n{"status":}\n`, accepted: false },
+  { name: "wrong JSON structure", stderr: `${JSON.stringify({ status: "blocked", message: explicitApprovalErrorMessage })}\n`, accepted: false },
+  { name: "wrong error message", stderr: `${JSON.stringify({ status: "blocked", environment: "codex", message: "different refusal" })}\n`, accepted: false },
+];
+
+describe("single full-line CLI error parsing", () => {
+  it.each(cliErrorParserCases)("$name", ({ stderr, accepted }) => {
+    if (accepted) {
+      expect(parseSingleCLIErrorLine(stderr)).toMatchObject({
+        status: "blocked",
+        environment: "codex",
+        message: explicitApprovalErrorMessage,
+      });
+    } else {
+      expect(() => parseSingleCLIErrorLine(stderr)).toThrow();
+    }
+  });
+});
+
 function isPathWithin(root: string, path: string): boolean {
   const relativePath = relative(resolve(root), resolve(path));
   return relativePath === "" || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
@@ -266,9 +321,11 @@ describe("approved charter initial registration CLI integration", () => {
         "--task-charter-file", charterPath,
       ], repositoryRoot, isolatedEnvironment);
       expect(missingExplicitApprovalResult.exitCode).toBe(2);
-      expect(JSON.parse(missingExplicitApprovalResult.stdout || missingExplicitApprovalResult.stderr)).toMatchObject({
+      expect(missingExplicitApprovalResult.stdout).toBe("");
+      expect(parseSingleCLIErrorLine(missingExplicitApprovalResult.stderr)).toMatchObject({
         status: "blocked",
-        message: expect.stringContaining("supplied together"),
+        environment: "codex",
+        message: explicitApprovalErrorMessage,
       });
 
       const wrongExplicitApprovalResult = await runProcess(process.execPath, ["--import", "tsx", cliPath,
