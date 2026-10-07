@@ -476,7 +476,6 @@ describe("approved charter initial registration CLI integration", () => {
     const runOrdering = async (ordering: "charter-first" | "ordinary-first", suffix: string) => {
       const scenarioRoot = join(root, ordering);
       const workspaceRoot = join(scenarioRoot, "workspace");
-      const durableRoot = join(workspaceRoot, ".d-ai");
       await mkdir(workspaceRoot, { recursive: true });
       await mkdir(join(workspaceRoot, ".agents", "skills"), { recursive: true });
       const isolatedLocalAppData = join(scenarioRoot, "isolated-localappdata");
@@ -494,6 +493,7 @@ describe("approved charter initial registration CLI integration", () => {
       const defaultMemoryRelative = relative(resolve(scenarioRoot), resolve(defaultMemoryPath));
       expect(defaultMemoryRelative === "" || (!defaultMemoryRelative.startsWith(`..${sep}`)
         && defaultMemoryRelative !== ".." && !isAbsolute(defaultMemoryRelative))).toBe(true);
+      expect(isPathWithin(scenarioRoot, memoryDatabasePath)).toBe(true);
       await runGit(workspaceRoot, "init", "--initial-branch=main");
       await runGit(workspaceRoot, "config", "user.name", "Synthetic Integration");
       await runGit(workspaceRoot, "config", "user.email", "synthetic@example.invalid");
@@ -503,6 +503,8 @@ describe("approved charter initial registration CLI integration", () => {
       const projectIdentity = `remote-repository:github.com/example/atomic-${suffix}`;
       await runGit(workspaceRoot, "remote", "add", "origin", `https://github.com/example/atomic-${suffix}.git`);
       const workspacePath = await realpath(workspaceRoot);
+      const rawDurableRoot = join(workspaceRoot, ".d-ai");
+      const durableRoot = join(workspacePath, ".d-ai");
       const ordinaryStatePath = join(scenarioRoot, "ordinary-state.json");
       const charterStatePath = join(scenarioRoot, "charter-state.json");
       const pausedPath = join(scenarioRoot, "paused");
@@ -603,6 +605,16 @@ describe("approved charter initial registration CLI integration", () => {
         });
         const status = parseCLIResult(statusResult.exitCode, statusResult.stdout, statusResult.stderr);
         const statusReadback = { exitCode: status.exitCode, taskId: status.response.taskId, status: status.response.status, message: status.response.message };
+        const canonicalTaskRoot = join(durableRoot, firstState.taskId);
+        const rawTaskRoot = join(rawDurableRoot, firstState.taskId);
+        const manifestDurablePaths = manifest?.durablePaths ?? [];
+        const manifestHashPaths = manifest === null ? [] : Object.keys(manifest.hashes);
+        const manifestPathsUnderCanonicalTaskRoot = manifest !== null && manifestDurablePaths.length > 0
+          && manifestDurablePaths.every((path) => path.startsWith(`${canonicalTaskRoot}${sep}`));
+        const manifestHashPathsMatchDurablePaths = manifest !== null
+          && JSON.stringify([...manifestHashPaths].sort()) === JSON.stringify([...manifestDurablePaths].sort());
+        const manifestUsesRawPreRealpathRoot = workspaceRoot !== workspacePath
+          && [...manifestDurablePaths, ...manifestHashPaths].some((path) => path === rawTaskRoot || path.startsWith(`${rawTaskRoot}${sep}`));
         const strictReadback = {
           taskId: published?.taskId ?? null,
           manifestId: manifest?.manifestId ?? null,
@@ -612,6 +624,11 @@ describe("approved charter initial registration CLI integration", () => {
           contenderCount: contenders.length,
           noElectionConflict: !await store.hasProjectSuccessorConflict(projectIdentity),
           ownershipReadback,
+          rawCanonicalWorkspaceSpellingSame: workspaceRoot === workspacePath,
+          durableRootUsesCanonicalWorkspace: durableRoot === join(workspacePath, ".d-ai"),
+          manifestPathsUnderCanonicalTaskRoot,
+          manifestHashPathsMatchDurablePaths,
+          manifestUsesRawPreRealpathRoot,
         };
         return { ...outcomes, strictReadback, statusReadback, expectedTaskId: firstState.taskId };
       } finally {
@@ -638,7 +655,22 @@ describe("approved charter initial registration CLI integration", () => {
             originalRedactedLength: redactedMessage.length,
             retainedRange: { start: 0, endExclusive: Math.min(redactedMessage.length, messageLimit) },
           },
+          canonicalPathEvidence: {
+            rawCanonicalWorkspaceSpellingSame: scenario.strictReadback.rawCanonicalWorkspaceSpellingSame,
+            durableRootUsesCanonicalWorkspace: scenario.strictReadback.durableRootUsesCanonicalWorkspace,
+            manifestPathsUnderCanonicalTaskRoot: scenario.strictReadback.manifestPathsUnderCanonicalTaskRoot,
+            manifestHashPathsMatchDurablePaths: scenario.strictReadback.manifestHashPathsMatchDurablePaths,
+            manifestUsesRawPreRealpathRoot: scenario.strictReadback.manifestUsesRawPreRealpathRoot,
+          },
         }));
+      }
+      for (const scenario of [charterFirst, ordinaryFirst]) {
+        expect(scenario.strictReadback).toMatchObject({
+          durableRootUsesCanonicalWorkspace: true,
+          manifestPathsUnderCanonicalTaskRoot: true,
+          manifestHashPathsMatchDurablePaths: true,
+          manifestUsesRawPreRealpathRoot: false,
+        });
       }
       expect({ charterFirst, ordinaryFirst }).toMatchObject({
         charterFirst: {
