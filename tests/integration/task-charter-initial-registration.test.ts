@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -430,18 +430,249 @@ describe("approved charter initial registration CLI integration", () => {
     }
   }, 90_000);
 
+  it("serializes approved initial admission against ordinary createIfAbsent in both cross-process orders", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-initial-admission-race-"));
+    const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+    const cliPath = join(repositoryRoot, "src", "entry", "codex-cli.ts");
+    const storeModuleUrl = new URL("../../src/state/file-durable-context-store.ts", import.meta.url).href;
+    const childScript = `
+      import { access, writeFile } from "node:fs/promises";
+      const { FileDurableContextStore } = await import(${JSON.stringify(storeModuleUrl)});
+      const { TaskOwnershipError } = await import(${JSON.stringify(new URL("../../src/domain/errors.ts", import.meta.url).href)});
+      const { DAI_TEST_ROOT: rootPath, DAI_TEST_STATE: statePath, DAI_TEST_MODE: mode, DAI_TEST_PAUSE_MODE: pauseMode, DAI_TEST_PAUSED: pausedPath, DAI_TEST_RELEASE: releasePath, DAI_TEST_CONTENDED: contendedPath, DAI_TEST_PROJECT: project } = process.env;
+      const pause = async () => {
+        await writeFile(pausedPath, "paused", "utf8");
+        const deadline = Date.now() + 20_000;
+        while (Date.now() < deadline) {
+          try { await access(releasePath); return; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+        }
+        throw new Error("initial-admission test barrier timed out");
+      };
+      const hooks = {
+        afterInitialCompanionsWritten: mode === pauseMode ? pause : undefined,
+        afterRootAdmissionContended: async () => writeFile(contendedPath, "contended", "utf8"),
+      };
+      try {
+        const state = JSON.parse(await (await import("node:fs/promises")).readFile(statePath, "utf8"));
+        const store = new FileDurableContextStore(rootPath, hooks);
+        const manifest = mode === "charter"
+          ? await store.createInitialProjectTaskIfEmpty(state, project)
+          : await store.createIfAbsent(state);
+        process.stdout.write(JSON.stringify({ kind: manifest === null ? "occupied" : "created", taskId: manifest?.taskId ?? null }));
+      } catch (error) {
+        process.stdout.write(JSON.stringify({ kind: "blocked", errorName: error instanceof Error ? error.name : typeof error, expectedContentionError: error instanceof TaskOwnershipError, message: error instanceof Error ? error.message : String(error) }));
+      }
+    `;
+    const waitForFile = async (path: string): Promise<void> => {
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        try { await access(path); return; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+      }
+      throw new Error("Cross-process initial-admission barrier timed out");
+    };
+    const runOrdering = async (ordering: "charter-first" | "ordinary-first", suffix: string) => {
+      const scenarioRoot = join(root, ordering);
+      const workspaceRoot = join(scenarioRoot, "workspace");
+      const durableRoot = join(workspaceRoot, ".d-ai");
+      await mkdir(workspaceRoot, { recursive: true });
+      const isolatedLocalAppData = join(scenarioRoot, "isolated-localappdata");
+      const isolatedXdgDataHome = join(scenarioRoot, "isolated-xdg-data");
+      const isolatedHome = join(scenarioRoot, "isolated-home");
+      const memoryDatabasePath = join(scenarioRoot, "isolated-memory.sqlite");
+      const isolatedMemoryEnvironment = {
+        ...process.env,
+        LOCALAPPDATA: isolatedLocalAppData,
+        XDG_DATA_HOME: isolatedXdgDataHome,
+        HOME: isolatedHome,
+        USERPROFILE: isolatedHome,
+      };
+      const defaultMemoryPath = resolveDefaultMemoryDatabasePath(isolatedMemoryEnvironment);
+      const defaultMemoryRelative = relative(resolve(scenarioRoot), resolve(defaultMemoryPath));
+      expect(defaultMemoryRelative === "" || (!defaultMemoryRelative.startsWith(`..${sep}`)
+        && defaultMemoryRelative !== ".." && !isAbsolute(defaultMemoryRelative))).toBe(true);
+      await runGit(workspaceRoot, "init", "--initial-branch=main");
+      await runGit(workspaceRoot, "config", "user.name", "Synthetic Integration");
+      await runGit(workspaceRoot, "config", "user.email", "synthetic@example.invalid");
+      await writeFile(join(workspaceRoot, "README.md"), "synthetic fixture\n", "utf8");
+      await runGit(workspaceRoot, "add", "README.md");
+      await runGit(workspaceRoot, "commit", "-m", "synthetic fixture");
+      const projectIdentity = `remote-repository:github.com/example/atomic-${suffix}`;
+      await runGit(workspaceRoot, "remote", "add", "origin", `https://github.com/example/atomic-${suffix}.git`);
+      const workspacePath = await realpath(workspaceRoot);
+      const ordinaryStatePath = join(scenarioRoot, "ordinary-state.json");
+      const charterStatePath = join(scenarioRoot, "charter-state.json");
+      const pausedPath = join(scenarioRoot, "paused");
+      const releasePath = join(scenarioRoot, "release");
+      const contendedPath = join(scenarioRoot, "contended");
+      const bindWorkspace = (state: TaskState): TaskState => ({
+        ...state,
+        contextManifest: state.contextManifest.map((entry) => entry.startsWith("identity:workspace:")
+          ? `identity:workspace:${workspacePath}:${"1".repeat(64)}`
+          : entry),
+      });
+      const ordinaryState = bindWorkspace(repositoryTaskState(`task-${suffix[0]!.repeat(24)}`, "ordinary initial task", projectIdentity));
+      const approvedCharter = charter(projectIdentity);
+      const digest = taskCharterContentDigest(approvedCharter);
+      const charterState: TaskState = bindWorkspace({
+        ...repositoryTaskState(taskCharterTaskId(projectIdentity, digest), approvedCharter.objective, projectIdentity),
+        routingDisposition: "ROUTABLE",
+        taskCharter: approvedCharter,
+        taskCharterConfirmation: {
+          confirmationId: `00000000-0000-4000-8000-${suffix[1]!.repeat(12)}`,
+          confirmedAt: "2026-10-07T00:00:00.000Z",
+          projectIdentity,
+          confirmedCharterDigest: digest,
+          channel: "explicit-task-charter-digest",
+        },
+      });
+      await writeFile(ordinaryStatePath, JSON.stringify(ordinaryState), "utf8");
+      await writeFile(charterStatePath, JSON.stringify(charterState), "utf8");
+      const pausedMode = ordering === "charter-first" ? "charter" : "ordinary";
+      const firstMode = pausedMode;
+      const firstStatePath = firstMode === "charter" ? charterStatePath : ordinaryStatePath;
+      const firstPromise = runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
+        ...process.env,
+        LOCALAPPDATA: join(scenarioRoot, "isolated-localappdata"),
+        DAI_TEST_ROOT: durableRoot,
+        DAI_TEST_STATE: firstStatePath,
+        DAI_TEST_MODE: firstMode,
+        DAI_TEST_PAUSE_MODE: pausedMode,
+        DAI_TEST_PAUSED: pausedPath,
+        DAI_TEST_RELEASE: releasePath,
+        DAI_TEST_CONTENDED: contendedPath,
+        DAI_TEST_PROJECT: projectIdentity,
+      });
+      void firstPromise.catch(() => undefined);
+      try {
+        await waitForFile(pausedPath);
+        const secondMode = firstMode === "charter" ? "ordinary" : "charter";
+        const secondStatePath = secondMode === "charter" ? charterStatePath : ordinaryStatePath;
+        const second = await runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
+          ...process.env,
+          LOCALAPPDATA: join(scenarioRoot, "isolated-localappdata"),
+          DAI_TEST_ROOT: durableRoot,
+          DAI_TEST_STATE: secondStatePath,
+          DAI_TEST_MODE: secondMode,
+          DAI_TEST_PAUSE_MODE: pausedMode,
+          DAI_TEST_PAUSED: join(scenarioRoot, "other-paused"),
+          DAI_TEST_RELEASE: join(scenarioRoot, "other-release"),
+          DAI_TEST_CONTENDED: contendedPath,
+          DAI_TEST_PROJECT: projectIdentity,
+        });
+        await writeFile(releasePath, "release", "utf8");
+        const first = await firstPromise;
+        const outcomes = {
+          first: JSON.parse(first.stdout) as { kind: string; taskId: string | null; errorName?: string; expectedContentionError?: boolean; message?: string },
+          second: JSON.parse(second.stdout) as { kind: string; taskId: string | null; errorName?: string; expectedContentionError?: boolean; message?: string },
+          firstExitCode: first.exitCode,
+          secondExitCode: second.exitCode,
+          contended: await access(contendedPath).then(() => true, () => false),
+          taskIds: (await readdir(durableRoot)).filter((entry) => /^task-[a-f0-9]{24}$/u.test(entry)).sort(),
+          electionDirectoryPresent: await access(join(durableRoot, ".project-successor-election")).then(() => true, () => false),
+        };
+        const firstState = firstMode === "charter" ? charterState : ordinaryState;
+        const store = new FileDurableContextStore(durableRoot);
+        const published = await store.load(firstState.taskId);
+        const manifest = published?.durableContext ?? null;
+        const generation = manifest === null ? null : await store.loadGenerationManifest(firstState.taskId, manifest.manifestId);
+        const activeTasks = await store.discoverActiveTasks(workspacePath);
+        const projectKey = createHash("sha256").update(`dai-project-election-v1\n${projectIdentity}`, "utf8").digest("hex");
+        const contenderDirectory = join(durableRoot, ".project-successor-election", projectKey, "contenders");
+        const contenderFiles = await access(contenderDirectory).then(() => readdir(contenderDirectory), () => [] as string[]);
+        const contenders = await Promise.all(contenderFiles.map(async (file) =>
+          JSON.parse(await readFile(join(contenderDirectory, file), "utf8")) as { taskId: string; charterDigest: string; candidateKind?: string }));
+        let ownershipReadback = false;
+        await store.withTaskOwnership!(firstState.taskId, firstState.environment, async (lease) => {
+          const current = await store.load(firstState.taskId);
+          ownershipReadback = lease.taskId === firstState.taskId && lease.environment === firstState.environment
+            && current?.taskId === firstState.taskId;
+        });
+        const statusResult = await runProcess(process.execPath, ["--import", "tsx", cliPath,
+          "--workspace", workspacePath, "--command", "@D-AI status",
+          "--memory-database", memoryDatabasePath,
+        ], repositoryRoot, {
+          ...isolatedMemoryEnvironment,
+          D_AI_GITHUB_EXTERNAL_CREDENTIALS_CONFIGURED: "0",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: join(root, "synthetic-gitconfig"),
+          GIT_TERMINAL_PROMPT: "0",
+        });
+        const status = parseCLIResult(statusResult.exitCode, statusResult.stdout, statusResult.stderr);
+        const statusReadback = { exitCode: status.exitCode, taskId: status.response.taskId, status: status.response.status, message: status.response.message };
+        const strictReadback = {
+          taskId: published?.taskId ?? null,
+          manifestId: manifest?.manifestId ?? null,
+          generationMatches: generation !== null && JSON.stringify(generation) === JSON.stringify(manifest),
+          activeTaskIds: activeTasks.map((task) => task.taskId),
+          contenderTaskIds: contenders.map((contender) => contender.taskId),
+          contenderCount: contenders.length,
+          noElectionConflict: !await store.hasProjectSuccessorConflict(projectIdentity),
+          ownershipReadback,
+        };
+        return { ...outcomes, strictReadback, statusReadback, expectedTaskId: firstState.taskId };
+      } finally {
+        await writeFile(releasePath, "release", "utf8").catch(() => undefined);
+        await firstPromise.catch(() => undefined);
+      }
+    };
+    try {
+      const charterFirst = await runOrdering("charter-first", "a1");
+      const ordinaryFirst = await runOrdering("ordinary-first", "b2");
+      expect({ charterFirst, ordinaryFirst }).toMatchObject({
+        charterFirst: {
+          first: { kind: "created" },
+          second: { kind: "blocked", errorName: "TaskOwnershipError", expectedContentionError: true, message: "Another durable task is being admitted at this root" },
+          firstExitCode: 0,
+          secondExitCode: 0,
+          contended: true,
+          taskIds: [charterFirst.first.taskId],
+          strictReadback: {
+            taskId: charterFirst.expectedTaskId,
+            generationMatches: true,
+            activeTaskIds: [charterFirst.expectedTaskId],
+            contenderTaskIds: [charterFirst.expectedTaskId],
+            contenderCount: 1,
+            noElectionConflict: true,
+            ownershipReadback: true,
+          },
+          statusReadback: { exitCode: 0, taskId: charterFirst.expectedTaskId, status: "accepted" },
+        },
+        ordinaryFirst: {
+          first: { kind: "created" },
+          second: { kind: "blocked", errorName: "TaskOwnershipError", expectedContentionError: true, message: "Another durable task is being admitted at this root" },
+          firstExitCode: 0,
+          secondExitCode: 0,
+          contended: true,
+          taskIds: [ordinaryFirst.first.taskId],
+          electionDirectoryPresent: false,
+          strictReadback: {
+            taskId: ordinaryFirst.expectedTaskId,
+            generationMatches: true,
+            activeTaskIds: [ordinaryFirst.expectedTaskId],
+            contenderTaskIds: [],
+            contenderCount: 0,
+            noElectionConflict: true,
+            ownershipReadback: true,
+          },
+          statusReadback: { exitCode: 0, taskId: ordinaryFirst.expectedTaskId, status: "accepted" },
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  }, 90_000);
+
   it("fences ordinary-establish versus approved-charter admission at the store boundary across independent processes", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-charter-initial-race-"));
     const durableRoot = join(root, "durable");
     const projectIdentity = "remote-repository:github.com/example/initial-race-fixture";
     const operatorStatePath = join(root, "ordinary-state.json");
     const charterStatePath = join(root, "charter-state.json");
-    const preflightA = join(root, "preflight-a");
-    const preflightB = join(root, "preflight-b");
-    const readyA = join(root, "ready-a");
-    const readyB = join(root, "ready-b");
+    const readyPath = join(root, "ordinary-ready");
+    const releasePath = join(root, "ordinary-release");
     const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
     const storeModuleUrl = new URL("../../src/state/file-durable-context-store.ts", import.meta.url).href;
+    let firstPromise: Promise<{ exitCode: number; stdout: string; stderr: string }> | null = null;
     try {
       const ordinary = repositoryTaskState(`task-${"e".repeat(24)}`, "ordinary establish race", projectIdentity);
       const approvedCharter = charter(projectIdentity);
@@ -464,19 +695,18 @@ describe("approved charter initial registration CLI integration", () => {
       const childScript = `
         import { access, readFile, writeFile } from "node:fs/promises";
         const { FileDurableContextStore } = await import(${JSON.stringify(storeModuleUrl)});
-        const { DAI_TEST_ROOT: rootPath, DAI_TEST_STATE: statePath, DAI_TEST_PREFLIGHT: preflightPath, DAI_TEST_OTHER_PREFLIGHT: otherPreflightPath, DAI_TEST_READY: readyPath, DAI_TEST_OTHER_READY: otherReadyPath, DAI_TEST_PROJECT: project } = process.env;
+        const { DAI_TEST_ROOT: rootPath, DAI_TEST_STATE: statePath, DAI_TEST_READY: ready, DAI_TEST_RELEASE: release, DAI_TEST_PAUSE: shouldPause, DAI_TEST_PROJECT: project } = process.env;
         const state = JSON.parse(await readFile(statePath, "utf8"));
-        const waitForPeer = async (ownPath, peerPath, phase) => {
-          await writeFile(ownPath, "ready", "utf8");
+        const pause = async () => {
+          await writeFile(ready, "ready", "utf8");
           const deadline = Date.now() + 20_000;
           while (Date.now() < deadline) {
-            try { await access(peerPath); return; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+            try { await access(release); return; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
           }
-          throw new Error("cross-process " + phase + " barrier timed out");
+          throw new Error("cross-process admission barrier timed out");
         };
         const hooks = {
-          beforeProjectContenderRegistered: () => waitForPeer(preflightPath, otherPreflightPath, "pre-registration"),
-          afterProjectContenderRegistered: () => waitForPeer(readyPath, otherReadyPath, "post-registration"),
+          afterProjectContenderRegistered: shouldPause === "1" ? pause : undefined,
         };
         try {
           const manifest = await new FileDurableContextStore(rootPath, hooks).createInitialProjectTaskIfEmpty(state, project);
@@ -492,24 +722,43 @@ describe("approved charter initial registration CLI integration", () => {
         GIT_TERMINAL_PROMPT: "0",
         DAI_TEST_ROOT: durableRoot,
         DAI_TEST_PROJECT: projectIdentity,
+        DAI_TEST_READY: readyPath,
+        DAI_TEST_RELEASE: releasePath,
+        DAI_TEST_PAUSE: "1",
       };
-      const [first, second] = await Promise.all([
-        runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
-          ...baseEnvironment, DAI_TEST_STATE: operatorStatePath, DAI_TEST_PREFLIGHT: preflightA, DAI_TEST_OTHER_PREFLIGHT: preflightB, DAI_TEST_READY: readyA, DAI_TEST_OTHER_READY: readyB,
-        }),
-        runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
-          ...baseEnvironment, DAI_TEST_STATE: charterStatePath, DAI_TEST_PREFLIGHT: preflightB, DAI_TEST_OTHER_PREFLIGHT: preflightA, DAI_TEST_READY: readyB, DAI_TEST_OTHER_READY: readyA,
-        }),
-      ]);
-      const outcomes = [JSON.parse(first.stdout), JSON.parse(second.stdout)] as Array<{ kind: string; message?: string }>;
-      expect(outcomes.map((outcome) => outcome.kind).sort()).toEqual(["blocked", "blocked"]);
-      expect(first.exitCode).toBe(0);
+      firstPromise = runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
+        ...baseEnvironment, DAI_TEST_STATE: operatorStatePath,
+      });
+      const barrierDeadline = Date.now() + 20_000;
+      while (Date.now() < barrierDeadline) {
+        try { await access(readyPath); break; } catch { await new Promise((resolvePromise) => setTimeout(resolvePromise, 10)); }
+      }
+      expect(await access(readyPath).then(() => true, () => false)).toBe(true);
+      const second = await runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
+        ...baseEnvironment, DAI_TEST_STATE: charterStatePath, DAI_TEST_PAUSE: "0",
+      });
+      const secondOutcome = JSON.parse(second.stdout) as { kind: string; message?: string };
       expect(second.exitCode).toBe(0);
-      expect(outcomes.every((outcome) => outcome.message?.includes("conflict"))).toBe(true);
+      expect(secondOutcome).toMatchObject({ kind: "blocked", message: "Another durable task is being admitted at this root" });
+      await writeFile(releasePath, "release", "utf8");
+      const first = await firstPromise;
+      const firstOutcome = JSON.parse(first.stdout) as { kind: string; taskId: string | null };
+      expect(first.exitCode).toBe(0);
+      expect(firstOutcome).toMatchObject({ kind: "created", taskId: ordinary.taskId });
+      const retry = await runProcess(process.execPath, ["--import", "tsx", "--input-type=module", "--eval", childScript], repositoryRoot, {
+        ...baseEnvironment, DAI_TEST_STATE: charterStatePath, DAI_TEST_PAUSE: "0",
+      });
+      const retryOutcome = JSON.parse(retry.stdout) as { kind: string; message?: string };
+      expect(retry.exitCode).toBe(0);
+      expect(retryOutcome).toMatchObject({ kind: "blocked", message: "A different approved charter already owns this project" });
       const durableStore = new FileDurableContextStore(durableRoot);
-      expect(await durableStore.hasProjectSuccessorConflict(projectIdentity)).toBe(true);
-      expect((await readdir(durableRoot)).filter((entry) => /^task-[a-f0-9]{24}$/u.test(entry))).toEqual([]);
+      expect((await durableStore.load(ordinary.taskId))?.taskCharter).toBeUndefined();
+      expect(await durableStore.load(charterState.taskId)).toBeNull();
+      expect(await durableStore.hasProjectSuccessorConflict(projectIdentity)).toBe(false);
+      expect((await readdir(durableRoot)).filter((entry) => /^task-[a-f0-9]{24}$/u.test(entry))).toEqual([ordinary.taskId]);
     } finally {
+      await writeFile(releasePath, "release", "utf8").catch(() => undefined);
+      await firstPromise?.catch(() => undefined);
       await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
     }
   }, 60_000);

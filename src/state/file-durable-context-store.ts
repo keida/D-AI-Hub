@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { link, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readFile, readdir, realpath, rename, rm, rmdir, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { InvalidTaskStateError, TaskOwnershipError } from "../domain/errors.js";
@@ -29,6 +29,8 @@ const ownershipReleasedFile = "released";
 const ownershipTransferFile = "transfer.json";
 const activeDirectoryName = "active";
 const initializationReservationFile = "initializing";
+const rootAdmissionDirectory = ".root-admission";
+const rootAdmissionOwnerFile = "owner.json";
 
 const stageSchema = z.enum([
   "bootstrap",
@@ -65,6 +67,11 @@ const ownershipRecordSchema = z.object({
   taskId: z.string().min(1),
   environment: environmentSchema,
   ownerToken: z.string().uuid(),
+}).strict();
+const rootAdmissionOwnerSchema = z.object({
+  schemaVersion: z.literal(1),
+  token: z.string().uuid(),
+  candidateKey: z.string().regex(/^[a-f0-9]{64}$/u),
 }).strict();
 const verificationEvidenceSchema = z
   .object({
@@ -396,8 +403,15 @@ function parseTaskState(value: unknown, targetPath: string): TaskState {
 
 export interface FileDurableContextStoreTestHooks {
   readonly afterInitialCompanionsWritten?: (() => Promise<void>) | undefined;
+  readonly afterRootAdmissionContended?: (() => Promise<void>) | undefined;
   readonly beforeProjectContenderRegistered?: (() => Promise<void>) | undefined;
   readonly afterProjectContenderRegistered?: (() => Promise<void>) | undefined;
+}
+
+interface RootAdmissionOwner {
+  readonly schemaVersion: 1;
+  readonly token: string;
+  readonly candidateKey: string;
 }
 
 interface ProjectSuccessorContender {
@@ -799,7 +813,85 @@ export class FileDurableContextStore implements DurableContextStore {
     this.testHooks = testHooks;
   }
 
+  private rootAdmissionCandidateKey(state: TaskState): string {
+    const identity = state.contextManifest.filter((entry) => entry.startsWith("identity:workspace:") || entry.startsWith("identity:repository:"));
+    const charterDigest = state.taskCharter === undefined ? "ordinary" : taskCharterContentDigest(state.taskCharter);
+    return createHashForContent(JSON.stringify([state.taskId, state.environment, charterDigest, identity]));
+  }
+
+  private async withRootAdmission<T>(candidateKey: string, waitForMatching: boolean, action: () => Promise<T>): Promise<T> {
+    await mkdir(this.rootPath, { recursive: true });
+    const admissionPath = join(this.rootPath, rootAdmissionDirectory);
+    const ownerPath = join(admissionPath, rootAdmissionOwnerFile);
+    const owner: RootAdmissionOwner = { schemaVersion: 1, token: randomUUID(), candidateKey };
+    const deadline = Date.now() + FILE_DURABLE_CONTEXT_LEASE_MS;
+    let contentionObserved = false;
+    while (true) {
+      try {
+        await mkdir(admissionPath);
+        try {
+          if (!await writeImmutableFile(ownerPath, serialize(owner))) {
+            throw new InvalidTaskStateError("Root admission reservation owner record already exists");
+          }
+        } catch (error: unknown) {
+          await rmdir(admissionPath).catch(() => {});
+          throw new InvalidTaskStateError(`Unable to initialize root admission reservation: ${describeError(error)}`);
+        }
+        break;
+      } catch (error: unknown) {
+        if (error instanceof InvalidTaskStateError) throw error;
+        if (isAlreadyExistsError(error)) {
+          if (!contentionObserved) {
+            contentionObserved = true;
+            await this.testHooks.afterRootAdmissionContended?.();
+          }
+          let active: RootAdmissionOwner;
+          try {
+            active = rootAdmissionOwnerSchema.parse(JSON.parse(await readFile(ownerPath, "utf8")));
+          } catch (readError: unknown) {
+            if (isMissingFileError(readError)) {
+              if (Date.now() >= deadline) throw new TaskOwnershipError("Matching durable task admission did not complete before the reservation deadline");
+              await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+              continue;
+            }
+            throw new InvalidTaskStateError(`Root admission is occupied by an unreadable reservation: ${describeError(readError)}`);
+          }
+          if (active.schemaVersion !== 1 || typeof active.token !== "string" || !/^[a-f0-9-]{36}$/u.test(active.token)
+            || typeof active.candidateKey !== "string" || !/^[a-f0-9]{64}$/u.test(active.candidateKey)) {
+            throw new InvalidTaskStateError("Root admission is occupied by an invalid reservation");
+          }
+          if (!waitForMatching || active.candidateKey !== candidateKey) {
+            throw new TaskOwnershipError("Another durable task is being admitted at this root");
+          }
+          if (Date.now() >= deadline) throw new TaskOwnershipError("Matching durable task admission did not complete before the reservation deadline");
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+          continue;
+        }
+        if (error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new InvalidTaskStateError("Root admission reservation could not be verified");
+        }
+        throw new InvalidTaskStateError(`Unable to acquire root admission reservation: ${describeError(error)}`);
+      }
+    }
+    try {
+      return await action();
+    } finally {
+      let current: RootAdmissionOwner;
+      try {
+        current = rootAdmissionOwnerSchema.parse(JSON.parse(await readFile(ownerPath, "utf8")));
+      } catch (error: unknown) {
+        throw new InvalidTaskStateError(`Root admission reservation could not be released safely: ${describeError(error)}`);
+      }
+      if (current.token !== owner.token) throw new InvalidTaskStateError("Root admission reservation ownership changed before release");
+      await rm(admissionPath, { recursive: true, force: false });
+    }
+  }
+
   public async registerProjectSuccessorContender(state: TaskState, projectIdentity: string, charterDigest: string): Promise<"registered" | "conflict"> {
+    return this.registerProjectSuccessorContenderInternal(state, projectIdentity, charterDigest);
+  }
+
+  private async registerProjectSuccessorContenderInternal(state: TaskState, projectIdentity: string, charterDigest: string): Promise<"registered" | "conflict"> {
     const normalizedProjectIdentity = projectIdentity.trim();
     const charter = parseApprovedTaskCharter(state.taskCharter);
     const confirmation = taskCharterConfirmationEventSchema.safeParse(state.taskCharterConfirmation);
@@ -837,6 +929,10 @@ export class FileDurableContextStore implements DurableContextStore {
   }
 
   public async createInitialProjectTaskIfEmpty(state: TaskState, projectIdentity: string): Promise<DurableContextManifest | null> {
+    return this.withRootAdmission(this.rootAdmissionCandidateKey(state), false, () => this.createInitialProjectTaskIfEmptyInternal(state, projectIdentity));
+  }
+
+  private async createInitialProjectTaskIfEmptyInternal(state: TaskState, projectIdentity: string): Promise<DurableContextManifest | null> {
     const normalizedProjectIdentity = projectIdentity.trim();
     if (normalizedProjectIdentity.length === 0 || normalizedProjectIdentity.length > 512 || state.durableContext !== null) {
       throw new InvalidTaskStateError("Initial project task identity is invalid");
@@ -863,6 +959,9 @@ export class FileDurableContextStore implements DurableContextStore {
 
     const existing = await this.load(state.taskId);
     if (existing !== null) {
+      if (successorOwnerBindingDigest(successorOwnerBinding(existing)) !== successorOwnerBindingDigest(successorOwnerBinding(state))) {
+        throw new TaskOwnershipError("Initial project task belongs to a different workspace or environment");
+      }
       if (!this.matchesInitialCandidate(existing, state, normalizedProjectIdentity, candidateKind, candidateDigest)) {
         throw new TaskOwnershipError(`Initial project task id ${state.taskId} is occupied by different durable state`);
       }
@@ -876,7 +975,7 @@ export class FileDurableContextStore implements DurableContextStore {
     if (!await this.canAttemptInitialProjectTask(normalizedProjectIdentity, state)) return null;
     await this.testHooks.beforeProjectContenderRegistered?.();
     if (candidateKind === "approved-charter") {
-      if (await this.registerProjectSuccessorContender(state, normalizedProjectIdentity, candidateDigest) === "conflict") {
+      if (await this.registerProjectSuccessorContenderInternal(state, normalizedProjectIdentity, candidateDigest) === "conflict") {
         throw new TaskOwnershipError("Competing initial project registrations conflict; explicit resolution is required");
       }
     } else if (await this.registerInitialOrdinaryContender(state, normalizedProjectIdentity, candidateDigest) === "conflict") {
@@ -892,7 +991,7 @@ export class FileDurableContextStore implements DurableContextStore {
       return null;
     }
 
-    if (approvedCharter !== null) return this.createSuccessorIfAbsent(state, normalizedProjectIdentity, candidateDigest);
+    if (approvedCharter !== null) return this.createSuccessorIfAbsentInternal(state, normalizedProjectIdentity, candidateDigest);
     return this.createStagedInitialTask(state, normalizedProjectIdentity, candidateDigest);
   }
 
@@ -938,7 +1037,7 @@ export class FileDurableContextStore implements DurableContextStore {
 
   private async canAttemptInitialProjectTask(projectIdentity: string, proposed: TaskState): Promise<boolean> {
     let rootEntries: Dirent<string>[];
-    try { rootEntries = await readdir(this.rootPath, { withFileTypes: true }); }
+    try { rootEntries = (await readdir(this.rootPath, { withFileTypes: true })).filter((entry) => entry.name !== rootAdmissionDirectory); }
     catch (error: unknown) {
       if (isMissingFileError(error)) return true;
       throw new InvalidTaskStateError(`Unable to inspect durable task root for initial registration: ${describeError(error)}`);
@@ -961,12 +1060,16 @@ export class FileDurableContextStore implements DurableContextStore {
           if (successorOwnerBindingDigest(successorOwnerBinding(existing)) !== successorOwnerBindingDigest(successorOwnerBinding(proposed))) {
             throw new TaskOwnershipError("An active task for this project belongs to a different workspace or environment");
           }
+          if (proposed.taskCharter !== undefined && (existing.taskCharter === undefined
+            || taskCharterContentDigest(existing.taskCharter) !== taskCharterContentDigest(proposed.taskCharter))) {
+            throw new TaskOwnershipError("A different approved charter already owns this project");
+          }
         }
         durableTaskHistoryFound = true;
         continue;
       }
       if (entry.name === "handoffs.json" && entry.isFile()) {
-        continue;
+        throw new InvalidTaskStateError("Existing handoff history blocks initial project admission");
       }
       if (entry.name !== projectSuccessorContendersDirectory || !entry.isDirectory()) {
         throw new InvalidTaskStateError(`Unknown durable task root entry blocks initial registration: ${entry.name}`);
@@ -999,7 +1102,7 @@ export class FileDurableContextStore implements DurableContextStore {
 
   private async hasOnlyInitialContender(projectIdentity: string, candidateDigest: string, state: TaskState): Promise<boolean> {
     let rootEntries: Dirent<string>[];
-    try { rootEntries = await readdir(this.rootPath, { withFileTypes: true }); }
+    try { rootEntries = (await readdir(this.rootPath, { withFileTypes: true })).filter((entry) => entry.name !== rootAdmissionDirectory); }
     catch (error: unknown) {
       if (isMissingFileError(error)) return true;
       throw new InvalidTaskStateError(`Unable to inspect durable task root for initial registration: ${describeError(error)}`);
@@ -1147,13 +1250,17 @@ export class FileDurableContextStore implements DurableContextStore {
   }
 
   public async createSuccessorIfAbsent(state: TaskState, projectIdentity: string, charterDigest: string): Promise<DurableContextManifest> {
+    return this.withRootAdmission(this.rootAdmissionCandidateKey(state), true, () => this.createSuccessorIfAbsentInternal(state, projectIdentity, charterDigest));
+  }
+
+  private async createSuccessorIfAbsentInternal(state: TaskState, projectIdentity: string, charterDigest: string): Promise<DurableContextManifest> {
     const charter = parseApprovedTaskCharter(state.taskCharter);
     if (charter.projectIdentity !== projectIdentity || taskCharterContentDigest(charter) !== charterDigest
       || state.taskId !== taskCharterTaskId(projectIdentity, charterDigest)
       || state.routingDisposition !== "ROUTABLE" || state.durableContext !== null) {
       throw new InvalidTaskStateError("Successor state does not match its approved project charter");
     }
-    if (await this.registerProjectSuccessorContender(state, projectIdentity, charterDigest) === "conflict") {
+    if (await this.registerProjectSuccessorContenderInternal(state, projectIdentity, charterDigest) === "conflict") {
       throw new TaskOwnershipError("Competing approved task charters conflict for this project; explicit resolution is required");
     }
     const finalPaths = createSnapshotPaths(this.rootPath, state.taskId);
@@ -1460,6 +1567,12 @@ export class FileDurableContextStore implements DurableContextStore {
     this.saveLocks.set(state.taskId, current);
     await previous;
     try {
+      if (await this.load(state.taskId) === null) {
+        return await this.withRootAdmission(this.rootAdmissionCandidateKey(state), false, async () => {
+          if (await this.load(state.taskId) !== null) throw new TaskOwnershipError(`Durable task ${state.taskId} already exists`);
+          return this.saveInternal(state, authorization);
+        });
+      }
       return await this.saveInternal(state, authorization);
     } finally {
       release();
@@ -1469,7 +1582,7 @@ export class FileDurableContextStore implements DurableContextStore {
 
   public async createIfAbsent(state: TaskState): Promise<DurableContextManifest> {
     assertTaskId(state.taskId);
-    return this.withTaskOwnership(state.taskId, state.environment, async (lease) => {
+    return this.withRootAdmission(this.rootAdmissionCandidateKey(state), false, () => this.withTaskOwnership(state.taskId, state.environment, async (lease) => {
       const existing = await this.load(state.taskId);
       if (existing !== null) {
         throw new TaskOwnershipError(`Durable task ${state.taskId} already exists`);
@@ -1481,11 +1594,11 @@ export class FileDurableContextStore implements DurableContextStore {
         if (raced !== null) {
           throw new TaskOwnershipError(`Durable task ${state.taskId} already exists`);
         }
-        return await this.save(state, lease);
+        return await this.saveInternal(state, lease);
       } finally {
         await releaseInitialCreation(paths, state.taskId);
       }
-    });
+    }));
   }
 
   private async saveInternal(state: TaskState, authorization?: TaskStateWriteAuthorization): Promise<DurableContextManifest> {
