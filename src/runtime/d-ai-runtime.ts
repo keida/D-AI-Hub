@@ -1480,6 +1480,49 @@ async function executeIntent(
     }
     throw error;
   }
+  const initialRepositoryIdentity = remoteRepositoryIdentity(bootstrapped);
+  const initialProjectIdentity = initialRepositoryIdentity === null ? null : `remote-repository:${initialRepositoryIdentity}`;
+  if (isExplicitNewTaskIntent(command.text) && initialProjectIdentity !== null
+    && bootstrapped.durableContext !== null
+    && (bootstrapped.stage === "close" || isLegacyFrozen(bootstrapped))) {
+    return response(bootstrapped, "blocked", "Closed or legacy-frozen project history cannot be reclassified as an initial task; use the approved successor path when eligible");
+  }
+  if (isExplicitNewTaskIntent(command.text)
+    && bootstrapped.durableContext === null
+    && initialProjectIdentity !== null
+    && dependencies.store.createInitialProjectTaskIfEmpty !== undefined) {
+    try {
+      const initialManifest = await dependencies.store.createInitialProjectTaskIfEmpty(bootstrapped, initialProjectIdentity);
+      if (initialManifest !== null) {
+        bootstrapped = { ...bootstrapped, durableContext: initialManifest };
+      } else {
+        const refreshed = await discoverCanonicalWorkspaceTasks(request, dependencies);
+        if (refreshed.kind === "unavailable") {
+          return blockedWithoutState(bootstrapped.taskId, request.sourceEnvironment, `${refreshed.message}; initial project admission is blocked without writes`);
+        }
+        const appearedTasks = refreshed.allWorkspaceCandidates
+          .filter((state) => electionProjectIdentity(state) === initialProjectIdentity && state.stage !== "close");
+        if (appearedTasks.length > 1) {
+          return blockedWithoutState("ambiguous", request.sourceEnvironment, "Multiple project tasks appeared during initial admission; ordinary task creation is blocked");
+        }
+        const appeared = appearedTasks[0];
+        if (appeared !== undefined) {
+          if (isLegacyFrozen(appeared)) {
+            return response(appeared, "blocked", "A legacy-frozen project requires an approved charter successor; ordinary establishment cannot bypass frozen history");
+          }
+          if (appeared.environment !== request.sourceEnvironment) {
+            return response(appeared, "blocked", `Project task ownership belongs to ${appeared.environment}; ordinary establishment cannot cross environment ownership`);
+          }
+          return response(appeared, "accepted", `Reused the project task ${appeared.taskId} that appeared during initial admission`);
+        }
+      }
+    } catch (error: unknown) {
+      return blockedWithoutState(bootstrapped.taskId, request.sourceEnvironment,
+        error instanceof TaskOwnershipError
+          ? "Competing initial project registrations conflict; explicit resolution is required"
+          : "Initial project admission failed closed; no task mutation is claimed");
+    }
+  }
   if (isExplicitNewTaskIntent(command.text)
     && isLocalOnlyTask(bootstrapped)
     && bootstrapped.durableContext === null
@@ -1850,6 +1893,68 @@ async function establishApprovedSuccessor(
   }
   const frozen = projectTasks.filter(isLegacyFrozen);
   if (frozen.length === 0) {
+    if (discovery.mode === "repository" && discovery.allWorkspaceCandidates.length === 0) {
+      if (dependencies.repositoryPath === null || dependencies.store.createInitialProjectTaskIfEmpty === undefined) {
+        return blockedWithoutState("unassigned", request.sourceEnvironment, "Durable initial project registration is unavailable; no task was created");
+      }
+      const initialDigest = taskCharterContentDigest(charter);
+      const initialConfirmation = {
+        confirmationId: randomUUID(),
+        confirmedAt: dependencies.now().toISOString(),
+        projectIdentity: expectedProjectIdentity,
+        confirmedCharterDigest: initialDigest,
+        channel: "explicit-task-charter-digest" as const,
+      };
+      let initialRepositoryPath: string;
+      try { initialRepositoryPath = await resolveGitRepositoryRoot(dependencies.workspacePath); }
+      catch { return blockedWithoutState("unassigned", request.sourceEnvironment, "The actual Git repository root could not be resolved for initial project registration"); }
+      let initialState: TaskState;
+      try {
+        initialState = await prepareBootstrapTask({
+          taskId: taskCharterTaskId(expectedProjectIdentity, initialDigest),
+          goal: charter.objective,
+          environment: request.sourceEnvironment,
+          workspacePath: dependencies.workspacePath,
+          repositoryPath: initialRepositoryPath,
+        }, dependencies.store, null);
+        const remoteIdentity = `remote-repository:${discovery.repository}`;
+        initialState = {
+          ...initialState,
+          contextManifest: initialState.contextManifest.includes(remoteIdentity)
+            ? [...initialState.contextManifest]
+            : [...initialState.contextManifest, remoteIdentity],
+          routingDisposition: "ROUTABLE",
+          taskCharter: charter,
+          taskCharterConfirmation: initialConfirmation,
+          durableContext: null,
+        };
+      } catch {
+        return blockedWithoutState("unassigned", request.sourceEnvironment, "Approved initial project bootstrap could not be prepared; no task was created");
+      }
+      try {
+        const manifest = await dependencies.store.createInitialProjectTaskIfEmpty(initialState, expectedProjectIdentity);
+        if (manifest === null) {
+          return blockedWithoutState("unassigned", request.sourceEnvironment, "Durable project history exists or is incomplete; initial charter registration is blocked without writes");
+        }
+        const persisted = await dependencies.store.load(initialState.taskId);
+        if (persisted === null || persisted.durableContext === null || persisted.taskCharter === undefined
+          || taskCharterContentDigest(persisted.taskCharter) !== initialDigest
+          || await dependencies.store.hasProjectSuccessorConflict?.(expectedProjectIdentity)) {
+          return blockedWithoutState(initialState.taskId, request.sourceEnvironment, "Initial project registration failed final durable read-back or conflict verification");
+        }
+        const finalDiscovery = await discoverCanonicalWorkspaceTasks(request, dependencies);
+        if (finalDiscovery.kind !== "available"
+          || finalDiscovery.allWorkspaceCandidates.filter((state) => electionProjectIdentity(state) === expectedProjectIdentity && !isLegacyFrozen(state) && state.stage !== "close").length !== 1) {
+          return blockedWithoutState(initialState.taskId, request.sourceEnvironment, "Initial project registration was not uniquely discoverable after publication");
+        }
+        return response({ ...persisted, durableContext: manifest }, "accepted", `Registered the first approved project task ${initialState.taskId}. Initial next action: ${charter.initialNextAction}`);
+      } catch (error: unknown) {
+        return blockedWithoutState(initialState.taskId, request.sourceEnvironment,
+          error instanceof TaskOwnershipError
+            ? "Competing initial project registrations conflict; explicit resolution is required"
+            : "Initial project registration failed closed; no completion claim is made");
+      }
+    }
     return blockedWithoutState("unassigned", request.sourceEnvironment, "DAI-ARCH-003B only establishes a successor for a legacy-frozen project; no matching frozen task was found");
   }
   if (dependencies.store.registerProjectSuccessorContender === undefined

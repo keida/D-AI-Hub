@@ -30,6 +30,8 @@ export interface DurableContextStore {
   loadGenerationManifest?(taskId: string, manifestId: string): Promise<DurableContextManifest>;
   verifyDurableSnapshot?(manifest: DurableContextManifest): Promise<void>;
   createIfAbsent?(state: TaskState): Promise<DurableContextManifest>;
+  /** Atomically admit a first project task only when the durable root contains no prior task history. */
+  createInitialProjectTaskIfEmpty?(state: TaskState, projectIdentity: string): Promise<DurableContextManifest | null>;
   registerProjectSuccessorContender?(state: TaskState, projectIdentity: string, charterDigest: string): Promise<"registered" | "conflict">;
   hasProjectSuccessorConflict?(projectIdentity: string): Promise<boolean>;
   createSuccessorIfAbsent?(state: TaskState, projectIdentity: string, charterDigest: string): Promise<DurableContextManifest>;
