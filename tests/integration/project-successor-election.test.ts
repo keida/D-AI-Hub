@@ -238,6 +238,7 @@ describe("project successor file-store election", () => {
       expect(await taskDirectories(root)).toEqual([state.taskId]);
       const loaded = await store.load(state.taskId);
       expect(loaded).toMatchObject({ taskId: state.taskId, routingDisposition: "ROUTABLE", taskCharter: { projectIdentity } });
+      expect(new Set(results.map((event) => event.manifestId))).toEqual(new Set([loaded?.durableContext?.manifestId]));
       await store.verifyDurableSnapshot(loaded!.durableContext!);
       const generations = await readdir(join(root, state.taskId, "generations"), { withFileTypes: true });
       expect(generations.filter((entry) => entry.isDirectory()).length).toBeGreaterThan(0);

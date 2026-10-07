@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -470,6 +470,176 @@ describe("FileDurableContextStore", () => {
         rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }),
         rm(unrelatedRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }),
       ]);
+    }
+  });
+
+  it("treats EEXIST and EPERM with a verified reservation as contention and preserves unreadable owners", async () => {
+    const existsRoot = await createStoreRoot();
+    const permissionRoot = await createStoreRoot();
+    const unreadableRoot = await createStoreRoot();
+    const directoryOwnerRoot = await createStoreRoot();
+    const candidate = createRepositoryState(`task-${"4".repeat(24)}`, "reservation acquisition boundary");
+    const reservation = {
+      schemaVersion: 1,
+      token: "00000000-0000-4000-8000-000000000101",
+      candidateKey: "f".repeat(64),
+    };
+    const reservationBytes = Buffer.from(`${JSON.stringify(reservation)}\n`, "utf8");
+    const systemError = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`synthetic ${code}`), { code });
+    try {
+      const existsPath = join(existsRoot, ".root-admission");
+      await mkdir(existsPath);
+      await writeFile(join(existsPath, "owner.json"), reservationBytes);
+      const existsStore = new FileDurableContextStore(existsRoot, {
+        createRootAdmissionReservation: async () => { throw systemError("EEXIST"); },
+      });
+      await expect(existsStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "TaskOwnershipError",
+        message: "Another durable task is being admitted at this root",
+      });
+      expect(await readFile(join(existsPath, "owner.json"))).toEqual(reservationBytes);
+
+      const permissionPath = join(permissionRoot, ".root-admission");
+      await mkdir(permissionPath);
+      await writeFile(join(permissionPath, "owner.json"), reservationBytes);
+      const permissionStore = new FileDurableContextStore(permissionRoot, {
+        createRootAdmissionReservation: async () => { throw systemError("EPERM"); },
+      });
+      await expect(permissionStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "TaskOwnershipError",
+        message: "Another durable task is being admitted at this root",
+      });
+      expect(await readFile(join(permissionPath, "owner.json"))).toEqual(reservationBytes);
+
+      const unreadablePath = join(unreadableRoot, ".root-admission");
+      const unreadableOwnerPath = join(unreadablePath, "owner.json");
+      const unreadableOwnerBytes = Buffer.from("{invalid", "utf8");
+      await mkdir(unreadablePath);
+      await writeFile(unreadableOwnerPath, unreadableOwnerBytes);
+      const unreadableStore = new FileDurableContextStore(unreadableRoot, {
+        createRootAdmissionReservation: async () => { throw systemError("EPERM"); },
+      });
+      await expect(unreadableStore.createIfAbsent(candidate)).rejects.toMatchObject({ name: "InvalidTaskStateError" });
+      expect(await readFile(unreadableOwnerPath)).toEqual(unreadableOwnerBytes);
+      expect(await unreadableStore.load(candidate.taskId)).toBeNull();
+
+      const directoryOwnerReservation = join(directoryOwnerRoot, ".root-admission");
+      const directoryOwnerPath = join(directoryOwnerReservation, "owner.json");
+      await mkdir(directoryOwnerReservation);
+      await mkdir(directoryOwnerPath);
+      const directoryOwnerStore = new FileDurableContextStore(directoryOwnerRoot, {
+        createRootAdmissionReservation: async () => { throw systemError("EPERM"); },
+      });
+      await expect(directoryOwnerStore.createIfAbsent(candidate)).rejects.toMatchObject({ name: "InvalidTaskStateError" });
+      expect((await lstat(directoryOwnerReservation)).isDirectory()).toBe(true);
+      expect((await lstat(directoryOwnerPath)).isDirectory()).toBe(true);
+      expect(await directoryOwnerStore.load(candidate.taskId)).toBeNull();
+    } finally {
+      await Promise.all([existsRoot, permissionRoot, unreadableRoot, directoryOwnerRoot].map((root) => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 })));
+    }
+  });
+
+  it("retries one EPERM only after the reservation directory disappears", async () => {
+    const rootPath = await createStoreRoot();
+    const candidate = createRepositoryState(`task-${"3".repeat(24)}`, "single root reservation retry");
+    let acquisitionAttempts = 0;
+    const systemError = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`synthetic ${code}`), { code });
+    const store = new FileDurableContextStore(rootPath, {
+      createRootAdmissionReservation: async (path) => {
+        acquisitionAttempts += 1;
+        if (acquisitionAttempts === 1) {
+          await mkdir(path);
+          await rm(path, { recursive: true });
+          throw systemError("EPERM");
+        }
+        await mkdir(path);
+      },
+    });
+    try {
+      await expect(store.createIfAbsent(candidate)).resolves.toMatchObject({ taskId: candidate.taskId });
+      expect(acquisitionAttempts).toBe(2);
+      expect(await store.load(candidate.taskId)).toMatchObject({ taskId: candidate.taskId });
+    } finally {
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("fails closed on repeated EPERM or an inaccessible reservation root", async () => {
+    const repeatedRoot = await createStoreRoot();
+    const inaccessibleRoot = await createStoreRoot();
+    const candidate = createRepositoryState(`task-${"2".repeat(24)}`, "permission error must not become contention");
+    const systemError = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`synthetic ${code}`), { code });
+    let repeatedAttempts = 0;
+    let inaccessibleAttempts = 0;
+    let inaccessibleInspections = 0;
+    const repeatedStore = new FileDurableContextStore(repeatedRoot, {
+      createRootAdmissionReservation: async () => {
+        repeatedAttempts += 1;
+        throw systemError("EPERM");
+      },
+    });
+    const inaccessibleStore = new FileDurableContextStore(inaccessibleRoot, {
+      createRootAdmissionReservation: async () => {
+        inaccessibleAttempts += 1;
+        throw systemError("EPERM");
+      },
+      lstatRootAdmissionReservation: async () => {
+        inaccessibleInspections += 1;
+        throw systemError("EACCES");
+      },
+    });
+    try {
+      await expect(repeatedStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "InvalidTaskStateError",
+        message: expect.stringContaining("repeated EPERM"),
+      });
+      expect(repeatedAttempts).toBe(2);
+      expect(await readdir(repeatedRoot)).toEqual([]);
+
+      await expect(inaccessibleStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "InvalidTaskStateError",
+        message: expect.stringContaining("could not be verified after EPERM"),
+      });
+      expect(inaccessibleAttempts).toBe(1);
+      expect(inaccessibleInspections).toBe(1);
+      expect(await readdir(inaccessibleRoot)).toEqual([]);
+      expect(await inaccessibleStore.load(candidate.taskId)).toBeNull();
+    } finally {
+      await Promise.all([repeatedRoot, inaccessibleRoot].map((root) => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 })));
+    }
+  });
+
+  it("rejects EPERM when the reservation path is not a real directory", async () => {
+    const fileRoot = await createStoreRoot();
+    const symlinkRoot = await createStoreRoot();
+    const candidate = createRepositoryState(`task-${"1".repeat(24)}`, "unverifiable reservation type");
+    const systemError = (code: string): NodeJS.ErrnoException => Object.assign(new Error(`synthetic ${code}`), { code });
+    const filePath = join(fileRoot, ".root-admission");
+    const fileBytes = Buffer.from("not a reservation directory", "utf8");
+    await writeFile(filePath, fileBytes);
+    const fileStore = new FileDurableContextStore(fileRoot, {
+      createRootAdmissionReservation: async () => { throw systemError("EPERM"); },
+    });
+    const symlinkStore = new FileDurableContextStore(symlinkRoot, {
+      createRootAdmissionReservation: async () => { throw systemError("EPERM"); },
+      lstatRootAdmissionReservation: async () => ({ isDirectory: () => true, isSymbolicLink: () => true }),
+    });
+    try {
+      await expect(fileStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "InvalidTaskStateError",
+        message: "Root admission path is not a verifiable reservation directory",
+      });
+      expect(await readFile(filePath)).toEqual(fileBytes);
+      expect(await fileStore.load(candidate.taskId)).toBeNull();
+
+      await expect(symlinkStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "InvalidTaskStateError",
+        message: "Root admission path is not a verifiable reservation directory",
+      });
+      expect(await readdir(symlinkRoot)).toEqual([]);
+      expect(await symlinkStore.load(candidate.taskId)).toBeNull();
+    } finally {
+      await Promise.all([fileRoot, symlinkRoot].map((root) => rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 })));
     }
   });
 

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
+import { redactSensitiveText } from "../../src/adapters/command-runner.js";
 import type { TaskCharter, TaskState } from "../../src/domain/types.js";
 import { resolveDefaultMemoryDatabasePath } from "../../src/memory/local-memory-path.js";
 import { FileDurableContextStore } from "../../src/state/file-durable-context-store.js";
@@ -253,6 +254,7 @@ describe("approved charter initial registration CLI integration", () => {
     const cliPath = join(repositoryRoot, "src", "entry", "codex-cli.ts");
     try {
       await mkdir(workspacePath, { recursive: true });
+      await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
       await runGit(workspacePath, "init", "--initial-branch=main");
       await runGit(workspacePath, "config", "user.name", "Synthetic Integration");
       await runGit(workspacePath, "config", "user.email", "synthetic@example.invalid");
@@ -341,6 +343,7 @@ describe("approved charter initial registration CLI integration", () => {
 
       const invalidGitWorkspace = join(root, ".git-invalid");
       await mkdir(invalidGitWorkspace, { recursive: true });
+      await mkdir(join(invalidGitWorkspace, ".agents", "skills"), { recursive: true });
       await runGit(invalidGitWorkspace, "init", "--initial-branch=main");
       const invalidGitResult = await runProcess(process.execPath, ["--import", "tsx", cliPath,
         "--workspace", invalidGitWorkspace,
@@ -475,6 +478,7 @@ describe("approved charter initial registration CLI integration", () => {
       const workspaceRoot = join(scenarioRoot, "workspace");
       const durableRoot = join(workspaceRoot, ".d-ai");
       await mkdir(workspaceRoot, { recursive: true });
+      await mkdir(join(workspaceRoot, ".agents", "skills"), { recursive: true });
       const isolatedLocalAppData = join(scenarioRoot, "isolated-localappdata");
       const isolatedXdgDataHome = join(scenarioRoot, "isolated-xdg-data");
       const isolatedHome = join(scenarioRoot, "isolated-home");
@@ -618,6 +622,24 @@ describe("approved charter initial registration CLI integration", () => {
     try {
       const charterFirst = await runOrdering("charter-first", "a1");
       const ordinaryFirst = await runOrdering("ordinary-first", "b2");
+      for (const [ordering, scenario] of [["charter-first", charterFirst], ["ordinary-first", ordinaryFirst]] as const) {
+        const redactedMessage = redactSensitiveText(scenario.statusReadback.message);
+        const messageLimit = 320;
+        console.info("[initial-admission-status-readback]", JSON.stringify({
+          ordering,
+          expectedTaskId: scenario.expectedTaskId,
+          strictActiveTaskIds: scenario.strictReadback.activeTaskIds,
+          statusExitCode: scenario.statusReadback.exitCode,
+          status: scenario.statusReadback.status,
+          taskId: scenario.statusReadback.taskId,
+          message: {
+            preview: redactedMessage.slice(0, messageLimit),
+            truncated: redactedMessage.length > messageLimit,
+            originalRedactedLength: redactedMessage.length,
+            retainedRange: { start: 0, endExclusive: Math.min(redactedMessage.length, messageLimit) },
+          },
+        }));
+      }
       expect({ charterFirst, ordinaryFirst }).toMatchObject({
         charterFirst: {
           first: { kind: "created" },
@@ -772,6 +794,7 @@ describe("approved charter initial registration CLI integration", () => {
     const cliPath = join(repositoryRoot, "src", "entry", "codex-cli.ts");
     try {
       await mkdir(workspacePath, { recursive: true });
+      await mkdir(join(workspacePath, ".agents", "skills"), { recursive: true });
       await runGit(workspacePath, "init", "--initial-branch=main");
       await runGit(workspacePath, "config", "user.name", "Synthetic Integration");
       await runGit(workspacePath, "config", "user.email", "synthetic@example.invalid");

@@ -404,6 +404,8 @@ function parseTaskState(value: unknown, targetPath: string): TaskState {
 export interface FileDurableContextStoreTestHooks {
   readonly afterInitialCompanionsWritten?: (() => Promise<void>) | undefined;
   readonly afterRootAdmissionContended?: (() => Promise<void>) | undefined;
+  readonly createRootAdmissionReservation?: ((path: string) => Promise<void>) | undefined;
+  readonly lstatRootAdmissionReservation?: ((path: string) => Promise<{ isDirectory(): boolean; isSymbolicLink(): boolean }>) | undefined;
   readonly beforeProjectContenderRegistered?: (() => Promise<void>) | undefined;
   readonly afterProjectContenderRegistered?: (() => Promise<void>) | undefined;
 }
@@ -825,10 +827,13 @@ export class FileDurableContextStore implements DurableContextStore {
     const ownerPath = join(admissionPath, rootAdmissionOwnerFile);
     const owner: RootAdmissionOwner = { schemaVersion: 1, token: randomUUID(), candidateKey };
     const deadline = Date.now() + FILE_DURABLE_CONTEXT_LEASE_MS;
+    const createReservation = this.testHooks.createRootAdmissionReservation ?? ((path: string) => mkdir(path));
+    const inspectReservation = this.testHooks.lstatRootAdmissionReservation ?? lstat;
     let contentionObserved = false;
+    let permissionRetryUsed = false;
     while (true) {
       try {
-        await mkdir(admissionPath);
+        await createReservation(admissionPath);
         try {
           if (!await writeImmutableFile(ownerPath, serialize(owner))) {
             throw new InvalidTaskStateError("Root admission reservation owner record already exists");
@@ -840,7 +845,27 @@ export class FileDurableContextStore implements DurableContextStore {
         break;
       } catch (error: unknown) {
         if (error instanceof InvalidTaskStateError) throw error;
-        if (isAlreadyExistsError(error)) {
+        let reservationObserved = isAlreadyExistsError(error);
+        if (!reservationObserved && isPermissionDeniedError(error)) {
+          let reservation: { isDirectory(): boolean; isSymbolicLink(): boolean };
+          try {
+            reservation = await inspectReservation(admissionPath);
+          } catch (statError: unknown) {
+            if (!isMissingFileError(statError)) {
+              throw new InvalidTaskStateError(`Root admission reservation could not be verified after EPERM: ${describeError(statError)}`);
+            }
+            if (permissionRetryUsed) {
+              throw new InvalidTaskStateError(`Unable to acquire root admission reservation after repeated EPERM errors: ${describeError(error)}`);
+            }
+            permissionRetryUsed = true;
+            continue;
+          }
+          if (reservation.isSymbolicLink() || !reservation.isDirectory()) {
+            throw new InvalidTaskStateError("Root admission path is not a verifiable reservation directory");
+          }
+          reservationObserved = true;
+        }
+        if (reservationObserved) {
           if (!contentionObserved) {
             contentionObserved = true;
             await this.testHooks.afterRootAdmissionContended?.();
@@ -2071,6 +2096,10 @@ function isMissingFileError(error: unknown): boolean {
 
 function isAlreadyExistsError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
+function isPermissionDeniedError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EPERM";
 }
 
 function describeError(error: unknown): string {
