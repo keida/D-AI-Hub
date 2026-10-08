@@ -2,16 +2,26 @@
 
 ## Open
 
+### BUG-007 — Historical Skill Pulse freeze is not represented in the stored task disposition
+
+- Severity: high operational/lifecycle safety risk for historical task selection.
+- Status: OPEN / diagnosis confirmed, **real durable data not modified**.
+- Observed: The Skill Pulse primary checkout still has historical task `task-7b959c2155241137b16a5220` with `stage=route`, `handoffState=none`, and no persisted `routingDisposition` field. Its owner-approved disposition is `LEGACY_FROZEN` for future routing, but that governance decision was not applied as a durable TaskState mutation.
+- Runtime boundary: `taskRoutingDisposition(state)` defaults an absent value to `ROUTABLE`. On 2026-10-08 a **read-only invocation of the installed Skill** with `@D-AI status` in the original Skill Pulse workspace returned `accepted`, task `task-7b959c2155241137b16a5220`, stage `route`, confirming that the historical task is still selected by ordinary status despite its separately approved `LEGACY_FROZEN` governance. A linked Skill Pulse feature worktree has a different, absent `.d-ai` root and reports missing `task-pointer` on rollover. Neither real durable root was modified.
+- Required safe resolution: An explicit owner-authorized, supported reconciliation of the historical freeze and/or registration of a separate approved current task, with a consistent data backup and strict readback. Preserve the original state/audit, history and existing worktree identity. A code default change would impact other valid legacy tasks and is not authorized here.
+- Never automatically copy `.d-ai`, rewrite identity paths, backfill a charter, mark the task closed, unfreeze it, or claim the frozen governance is already durably enforced.
+- Local candidate boundary (2026-10-08): the candidate adds distinct read-only Boss recovery diagnostics and regression coverage for historical-only/foreign ownership cases. This does not mutate or repair either real Skill Pulse task root and does not close BUG-007; persistent routing disposition and real successor approval remain unresolved.
+
 ### BUG-006 — Project-owned acceptance cannot enter D-AI-Hub orchestration lifecycle
 
 - Severity: high workflow blocker for the affected cross-project task.
-- Status: open; tracked by accepted, deferred [DAI-ARCH-002](ROADMAP.md#dai-arch-002--project-owned-lifecycle-handoff-accepted-deferred).
+- Status: open for the real historical lifecycle decision; the [DAI-ARCH-002](ROADMAP.md#dai-arch-002--project-owned-lifecycle-handoff-accepted-deferred) HUMAN-CONFIRMED handoff mechanism has been published, but publication alone does not authorize task transition or closure.
 - Project/task: Skill Pulse F3 / `task-7b959c2155241137b16a5220`; project execution owner is Skill Pulse project Boss.
 - Observed: project Boss accepted SP-OPS-006 from the natural production run, while the D-AI-Hub durable task remains at `route`. A direct `route → verify` attempt was rejected by the ordinary transition guard.
 - Project Boss evidence reported for the 2026-09-22 13:30:01 Pacific/Auckland natural run: Scheduler result `0`, collector and snapshot validation PASS, snapshot commit `0b41473d…`, Netlify production deploy ready, immutable and alias manifests HTTP 200, Git-blob SHA-256 provenance PASS, with no manual trigger, retry, or repair. This is project acceptance evidence, not a D-AI lifecycle transition.
 - Expected: a typed, owner-authenticated and evidence-backed project-result handoff can reconcile D-AI-Hub orchestration without recording D-AI execution stages that did not occur.
-- Current handling: task remains at `route`, unclosed, `BLOCKED — awaiting lifecycle handoff capability`; no manual rewrite, forced transition, or fake intermediate stage.
-- Resolution condition: DAI-ARCH-002 is implemented and independently verified after the prerequisite publication sequence, then the real Skill Pulse evidence is reconciled through that accepted mechanism.
+- Current handling: the project-owned HUMAN-CONFIRMED handoff was reconciled as historical evidence, but the task remains at `route` and unclosed. Its frozen-routing decision is not a persisted TaskState change (see BUG-007); no forced transition or fictitious intermediate stage is permitted.
+- Resolution condition: project owner explicitly approves a supported final lifecycle disposition with current recovery and conflict evidence, and the durable state is updated and read back without erasing historical audit. No automatic close or cross-worktree adoption is authorized.
 
 ### BUG-001 — Local Git CLI authentication may be unavailable in a new environment
 

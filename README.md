@@ -14,6 +14,8 @@ Local-first personal AI operating system shared across ChatGPT Web, Codex, and o
 
 The local runtime, working tree, durable state, SQLite private memory, and project checkpoints are the active working truth. GitHub is the published framework/source and the transport for explicitly approved milestones, releases, backups, and cross-device transfer; it is not a default publication target.
 
+**Git worktrees do not automatically share D-AI task state.** Each workspace has its own default `.d-ai` root and exact identity/path checks. See [worktree task ownership and Boss rollover recovery](docs/worktree-task-ownership.md) before registering, copying, or relocating tasks.
+
 ## Repository map
 
 - `.agents/skills/` — Agent Skills-compatible entry points.
@@ -25,7 +27,7 @@ The local runtime, working tree, durable state, SQLite private memory, and proje
 - `prompts/` — reusable prompts.
 - `templates/` — reusable Markdown templates.
 - `indexes/` — discovery indexes.
-- `docs/superpowers/` — design specs and implementation plans.
+- `docs/superpowers/` — retained historical design specs and plans; Superpowers execution is disabled, not an active routing dependency.
 
 ## Operating model
 

@@ -406,6 +406,7 @@ export interface FileDurableContextStoreTestHooks {
   readonly afterRootAdmissionContended?: (() => Promise<void>) | undefined;
   readonly createRootAdmissionReservation?: ((path: string) => Promise<void>) | undefined;
   readonly lstatRootAdmissionReservation?: ((path: string) => Promise<{ isDirectory(): boolean; isSymbolicLink(): boolean }>) | undefined;
+  readonly readRootAdmissionOwnerRecord?: ((path: string) => Promise<string>) | undefined;
   readonly beforeProjectContenderRegistered?: (() => Promise<void>) | undefined;
   readonly afterProjectContenderRegistered?: (() => Promise<void>) | undefined;
 }
@@ -829,8 +830,10 @@ export class FileDurableContextStore implements DurableContextStore {
     const deadline = Date.now() + FILE_DURABLE_CONTEXT_LEASE_MS;
     const createReservation = this.testHooks.createRootAdmissionReservation ?? ((path: string) => mkdir(path));
     const inspectReservation = this.testHooks.lstatRootAdmissionReservation ?? lstat;
+    const readReservationOwner = this.testHooks.readRootAdmissionOwnerRecord ?? ((path: string) => readFile(path, "utf8"));
     let contentionObserved = false;
     let permissionRetryUsed = false;
+    let transientOwnerReadRetries = 0;
     while (true) {
       try {
         await createReservation(admissionPath);
@@ -872,10 +875,18 @@ export class FileDurableContextStore implements DurableContextStore {
           }
           let active: RootAdmissionOwner;
           try {
-            active = rootAdmissionOwnerSchema.parse(JSON.parse(await readFile(ownerPath, "utf8")));
+            active = rootAdmissionOwnerSchema.parse(JSON.parse(await readReservationOwner(ownerPath)));
+            transientOwnerReadRetries = 0;
           } catch (readError: unknown) {
             if (isMissingFileError(readError)) {
               if (Date.now() >= deadline) throw new TaskOwnershipError("Matching durable task admission did not complete before the reservation deadline");
+              await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+              continue;
+            }
+            // Windows may briefly deny opening a reservation owner while its writer releases the directory.
+            // Retry only a few read-only times; persistent EPERM still fails closed without taking ownership.
+            if (isPermissionDeniedError(readError) && transientOwnerReadRetries < 3 && Date.now() < deadline) {
+              transientOwnerReadRetries += 1;
               await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
               continue;
             }
