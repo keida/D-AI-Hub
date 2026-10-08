@@ -3,14 +3,26 @@
 ## State
 
 - Lifecycle: active
-- Current objective: DAI-ARCH-003 — design bounded routable task succession after the Skill Pulse Project Boss confirmed that its open legacy task must be retained for history but excluded from future normal routing. DAI-ARCH-002 HUMAN-CONFIRMED handoff is published on canonical main; Skill Pulse remains at `route` and unclosed. DSH 2 and Weekly Review retain their distinct paused/resumable dispositions.
+- Current objective: Audit and improve the local-first D-AI-Hub runtime, focusing on safe task ownership and actionable Boss rollover recovery across Git worktrees. Preserve historical/frozen project tasks, installed runtime and private data. Do not auto-adopt sibling tasks or alter real Skill Pulse state.
 - Privacy intent: PUBLIC is the accepted intentional state; do not store real private Memory, credentials, or confidential durable context while PUBLIC.
 - Stable capability: natural-language intent classification, explicit `@D-AI` priority, structured Codex-agent handoff, bounded delivery, workspace fencing, and fail-closed configured Codex repository identity preflight.
 - Live PR status must be queried from GitHub.
 - Live GitHub CI, branch-protection, visibility, and remote-freshness state must be queried before release or privacy decisions.
-- Last checkpoint: 2026-09-26
+- Last checkpoint: 2026-10-08 (unpublished local audit candidate)
 
 ## Current checkpoint
+
+- Local baseline: GitHub PR #66 is merged at `64082a482e4396f31167e07e5f2718ff3d21df7d`; the installed shared Skill is outside this candidate and must not be changed by local development work.
+- Local audit candidate: `codex/dai-local-audit-20261008` in an independent worktree, based on the merged runtime. This candidate is **uncommitted and unpublished**.
+- Verified design boundary: durable task roots and strict workspace identity are worktree-local; Git-linked siblings are intentionally isolated even when remote identity matches. Skill Pulse's old task is governed as `LEGACY_FROZEN` but its persisted TaskState lacks `routingDisposition`, which the current reader defaults to `ROUTABLE`; see BUG-007. It is not an authorized current resume anchor.
+- Prior field observation recorded at candidate intake (2026-10-08; not re-read during this audit continuation): the intended Skill Pulse Boss worktree had no local `.d-ai`/task-pointer; read-only rollover via the **then-installed runtime** returned `BLOCKED`, `missingFields: ["task-pointer"]`, no handoff. The original Skill Pulse owner checkout's read-only `@D-AI status` separately returned `accepted / route` for the historically frozen task; see BUG-007. This report does not claim a fresh observation. No real `.d-ai` root or private Memory content was read or changed during this continuation.
+- Candidate fix: distinct no-task, historical-only, foreign-agent-ownership and malformed-identity Boss diagnostics; linked-worktree regression and worktree ownership guidance; local-private-state `.gitignore`; and bounded, read-only retry of transient Windows `EPERM` on root-admission owner-file reads while keeping permanent denials fail-closed. No automatic cross-root migration, task creation, private memory changes, or installed activation.
+- Latest isolated, uninterrupted `npm run verify` (2026-10-08): TypeScript typecheck PASS; unit suite **42 files, 994 passed, 9 skipped**; serial integration suite **12 files, 183 passed, 1 skipped**. All test stages passed. The final structural health command returned `unhealthy` only because its two working-tree cleanliness checks detected the intentionally uncommitted candidate; repository identity, required files, index freshness, Skill frontmatter, and Markdown links passed. This is a local Windows run, not cross-platform CI. The synthetic new OS process exercised the public CLI, but is not a real newly created Codex Boss. Installed activation and real Skill Pulse rollover remain NOT VERIFIED. Full log: `C:\Users\User\Documents\Codex\2026-10-08\dai-local-audit-baseline-20261008-558d5ee8e0e046abb10dc41d95ee5a8b\validation-isolation\npm-run-verify-corrected.log`.
+- Hygiene inventory: original D-AI-Hub Git repository registers 65 worktrees (1 prune-eligible missing-path metadata entry), with 34 `D-AI-Hub*` sibling directories under the ChatGPT project folder. All were inventoried without pruning, resetting, deleting or reassigning any workspace; dirty sources and retained runtimes may contain irreplaceable data.
+- Remaining boundary: cross-root global uniqueness and project task transfer are not supported. Actual Skill Pulse charter approval, authoritative phase/nextAction, handoff preparation and independent new-Boss recovery are not yet demonstrated.
+- Candidate implementation and isolated full verification are complete; next action is independent review of this exact uncommitted candidate, followed by a separate decision on any publication or installation. Do not alter real Skill Pulse state or installed runtime. Preserve existing local `main` edits and untracked files; do not fast-forward a dirty older checkout.
+
+## Historical checkpoint (2026-09-26)
 
 - V1 Foundation: CLOSED.
 - Verified V1 foundation: V1 Stabilization is CLOSED; legacy migration is ALREADY SATISFIED; natural-language project continuation DOGFOOD is PASS; explicit task-ID continuation is PASS; and the future-task canonical repository guarantee is CLOSED.
@@ -30,6 +42,12 @@
 
 ## Current blockers
 
+- Worktree-local task roots are intentionally isolated. There is no supported automatic owner transfer or cross-root global uniqueness proof; do not adopt another root's active or historical task.
+- Skill Pulse's current Boss worktree has no canonical task. Real task approval, authoritative recovery completeness, and new-Boss handoff verification remain separate gates.
+- The root `D-AI-Hub` documentation-only checkout is older and dirty; leave its five tracked edits and untracked files intact. Do not merge/reset it automatically.
+
+## Historical blockers (as of 2026-09-26)
+
 - DSH 2 remains intentionally `INCOMPLETE: phase` and Weekly Review remains intentionally `INCOMPLETE: phase,nextAction`; both have owner-confirmed paused/resumable dispositions and neither is unresolved canonical-state repair debt. Skill Pulse close eligibility is blocked by unknown original task scope. The `LEGACY_FROZEN` routing model is canonical, but no real Skill Pulse task-state mutation or successor creation has been authorized or performed. The published handoff's historical-evidence limitations remain recorded in its audit. Source-chat finalization is not yet verified: `SAFE TO DELETE SOURCE CHAT = NO`.
 - While the repository remains PUBLIC, do not store real private Memory, credentials, or confidential durable context.
 - Any PR, CI, branch-protection, or remote-freshness claim must be refreshed from GitHub rather than copied into this checkpoint.
@@ -37,7 +55,7 @@
 
 ## Next concrete action
 
-Complete Boss review of the local DAI-ARCH-003B Slice B candidate against its exact authorized checkout and evidence; if accepted, make a separate publication decision. Do not mutate the Skill Pulse legacy task, create its successor, or close it during candidate review. DSH 2 and Weekly Review remain paused/resumable; `HOST-ATTESTED` and source-chat finalization remain deferred.
+Complete independent Boss review of the exact final uncommitted diff and full verification evidence. If accepted, make publication and installed activation separate explicit decisions. Do not modify installed D-AI, real Skill Pulse tasks, raw memory, or source chat; preserve the older dirty documentation checkout and its untracked files.
 
 ## Evidence pointers
 

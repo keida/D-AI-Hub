@@ -539,6 +539,118 @@ describe("FileDurableContextStore", () => {
     }
   });
 
+  it("retries transient Windows EPERM while reading a reservation owner, but fails closed on persistent denial", async () => {
+    const rootPath = await createStoreRoot();
+    const admissionPath = join(rootPath, ".root-admission");
+    const ownerPath = join(admissionPath, "owner.json");
+    const candidate = createRepositoryState(`task-${"8".repeat(24)}`, "bounded reservation owner read retry");
+    const owner = { schemaVersion: 1, token: "00000000-0000-4000-8000-000000000108", candidateKey: "f".repeat(64) };
+    const ownerBytes = Buffer.from(`${JSON.stringify(owner)}\n`, "utf8");
+    let transientReads = 0;
+    let persistentReads = 0;
+    const permissionError = (): NodeJS.ErrnoException => Object.assign(new Error("synthetic transient EPERM"), { code: "EPERM" });
+    try {
+      await mkdir(admissionPath);
+      await writeFile(ownerPath, ownerBytes);
+      const transientStore = new FileDurableContextStore(rootPath, {
+        readRootAdmissionOwnerRecord: async (path) => {
+          transientReads += 1;
+          if (transientReads <= 2) throw permissionError();
+          return readFile(path, "utf8");
+        },
+      });
+      await expect(transientStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "TaskOwnershipError", message: "Another durable task is being admitted at this root",
+      });
+      expect(transientReads).toBe(3);
+      expect(await readFile(ownerPath)).toEqual(ownerBytes);
+
+      const deniedStore = new FileDurableContextStore(rootPath, {
+        readRootAdmissionOwnerRecord: async () => {
+          persistentReads += 1;
+          throw permissionError();
+        },
+      });
+      await expect(deniedStore.createIfAbsent(candidate)).rejects.toMatchObject({
+        name: "InvalidTaskStateError", message: expect.stringContaining("unreadable reservation"),
+      });
+      expect(persistentReads).toBe(4);
+      expect(await readFile(ownerPath)).toEqual(ownerBytes);
+      expect(await deniedStore.load(candidate.taskId)).toBeNull();
+    } finally {
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
+  it("publishes a matching successor after transient reservation-owner read denial", async () => {
+    const rootPath = await createStoreRoot();
+    const charter = approvedCharter(initialProjectIdentity, "matching successor after transient owner read denial");
+    const digest = taskCharterContentDigest(charter);
+    const candidate: TaskState = {
+      ...createRepositoryState(taskCharterTaskId(initialProjectIdentity, digest), charter.objective),
+      routingDisposition: "ROUTABLE",
+      taskCharter: charter,
+      taskCharterConfirmation: {
+        confirmationId: "00000000-0000-4000-8000-000000000108",
+        confirmedAt: "2026-10-07T00:00:00.000Z",
+        projectIdentity: initialProjectIdentity,
+        confirmedCharterDigest: digest,
+        channel: "explicit-task-charter-digest",
+      },
+    };
+    let releaseFirstAdmission!: () => void;
+    const firstAdmissionGate = new Promise<void>((resolve) => { releaseFirstAdmission = resolve; });
+    let signalFirstAdmissionHeld!: () => void;
+    const firstAdmissionHeld = new Promise<void>((resolve) => { signalFirstAdmissionHeld = resolve; });
+    let denyOwnerReads = 0;
+    let signalMatchingOwnerRead!: () => void;
+    const matchingOwnerReadObserved = new Promise<void>((resolve) => { signalMatchingOwnerRead = resolve; });
+    const firstStore = new FileDurableContextStore(rootPath, {
+      afterProjectContenderRegistered: async () => {
+        signalFirstAdmissionHeld();
+        await firstAdmissionGate;
+      },
+    });
+    const waitingStore = new FileDurableContextStore(rootPath, {
+      readRootAdmissionOwnerRecord: async (path) => {
+        denyOwnerReads += 1;
+        if (denyOwnerReads <= 2) {
+          throw Object.assign(new Error("synthetic transient EPERM"), { code: "EPERM" });
+        }
+        const ownerRecord = await readFile(path, "utf8");
+        if (denyOwnerReads === 3) signalMatchingOwnerRead();
+        return ownerRecord;
+      },
+    });
+    const pendingPublications: Promise<unknown>[] = [];
+    try {
+      const firstPublication = firstStore.createSuccessorIfAbsent!(candidate, initialProjectIdentity, digest);
+      pendingPublications.push(firstPublication);
+      await firstAdmissionHeld;
+      const waitingPublication = waitingStore.createSuccessorIfAbsent!(candidate, initialProjectIdentity, digest);
+      pendingPublications.push(waitingPublication);
+      await matchingOwnerReadObserved;
+      releaseFirstAdmission();
+
+      const [firstManifest, waitingManifest] = await Promise.all([
+        firstPublication,
+        waitingPublication,
+      ]);
+      expect(firstManifest.taskId).toBe(candidate.taskId);
+      expect(waitingManifest.taskId).toBe(candidate.taskId);
+      expect(denyOwnerReads).toBeGreaterThanOrEqual(3);
+      expect(await waitingStore.load(candidate.taskId)).toMatchObject({
+        taskId: candidate.taskId,
+        routingDisposition: "ROUTABLE",
+        taskCharter: { projectIdentity: initialProjectIdentity },
+      });
+    } finally {
+      releaseFirstAdmission();
+      await Promise.allSettled(pendingPublications);
+      await rm(rootPath, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
   it("retries one EPERM only after the reservation directory disappears", async () => {
     const rootPath = await createStoreRoot();
     const candidate = createRepositoryState(`task-${"3".repeat(24)}`, "single root reservation retry");

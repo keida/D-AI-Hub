@@ -2309,6 +2309,7 @@ describe("D-AI runtime", () => {
 
     expect(status).toMatchObject({ taskId: "unassigned", status: "blocked" });
     expect(status.message).toContain("No active D-AI task matches this workspace");
+    expect(status.message).toContain("not shared across Git worktrees");
     expect(establish).toMatchObject({ taskId: frozen.taskId, status: "blocked" });
     expect(establish.message).toContain("Only legacy-frozen tasks match this workspace");
     expect(runtimeHarness.savedStates).toHaveLength(beforeWrites);

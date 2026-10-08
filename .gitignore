@@ -12,6 +12,13 @@
 secrets/
 credentials/
 
+# Private D-AI runtime state, machine bindings and local SQLite memory
+.d-ai/
+.runtime-root
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
 # Authentication/session artifacts
 *.cookie
 *.cookies

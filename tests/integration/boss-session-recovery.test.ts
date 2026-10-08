@@ -57,6 +57,15 @@ async function seedRemoteTask(store: FileDurableContextStore, taskId: string, wo
   return state;
 }
 
+async function runPublicCLIProcess(arguments_: readonly string[]) {
+  return runCommand({
+    command: process.execPath,
+    arguments: ["--import", "tsx", ...arguments_],
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+}
+
 async function logicalTaskSnapshot(store: FileDurableContextStore, durableRoot: string): Promise<{
   readonly taskIds: readonly string[];
   readonly taskStates: readonly { taskId: string; state: unknown }[];
@@ -278,6 +287,48 @@ describe("P4 Boss startup and rollover", () => {
     }
   });
 
+  it("explains workspace-local task ownership when a linked Git worktree has no durable root", async () => {
+    const root = await mkdtemp(join(tmpdir(), "d-ai-p4-missing-linked-worktree-root-"));
+    const ownerWorkspace = join(root, "owner");
+    const siblingWorkspace = join(root, "sibling");
+    const ownerDurableRoot = join(ownerWorkspace, ".d-ai");
+    try {
+      await mkdir(ownerWorkspace, { recursive: true });
+      await gitWorkspace(ownerWorkspace, true);
+      await runCommand({ command: "git", arguments: ["worktree", "add", "--detach", siblingWorkspace, "HEAD"], cwd: ownerWorkspace });
+      await mkdir(join(siblingWorkspace, ".agents", "skills"), { recursive: true });
+
+      const ownerStore = new FileDurableContextStore(ownerDurableRoot);
+      await seedRemoteTask(ownerStore, "task-p4-owner-only-linked", ownerWorkspace);
+      const ownerBefore = await logicalTaskSnapshot(ownerStore, ownerDurableRoot);
+
+      const rollover = await createCodexActivation(createConfiguredDAIRuntime({
+        workspacePath: siblingWorkspace,
+        memoryDatabasePath: join(root, "synthetic-memory.sqlite"),
+      }))({ rawCommand: "@D-AI rollover", taskId: null });
+
+      expect(rollover).toMatchObject({
+        status: "blocked",
+        bossSession: {
+          decision: "BLOCKED",
+          handoff: null,
+          recoveryCompleteness: {
+            status: "BLOCKED",
+            projection: "UNAVAILABLE",
+            missingFields: ["task-pointer"],
+            diagnosticReason: expect.stringContaining("Git worktrees do not automatically share"),
+          },
+        },
+      });
+      expect(rollover.message).toContain("inspect existing project history before approving initial registration");
+      await expect(readdir(join(siblingWorkspace, ".d-ai"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await logicalTaskSnapshot(ownerStore, ownerDurableRoot)).toEqual(ownerBefore);
+    } finally {
+      await runCommand({ command: "git", arguments: ["worktree", "remove", "--force", siblingWorkspace], cwd: ownerWorkspace }).catch(() => {});
+      await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 });
+    }
+  });
+
   it("blocks detached-remote recovery across environment ownership without changing task records", async () => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-p4-detached-remote-environment-"));
     const workspacePath = join(root, "workspace");
@@ -291,7 +342,10 @@ describe("P4 Boss startup and rollover", () => {
 
       const result = await createCodexActivation(createConfiguredDAIRuntime({ workspacePath, durableRoot }))({ rawCommand: "@D-AI continue", taskId: null });
 
-      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED", recoveryCompleteness: {
+        status: "BLOCKED", missingFields: [], diagnosticReason: expect.stringContaining("another agent environment"),
+      } } });
+      expect(result.message).toContain("not an absent task-pointer");
       expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
@@ -331,7 +385,16 @@ describe("P4 Boss startup and rollover", () => {
       const current = await activate({ rawCommand: "@D-AI continue", taskId: null });
       const historical = await activate({ rawCommand: "@D-AI status", taskId: frozenTaskId });
 
-      expect(current).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+      expect(current).toMatchObject({
+        status: "blocked",
+        bossSession: {
+          decision: "BLOCKED",
+          recoveryCompleteness: {
+            missingFields: ["task-pointer"],
+            diagnosticReason: expect.stringContaining("only LEGACY_FROZEN history"),
+          },
+        },
+      });
       expect(historical).toMatchObject({ status: "accepted", taskId: frozenTaskId });
       expect(historical.message).toMatch(/LEGACY_FROZEN|historical/i);
       expect(await logicalTaskSnapshot(store, durableRoot)).toEqual(before);
@@ -549,7 +612,11 @@ describe("P4 Boss startup and rollover", () => {
       if (state === null) throw new Error("Expected task");
       await store.createIfAbsent!({ ...state, taskId: "task-p4-other-environment", environment: "work", durableContext: null });
       const result = await activate({ rawCommand: "@D-AI continue", taskId: first.taskId });
-      expect(result).toMatchObject({ status: "blocked", bossSession: { decision: "BLOCKED" } });
+      expect(result).toMatchObject({ status: "blocked", bossSession: {
+        decision: "BLOCKED", recoveryCompleteness: {
+          status: "BLOCKED", missingFields: [], diagnosticReason: expect.stringContaining("another agent environment"),
+        },
+      } });
       expect((await readdir(durableRoot)).filter((entry) => entry.startsWith("task-")).sort()).toEqual([first.taskId, "task-p4-other-environment"].sort());
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 25 }); }
   });
@@ -599,7 +666,7 @@ describe("P4 Boss startup and rollover", () => {
   it.each(["trailing-space", "aggregate-overflow"] as const)("keeps authoritative limitations recoverable through bounded Boss context: %s", async (caseName) => {
     const root = await mkdtemp(join(tmpdir(), "d-ai-p4r-limitations-"));
     const workspacePath = join(root, "workspace");
-    const durableRoot = join(root, "durable");
+    const durableRoot = join(workspacePath, ".d-ai");
     const memoryDatabasePath = join(root, "memory.sqlite");
     try {
       await mkdir(workspacePath, { recursive: true });
@@ -632,6 +699,48 @@ describe("P4 Boss startup and rollover", () => {
         expect(presentation?.omittedMemoryIds.length).toBe(presentation?.omittedCount);
         expect(Buffer.byteLength(JSON.stringify(startup.bossSession?.startup?.limitations), "utf8")).toBeLessThanOrEqual(2048);
       }
+      const continuedProcess = await runPublicCLIProcess([
+        "src/entry/codex-cli.ts", "--workspace", workspacePath, "--command", "@D-AI continue", "--memory-database", memoryDatabasePath,
+      ]);
+      expect(continuedProcess.exitCode, continuedProcess.stderr).toBe(0);
+      const continued = JSON.parse(continuedProcess.stdout) as {
+        status: string;
+        taskId: string;
+        bossSession?: { decision?: string; startup?: { taskId?: string; phase?: string | null; nextAction?: string | null; limitationsPresentation?: { truncatedMemoryIds?: string[]; omittedMemoryIds?: string[] } } | null };
+      };
+      expect(continued).toMatchObject({ status: "accepted", taskId: first.taskId, bossSession: {
+        decision: "CONTINUE_CURRENT_BOSS", startup: { taskId: first.taskId, phase: "pilot verification", nextAction: "resume canonical work." },
+      } });
+      const processPresentation = continued.bossSession?.startup?.limitationsPresentation;
+      if (caseName === "trailing-space") {
+        expect(processPresentation?.truncatedMemoryIds).toEqual(["p4r-limitation-0"]);
+      } else {
+        const omittedMemoryIds = processPresentation?.omittedMemoryIds ?? [];
+        expect(omittedMemoryIds.length).toBeGreaterThan(0);
+        expect(omittedMemoryIds.every((memoryId) => facts.some((_, index) => memoryId === `p4r-limitation-${index}`))).toBe(true);
+      }
+      const statusProcess = await runPublicCLIProcess([
+        "src/entry/codex-cli.ts", "--workspace", workspacePath, "--command", "@D-AI status", "--task", first.taskId, "--memory-database", memoryDatabasePath,
+      ]);
+      expect(statusProcess.exitCode, statusProcess.stderr).toBe(0);
+      expect(JSON.parse(statusProcess.stdout)).toMatchObject({ status: "accepted", taskId: first.taskId });
+
+      const databaseBeforePublicReads = await readFile(memoryDatabasePath);
+      for (const [index, fact] of facts.entries()) {
+        const readProcess = await runPublicCLIProcess([
+          "src/memory/memory-cli.ts", "get",
+          "--database", memoryDatabasePath,
+          "--workspace", dirname(memoryDatabasePath),
+          "--scope", resolveLocalMemoryScopeId(memoryDatabasePath),
+          "--writer", "primary-device",
+          "--mode", "reader",
+          "--memory-id", `p4r-limitation-${index}`,
+        ]);
+        expect(readProcess.exitCode, readProcess.stderr).toBe(0);
+        expect(JSON.parse(readProcess.stdout)).toMatchObject({ value: { fact } });
+      }
+      expect(await readFile(memoryDatabasePath)).toEqual(databaseBeforePublicReads);
+
       const rollover = await activate({ rawCommand: "@D-AI rollover", taskId: first.taskId, bossSession: { mode: "prepare", sourceKey: "boss-source" } });
       expect(rollover).toMatchObject({ status: "accepted", taskId: first.taskId, bossSession: { decision: "ROLLOVER_PREPARED", handoff: { recovery: { taskId: first.taskId }, limitationsPresentation: { totalCount: facts.length } } } });
       expect(await readFile(join(durableRoot, first.taskId, "state.json"))).toEqual(beforeState);

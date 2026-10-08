@@ -3169,7 +3169,7 @@ async function selectDiscoveredDurableTask(
     return blockedWithoutState(
       "unassigned",
       request.sourceEnvironment,
-      "No active D-AI task matches this workspace. Use @D-AI continue <task-id> or add --task <task-id> for an explicit selection",
+      "No active D-AI task matches this workspace. Task state is workspace-local, not shared across Git worktrees. Check the owner workspace before new registration; use @D-AI continue <task-id> or --task <task-id> only for a task stored here.",
     );
   }
   if (candidates.length > 1) {
@@ -3298,12 +3298,22 @@ async function bossSessionResponse(request: DAIRequest, dependencies: DAIRuntime
   const workspaceRoutingCandidates = defaultRoutingCandidates(discovery.allWorkspaceCandidates);
   const otherEnvironmentRoutingCandidates = defaultRoutingCandidates(discovery.otherEnvironmentCandidates);
   const malformedIdentity = discovery.allWorkspaceCandidates.some((candidate) => projectIdentityMode(candidate) === null);
-  if (routingCandidates.length !== 1 || workspaceRoutingCandidates.length !== 1 || otherEnvironmentRoutingCandidates.length !== 0 || discovery.repositoryConflicts.length !== 0 || malformedIdentity || (discovery.mode === "repository" && discovery.localOnlyCandidates.length !== 0)) {
-    const reason = "Boss recovery requires exactly one canonical project task without identity conflicts";
-    const onlyWorkspaceTask = workspaceRoutingCandidates.length === 1 ? workspaceRoutingCandidates[0]! : null;
-    const missingFields = onlyWorkspaceTask !== null && projectIdentityMode(onlyWorkspaceTask) === null
+  const identityConflict = discovery.repositoryConflicts.length !== 0 || malformedIdentity
+    || (discovery.mode === "repository" && discovery.localOnlyCandidates.length !== 0);
+  const environmentConflict = otherEnvironmentRoutingCandidates.length !== 0;
+  if (routingCandidates.length !== 1 || workspaceRoutingCandidates.length !== 1 || environmentConflict || identityConflict) {
+    const reason = identityConflict
+      ? "Boss recovery found a malformed or conflicting project identity in this workspace; inspect the durable owner and repository identity before retrying. Do not register a replacement task."
+      : environmentConflict
+        ? "Boss recovery found a task owned by another agent environment in this workspace; this is an ownership conflict, not an absent task-pointer. Do not register a replacement task."
+        : workspaceRoutingCandidates.length === 0
+          ? discovery.allWorkspaceCandidates.some(isLegacyFrozen)
+            ? "Boss recovery found only LEGACY_FROZEN history in this workspace; no routable task-pointer exists. Historical tasks cannot be resumed as current without an approved successor."
+            : "Boss recovery found no routable task-pointer in this workspace's local .d-ai. Git worktrees do not automatically share D-AI task roots; inspect existing project history before approving initial registration."
+          : "Boss recovery requires exactly one canonical project task without identity conflicts";
+    const missingFields = identityConflict
       ? ["project-identity"] as const
-      : workspaceRoutingCandidates.length === 0 ? ["task-pointer"] as const : [];
+      : environmentConflict ? [] : workspaceRoutingCandidates.length === 0 ? ["task-pointer"] as const : [];
     return blocked(reason, null, blockedCompleteness(reason, missingFields));
   }
   const discovered = routingCandidates[0]!;
